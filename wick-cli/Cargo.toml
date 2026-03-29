@@ -1,0 +1,18 @@
+[package]
+name = "wick-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI for the Wick LLM inference engine"
+
+[[bin]]
+name = "wick"
+path = "src/main.rs"
+
+[dependencies]
+wick = { path = "../wick" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
