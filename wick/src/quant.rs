@@ -1,3 +1,7 @@
+use half::f16;
+
+// ── Block layouts ────────────────────────────────────────────────────────────
+
 /// Q8_0 quantization block: 32 values in 34 bytes.
 ///
 /// Layout:
@@ -29,3 +33,418 @@ pub struct BlockQ4KM {
 }
 
 const _: () = assert!(size_of::<BlockQ4KM>() == 144);
+
+// ── Q8_0 dequantization ─────────────────────────────────────────────────────
+
+/// Dequantize a single Q8_0 block to 32 f32 values.
+pub fn dequantize_q8_0_block(block: &BlockQ8_0) -> [f32; 32] {
+    let d = f16::from_bits(block.delta).to_f32();
+    let mut out = [0.0f32; 32];
+    for (o, &q) in out.iter_mut().zip(block.quants.iter()) {
+        *o = q as f32 * d;
+    }
+    out
+}
+
+/// Dequantize a row of Q8_0 blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ8_0>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 32);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        // SAFETY: BlockQ8_0 is repr(C, packed) and we've verified the slice length
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ8_0) };
+        let values = dequantize_q8_0_block(block);
+        dst[i * 32..(i + 1) * 32].copy_from_slice(&values);
+    }
+}
+
+/// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
+pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 32);
+    let d = f16::from_bits(block.delta).to_f32();
+    let sum: f32 = block
+        .quants
+        .iter()
+        .zip(y.iter())
+        .map(|(&q, &y)| q as f32 * y)
+        .sum();
+    sum * d
+}
+
+// ── Q4_K_M dequantization ───────────────────────────────────────────────────
+
+/// Decode the packed sub-block scales and minimums from Q4_K_M's 12-byte scales array.
+///
+/// Q4_K_M has 8 sub-blocks of 32 values each. The 12 bytes encode:
+/// - 8 6-bit scales and 8 6-bit minimums
+///
+/// Bytes 0-3: low 4 bits of scales[0..3] and mins[0..3]  (packed as scale|min per byte)
+///   Wait — actually llama.cpp packs them differently.
+///
+/// From ggml-quants.c (get_scale_min_k4):
+///   j < 4:  sc = scales[j] & 63,      m = scales[j+4] & 63
+///   j >= 4: sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4),
+///           m  = (scales[j+4] >> 4)   | ((scales[j-0] >> 6) << 4)
+///
+/// Returns (scales[8], mins[8]).
+fn decode_q4km_scales(scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let mut sc = [0u8; 8];
+    let mut mn = [0u8; 8];
+
+    for j in 0..4 {
+        sc[j] = scales[j] & 63;
+        mn[j] = scales[j + 4] & 63;
+    }
+    for j in 4..8 {
+        sc[j] = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        mn[j] = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+
+    (sc, mn)
+}
+
+/// Dequantize a single Q4_K_M block to 256 f32 values.
+///
+/// Ported from llama.cpp's dequantize_row_q4_K.
+pub fn dequantize_q4_k_m_block(block: &BlockQ4KM) -> [f32; 256] {
+    let d = f16::from_bits(block.d).to_f32();
+    let dmin = f16::from_bits(block.dmin).to_f32();
+    let (sc, mn) = decode_q4km_scales(&block.scales);
+
+    let mut out = [0.0f32; 256];
+    let qs = &block.qs;
+
+    for j in 0..8 {
+        // Each sub-block has 32 values
+        let sc_val = d * sc[j] as f32;
+        let mn_val = dmin * mn[j] as f32;
+
+        // First 16 values: low nibble of qs[j*16..j*16+16]
+        // Second 16 values: high nibble of qs[j*16..j*16+16]
+        // But the layout is actually:
+        //   sub-blocks 0-3 use qs[0..64], lower nibble for 0-1, upper for 2-3
+        //   sub-blocks 4-7 use qs[64..128], lower nibble for 4-5, upper for 6-7
+        //
+        // Actually from llama.cpp:
+        //   for (int l = 0; l < 32; ++l) {
+        //     *y++ = d * sc[is] * ((q[l] & 0xF) - (m ? dmin * mn[is] : 0))
+        //   but that's not right either.
+        //
+        // Let me re-read the llama.cpp source carefully.
+        // The actual layout from dequantize_row_q4_K:
+        //
+        //   q = qs (pointer to start of qs array)
+        //   for j in 0..QK_K/64:     (QK_K=256, so j in 0..4)
+        //     sc1 = get_scale(j*2), mn1 = get_min(j*2)
+        //     sc2 = get_scale(j*2+1), mn2 = get_min(j*2+1)
+        //     for l in 0..32:
+        //       y[l+0]  = d * sc1 * (q[l] & 0xF) - dmin * mn1
+        //       y[l+32] = d * sc2 * (q[l] >> 4)   - dmin * mn2
+        //     q += 32, y += 64
+        //
+        // So it processes 64 values at a time using 32 bytes of qs.
+        // Each byte holds two 4-bit values: low nibble and high nibble.
+        let _ = (sc_val, mn_val); // will use below
+    }
+
+    // Re-implement following llama.cpp's actual loop structure
+    let mut qi = 0; // index into qs
+    let mut yi = 0; // index into output
+
+    for j in 0..4 {
+        let d_sc1 = d * sc[j * 2] as f32;
+        let d_mn1 = dmin * mn[j * 2] as f32;
+        let d_sc2 = d * sc[j * 2 + 1] as f32;
+        let d_mn2 = dmin * mn[j * 2 + 1] as f32;
+
+        for l in 0..32 {
+            out[yi + l] = d_sc1 * (qs[qi + l] & 0xF) as f32 - d_mn1;
+            out[yi + l + 32] = d_sc2 * (qs[qi + l] >> 4) as f32 - d_mn2;
+        }
+        qi += 32;
+        yi += 64;
+    }
+
+    out
+}
+
+/// Dequantize a row of Q4_K_M blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q4_k_m_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ4KM>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 256);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ4KM) };
+        let values = dequantize_q4_k_m_block(block);
+        dst[i * 256..(i + 1) * 256].copy_from_slice(&values);
+    }
+}
+
+/// Dot product of a Q4_K_M block with an f32 vector of length 256. Scalar version.
+///
+/// Ported from llama.cpp's ggml_vec_dot_q4_K_q8_K.
+pub fn vec_dot_q4_k_m_f32_scalar(block: &BlockQ4KM, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 256);
+
+    let d = f16::from_bits(block.d).to_f32();
+    let dmin = f16::from_bits(block.dmin).to_f32();
+    let (sc, mn) = decode_q4km_scales(&block.scales);
+    let qs = &block.qs;
+
+    let mut sumf = 0.0f32;
+    let mut qi = 0usize;
+    let mut yi = 0usize;
+
+    for j in 0..4 {
+        let sc1 = sc[j * 2] as f32;
+        let mn1 = mn[j * 2] as f32;
+        let sc2 = sc[j * 2 + 1] as f32;
+        let mn2 = mn[j * 2 + 1] as f32;
+
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum_mn1 = 0.0f32;
+        let mut sum_mn2 = 0.0f32;
+
+        for l in 0..32 {
+            sum1 += (qs[qi + l] & 0xF) as f32 * y[yi + l];
+            sum2 += (qs[qi + l] >> 4) as f32 * y[yi + l + 32];
+            sum_mn1 += y[yi + l];
+            sum_mn2 += y[yi + l + 32];
+        }
+
+        sumf += d * (sc1 * sum1 + sc2 * sum2) - dmin * (mn1 * sum_mn1 + mn2 * sum_mn2);
+        qi += 32;
+        yi += 64;
+    }
+
+    sumf
+}
+
+// ── Dispatch functions ──────────────────────────────────────────────────────
+
+/// Dot product of a Q8_0 block with an f32 vector. Dispatches to best available impl.
+pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
+    vec_dot_q8_0_f32_scalar(block, y)
+}
+
+/// Dot product of a Q4_K_M block with an f32 vector. Dispatches to best available impl.
+pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
+    vec_dot_q4_k_m_f32_scalar(block, y)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Q8_0 block from known values for testing.
+    fn make_q8_0_block(scale: f32, quants: [i8; 32]) -> BlockQ8_0 {
+        BlockQ8_0 {
+            delta: f16::from_f32(scale).to_bits(),
+            quants,
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q8_0_simple() {
+        let block = make_q8_0_block(0.5, {
+            let mut q = [0i8; 32];
+            for i in 0..32 {
+                q[i] = i as i8;
+            }
+            q
+        });
+        let out = dequantize_q8_0_block(&block);
+        for i in 0..32 {
+            let expected = i as f32 * 0.5;
+            assert!(
+                (out[i] - expected).abs() < 1e-3,
+                "mismatch at {i}: got {}, expected {expected}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q8_0_row() {
+        // Two blocks
+        let block1 = make_q8_0_block(1.0, {
+            let mut q = [0i8; 32];
+            for i in 0..32 {
+                q[i] = (i as i8) - 16;
+            }
+            q
+        });
+        let block2 = make_q8_0_block(0.25, [1i8; 32]);
+
+        let mut src = vec![0u8; 68];
+        unsafe {
+            std::ptr::copy_nonoverlapping(&block1 as *const _ as *const u8, src.as_mut_ptr(), 34);
+            std::ptr::copy_nonoverlapping(
+                &block2 as *const _ as *const u8,
+                src.as_mut_ptr().add(34),
+                34,
+            );
+        }
+
+        let mut dst = vec![0.0f32; 64];
+        dequantize_q8_0_row(&src, &mut dst);
+
+        // Check block1 values
+        for i in 0..32 {
+            let expected = (i as f32 - 16.0) * 1.0;
+            assert!(
+                (dst[i] - expected).abs() < 1e-3,
+                "block1[{i}]: got {}, expected {expected}",
+                dst[i]
+            );
+        }
+        // Check block2 values
+        for i in 0..32 {
+            let expected = 1.0 * 0.25;
+            assert!(
+                (dst[32 + i] - expected).abs() < 1e-3,
+                "block2[{i}]: got {}, expected {expected}",
+                dst[32 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_vec_dot_q8_0() {
+        let block = make_q8_0_block(0.1, {
+            let mut q = [0i8; 32];
+            for i in 0..32 {
+                q[i] = (i as i8) * 2 - 31;
+            }
+            q
+        });
+        let y: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
+
+        // Compute expected via dequantize
+        let dequantized = dequantize_q8_0_block(&block);
+        let expected: f32 = dequantized.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q8_0_f32(&block, &y);
+
+        assert!(
+            (got - expected).abs() < 1e-3,
+            "vec_dot mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dequantize_q4_k_m_basic() {
+        // Create a Q4_K_M block with known values
+        let mut block = BlockQ4KM {
+            d: f16::from_f32(1.0).to_bits(),
+            dmin: f16::from_f32(0.0).to_bits(), // zero min for simplicity
+            scales: [0u8; 12],
+            qs: [0u8; 128],
+        };
+        // Set all sub-block scales to 1 (6-bit value)
+        for i in 0..4 {
+            block.scales[i] = 1; // sc[i] = 1, bits 6-7 = 0
+        }
+        for i in 4..8 {
+            block.scales[i] = 0; // mn[0..4] = 0
+        }
+        // sc[4..8] and mn[4..8] come from bytes 8-11
+        for i in 8..12 {
+            block.scales[i] = 0x01; // sc[j] low nibble = 1, mn[j] high nibble = 0
+        }
+
+        // Set qs: all nibbles = 3
+        for b in block.qs.iter_mut() {
+            *b = 0x33; // low nibble = 3, high nibble = 3
+        }
+
+        let out = dequantize_q4_k_m_block(&block);
+        // With d=1.0, dmin=0.0, sc=1, all nibbles=3:
+        // value = 1.0 * 1 * 3 - 0.0 = 3.0
+        for (i, &v) in out.iter().enumerate() {
+            assert!(
+                (v - 3.0).abs() < 1e-3,
+                "mismatch at {i}: got {v}, expected 3.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vec_dot_q4km_matches_dequantize() {
+        // Create a block with varied values
+        let mut block = BlockQ4KM {
+            d: f16::from_f32(0.5).to_bits(),
+            dmin: f16::from_f32(0.1).to_bits(),
+            scales: [0u8; 12],
+            qs: [0u8; 128],
+        };
+        // Set scales: sc=2, mn=1 for first 4 sub-blocks
+        for i in 0..4 {
+            block.scales[i] = 2;
+        }
+        for i in 4..8 {
+            block.scales[i] = 1;
+        }
+        for i in 8..12 {
+            block.scales[i] = 0x21; // sc low=1, mn high=2 -> sc[j]=1|(bits<<4), mn[j]=(2)|(bits<<4)
+        }
+
+        // Varied quantized values
+        for (i, b) in block.qs.iter_mut().enumerate() {
+            *b = ((i % 7) as u8) | (((i % 11) as u8) << 4);
+        }
+
+        let y: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
+
+        // Compute expected via dequantize + dot
+        let dequantized = dequantize_q4_k_m_block(&block);
+        let expected: f32 = dequantized.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q4_k_m_f32(&block, &y);
+
+        assert!(
+            (got - expected).abs() < 1e-2,
+            "vec_dot mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_decode_q4km_scales_roundtrip() {
+        // Test that known scale values decode correctly
+        let mut scales = [0u8; 12];
+        // Set sc[0]=5, sc[1]=10, sc[2]=15, sc[3]=20 (6-bit, low bits in bytes 0-3)
+        scales[0] = 5;
+        scales[1] = 10;
+        scales[2] = 15;
+        scales[3] = 20;
+        // Set mn[0]=1, mn[1]=2, mn[2]=3, mn[3]=4 (6-bit, low bits in bytes 4-7)
+        scales[4] = 1;
+        scales[5] = 2;
+        scales[6] = 3;
+        scales[7] = 4;
+        // sc[4..8] and mn[4..8]: bytes 8-11, with high bits from bytes 0-3 bits 6-7
+        // For simplicity set bytes 8-11 to 0 and don't use high bits
+        scales[8] = 0;
+        scales[9] = 0;
+        scales[10] = 0;
+        scales[11] = 0;
+
+        let (sc, mn) = decode_q4km_scales(&scales);
+        assert_eq!(sc[0], 5);
+        assert_eq!(sc[1], 10);
+        assert_eq!(sc[2], 15);
+        assert_eq!(sc[3], 20);
+        assert_eq!(mn[0], 1);
+        assert_eq!(mn[1], 2);
+        assert_eq!(mn[2], 3);
+        assert_eq!(mn[3], 4);
+    }
+}

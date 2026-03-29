@@ -10,6 +10,7 @@ description = "Rust-native LLM inference engine"
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bytemuck.workspace = true
 byteorder.workspace = true
 half.workspace = true
 memmap2.workspace = true
