@@ -34,6 +34,7 @@
 - GGUF magic was initially set to 0x46475547 ("FGUG") instead of 0x46554747 ("GGUF"). Fixed by verifying with Python struct.unpack.
 - Clippy `manual_div_ceil`: alignment rounding used manual formula, replaced with `.div_ceil()`.
 - Q4_0 quant type in the LFM2-VL-450M-Q4_0 GGUF shows 0.00 MB sizes in inspect — expected, since Q4_0 is not yet a supported quant type (only Q4_K_M and Q8_0 in v1). Parser still reads all metadata and tensor names correctly.
+- 2026-03-29T19:36-0700 CI failed on x86_64: unnecessary `unsafe` block in hsum_avx — the function is already `unsafe fn` so the inner block is redundant. Only triggers on x86 targets (not aarch64 where NEON path compiles). Fixed by removing the inner unsafe block.
 
 ## Research & Discoveries
 
@@ -48,4 +49,6 @@
 
 - 71e50ac — feat: implement tensor ops, quantization, CPU compute, and SIMD kernels (Phase 1)
 - 4221114 — feat: implement GGUF parser, BPE tokenizer, and chat templates (Phase 2)
-- HEAD — ci: add GitHub Actions workflow and just ci recipe
+- 274b6e6 — ci: add GitHub Actions workflow and just ci recipe
+- fead476 — feat: add Q4_0 quantization support
+- HEAD — fix: remove unnecessary unsafe block in hsum_avx for x86_64 CI

@@ -235,14 +235,12 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     unsafe fn hsum_avx(v: __m256) -> f32 {
-        unsafe {
-            let hi128 = _mm256_extractf128_ps(v, 1);
-            let lo128 = _mm256_castps256_ps128(v);
-            let sum128 = _mm_add_ps(lo128, hi128);
-            let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-            let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-            _mm_cvtss_f32(sum32)
-        }
+        let hi128 = _mm256_extractf128_ps(v, 1);
+        let lo128 = _mm256_castps256_ps128(v);
+        let sum128 = _mm_add_ps(lo128, hi128);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+        _mm_cvtss_f32(sum32)
     }
 }
 
