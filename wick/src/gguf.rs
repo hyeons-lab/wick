@@ -344,10 +344,17 @@ impl GgufFile {
                 Err(_) => (DType::F32, 0), // placeholder — get_tensor() will reject
             };
 
-            let abs_offset = data_offset as u64 + offset;
+            let abs_offset = (data_offset as u64)
+                .checked_add(offset)
+                .with_context(|| format!("tensor {name} offset overflow (data_offset={data_offset}, offset={offset})"))?;
             if size_bytes > 0 {
+                let abs_usize = usize::try_from(abs_offset)
+                    .with_context(|| format!("tensor {name} offset {abs_offset} exceeds usize range"))?;
+                let end = abs_usize
+                    .checked_add(size_bytes)
+                    .with_context(|| format!("tensor {name} end offset overflow (offset={abs_usize}, size={size_bytes})"))?;
                 ensure!(
-                    (abs_offset as usize) + size_bytes <= file_size,
+                    end <= file_size,
                     "tensor {name} extends beyond file (offset={abs_offset}, size={size_bytes}, file_size={file_size})"
                 );
             }
@@ -462,8 +469,11 @@ impl GgufFile {
             ggml_type_name(info.ggml_type_id)
         );
 
-        let start = info.offset as usize;
-        let end = start + info.size_bytes;
+        let start = usize::try_from(info.offset)
+            .with_context(|| format!("tensor {name} offset {} exceeds usize range", info.offset))?;
+        let end = start
+            .checked_add(info.size_bytes)
+            .with_context(|| format!("tensor {name} end offset overflow"))?;
         ensure!(
             end <= self.mmap.len(),
             "tensor {name} data extends beyond mmap"
@@ -480,8 +490,18 @@ impl GgufFile {
             .get(name)
             .with_context(|| format!("tensor not found: {name}"))?;
 
-        let start = info.offset as usize;
-        let end = start + info.size_bytes;
+        ensure!(
+            info.size_bytes > 0,
+            "tensor {name} has unsupported GGML type {} ({})",
+            info.ggml_type_id,
+            ggml_type_name(info.ggml_type_id)
+        );
+
+        let start = usize::try_from(info.offset)
+            .with_context(|| format!("tensor {name} offset {} exceeds usize range", info.offset))?;
+        let end = start
+            .checked_add(info.size_bytes)
+            .with_context(|| format!("tensor {name} end offset overflow"))?;
         ensure!(
             end <= self.mmap.len(),
             "tensor {name} data extends beyond mmap"

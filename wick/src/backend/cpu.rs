@@ -4,6 +4,7 @@
 
 use crate::backend::simd::{vec_dot_q4_k_m_f32, vec_dot_q8_0_f32};
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32};
+use std::mem::size_of;
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
 

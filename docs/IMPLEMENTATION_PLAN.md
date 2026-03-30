@@ -319,6 +319,10 @@ default = []
 gpu = ["dep:wgpu"]
 ```
 
+> **Note:** The `wgpu` dependency and `gpu = ["dep:wgpu"]` feature shown above are
+> illustrative of the planned V2 layout. The current `wick/Cargo.toml` has `gpu = []`
+> as a placeholder with no `wgpu` dependency wired in yet.
+
 No `tokenizers`, no `rayon`, no `axum`, no `tokio`, no `wasm-bindgen`.
 Add these in v2 modules that need them.
 
