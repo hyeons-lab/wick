@@ -207,6 +207,12 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 5.3  Subgroup-enhanced variants (feature-detect at init)
 5.4  Full GPU forward pass: single CommandEncoder, read back logits only.
 5.5  CLI: --device gpu/cpu/auto. Benchmark CPU vs GPU.
+
+     Note: V1 shaders use fixed workgroup sizes. Per-shape kernel tuning
+     (V2.7) adds profile-guided dispatch for decode GEMV — significant
+     wins on AMD RDNA3 (see kernel-anvil results: 2.25x on 7900 XTX).
+     Design shader dispatch to accept configurable workgroup params from
+     the start so V2.7 is a config change, not a rewrite.
 ```
 
 ---
@@ -254,42 +260,47 @@ Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV
 ### V2.6: More Quantization Formats — 1 week per format
 Q2_K through Q6_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
 
-### V2.7: Speculative Decoding — 1-2 weeks
+### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks
+Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For wick: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `wick tune` command.
+
+### V2.8: Speculative Decoding — 1-2 weeks
 Draft model + verification, self-speculative. 1.3-2x decode speedup.
 
-### V2.8: LoRA Adapters — 1-2 weeks
+### V2.9: LoRA Adapters — 1-2 weeks
 Runtime LoRA loading, merge/unmerge, per-request LoRA selection.
 
-### V2.9: MoE Support — 2-3 weeks
+### V2.10: MoE Support — 2-3 weeks
 Top-K expert routing for Mixtral, LFM2-8B-A1B, LFM2-24B-A2B.
 
-### V2.10: Multi-GPU — 3-4 weeks
+### V2.11: Multi-GPU — 3-4 weeks
 Pipeline parallelism, tensor parallelism, CPU offloading.
 
-### V2.11: CUDA Backend — 3-4 weeks
+### V2.12: CUDA Backend — 3-4 weeks
 Optional cuBLAS + FlashAttention + CUDA graphs. Requires nvcc.
 
-### V2.12: Python Bindings — 1-2 weeks
+### V2.13: Python Bindings — 1-2 weeks
 PyO3 bindings, `pip install wick-engine`.
 
-### V2.13: Kotlin Multiplatform Bindings — 2-3 weeks
+### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
 
 ---
 
 ## V2 Prioritization
 
-**Local inference on laptop:** V1 is sufficient. Add V2.6 for more quants.
+**Local inference on laptop:** V1 is sufficient. Add V2.6 for more quants, V2.7 for per-shape tuning.
 
 **Production API server:** V2.1 → V2.5 → V2.5b (TurboQuant) → V2.3
 
 **Browser inference (differentiator):** V2.2 → V2.5b (TurboQuant) → V2.4 → V2.3
 
-**Mobile / on-device apps:** V2.13 → V2.5b (TurboQuant) → V2.4 (KV serialization) → V2.3
+**Mobile / on-device apps:** V2.14 → V2.5b (TurboQuant) → V2.4 (KV serialization) → V2.3
+
+**AMD GPU performance:** V2.7 (per-shape tuning) → V2.6 (more quants) → V2.8 (speculative)
 
 **Long-context use cases (32K+):** V2.5b (TurboQuant) → V2.1 (paged attention) → V2.5 (prefix caching)
 
-**Largest models:** V2.9 → V2.10 → V2.11
+**Largest models:** V2.10 → V2.11 → V2.12
 
 ---
 
