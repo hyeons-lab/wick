@@ -53,6 +53,17 @@ enum Command {
         system: Option<String>,
     },
 
+    /// Tokenize text and print token IDs (for comparison with HuggingFace).
+    Tokenize {
+        /// Path to the GGUF model file.
+        #[arg(short, long)]
+        model: String,
+
+        /// Text to tokenize.
+        #[arg(short, long)]
+        text: String,
+    },
+
     /// Run benchmarks on a model.
     Bench {
         /// Path to the GGUF model file.
@@ -84,6 +95,12 @@ fn main() -> Result<()> {
         Command::Inspect { model } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             gguf.print_inspect();
+        }
+        Command::Tokenize { model, text } => {
+            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
+            let tok = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+            let ids = tok.encode(&text);
+            println!("{ids:?}");
         }
         Command::Chat { model, .. } => {
             println!("wick chat: model={model}");

@@ -35,6 +35,7 @@
 - Clippy `manual_div_ceil`: alignment rounding used manual formula, replaced with `.div_ceil()`.
 - Q4_0 quant type in the LFM2-VL-450M-Q4_0 GGUF shows 0.00 MB sizes in inspect — expected, since Q4_0 is not yet a supported quant type (only Q4_K_M and Q8_0 in v1). Parser still reads all metadata and tensor names correctly.
 - 2026-03-29T19:36-0700 CI failed on x86_64: unnecessary `unsafe` block in hsum_avx — the function is already `unsafe fn` so the inner block is redundant. Only triggers on x86 targets (not aarch64 where NEON path compiles). Fixed by removing the inner unsafe block.
+- 2026-03-29T19:48-0700 HuggingFace tokenizer comparison: LiquidAI models are gated, can't use `AutoTokenizer.from_pretrained`. Used `gguf` Python library to extract vocab/merges from GGUF directly and built a Python BPE reference encoder. 10/10 test cases passed — Wick output matches exactly.
 
 ## Research & Discoveries
 
@@ -51,4 +52,5 @@
 - 4221114 — feat: implement GGUF parser, BPE tokenizer, and chat templates (Phase 2)
 - 274b6e6 — ci: add GitHub Actions workflow and just ci recipe
 - fead476 — feat: add Q4_0 quantization support
-- HEAD — fix: remove unnecessary unsafe block in hsum_avx for x86_64 CI
+- 01715f6 — fix: remove unnecessary unsafe block in hsum_avx for x86_64 CI
+- HEAD — feat: add `wick tokenize` CLI command and Python comparison script
