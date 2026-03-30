@@ -12,6 +12,7 @@
 
 - 2026-03-30T09:44-0700 docs/IMPLEMENTATION_PLAN.md — added V2.7 per-shape kernel tuning section inspired by kernel-anvil; added design note to Phase 5 wgpu shaders; added AMD GPU performance prioritization path; renumbered V2.8-V2.14
 - 2026-03-30T09:54-0700 CLAUDE.md — created with build/test commands, architecture overview, pre-commit fmt requirement, and project conventions
+- 2026-03-30T10:09-0700 .github/workflows/code-review.yml — added Junie automated code review workflow for PRs
 
 ## Decisions
 
@@ -34,4 +35,5 @@
 - 9719c04 — fix: address PR #2 review comments — checked arithmetic, consistent tensor_data, docs note, size_of import
 - afb1f8f — docs: add per-shape kernel tuning (V2.7) to implementation plan
 - 187c622 — style: cargo fmt checked arithmetic in gguf.rs
-- HEAD — docs: add CLAUDE.md with build commands, architecture, and conventions
+- 4bf00bb — docs: add CLAUDE.md with build commands, architecture, and conventions
+- HEAD — ci: add Junie automated code review workflow
