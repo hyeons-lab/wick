@@ -33,6 +33,9 @@ run *ARGS:
 bench *ARGS:
     cargo run --release --bin wick -- bench {{ARGS}}
 
+# Run all CI checks locally (mirrors GitHub Actions)
+ci: fmt clippy test
+
 # Clean build artifacts
 clean:
     cargo clean

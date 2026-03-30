@@ -33,8 +33,19 @@
 - Rust 2024 `unsafe_op_in_unsafe_fn` lint: first SIMD build had ~12 warnings. Fixed by wrapping function bodies.
 - GGUF magic was initially set to 0x46475547 ("FGUG") instead of 0x46554747 ("GGUF"). Fixed by verifying with Python struct.unpack.
 - Clippy `manual_div_ceil`: alignment rounding used manual formula, replaced with `.div_ceil()`.
+- Q4_0 quant type in the LFM2-VL-450M-Q4_0 GGUF shows 0.00 MB sizes in inspect — expected, since Q4_0 is not yet a supported quant type (only Q4_K_M and Q8_0 in v1). Parser still reads all metadata and tensor names correctly.
+
+## Research & Discoveries
+
+- 2026-03-29T17:57-0700 Real LFM2 GGUF tensor naming verified from ~/.leap/models/LFM2-VL-450M-Q8_0:
+  - Conv blocks: `blk.N.shortconv.{in_proj,conv,out_proj}.weight`, `blk.N.attn_norm.weight`, `blk.N.ffn_{gate,up,down}.weight`, `blk.N.ffn_norm.weight`
+  - Attn blocks: `blk.N.attn_{q,k,v}.weight`, `blk.N.attn_{q,k}_norm.weight`, `blk.N.attn_output.weight`, plus same ffn and norms
+  - Global: `token_embd.weight`, `token_embd_norm.weight`
+  - LFM2-450M: 16 blocks, 8 conv + 8 attn (alternating pattern: 0,1 conv, 2 attn, 3,4 conv, 5 attn, ...)
+  - `lfm2.attention.head_count_kv` is an i32 array (per-layer KV heads), not a scalar
 
 ## Commits
 
 - 71e50ac — feat: implement tensor ops, quantization, CPU compute, and SIMD kernels (Phase 1)
-- HEAD — feat: implement GGUF parser, BPE tokenizer, and chat templates (Phase 2)
+- 4221114 — feat: implement GGUF parser, BPE tokenizer, and chat templates (Phase 2)
+- HEAD — ci: add GitHub Actions workflow and just ci recipe
