@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -80,8 +82,8 @@ fn main() -> Result<()> {
             println!("Not yet implemented — coming in Phase 3.");
         }
         Command::Inspect { model } => {
-            println!("wick inspect: model={model}");
-            println!("Not yet implemented — coming in Phase 2.");
+            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
+            gguf.print_inspect();
         }
         Command::Chat { model, .. } => {
             println!("wick chat: model={model}");

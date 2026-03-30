@@ -2,7 +2,7 @@
 
 **Agent:** Claude Code (claude-opus-4-6) @ repository branch feature/tensor-cpu-compute
 
-**Intent:** Implement Phase 1 of Wick — tensor types, Q4_K_M/Q8_0 dequantization, all CPU compute ops (naive + SIMD), and tests proving correctness.
+**Intent:** Implement Phases 1-2 of Wick — tensor types, quantization, CPU compute ops, SIMD kernels, GGUF parser, BPE tokenizer, and chat templates.
 
 ## What Changed
 
@@ -13,6 +13,9 @@
 - 2026-03-29T16:32-0700 wick/src/backend/cpu.rs — all naive CPU ops: matmul_f32, matmul_q8_0_f32, matmul_q4km_f32, rmsnorm, silu, softmax, rope, conv1d_depthwise, add_inplace, mul_inplace
 - 2026-03-29T16:34-0700 wick/src/backend/simd.rs — NEON (aarch64) and AVX2 (x86_64) optimized vec_dot for Q8_0 and Q4_K_M with runtime dispatch
 - 2026-03-29T16:34-0700 wick/src/backend/mod.rs — added simd module
+- 2026-03-29T17:20-0700 wick/src/gguf.rs — full GGUF v3 parser: header, KV metadata (all types including arrays), tensor info, memory-mapped data via memmap2, get_tensor/tensor_data, print_inspect
+- 2026-03-29T17:22-0700 wick-cli/src/main.rs — wired `wick inspect` command to GgufFile::open + print_inspect
+- 2026-03-29T17:24-0700 wick/src/tokenizer.rs — byte-level BPE tokenizer loaded from GGUF metadata, encode/decode, special token handling, chat template rendering via minijinja
 
 ## Decisions
 
@@ -20,13 +23,18 @@
 - 2026-03-29T16:30-0700 Q4_K_M scale decoding follows llama.cpp's get_scale_min_k4 exactly — 6-bit scales packed into 12 bytes with split high bits
 - 2026-03-29T16:32-0700 Quantized matmul extracts column slices into temp Vec for vec_dot — correct but not fast. OK for Phase 1 correctness; will optimize in Phase 5 when weights are transposed.
 - 2026-03-29T16:34-0700 SIMD dispatch: compile-time cfg for aarch64 (NEON always available), runtime feature detection for x86_64 AVX2+FMA
-- 2026-03-29T16:34-0700 Rust 2024 edition requires unsafe blocks inside unsafe fn — wrapped all SIMD intrinsic calls in explicit unsafe blocks
+- 2026-03-29T17:20-0700 GGUF parser reads header via BufReader then mmaps the whole file — mmap gives zero-copy tensor access, BufReader handles sequential metadata parsing
+- 2026-03-29T17:20-0700 Unsupported quant types (Q2_K, Q3_K, Q5_K, Q6_K, etc.) still parse and appear in inspect, stored with DType::F32 placeholder — we don't load their data but can show their shapes
+- 2026-03-29T17:24-0700 Token unescaping handles <0xHH> byte tokens and ▁ sentencepiece space markers — covers the conventions used by LLaMA, LFM2, and GPT-NeoX vocabularies
+- 2026-03-29T17:24-0700 BPE merge priority uses rank (index in merge list) — lower rank = higher priority, matches HuggingFace tokenizers behavior
 
 ## Issues
 
-- Rust 2024 `unsafe_op_in_unsafe_fn` lint: first SIMD build had ~12 warnings because intrinsics inside `unsafe fn` need explicit `unsafe {}` blocks. Fixed by wrapping function bodies.
-- Clippy `needless_range_loop`: refactored Q8_0 dequant/dot to use iterators.
+- Rust 2024 `unsafe_op_in_unsafe_fn` lint: first SIMD build had ~12 warnings. Fixed by wrapping function bodies.
+- GGUF magic was initially set to 0x46475547 ("FGUG") instead of 0x46554747 ("GGUF"). Fixed by verifying with Python struct.unpack.
+- Clippy `manual_div_ceil`: alignment rounding used manual formula, replaced with `.div_ceil()`.
 
 ## Commits
 
-- HEAD — feat: implement tensor ops, quantization, CPU compute, and SIMD kernels (Phase 1)
+- 71e50ac — feat: implement tensor ops, quantization, CPU compute, and SIMD kernels (Phase 1)
+- HEAD — feat: implement GGUF parser, BPE tokenizer, and chat templates (Phase 2)
