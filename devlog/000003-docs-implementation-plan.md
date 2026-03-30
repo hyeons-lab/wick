@@ -31,4 +31,5 @@
 ## Commits
 
 - 9719c04 — fix: address PR #2 review comments — checked arithmetic, consistent tensor_data, docs note, size_of import
-- HEAD — docs: add per-shape kernel tuning (V2.7) to implementation plan
+- afb1f8f — docs: add per-shape kernel tuning (V2.7) to implementation plan
+- HEAD — style: cargo fmt checked arithmetic in gguf.rs

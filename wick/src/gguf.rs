@@ -344,15 +344,20 @@ impl GgufFile {
                 Err(_) => (DType::F32, 0), // placeholder — get_tensor() will reject
             };
 
-            let abs_offset = (data_offset as u64)
-                .checked_add(offset)
-                .with_context(|| format!("tensor {name} offset overflow (data_offset={data_offset}, offset={offset})"))?;
+            let abs_offset = (data_offset as u64).checked_add(offset).with_context(|| {
+                format!(
+                    "tensor {name} offset overflow (data_offset={data_offset}, offset={offset})"
+                )
+            })?;
             if size_bytes > 0 {
-                let abs_usize = usize::try_from(abs_offset)
-                    .with_context(|| format!("tensor {name} offset {abs_offset} exceeds usize range"))?;
-                let end = abs_usize
-                    .checked_add(size_bytes)
-                    .with_context(|| format!("tensor {name} end offset overflow (offset={abs_usize}, size={size_bytes})"))?;
+                let abs_usize = usize::try_from(abs_offset).with_context(|| {
+                    format!("tensor {name} offset {abs_offset} exceeds usize range")
+                })?;
+                let end = abs_usize.checked_add(size_bytes).with_context(|| {
+                    format!(
+                        "tensor {name} end offset overflow (offset={abs_usize}, size={size_bytes})"
+                    )
+                })?;
                 ensure!(
                     end <= file_size,
                     "tensor {name} extends beyond file (offset={abs_offset}, size={size_bytes}, file_size={file_size})"
