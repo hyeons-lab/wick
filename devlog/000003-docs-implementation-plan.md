@@ -2,7 +2,7 @@
 
 **Agent:** Claude Code (claude-opus-4-6) @ repository branch docs/implementation-plan
 
-**Intent:** Address PR #2 review comments and incorporate per-shape kernel tuning research into the implementation plan.
+**Intent:** Address PR #2 review comments, incorporate per-shape kernel tuning research, and add CLAUDE.md for future Claude Code sessions.
 
 ## What Changed
 
@@ -11,6 +11,7 @@
 - 2026-03-30T09:07-0700 wick/src/gguf.rs — replaced unchecked arithmetic with `checked_add`/`usize::try_from` in parsing loop, `get_tensor()`, and `tensor_data()`; added unsupported-type check to `tensor_data()` for consistency with `get_tensor()`
 
 - 2026-03-30T09:44-0700 docs/IMPLEMENTATION_PLAN.md — added V2.7 per-shape kernel tuning section inspired by kernel-anvil; added design note to Phase 5 wgpu shaders; added AMD GPU performance prioritization path; renumbered V2.8-V2.14
+- 2026-03-30T09:54-0700 CLAUDE.md — created with build/test commands, architecture overview, pre-commit fmt requirement, and project conventions
 
 ## Decisions
 
@@ -32,4 +33,5 @@
 
 - 9719c04 — fix: address PR #2 review comments — checked arithmetic, consistent tensor_data, docs note, size_of import
 - afb1f8f — docs: add per-shape kernel tuning (V2.7) to implementation plan
-- HEAD — style: cargo fmt checked arithmetic in gguf.rs
+- 187c622 — style: cargo fmt checked arithmetic in gguf.rs
+- HEAD — docs: add CLAUDE.md with build commands, architecture, and conventions
