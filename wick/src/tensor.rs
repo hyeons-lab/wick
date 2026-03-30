@@ -6,6 +6,7 @@ pub enum DType {
     BF16,
     I32,
     U8,
+    Q4_0,
     Q4KM,
     Q8_0,
 }
@@ -20,13 +21,14 @@ impl DType {
             DType::BF16 => Some(2),
             DType::I32 => Some(4),
             DType::U8 => Some(1),
-            DType::Q4KM | DType::Q8_0 => None,
+            DType::Q4_0 | DType::Q4KM | DType::Q8_0 => None,
         }
     }
 
     /// Number of elements per quantization block.
     pub fn block_size(&self) -> usize {
         match self {
+            DType::Q4_0 => 32,
             DType::Q4KM => 256,
             DType::Q8_0 => 32,
             _ => 1,
@@ -36,6 +38,7 @@ impl DType {
     /// Number of bytes per quantization block.
     pub fn block_bytes(&self) -> usize {
         match self {
+            DType::Q4_0 => 18,
             DType::Q4KM => 144,
             DType::Q8_0 => 34,
             DType::F32 => 4,
@@ -132,6 +135,11 @@ impl Tensor {
             DType::BF16 => {
                 let bf16s: &[half::bf16] = bytemuck::cast_slice(&self.data);
                 bf16s.iter().map(|x| x.to_f32()).collect()
+            }
+            DType::Q4_0 => {
+                let mut out = vec![0.0f32; self.numel()];
+                crate::quant::dequantize_q4_0_row(&self.data, &mut out);
+                out
             }
             DType::Q8_0 => {
                 let mut out = vec![0.0f32; self.numel()];

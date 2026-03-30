@@ -2,7 +2,9 @@
 //
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
-use crate::quant::{BlockQ4KM, BlockQ8_0, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32};
+use crate::quant::{
+    BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32,
+};
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
 
@@ -20,6 +22,34 @@ pub fn matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: us
             for j in 0..n {
                 c[i * n + j] += a_val * b[p * n + j];
             }
+        }
+    }
+}
+
+/// Quantized Q4_0 × f32 matmul: C[m,n] = dequant(A_q4_0)[m,k] * B[k,n].
+///
+/// `a_quant` is raw Q4_0 bytes, row-major with `m` rows of `k` elements each.
+/// Each row is k/32 blocks of 18 bytes.
+pub fn matmul_q4_0_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    debug_assert_eq!(k % 32, 0);
+    let blocks_per_row = k / 32;
+    let bytes_per_row = blocks_per_row * size_of::<BlockQ4_0>();
+    debug_assert_eq!(a_quant.len(), m * bytes_per_row);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(c.len(), m * n);
+
+    for i in 0..m {
+        let row_start = i * bytes_per_row;
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let block_offset = row_start + bi * size_of::<BlockQ4_0>();
+                let block = unsafe { &*(a_quant.as_ptr().add(block_offset) as *const BlockQ4_0) };
+                let col_start = bi * 32;
+                let b_slice: Vec<f32> = (0..32).map(|l| b[(col_start + l) * n + j]).collect();
+                sum += vec_dot_q4_0_f32(block, &b_slice);
+            }
+            c[i * n + j] = sum;
         }
     }
 }

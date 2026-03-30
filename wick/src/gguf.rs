@@ -206,11 +206,12 @@ fn ggml_type_to_dtype(type_id: u32) -> Result<DType> {
         GGML_TYPE_F16 => Ok(DType::F16),
         GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
+        GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
         GGML_TYPE_Q4_K => Ok(DType::Q4KM),
         GGML_TYPE_I32 => Ok(DType::I32),
         // Map unsupported-but-parseable types to an error with context
-        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q8_1
-        | GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_K => {
+        GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q8_1 | GGML_TYPE_Q2_K
+        | GGML_TYPE_Q3_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_K => {
             bail!("quantization type {type_id} not yet supported")
         }
         _ => bail!("unknown GGML type: {type_id}"),

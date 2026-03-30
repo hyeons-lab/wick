@@ -2,6 +2,20 @@ use half::f16;
 
 // ── Block layouts ────────────────────────────────────────────────────────────
 
+/// Q4_0 quantization block: 32 values in 18 bytes.
+///
+/// Layout:
+///   d: f16 (2 bytes) — scale factor
+///   qs: [u8; 16] (16 bytes) — 32 4-bit unsigned quantized values (offset by 8)
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_0 {
+    pub d: u16, // f16 stored as raw bits
+    pub qs: [u8; 16],
+}
+
+const _: () = assert!(size_of::<BlockQ4_0>() == 18);
+
 /// Q8_0 quantization block: 32 values in 34 bytes.
 ///
 /// Layout:
@@ -33,6 +47,57 @@ pub struct BlockQ4KM {
 }
 
 const _: () = assert!(size_of::<BlockQ4KM>() == 144);
+
+// ── Q4_0 dequantization ─────────────────────────────────────────────────────
+
+/// Dequantize a single Q4_0 block to 32 f32 values.
+///
+/// Each byte in qs holds two 4-bit unsigned values (low nibble, high nibble).
+/// Values are offset by -8 to center around zero: value = (nibble - 8) * d.
+pub fn dequantize_q4_0_block(block: &BlockQ4_0) -> [f32; 32] {
+    let d = f16::from_bits(block.d).to_f32();
+    let mut out = [0.0f32; 32];
+
+    for i in 0..16 {
+        let byte = block.qs[i];
+        let lo = (byte & 0xF) as i32 - 8;
+        let hi = (byte >> 4) as i32 - 8;
+        out[i] = lo as f32 * d;
+        out[i + 16] = hi as f32 * d;
+    }
+    out
+}
+
+/// Dequantize a row of Q4_0 blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ4_0>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 32);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ4_0) };
+        let values = dequantize_q4_0_block(block);
+        dst[i * 32..(i + 1) * 32].copy_from_slice(&values);
+    }
+}
+
+/// Dot product of a Q4_0 block with an f32 vector of length 32. Scalar version.
+pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 32);
+    let d = f16::from_bits(block.d).to_f32();
+    let mut sum = 0.0f32;
+
+    for i in 0..16 {
+        let byte = block.qs[i];
+        let lo = (byte & 0xF) as i32 - 8;
+        let hi = (byte >> 4) as i32 - 8;
+        sum += lo as f32 * y[i];
+        sum += hi as f32 * y[i + 16];
+    }
+    sum * d
+}
 
 // ── Q8_0 dequantization ─────────────────────────────────────────────────────
 
@@ -230,6 +295,11 @@ pub fn vec_dot_q4_k_m_f32_scalar(block: &BlockQ4KM, y: &[f32]) -> f32 {
 
 // ── Dispatch functions ──────────────────────────────────────────────────────
 
+/// Dot product of a Q4_0 block with an f32 vector. Dispatches to best available impl.
+pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
+    vec_dot_q4_0_f32_scalar(block, y)
+}
+
 /// Dot product of a Q8_0 block with an f32 vector. Dispatches to best available impl.
 pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
     vec_dot_q8_0_f32_scalar(block, y)
@@ -252,6 +322,73 @@ mod tests {
             delta: f16::from_f32(scale).to_bits(),
             quants,
         }
+    }
+
+    #[test]
+    fn test_dequantize_q4_0_simple() {
+        // All nibbles = 8 → offset to 0
+        let block = BlockQ4_0 {
+            d: f16::from_f32(1.0).to_bits(),
+            qs: [0x88; 16], // lo=8, hi=8 → both (8-8)*1.0 = 0.0
+        };
+        let out = dequantize_q4_0_block(&block);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.abs() < 1e-3, "expected 0.0 at {i}, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q4_0_varied() {
+        // lo nibbles: 0..16, hi nibbles: all 15
+        let mut qs = [0u8; 16];
+        for i in 0..16 {
+            qs[i] = (i as u8) | (15 << 4);
+        }
+        let block = BlockQ4_0 {
+            d: f16::from_f32(0.5).to_bits(),
+            qs,
+        };
+        let out = dequantize_q4_0_block(&block);
+
+        // First 16: (i - 8) * 0.5
+        for i in 0..16 {
+            let expected = (i as f32 - 8.0) * 0.5;
+            assert!(
+                (out[i] - expected).abs() < 1e-3,
+                "lo[{i}]: got {}, expected {expected}",
+                out[i]
+            );
+        }
+        // Last 16: (15 - 8) * 0.5 = 3.5
+        for i in 16..32 {
+            assert!(
+                (out[i] - 3.5).abs() < 1e-3,
+                "hi[{i}]: got {}, expected 3.5",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_vec_dot_q4_0_matches_dequantize() {
+        let mut qs = [0u8; 16];
+        for i in 0..16 {
+            qs[i] = ((i % 13) as u8) | (((i % 7) as u8) << 4);
+        }
+        let block = BlockQ4_0 {
+            d: f16::from_f32(0.3).to_bits(),
+            qs,
+        };
+        let y: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+
+        let dequantized = dequantize_q4_0_block(&block);
+        let expected: f32 = dequantized.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q4_0_f32(&block, &y);
+
+        assert!(
+            (got - expected).abs() < 1e-3,
+            "vec_dot Q4_0 mismatch: got {got}, expected {expected}"
+        );
     }
 
     #[test]
