@@ -110,7 +110,7 @@ for text in TEST_STRINGS:
 
     # Wick encode
     result = subprocess.run(
-        ["cargo", "run", "--quiet", "--", "tokenize", "-m", gguf_path, "-t", text],
+        ["cargo", "run", "--quiet", "--bin", "wick", "--", "tokenize", "-m", gguf_path, "-t", text],
         capture_output=True, text=True, cwd=wick_dir,
     )
     wick_output = result.stdout.strip()

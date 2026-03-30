@@ -74,6 +74,8 @@ pub struct TensorInfo {
     pub offset: u64,
     /// Size of this tensor's data in bytes.
     pub size_bytes: usize,
+    /// Raw GGML type ID (for display of unsupported types).
+    pub ggml_type_id: u32,
 }
 
 /// A parsed GGUF file with memory-mapped tensor data.
@@ -219,7 +221,6 @@ fn ggml_type_to_dtype(type_id: u32) -> Result<DType> {
 }
 
 /// Map a GGML type ID to its string name for display.
-#[allow(dead_code)]
 pub fn ggml_type_name(type_id: u32) -> &'static str {
     match type_id {
         GGML_TYPE_F32 => "F32",
@@ -329,31 +330,27 @@ impl GgufFile {
 
         // Current position in the file after reading all headers
         let header_end = reader.pos as usize;
+        ensure!(
+            alignment > 0 && alignment <= 1024 * 1024,
+            "invalid GGUF alignment: {alignment}"
+        );
         let data_offset = header_end.div_ceil(alignment) * alignment;
 
         // Now convert tensor infos with proper types and absolute offsets
         for (name, shape, type_id, offset) in tensor_infos_raw {
-            // Try to convert the type — store even if unsupported for inspect
-            let dtype = match ggml_type_to_dtype(type_id) {
-                Ok(dt) => dt,
-                Err(_) => {
-                    // Store as F32 placeholder for unsupported types (inspect can still show them)
-                    // The type name is available via the raw type_id
-                    DType::F32
-                }
-            };
-
-            let size_bytes = if ggml_type_to_dtype(type_id).is_ok() {
-                tensor_data_size(&shape, dtype)
-            } else {
-                0 // unknown size for unsupported types
+            // Convert GGML type; unsupported types get a placeholder for inspect
+            let (dtype, size_bytes) = match ggml_type_to_dtype(type_id) {
+                Ok(dt) => (dt, tensor_data_size(&shape, dt)),
+                Err(_) => (DType::F32, 0), // placeholder — get_tensor() will reject
             };
 
             let abs_offset = data_offset as u64 + offset;
-            ensure!(
-                (abs_offset as usize) + size_bytes <= file_size,
-                "tensor {name} extends beyond file (offset={abs_offset}, size={size_bytes}, file_size={file_size})"
-            );
+            if size_bytes > 0 {
+                ensure!(
+                    (abs_offset as usize) + size_bytes <= file_size,
+                    "tensor {name} extends beyond file (offset={abs_offset}, size={size_bytes}, file_size={file_size})"
+                );
+            }
 
             tensors.insert(
                 name.clone(),
@@ -363,6 +360,7 @@ impl GgufFile {
                     dtype,
                     offset: abs_offset,
                     size_bytes,
+                    ggml_type_id: type_id,
                 },
             );
         }
@@ -457,6 +455,13 @@ impl GgufFile {
             .get(name)
             .with_context(|| format!("tensor not found: {name}"))?;
 
+        ensure!(
+            info.size_bytes > 0,
+            "tensor {name} has unsupported GGML type {} ({})",
+            info.ggml_type_id,
+            ggml_type_name(info.ggml_type_id)
+        );
+
         let start = info.offset as usize;
         let end = start + info.size_bytes;
         ensure!(
@@ -513,10 +518,10 @@ impl GgufFile {
         tensor_list.sort_by_key(|t| &t.name);
         for t in tensor_list {
             println!(
-                "  {} | {:?} | {:?} | {:.2} MB",
+                "  {} | {:?} | {} | {:.2} MB",
                 t.name,
                 t.shape,
-                t.dtype,
+                ggml_type_name(t.ggml_type_id),
                 t.size_bytes as f64 / (1024.0 * 1024.0)
             );
         }

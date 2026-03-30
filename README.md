@@ -2,6 +2,8 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
+> **Note:** This project is a learning experiment — built to explore LLM inference internals, GGUF parsing, quantization, and SIMD/GPU compute in Rust. Not intended for production use.
+
 ## Features
 
 - **GGUF model loading** with memory-mapped tensors
