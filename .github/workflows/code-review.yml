@@ -1,0 +1,22 @@
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-review:
+    name: Junie Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JetBrains/junie-github-action@v0
+        with:
+          junie_api_key: ${{ secrets.JUNIE_API_KEY }}
+          use_single_comment: true
+          prompt: "code-review"
