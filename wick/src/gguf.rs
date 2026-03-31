@@ -344,8 +344,9 @@ impl GgufFile {
             "invalid GGUF alignment: {alignment}"
         );
         let data_offset = header_end
-            .div_ceil(alignment)
-            .checked_mul(alignment)
+            .checked_add(alignment - 1)
+            .and_then(|v| v.checked_div(alignment))
+            .and_then(|v| v.checked_mul(alignment))
             .with_context(|| {
                 format!(
                     "GGUF data offset overflow (header_end={header_end}, alignment={alignment})"

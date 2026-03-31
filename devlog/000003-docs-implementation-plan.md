@@ -39,4 +39,5 @@
 - 187c622 — style: cargo fmt checked arithmetic in gguf.rs
 - 4bf00bb — docs: add CLAUDE.md with build commands, architecture, and conventions
 - 56ab988 — ci: add Junie automated code review workflow
-- HEAD — fix: address Junie review — checked tensor_data_size, data_offset overflow, tensor_range helper, tokenizer script error handling, tests
+- b7aa262 — fix: address Junie review — checked tensor_data_size, data_offset overflow, tensor_range helper, tokenizer script error handling, tests
+- HEAD — fix: replace div_ceil with fully checked arithmetic to prevent panic on overflow
