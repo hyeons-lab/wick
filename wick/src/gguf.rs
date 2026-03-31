@@ -244,17 +244,26 @@ pub fn ggml_type_name(type_id: u32) -> &'static str {
 }
 
 /// Compute the size in bytes for a tensor with the given shape and type.
-fn tensor_data_size(shape: &[usize], dtype: DType) -> usize {
-    let numel: usize = shape.iter().product();
+fn tensor_data_size(shape: &[usize], dtype: DType) -> Result<usize> {
+    let numel: usize = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .context("tensor numel overflow")?;
     let block_size = dtype.block_size();
     let block_bytes = dtype.block_bytes();
 
     if block_size == 1 {
-        numel * block_bytes
+        numel
+            .checked_mul(block_bytes)
+            .context("tensor size overflow")
     } else {
-        // Quantized: numel must be divisible by block_size
-        debug_assert_eq!(numel % block_size, 0);
-        (numel / block_size) * block_bytes
+        ensure!(
+            numel % block_size == 0,
+            "tensor element count {numel} is not divisible by block size {block_size}"
+        );
+        (numel / block_size)
+            .checked_mul(block_bytes)
+            .context("tensor size overflow")
     }
 }
 
@@ -334,13 +343,20 @@ impl GgufFile {
             alignment > 0 && alignment <= 1024 * 1024,
             "invalid GGUF alignment: {alignment}"
         );
-        let data_offset = header_end.div_ceil(alignment) * alignment;
+        let data_offset = header_end
+            .div_ceil(alignment)
+            .checked_mul(alignment)
+            .with_context(|| {
+                format!(
+                    "GGUF data offset overflow (header_end={header_end}, alignment={alignment})"
+                )
+            })?;
 
         // Now convert tensor infos with proper types and absolute offsets
         for (name, shape, type_id, offset) in tensor_infos_raw {
             // Convert GGML type; unsupported types get a placeholder for inspect
             let (dtype, size_bytes) = match ggml_type_to_dtype(type_id) {
-                Ok(dt) => (dt, tensor_data_size(&shape, dt)),
+                Ok(dt) => (dt, tensor_data_size(&shape, dt)?),
                 Err(_) => (DType::F32, 0), // placeholder — get_tensor() will reject
             };
 
@@ -459,9 +475,8 @@ impl GgufFile {
         }
     }
 
-    /// Load a tensor by name, returning an owned Tensor.
-    /// The data is copied from the memory-mapped file.
-    pub fn get_tensor(&self, name: &str) -> Result<Tensor> {
+    /// Validate a tensor and return its byte range within the mmap.
+    fn tensor_range(&self, name: &str) -> Result<(&TensorInfo, std::ops::Range<usize>)> {
         let info = self
             .tensors
             .get(name)
@@ -484,35 +499,21 @@ impl GgufFile {
             "tensor {name} data extends beyond mmap"
         );
 
-        let data = self.mmap[start..end].to_vec();
+        Ok((info, start..end))
+    }
+
+    /// Load a tensor by name, returning an owned Tensor.
+    /// The data is copied from the memory-mapped file.
+    pub fn get_tensor(&self, name: &str) -> Result<Tensor> {
+        let (info, range) = self.tensor_range(name)?;
+        let data = self.mmap[range].to_vec();
         Ok(Tensor::new(data, info.shape.clone(), info.dtype))
     }
 
     /// Get a reference to a tensor's raw data in the mmap without copying.
     pub fn tensor_data(&self, name: &str) -> Result<&[u8]> {
-        let info = self
-            .tensors
-            .get(name)
-            .with_context(|| format!("tensor not found: {name}"))?;
-
-        ensure!(
-            info.size_bytes > 0,
-            "tensor {name} has unsupported GGML type {} ({})",
-            info.ggml_type_id,
-            ggml_type_name(info.ggml_type_id)
-        );
-
-        let start = usize::try_from(info.offset)
-            .with_context(|| format!("tensor {name} offset {} exceeds usize range", info.offset))?;
-        let end = start
-            .checked_add(info.size_bytes)
-            .with_context(|| format!("tensor {name} end offset overflow"))?;
-        ensure!(
-            end <= self.mmap.len(),
-            "tensor {name} data extends beyond mmap"
-        );
-
-        Ok(&self.mmap[start..end])
+        let (_info, range) = self.tensor_range(name)?;
+        Ok(&self.mmap[range])
     }
 
     /// Print a summary of the GGUF file for inspection.
@@ -608,16 +609,89 @@ mod tests {
     #[test]
     fn test_tensor_data_size() {
         // F32: 4 bytes per element
-        assert_eq!(tensor_data_size(&[10, 20], DType::F32), 10 * 20 * 4);
+        assert_eq!(
+            tensor_data_size(&[10, 20], DType::F32).unwrap(),
+            10 * 20 * 4
+        );
 
         // F16: 2 bytes per element
-        assert_eq!(tensor_data_size(&[10, 20], DType::F16), 10 * 20 * 2);
+        assert_eq!(
+            tensor_data_size(&[10, 20], DType::F16).unwrap(),
+            10 * 20 * 2
+        );
 
         // Q8_0: 32 elements per 34-byte block
-        assert_eq!(tensor_data_size(&[256], DType::Q8_0), 8 * 34); // 256/32 = 8 blocks
+        assert_eq!(tensor_data_size(&[256], DType::Q8_0).unwrap(), 8 * 34); // 256/32 = 8 blocks
 
         // Q4_K_M: 256 elements per 144-byte block
-        assert_eq!(tensor_data_size(&[512], DType::Q4KM), 2 * 144); // 512/256 = 2 blocks
+        assert_eq!(tensor_data_size(&[512], DType::Q4KM).unwrap(), 2 * 144); // 512/256 = 2 blocks
+    }
+
+    #[test]
+    fn test_tensor_data_size_overflow() {
+        // numel overflow: huge dimensions
+        assert!(tensor_data_size(&[usize::MAX, 2], DType::F32).is_err());
+    }
+
+    #[test]
+    fn test_tensor_data_size_bad_block_alignment() {
+        // Q8_0 block_size=32, 100 is not divisible by 32
+        assert!(tensor_data_size(&[100], DType::Q8_0).is_err());
+    }
+
+    #[test]
+    fn test_tensor_range_unsupported_type() {
+        // Build a GgufFile with a tensor that has size_bytes=0 (unsupported type)
+        let mmap = memmap2::MmapMut::map_anon(256)
+            .unwrap()
+            .make_read_only()
+            .unwrap();
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "test_unsupported".to_string(),
+            TensorInfo {
+                name: "test_unsupported".to_string(),
+                shape: vec![32],
+                dtype: DType::F32,
+                offset: 0,
+                size_bytes: 0, // unsupported type marker
+                ggml_type_id: 99,
+            },
+        );
+        tensors.insert(
+            "test_supported".to_string(),
+            TensorInfo {
+                name: "test_supported".to_string(),
+                shape: vec![4],
+                dtype: DType::F32,
+                offset: 0,
+                size_bytes: 16,
+                ggml_type_id: GGML_TYPE_F32,
+            },
+        );
+
+        let gguf = GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            mmap,
+            data_offset: 0,
+        };
+
+        // Unsupported type should be rejected by both get_tensor and tensor_data
+        match gguf.get_tensor("test_unsupported") {
+            Err(e) => assert!(e.to_string().contains("unsupported GGML type")),
+            Ok(_) => panic!("get_tensor should reject unsupported type"),
+        }
+
+        match gguf.tensor_data("test_unsupported") {
+            Err(e) => assert!(e.to_string().contains("unsupported GGML type")),
+            Ok(_) => panic!("tensor_data should reject unsupported type"),
+        }
+
+        // Supported type should succeed
+        assert!(gguf.tensor_data("test_supported").is_ok());
+        assert!(gguf.get_tensor("test_supported").is_ok());
     }
 
     #[test]

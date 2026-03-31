@@ -13,6 +13,8 @@
 - 2026-03-30T09:44-0700 docs/IMPLEMENTATION_PLAN.md — added V2.7 per-shape kernel tuning section inspired by kernel-anvil; added design note to Phase 5 wgpu shaders; added AMD GPU performance prioritization path; renumbered V2.8-V2.14
 - 2026-03-30T09:54-0700 CLAUDE.md — created with build/test commands, architecture overview, pre-commit fmt requirement, and project conventions
 - 2026-03-30T10:09-0700 .github/workflows/code-review.yml — added Junie automated code review workflow for PRs
+- 2026-03-31T07:40-0700 wick/src/gguf.rs — `tensor_data_size()` now returns `Result` with checked arithmetic and block alignment validation; `data_offset` computation uses `checked_mul`; extracted `tensor_range()` helper deduplicating validation in `get_tensor()`/`tensor_data()`; added 3 new tests (overflow, bad alignment, unsupported type rejection)
+- 2026-03-31T07:40-0700 scripts/compare_tokenizer.py — fail fast on non-zero cargo run exit code
 
 ## Decisions
 
@@ -36,4 +38,5 @@
 - afb1f8f — docs: add per-shape kernel tuning (V2.7) to implementation plan
 - 187c622 — style: cargo fmt checked arithmetic in gguf.rs
 - 4bf00bb — docs: add CLAUDE.md with build commands, architecture, and conventions
-- HEAD — ci: add Junie automated code review workflow
+- 56ab988 — ci: add Junie automated code review workflow
+- HEAD — fix: address Junie review — checked tensor_data_size, data_offset overflow, tensor_range helper, tokenizer script error handling, tests

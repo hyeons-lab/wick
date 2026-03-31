@@ -113,6 +113,13 @@ for text in TEST_STRINGS:
         ["cargo", "run", "--quiet", "--bin", "wick", "--", "tokenize", "-m", gguf_path, "-t", text],
         capture_output=True, text=True, cwd=wick_dir,
     )
+    if result.returncode != 0:
+        print(f"\n[ERROR] 'cargo run' failed with exit code {result.returncode} for input {text!r}", file=sys.stderr)
+        if result.stderr:
+            print("stderr:", result.stderr.strip(), file=sys.stderr)
+        if result.stdout:
+            print("stdout:", result.stdout.strip(), file=sys.stderr)
+        sys.exit(result.returncode or 1)
     wick_output = result.stdout.strip()
     if wick_output == "[]":
         wick_ids = []
