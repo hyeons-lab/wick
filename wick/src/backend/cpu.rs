@@ -178,6 +178,28 @@ pub fn quantize_f32_to_q8_0(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
     (scales, quants)
 }
 
+/// GEMV with pre-quantized Q8_0 input. Dispatches to Q4_0 or Q8_0 integer path.
+/// For other dtypes, falls back to the regular f32 path.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_with_preq(
+    dtype: DType,
+    a_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    x_f32: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    match dtype {
+        DType::Q4_0 => gemv_q4_0_with_q8(a_quant, x_scales, x_quants, y, m, k),
+        DType::Q8_0 => unsafe {
+            crate::backend::simd::neon::gemv_q8_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
+        _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
+    }
+}
+
 /// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
 /// the same input is used for multiple weight matrices (e.g., ffn_gate + ffn_up).
 #[cfg(target_arch = "aarch64")]
