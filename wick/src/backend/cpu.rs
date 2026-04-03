@@ -7,6 +7,7 @@ use crate::quant::{
     vec_dot_q6_k_f32, vec_dot_q8_0_f32,
 };
 use crate::tensor::DType;
+use rayon::prelude::*;
 use std::mem::size_of;
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
@@ -149,7 +150,10 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     }
 }
 
-/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. No inner allocation.
+/// Minimum output dimension to use parallel GEMV (avoid rayon overhead for small ops).
+pub const GEMV_PAR_THRESHOLD: usize = 256;
+
+/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. Parallelized across rows.
 pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -158,7 +162,7 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
+    let compute_row = |(i, yi): (usize, &mut f32)| {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -167,10 +171,16 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
             sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
         }
         *yi = sum;
+    };
+
+    if m >= GEMV_PAR_THRESHOLD {
+        y.par_iter_mut().enumerate().for_each(compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
     }
 }
 
-/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. No inner allocation.
+/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
 pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -179,7 +189,7 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
     let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
+    let compute_row = |(i, yi): (usize, &mut f32)| {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -188,10 +198,16 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
             sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
         }
         *yi = sum;
+    };
+
+    if m >= GEMV_PAR_THRESHOLD {
+        y.par_iter_mut().enumerate().for_each(compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
     }
 }
 
-/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. No inner allocation.
+/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. Parallelized across rows.
 pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -200,7 +216,7 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
+    let compute_row = |(i, yi): (usize, &mut f32)| {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -209,6 +225,12 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
             sum += vec_dot_q4_k_m_f32(block, &x[bi * 256..(bi + 1) * 256]);
         }
         *yi = sum;
+    };
+
+    if m >= GEMV_PAR_THRESHOLD {
+        y.par_iter_mut().enumerate().for_each(compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
     }
 }
 
