@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 
 use crate::gguf::{GgufFile, GgufValue};
 
@@ -24,6 +25,12 @@ pub struct BpeTokenizer {
     eos_id: Option<u32>,
     /// Chat template (Jinja2 format) if present.
     chat_template: Option<String>,
+    /// Pre-compiled pretokenizer regex.
+    pretokenize_re: Regex,
+    /// GPT-2 byte→unicode mapping (computed once, used in encode).
+    byte_to_unicode: [char; 256],
+    /// GPT-2 unicode→byte mapping (computed once, used in decode).
+    unicode_to_byte: HashMap<char, u8>,
 }
 
 impl BpeTokenizer {
@@ -83,6 +90,12 @@ impl BpeTokenizer {
         // Extract chat template
         let chat_template = gguf.get_str("tokenizer.chat_template").map(String::from);
 
+        // Select pretokenizer based on model type
+        let pre_type = gguf.get_str("tokenizer.ggml.pre").unwrap_or("gpt2");
+        let pretokenize_re = build_pretokenize_regex(pre_type);
+        let byte_to_unicode = build_byte_to_unicode();
+        let unicode_to_byte = build_unicode_to_byte();
+
         Ok(BpeTokenizer {
             vocab,
             token_to_id,
@@ -91,18 +104,62 @@ impl BpeTokenizer {
             bos_id,
             eos_id,
             chat_template,
+            pretokenize_re,
+            byte_to_unicode,
+            unicode_to_byte,
         })
     }
 
-    /// Encode text into token IDs using byte-level BPE.
+    /// Encode text into token IDs using byte-level BPE with pretokenization.
+    ///
+    /// The text is first split into chunks using a regex pattern (matching
+    /// llama.cpp's LLAMA3 pretokenizer, which is used for LFM2 models).
+    /// BPE merges are then applied within each chunk independently.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
             return vec![];
         }
 
-        // Start with each byte as its own token
-        let bytes = text.as_bytes();
-        let mut tokens: Vec<Vec<u8>> = bytes.iter().map(|&b| vec![b]).collect();
+        // Pretokenize: split text into chunks using the LLAMA3/LFM2 regex pattern.
+        // This keeps spaces attached to the following word (e.g., " world" as one chunk)
+        // so they match vocab entries like "Ġworld" (where Ġ = space in GPT-2 encoding).
+        let chunks: Vec<&str> = self
+            .pretokenize_re
+            .find_iter(text)
+            .map(|m| m.as_str())
+            .collect();
+
+        let mut result = Vec::new();
+        for chunk in &chunks {
+            // Each chunk's UTF-8 bytes are split into individual characters,
+            // then BPE merges are applied within the chunk.
+            let ids = self.bpe_encode_chunk(chunk);
+            result.extend(ids);
+        }
+        result
+    }
+
+    /// Apply BPE to a single pretokenized chunk.
+    fn bpe_encode_chunk(&self, chunk: &str) -> Vec<u32> {
+        if chunk.is_empty() {
+            return vec![];
+        }
+
+        // Convert each raw byte through the GPT-2 byte-to-unicode mapping,
+        // then split into individual unicode characters. This ensures space (0x20)
+        // becomes Ġ (U+0120), matching how vocab tokens are stored.
+        let unicode_str = bytes_to_gpt2_unicode(chunk.as_bytes(), &self.byte_to_unicode);
+
+        // Each mapped unicode character becomes an initial BPE symbol.
+        // Characters may be multi-byte in UTF-8 (e.g., Ġ = \xC4\xA0).
+        let mut tokens: Vec<Vec<u8>> = unicode_str
+            .chars()
+            .map(|c| {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                s.as_bytes().to_vec()
+            })
+            .collect();
 
         // Repeatedly merge the highest-priority pair
         loop {
@@ -110,7 +167,6 @@ impl BpeTokenizer {
                 break;
             }
 
-            // Find the merge pair with the lowest rank (= highest priority)
             let mut best_rank = usize::MAX;
             let mut best_idx = 0;
 
@@ -125,10 +181,9 @@ impl BpeTokenizer {
             }
 
             if best_rank == usize::MAX {
-                break; // No more merges possible
+                break;
             }
 
-            // Apply the merge: combine tokens[best_idx] and tokens[best_idx + 1]
             let merged = [tokens[best_idx].as_slice(), tokens[best_idx + 1].as_slice()].concat();
             tokens[best_idx] = merged;
             tokens.remove(best_idx + 1);
@@ -137,22 +192,33 @@ impl BpeTokenizer {
         // Convert token byte sequences to IDs
         tokens
             .iter()
-            .map(|t| {
-                self.token_to_id.get(t).copied().unwrap_or(0) // fallback to token 0 for unknown sequences
-            })
+            .map(|t| self.token_to_id.get(t).copied().unwrap_or(0))
             .collect()
     }
 
     /// Decode token IDs back to a string.
+    ///
+    /// Reverses the GPT-2 byte-to-unicode mapping: collects the unicode chars
+    /// from each token's vocab entry, maps them back to raw bytes, then
+    /// interprets the result as UTF-8.
     pub fn decode(&self, token_ids: &[u32]) -> String {
-        let mut bytes = Vec::new();
+        let mut raw_bytes = Vec::new();
         for &id in token_ids {
             if let Some(token_bytes) = self.vocab.get(id as usize) {
-                bytes.extend_from_slice(token_bytes);
+                let token_str = String::from_utf8_lossy(token_bytes);
+                for ch in token_str.chars() {
+                    if let Some(&b) = self.unicode_to_byte.get(&ch) {
+                        raw_bytes.push(b);
+                    } else {
+                        // Fallback: emit the raw UTF-8 bytes of the char
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        raw_bytes.extend_from_slice(s.as_bytes());
+                    }
+                }
             }
         }
-        // Best-effort UTF-8 decode, replacing invalid sequences
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&raw_bytes).into_owned()
     }
 
     /// Vocabulary size.
@@ -238,6 +304,98 @@ pub fn apply_chat_template(
     tmpl.render(ctx).context("rendering chat template")
 }
 
+// ── GPT-2 byte-to-unicode mapping ──────────────────────────────────────────
+
+/// Build the GPT-2 byte-to-unicode mapping table.
+///
+/// GPT-2 BPE uses a reversible mapping from bytes (0-255) to Unicode characters
+/// so that every byte can be represented as a valid UTF-8 token. Printable ASCII
+/// and Latin-1 bytes map to themselves; other bytes map to Unicode codepoints
+/// starting at U+0100. Space (0x20) → Ġ (U+0120).
+fn build_byte_to_unicode() -> [char; 256] {
+    let mut table = ['\0'; 256];
+    let mut n = 0u32; // counter for non-printable bytes
+
+    for b in 0u16..256 {
+        let ch = match b {
+            // Printable ASCII subset + Latin-1 supplement (these map to themselves)
+            0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => b as u32,
+            // Everything else maps to U+0100 + n (sequential assignment)
+            _ => {
+                let c = 256 + n;
+                n += 1;
+                c
+            }
+        };
+        table[b as usize] = char::from_u32(ch).unwrap();
+    }
+    table
+}
+
+/// Convert raw bytes to a GPT-2 unicode string using the byte-to-unicode mapping.
+fn bytes_to_gpt2_unicode(bytes: &[u8], table: &[char; 256]) -> String {
+    bytes.iter().map(|&b| table[b as usize]).collect()
+}
+
+/// Build the reverse mapping: GPT-2 unicode char → original byte.
+fn build_unicode_to_byte() -> HashMap<char, u8> {
+    let table = build_byte_to_unicode();
+    table
+        .iter()
+        .enumerate()
+        .map(|(b, &ch)| (ch, b as u8))
+        .collect()
+}
+
+// ── Pretokenization ────────────────────────────────────────────────────────
+
+/// Build the pretokenizer regex based on the `tokenizer.ggml.pre` type.
+///
+/// Different model families use different pretokenizer patterns:
+/// - "lfm2", "llama3", "llama-v3" → LLAMA3 pattern (case-insensitive contractions,
+///   1-3 digit groups, newline handling)
+/// - "gpt2" → GPT-2 pattern (simpler, case-sensitive contractions)
+/// - Others → defaults to LLAMA3 with a warning
+fn build_pretokenize_regex(pre_type: &str) -> Regex {
+    let pattern = match pre_type {
+        // LLAMA3 pattern — used by LFM2, LLaMA 3, and similar models.
+        // Simplified: the original has \s+(?!\S)|\s+ which requires lookahead;
+        // we use just \s+ since the earlier alternatives capture space-prefixed words.
+        "lfm2" | "llama3" | "llama-v3" => concat!(
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+            r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+            r"|\p{N}{1,3}",
+            r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+            r"|\s*[\r\n]+",
+            r"|\s+",
+        ),
+        // GPT-2 pattern — simpler, case-sensitive contractions.
+        "gpt2" => concat!(
+            r"(?:'s|'t|'re|'ve|'m|'ll|'d)",
+            r"| ?\p{L}+",
+            r"| ?\p{N}+",
+            r"| ?[^\s\p{L}\p{N}]+",
+            r"|\s+",
+        ),
+        // Default to LLAMA3 for unknown types (most general pattern)
+        other => {
+            tracing::warn!(
+                "unknown tokenizer.ggml.pre type '{other}', defaulting to LLAMA3 pretokenizer"
+            );
+            concat!(
+                r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+                r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+                r"|\p{N}{1,3}",
+                r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+                r"|\s*[\r\n]+",
+                r"|\s+",
+            )
+        }
+    };
+
+    Regex::new(pattern).expect("invalid pretokenizer regex")
+}
+
 // ── Token unescaping ────────────────────────────────────────────────────────
 
 /// Convert a token string from GGUF vocabulary to raw bytes.
@@ -307,7 +465,155 @@ mod tests {
             bos_id: None,
             eos_id: None,
             chat_template: None,
+            pretokenize_re: build_pretokenize_regex("lfm2"),
+            byte_to_unicode: build_byte_to_unicode(),
+            unicode_to_byte: build_unicode_to_byte(),
         }
+    }
+
+    #[test]
+    fn test_byte_to_unicode_space() {
+        let table = build_byte_to_unicode();
+        // Space (0x20) should map to Ġ (U+0120)
+        assert_eq!(table[0x20], '\u{0120}');
+        // Printable ASCII should map to itself
+        assert_eq!(table[b'A' as usize], 'A');
+        assert_eq!(table[b'z' as usize], 'z');
+        assert_eq!(table[b'0' as usize], '0');
+        // Newline (0x0A) should NOT map to itself (it's a control char)
+        assert_ne!(table[0x0A], '\n');
+    }
+
+    #[test]
+    fn test_byte_unicode_roundtrip() {
+        let table = build_byte_to_unicode();
+        let reverse = build_unicode_to_byte();
+        for b in 0u8..=255 {
+            let ch = table[b as usize];
+            assert_eq!(reverse[&ch], b, "roundtrip failed for byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn test_pretokenize_splits_words() {
+        let re = build_pretokenize_regex("lfm2");
+        let chunks: Vec<&str> = re
+            .find_iter("The meaning of life")
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(chunks, vec!["The", " meaning", " of", " life"]);
+    }
+
+    #[test]
+    fn test_pretokenize_contractions() {
+        let re = build_pretokenize_regex("lfm2");
+        let chunks: Vec<&str> = re.find_iter("I'm don't").map(|m| m.as_str()).collect();
+        assert!(chunks.contains(&"'m"));
+        assert!(chunks.contains(&"'t"));
+    }
+
+    #[test]
+    fn test_pretokenize_numbers() {
+        let re = build_pretokenize_regex("lfm2");
+        let chunks: Vec<&str> = re.find_iter("test 12345").map(|m| m.as_str()).collect();
+        // Numbers split into 1-3 digit groups
+        assert_eq!(chunks, vec!["test", " ", "123", "45"]);
+    }
+
+    /// Build a tokenizer with GPT-2-style vocab (Ġ-prefixed tokens for spaces).
+    fn make_gpt2_style_tokenizer() -> BpeTokenizer {
+        let table = build_byte_to_unicode();
+        let mut vocab: Vec<Vec<u8>> = Vec::new();
+        let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::new();
+
+        // Token 0: pad
+        vocab.push(b"<pad>".to_vec());
+        token_to_id.insert(b"<pad>".to_vec(), 0);
+
+        // Individual GPT-2 unicode chars for common bytes
+        for b in 0u8..=127 {
+            let ch = table[b as usize];
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            let bytes = s.as_bytes().to_vec();
+            let id = vocab.len() as u32;
+            vocab.push(bytes.clone());
+            token_to_id.insert(bytes, id);
+        }
+
+        // Add merged tokens with Ġ prefix (space = U+0120 in GPT-2 encoding)
+        let space_char = table[b' ' as usize]; // Ġ
+        let add_token =
+            |vocab: &mut Vec<Vec<u8>>, map: &mut HashMap<Vec<u8>, u32>, s: &str| -> u32 {
+                let bytes = s.as_bytes().to_vec();
+                let id = vocab.len() as u32;
+                vocab.push(bytes.clone());
+                map.insert(bytes, id);
+                id
+            };
+
+        // "Hi" merged token
+        let _hi_id = add_token(&mut vocab, &mut token_to_id, "Hi");
+        // "Ġworld" merged token (space-prefixed "world")
+        let space_world = format!("{space_char}world");
+        let _world_id = add_token(&mut vocab, &mut token_to_id, &space_world);
+
+        // Merges
+        let mut merge_ranks = HashMap::new();
+        merge_ranks.insert((b"H".to_vec(), b"i".to_vec()), 0);
+        // Ġ + w merge
+        let g_bytes = {
+            let mut buf = [0u8; 4];
+            space_char.encode_utf8(&mut buf).as_bytes().to_vec()
+        };
+        merge_ranks.insert((g_bytes.clone(), b"w".to_vec()), 1);
+        // Ġw + o
+        let gw_bytes = [g_bytes.as_slice(), b"w"].concat();
+        merge_ranks.insert((gw_bytes.clone(), b"o".to_vec()), 2);
+        // Ġwo + r
+        let gwor = [gw_bytes.as_slice(), b"o"].concat();
+        merge_ranks.insert((gwor.clone(), b"r".to_vec()), 3);
+        // Ġwor + l
+        let gworl = [gwor.as_slice(), b"r"].concat();
+        merge_ranks.insert((gworl.clone(), b"l".to_vec()), 4);
+        // Ġworl + d
+        let gworld = [gworl.as_slice(), b"l"].concat();
+        merge_ranks.insert((gworld.clone(), b"d".to_vec()), 5);
+
+        BpeTokenizer {
+            vocab,
+            token_to_id,
+            merge_ranks,
+            special_tokens: HashMap::new(),
+            bos_id: None,
+            eos_id: None,
+            chat_template: None,
+            pretokenize_re: build_pretokenize_regex("lfm2"),
+            byte_to_unicode: build_byte_to_unicode(),
+            unicode_to_byte: build_unicode_to_byte(),
+        }
+    }
+
+    #[test]
+    fn test_gpt2_encode_space_prefix() {
+        let tok = make_gpt2_style_tokenizer();
+        let ids = tok.encode("Hi world");
+        // "Hi world" → pretokenize → ["Hi", " world"]
+        // "Hi" → BPE merges to "Hi" token
+        // " world" → byte-to-unicode → "Ġworld" → BPE merges to "Ġworld" token
+        let hi_id = *tok.token_to_id.get(b"Hi".as_slice()).unwrap();
+        let table = build_byte_to_unicode();
+        let space_world = format!("{}world", table[b' ' as usize]);
+        let world_id = *tok.token_to_id.get(space_world.as_bytes()).unwrap();
+        assert_eq!(ids, vec![hi_id, world_id]);
+    }
+
+    #[test]
+    fn test_gpt2_decode_reverses_encode() {
+        let tok = make_gpt2_style_tokenizer();
+        let ids = tok.encode("Hi world");
+        let decoded = tok.decode(&ids);
+        assert_eq!(decoded, "Hi world");
     }
 
     #[test]
