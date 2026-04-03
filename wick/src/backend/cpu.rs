@@ -234,7 +234,6 @@ pub fn gemv_q4_0_with_q8(
     }
 }
 
-/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. Parallelized across rows.
 /// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k].
 /// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
 /// with vdotq_s32 — ~4x fewer instructions than f32 widening path).
@@ -666,6 +665,26 @@ mod tests {
         assert!((x[1] - 0.7311).abs() < 1e-3);
         assert!((x[2] - (-0.2689)).abs() < 1e-3);
         assert!((x[3] - 4.9665).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_silu_mul_inplace() {
+        let mut gate = vec![0.0, 1.0, -1.0, 5.0];
+        let up = vec![2.0, 3.0, 0.5, 1.0];
+
+        // Reference: silu(gate) * up
+        let mut gate_ref = gate.clone();
+        silu_inplace(&mut gate_ref);
+        mul_inplace(&mut gate_ref, &up);
+
+        silu_mul_inplace(&mut gate, &up);
+
+        for (i, (&got, &expected)) in gate.iter().zip(gate_ref.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "silu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
     }
 
     #[test]

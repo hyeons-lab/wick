@@ -613,20 +613,9 @@ impl Model for Lfm2Model {
             normed.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
 
-            // Pre-quantize normed input for Q4_0 operator GEMVs (shared across all projections)
+            // Pre-quantize normed input for operator GEMVs (shared across all projections)
             #[cfg(target_arch = "aarch64")]
-            {
-                let n_blocks = normed.len() / 32;
-                state.scratch.q8_scales.resize(n_blocks, 0.0);
-                state.scratch.q8_quants.resize(normed.len(), 0);
-                unsafe {
-                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                        &normed,
-                        &mut state.scratch.q8_scales,
-                        &mut state.scratch.q8_quants,
-                    );
-                }
-            }
+            Self::quantize_to_scratch(&normed, state);
 
             // Operator: conv or attention (writes result to state.scratch.out)
             if cfg.block_types[i] == BlockType::GatedConv {

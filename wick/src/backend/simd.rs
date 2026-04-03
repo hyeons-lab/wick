@@ -11,6 +11,7 @@ use half::f16;
 /// Send+Sync pointer wrapper for parallel GEMV closures.
 /// Stores pointers as usize to satisfy Send+Sync (raw pointers don't implement them).
 /// Safety: callers ensure non-overlapping row access and immutable source data.
+#[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct GemvPtrs {
     a: usize,
@@ -209,6 +210,13 @@ pub(crate) mod neon {
     ) -> usize {
         unsafe {
             let k = x.len();
+            debug_assert_eq!(
+                k % 32,
+                0,
+                "quantize_f32_to_q8_0: x.len() must be divisible by 32"
+            );
+            debug_assert!(scales.len() >= k / 32);
+            debug_assert!(quants.len() >= k);
             let n_blocks = k / 32;
 
             for bi in 0..n_blocks {
