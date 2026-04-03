@@ -293,6 +293,7 @@ pub fn gemv_q8_0_f32(
 
 /// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
 /// On aarch64, quantizes x to Q8_0 then uses integer Q6_K × Q8_0 dot product with vdotq_s32.
+#[allow(clippy::ptr_arg)]
 #[allow(unused_variables)]
 pub fn gemv_q6k_f32(
     a_quant: &[u8],
