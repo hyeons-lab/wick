@@ -357,6 +357,96 @@ pub(crate) mod neon {
             gemv_q4_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
         }
     }
+
+    /// NEON integer GEMV: y[m] = A_q8_0[m,k] @ x_f32[k].
+    /// Quantizes x to Q8_0, then does Q8_0 × Q8_0 integer dot products.
+    /// ~4x fewer instructions per block vs the f32 widening path.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q8_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            let row_bytes = n_blocks * size_of::<BlockQ8_0>();
+
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+
+            let ptrs = GemvPtrs {
+                a: a_quant.as_ptr() as usize,
+                xq: q8_quants.as_ptr() as usize,
+                xs: q8_scales.as_ptr() as usize,
+            };
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let row_start = i * row_bytes;
+                let mut sumv0 = vdupq_n_f32(0.0);
+                let mut sumv1 = vdupq_n_f32(0.0);
+
+                let mut bi = 0usize;
+                while bi + 1 < n_blocks {
+                    // Weight block 0
+                    let wb0 = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+                    let wb1 = &*(ptrs.a().add(row_start + (bi + 1) * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+
+                    // Load weight quants (32 i8 per block = 2 × int8x16_t)
+                    let w0_lo = vld1q_s8(wb0.quants.as_ptr());
+                    let w0_hi = vld1q_s8(wb0.quants.as_ptr().add(16));
+                    let w1_lo = vld1q_s8(wb1.quants.as_ptr());
+                    let w1_hi = vld1q_s8(wb1.quants.as_ptr().add(16));
+
+                    // Load input quants
+                    let x0_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let x0_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let x1_lo = vld1q_s8(ptrs.xq().add((bi + 1) * 32));
+                    let x1_hi = vld1q_s8(ptrs.xq().add((bi + 1) * 32 + 16));
+
+                    // Integer dot product: 2 × vdotq_s32 per block
+                    let z = vdupq_n_s32(0);
+                    let p_0 = vdotq_s32(vdotq_s32(z, w0_lo, x0_lo), w0_hi, x0_hi);
+                    let p_1 = vdotq_s32(vdotq_s32(z, w1_lo, x1_lo), w1_hi, x1_hi);
+
+                    // Scale: d_weight × d_input
+                    let d0 = f16::from_bits(wb0.delta).to_f32() * *ptrs.xs().add(bi);
+                    let d1 = f16::from_bits(wb1.delta).to_f32() * *ptrs.xs().add(bi + 1);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                    sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+                    bi += 2;
+                }
+
+                if bi < n_blocks {
+                    let wb = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+                    let w_lo = vld1q_s8(wb.quants.as_ptr());
+                    let w_hi = vld1q_s8(wb.quants.as_ptr().add(16));
+                    let x_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let x_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let z = vdupq_n_s32(0);
+                    let p = vdotq_s32(vdotq_s32(z, w_lo, x_lo), w_hi, x_hi);
+                    let d = f16::from_bits(wb.delta).to_f32() * *ptrs.xs().add(bi);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                }
+
+                *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+            };
+
+            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                use rayon::prelude::*;
+                y.par_iter_mut().enumerate().for_each(compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+    }
 }
 
 // ── x86_64 AVX2 ─────────────────────────────────────────────────────────────

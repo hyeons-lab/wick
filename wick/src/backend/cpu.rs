@@ -195,7 +195,18 @@ pub fn gemv_q4_0_with_q8(
 }
 
 /// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. Parallelized across rows.
-pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k].
+/// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
+/// with vdotq_s32 — ~4x fewer instructions than f32 widening path).
+pub fn gemv_q8_0_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
@@ -203,21 +214,34 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    let compute_row = |(i, yi): (usize, &mut f32)| {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ8_0>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
-            sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q8_0_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
-        *yi = sum;
-    };
+    }
 
-    if m >= GEMV_PAR_THRESHOLD {
-        y.par_iter_mut().enumerate().for_each(compute_row);
-    } else {
-        y.iter_mut().enumerate().for_each(compute_row);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (q8_scales, q8_quants);
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ8_0>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
+                sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+            }
+            *yi = sum;
+        };
+
+        if m >= GEMV_PAR_THRESHOLD {
+            y.par_iter_mut().enumerate().for_each(compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 
@@ -313,8 +337,16 @@ pub fn gemv_dispatch(
                 gemv_q4_0_f32(data, x, y, m, k, &mut s, &mut q);
             }
         }
+        DType::Q8_0 => {
+            if let Some((scales, quants)) = q8_scratch {
+                gemv_q8_0_f32(data, x, y, m, k, scales, quants);
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
         DType::F32 => gemv_f32(data, x, y, m, k),
-        DType::Q8_0 => gemv_q8_0_f32(data, x, y, m, k),
         DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
