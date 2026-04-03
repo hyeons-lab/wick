@@ -123,9 +123,9 @@ impl InferenceState {
                 gate: vec![0.0; config.intermediate_size],
                 up: vec![0.0; config.intermediate_size],
                 out: vec![0.0; config.hidden_size],
-                scores: Vec::new(),
-                q8_scales: Vec::new(),
-                q8_quants: Vec::new(), // grows with seq_len during inference
+                scores: Vec::new(),    // grows with seq_len during inference
+                q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
+                q8_quants: Vec::new(), // resized per GEMV input dimension
             },
         }
     }

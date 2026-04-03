@@ -133,6 +133,7 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
+#[allow(clippy::ptr_arg)]
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
 ///
 /// On aarch64, uses integer dot product with caller-provided Q8_0 scratch buffers
@@ -241,6 +242,7 @@ pub fn gemv_q4_0_with_q8(
     }
 }
 
+#[allow(clippy::ptr_arg)]
 /// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k].
 /// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
 /// with vdotq_s32 — ~4x fewer instructions than f32 widening path).
