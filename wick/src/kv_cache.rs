@@ -36,6 +36,8 @@ pub struct ScratchBuffers {
     pub up: Vec<f32>,
     /// Scratch for block/FFN output (hidden_size).
     pub out: Vec<f32>,
+    /// Scratch for attention scores (grows with seq_len, reused across heads).
+    pub scores: Vec<f32>,
 }
 
 /// Inference state across all layers.
@@ -68,6 +70,7 @@ impl InferenceState {
                 gate: Vec::new(),
                 up: Vec::new(),
                 out: Vec::new(),
+                scores: Vec::new(),
             },
         }
     }
@@ -114,6 +117,7 @@ impl InferenceState {
                 gate: vec![0.0; config.intermediate_size],
                 up: vec![0.0; config.intermediate_size],
                 out: vec![0.0; config.hidden_size],
+                scores: Vec::new(), // grows with seq_len during inference
             },
         }
     }

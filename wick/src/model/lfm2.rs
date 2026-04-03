@@ -423,17 +423,21 @@ impl Lfm2Model {
         // RoPE
         cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-        // Append K, V to cache (need temporaries to satisfy borrow checker)
-        let k_to_cache = state.scratch.k[..kv_dim].to_vec();
-        let v_to_cache = state.scratch.v[..kv_dim].to_vec();
-        state.append_kv(layer, &k_to_cache, &v_to_cache);
+        // Append K, V to cache using disjoint field borrows (avoids to_vec() copies)
+        if let LayerState::Attention {
+            key_cache,
+            value_cache,
+        } = &mut state.layers[layer]
+        {
+            key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+            value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+        }
 
         // GQA: grouped query attention
-        // Compute attention into a local buffer to avoid borrow conflicts with KV cache.
         let group_size = cfg.n_heads / n_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
         {
-            // Access layer cache and scratch directly to avoid whole-state borrow
+            // Access layers and scratch as disjoint fields to avoid whole-state borrow
             let (k_cache, v_cache) = match &state.layers[layer] {
                 LayerState::Attention {
                     key_cache,
@@ -445,12 +449,14 @@ impl Lfm2Model {
             let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
             attn_out.fill(0.0);
             let q = &state.scratch.q[..cfg.hidden_size];
+            let scores = &mut state.scratch.scores;
 
             for h in 0..cfg.n_heads {
                 let kv_h = h / group_size;
                 let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-                let mut scores = vec![0.0f32; seq_len];
+                // Resize scores to current seq_len (reuses allocation across heads/tokens)
+                scores.resize(seq_len, 0.0);
                 for (t, score) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
@@ -459,7 +465,7 @@ impl Lfm2Model {
                     *score = dot * scale;
                 }
 
-                cpu::softmax_inplace(&mut scores);
+                cpu::softmax_inplace(scores);
 
                 for d in 0..head_dim {
                     let mut val = 0.0f32;
@@ -469,7 +475,7 @@ impl Lfm2Model {
                     attn_out[h * head_dim + d] = val;
                 }
             }
-        } // k_cache/v_cache borrows end here
+        }
 
         // Output projection
         let out = &mut state.scratch.out[..cfg.hidden_size];
