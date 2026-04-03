@@ -1,0 +1,16 @@
+@@ -723,6 +723,7 @@
+         let n = tokens.len();
+ 
+         // 1. Embed all tokens
++        eprintln!("[prefill] n={n}, hs={hs}, layers={}", cfg.n_layers);
+         let mut hidden = vec![0.0f32; hs * n];
+         for (j, &token_id) in tokens.iter().enumerate() {
+             let emb = self.dequantize_row(&self.embd_ref, token_id as usize);
+@@ -772,6 +775,7 @@
+             }
+ 
+             // FFN: batch GEMM
++            eprintln!("[prefill] layer={layer} ffn_gemm");
+             let mut ffn_input = vec![0.0f32; hs * n];
+ 
+ 

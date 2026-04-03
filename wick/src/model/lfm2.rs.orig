@@ -758,9 +758,6 @@ impl Model for Lfm2Model {
                 for i in 0..hs {
                     col[i] = normed[i * n + j];
                 }
-                // Pre-quantize this single token for the block functions
-                #[cfg(target_arch = "aarch64")]
-                Self::quantize_to_scratch(&col, state);
 
                 if cfg.block_types[layer] == BlockType::GatedConv {
                     self.forward_conv_block(layer, &col, state);
@@ -793,67 +790,52 @@ impl Model for Lfm2Model {
                 }
             }
 
-            // FFN per-token using fast integer GEMV path
+            // Batch GEMM: gate[intermediate, n] = W_gate[intermediate, hs] × ffn_input[hs, n]
             let refs = &self.layer_refs[layer];
-            let mut ffn_out = vec![0.0f32; hs * n];
+            let mut gate = vec![0.0f32; cfg.intermediate_size * n];
+            let mut up = vec![0.0f32; cfg.intermediate_size * n];
+            let gate_data = self.weight_data(&refs.ffn_gate);
+            let up_data = self.weight_data(&refs.ffn_up);
+            cpu::matmul_dispatch(
+                refs.ffn_gate.dtype,
+                gate_data,
+                &ffn_input,
+                &mut gate,
+                cfg.intermediate_size,
+                n,
+                hs,
+            );
+            cpu::matmul_dispatch(
+                refs.ffn_up.dtype,
+                up_data,
+                &ffn_input,
+                &mut up,
+                cfg.intermediate_size,
+                n,
+                hs,
+            );
+
+            // Fused SiLU+mul per column
             for j in 0..n {
-                // Extract FFN input column
-                let mut col = vec![0.0f32; hs];
-                for i in 0..hs {
-                    col[i] = ffn_input[i * n + j];
-                }
-
-                // Gate + Up (share quantized input)
-                #[cfg(target_arch = "aarch64")]
-                Self::quantize_to_scratch(&col, state);
-
-                let mut gate_col = vec![0.0f32; cfg.intermediate_size];
-                let mut up_col = vec![0.0f32; cfg.intermediate_size];
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.gemv_preq(
-                        &refs.ffn_gate,
-                        &col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut gate_col,
-                    );
-                    self.gemv_preq(
-                        &refs.ffn_up,
-                        &col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut up_col,
-                    );
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    self.gemv(&refs.ffn_gate, &col, &mut gate_col);
-                    self.gemv(&refs.ffn_up, &col, &mut up_col);
-                }
-
-                cpu::silu_mul_inplace(&mut gate_col, &up_col);
-
-                // Down projection
-                let mut out_col = vec![0.0f32; hs];
-                #[cfg(target_arch = "aarch64")]
-                {
-                    Self::quantize_to_scratch(&gate_col, state);
-                    self.gemv_preq(
-                        &refs.ffn_down,
-                        &gate_col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut out_col,
-                    );
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
-
-                for i in 0..hs {
-                    ffn_out[i * n + j] = out_col[i];
+                for i in 0..cfg.intermediate_size {
+                    let idx = i * n + j;
+                    let g = gate[idx];
+                    gate[idx] = g / (1.0 + (-g).exp()) * up[idx];
                 }
             }
+
+            // FFN down: out[hs, n] = W_down[hs, intermediate] × gate[intermediate, n]
+            let mut ffn_out = vec![0.0f32; hs * n];
+            let down_data = self.weight_data(&refs.ffn_down);
+            cpu::matmul_dispatch(
+                refs.ffn_down.dtype,
+                down_data,
+                &gate,
+                &mut ffn_out,
+                hs,
+                n,
+                cfg.intermediate_size,
+            );
 
             // Second residual
             for i in 0..hs * n {

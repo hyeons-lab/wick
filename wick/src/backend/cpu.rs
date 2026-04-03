@@ -115,6 +115,44 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
     }
 }
 
+/// Dispatch GEMM based on dtype: C[m,n] = A_quant[m,k] × B_f32[k,n].
+/// For n=1 (GEMV), prefer gemv_dispatch instead for better performance.
+pub fn matmul_dispatch(
+    dtype: DType,
+    a: &[u8],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    match dtype {
+        DType::Q4_0 => matmul_q4_0_f32(a, b, c, m, n, k),
+        DType::Q8_0 => matmul_q8_0_f32(a, b, c, m, n, k),
+        DType::Q4KM => matmul_q4km_f32(a, b, c, m, n, k),
+        DType::Q6K => {
+            // Q6_K: dequantize each row then f32 matmul
+            // (no dedicated Q6_K GEMM yet)
+            let blocks_per_row = k / 256;
+            let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ6K>();
+            for i in 0..m {
+                let row_data = &a[i * row_bytes..(i + 1) * row_bytes];
+                let mut row_f32 = vec![0.0f32; k];
+                crate::quant::dequantize_q6_k_row(row_data, &mut row_f32);
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for l in 0..k {
+                        sum += row_f32[l] * b[l * n + j];
+                    }
+                    c[i * n + j] = sum;
+                }
+            }
+        }
+        DType::F32 => matmul_f32(bytemuck::cast_slice(a), b, c, m, n, k),
+        _ => panic!("matmul_dispatch: unsupported dtype {:?}", dtype),
+    }
+}
+
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
 /// Parallel for_each with chunking to prevent over-splitting.
