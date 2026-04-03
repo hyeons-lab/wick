@@ -20,6 +20,7 @@ struct GemvPtrs {
     xq: usize,
     xs: usize,
 }
+#[cfg(target_arch = "aarch64")]
 impl GemvPtrs {
     fn a(&self) -> *const u8 {
         self.a as *const u8
