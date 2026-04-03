@@ -96,11 +96,11 @@ impl Lfm2Model {
         // Detect block types from tensor presence
         let mut block_types = Vec::with_capacity(n_layers);
         let mut kv_heads_per_layer = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
+        for (i, &kv_heads) in kv_heads_array.iter().enumerate().take(n_layers) {
             let is_attn = gguf.tensors.contains_key(&format!("blk.{i}.attn_q.weight"));
             if is_attn {
                 block_types.push(BlockType::Attention);
-                kv_heads_per_layer.push(kv_heads_array[i] as usize);
+                kv_heads_per_layer.push(kv_heads as usize);
             } else {
                 block_types.push(BlockType::GatedConv);
                 kv_heads_per_layer.push(0);
@@ -134,7 +134,7 @@ impl Lfm2Model {
         let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
         let mut conv_weights = Vec::with_capacity(n_layers);
 
-        for i in 0..n_layers {
+        for (i, bt) in block_types.iter().enumerate() {
             attn_norm_weights.push(
                 gguf.get_tensor(&format!("blk.{i}.attn_norm.weight"))?
                     .to_f32_vec(),
@@ -144,7 +144,7 @@ impl Lfm2Model {
                     .to_f32_vec(),
             );
 
-            if block_types[i] == BlockType::Attention {
+            if *bt == BlockType::Attention {
                 attn_q_norm_weights.push(Some(
                     gguf.get_tensor(&format!("blk.{i}.attn_q_norm.weight"))?
                         .to_f32_vec(),
@@ -168,13 +168,13 @@ impl Lfm2Model {
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
 
         let mut layer_refs = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
+        for (i, bt) in block_types.iter().enumerate() {
             let ffn_gate = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?;
             let ffn_up = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?;
             let ffn_down = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?;
 
             let (shortconv_in_proj, shortconv_out_proj, attn_q, attn_k, attn_v, attn_output) =
-                if block_types[i] == BlockType::GatedConv {
+                if *bt == BlockType::GatedConv {
                     (
                         Some(Self::resolve_weight(
                             &gguf,
@@ -312,6 +312,8 @@ impl Lfm2Model {
     ) -> Vec<f32> {
         let refs = &self.layer_refs[layer];
         let hidden_size = self.config.hidden_size;
+        let kernel_size = self.config.conv_kernel_size.unwrap_or(3);
+        let d_conv = kernel_size - 1; // number of buffered past states
         let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights[layer].as_ref().unwrap();
@@ -327,33 +329,39 @@ impl Lfm2Model {
         let x = &proj[2 * hidden_size..3 * hidden_size];
 
         // bx = b ⊙ x (element-wise gate before conv)
-        let mut bx = vec![0.0f32; hidden_size];
-        for i in 0..hidden_size {
-            bx[i] = b[i] * x[i];
-        }
+        let bx: Vec<f32> = b.iter().zip(x.iter()).map(|(bi, xi)| bi * xi).collect();
 
-        // Depthwise conv1d with valid convolution using rolling buffer
-        // Buffer stores previous d_conv bx values (time-major)
+        // Depthwise conv1d with valid convolution using rolling buffer.
+        // Buffer stores d_conv previous bx values (time-major: [d_conv, hidden]).
+        // Conv weight layout: [hidden, kernel_size] = weight[ch * kernel_size + k].
         let mut conv_out = vec![0.0f32; hidden_size];
         if let LayerState::Conv { buffer } = &state.layers[layer] {
             for ch in 0..hidden_size {
-                conv_out[ch] = buffer[ch] * conv_weight[ch * 3]
-                    + buffer[hidden_size + ch] * conv_weight[ch * 3 + 1]
-                    + bx[ch] * conv_weight[ch * 3 + 2];
+                let mut sum = 0.0f32;
+                for k in 0..d_conv {
+                    sum += buffer[k * hidden_size + ch] * conv_weight[ch * kernel_size + k];
+                }
+                // Current bx is the last element in the kernel window
+                sum += bx[ch] * conv_weight[ch * kernel_size + d_conv];
+                conv_out[ch] = sum;
             }
         }
 
-        // Update rolling buffer: shift left, append bx
+        // Update rolling buffer: shift left by one slot, append bx
         if let LayerState::Conv { buffer } = &mut state.layers[layer] {
-            buffer.copy_within(hidden_size.., 0);
-            buffer[hidden_size..].copy_from_slice(&bx);
+            if d_conv > 1 {
+                buffer.copy_within(hidden_size.., 0);
+            }
+            let last_slot = (d_conv - 1) * hidden_size;
+            buffer[last_slot..last_slot + hidden_size].copy_from_slice(&bx);
         }
 
         // o = c ⊙ conv_out (second gate)
-        let mut o = vec![0.0f32; hidden_size];
-        for i in 0..hidden_size {
-            o[i] = c[i] * conv_out[i];
-        }
+        let o: Vec<f32> = c
+            .iter()
+            .zip(conv_out.iter())
+            .map(|(ci, co)| ci * co)
+            .collect();
 
         // out_proj: hidden → hidden
         let mut out = vec![0.0f32; hidden_size];

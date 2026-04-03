@@ -74,11 +74,10 @@ impl Sampler {
 
     fn apply_top_k(&self, logits: &mut [f32]) {
         let k = self.config.top_k;
-        // Find the k-th largest value
+        // Use partial sort to find the k-th largest value in O(n) average
         let mut sorted: Vec<f32> = logits.to_vec();
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-        let threshold = sorted[k - 1];
-        // Mask everything below threshold
+        let (_, &mut threshold, _) =
+            sorted.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap());
         for l in logits.iter_mut() {
             if *l < threshold {
                 *l = f32::NEG_INFINITY;
@@ -87,11 +86,16 @@ impl Sampler {
     }
 
     fn apply_top_p(&self, logits: &mut [f32]) {
-        // Sort indices by descending logit value
-        let mut indices: Vec<usize> = (0..logits.len()).collect();
+        // Collect only finite indices (respects prior top-k masking)
+        let mut indices: Vec<usize> = (0..logits.len())
+            .filter(|&i| logits[i].is_finite())
+            .collect();
+        if indices.is_empty() {
+            return;
+        }
         indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
 
-        // Compute softmax probabilities for sorting
+        // Compute softmax probabilities over finite logits only
         let max_val = logits[indices[0]];
         let mut probs: Vec<f32> = indices
             .iter()
@@ -103,8 +107,8 @@ impl Sampler {
         }
 
         // Accumulate until we exceed top_p
-        let mut cumsum = 0.0f32;
         let mut cutoff_idx = probs.len();
+        let mut cumsum = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
             cumsum += p;
             if cumsum >= self.config.top_p {

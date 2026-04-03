@@ -121,7 +121,7 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
 
-    for i in 0..m {
+    for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -129,7 +129,7 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
             let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
             sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
         }
-        y[i] = sum;
+        *yi = sum;
     }
 }
 
@@ -140,7 +140,7 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
 
-    for i in 0..m {
+    for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -148,7 +148,7 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
             let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
             sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
         }
-        y[i] = sum;
+        *yi = sum;
     }
 }
 
@@ -159,7 +159,7 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
     let blocks_per_row = k / 256;
     let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
 
-    for i in 0..m {
+    for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -167,7 +167,7 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
             let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
             sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
         }
-        y[i] = sum;
+        *yi = sum;
     }
 }
 
@@ -178,13 +178,30 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let blocks_per_row = k / 256;
     let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
 
-    for i in 0..m {
+    for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
             let offset = row_start + bi * size_of::<BlockQ4KM>();
             let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4KM) };
             sum += vec_dot_q4_k_m_f32(block, &x[bi * 256..(bi + 1) * 256]);
+        }
+        *yi = sum;
+    }
+}
+
+/// F32 GEMV: y[m] = A_f32[m,k] @ x[k].
+pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let a_f32: &[f32] = bytemuck::cast_slice(a);
+    debug_assert_eq!(a_f32.len(), m * k);
+
+    for i in 0..m {
+        let row = &a_f32[i * k..(i + 1) * k];
+        let mut sum = 0.0f32;
+        for j in 0..k {
+            sum += row[j] * x[j];
         }
         y[i] = sum;
     }
@@ -193,6 +210,7 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
 /// Dispatch GEMV based on dtype: y[m] = W[m,k] @ x[k].
 pub fn gemv_dispatch(dtype: DType, data: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     match dtype {
+        DType::F32 => gemv_f32(data, x, y, m, k),
         DType::Q4_0 => gemv_q4_0_f32(data, x, y, m, k),
         DType::Q8_0 => gemv_q8_0_f32(data, x, y, m, k),
         DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
