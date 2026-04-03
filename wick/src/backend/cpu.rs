@@ -279,8 +279,10 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
 
     #[cfg(target_arch = "aarch64")]
     {
+        let mut s = Vec::new();
+        let mut q = Vec::new();
         unsafe {
-            crate::backend::simd::neon::gemv_q6k_f32_neon(a_quant, x, y, m, k);
+            crate::backend::simd::neon::gemv_q6k_f32_neon(a_quant, x, y, m, k, &mut s, &mut q);
         }
     }
 
@@ -384,7 +386,22 @@ pub fn gemv_dispatch(
             }
         }
         DType::F32 => gemv_f32(data, x, y, m, k),
-        DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
+        DType::Q6K => {
+            #[cfg(target_arch = "aarch64")]
+            if let Some((scales, quants)) = q8_scratch {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, scales, quants);
+                }
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                unsafe {
+                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, &mut s, &mut q);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            gemv_q6k_f32(data, x, y, m, k);
+        }
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
     }
