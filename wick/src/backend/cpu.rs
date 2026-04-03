@@ -7,7 +7,6 @@ use crate::quant::{
     vec_dot_q6_k_f32, vec_dot_q8_0_f32,
 };
 use crate::tensor::DType;
-use rayon::prelude::*;
 use std::mem::size_of;
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
@@ -120,7 +119,8 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 /// Parallel for_each with chunking to prevent over-splitting.
 /// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
-    use rayon::prelude::*;
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
     let chunk_size = (y.len() / rayon::current_num_threads()).max(min_rows);
     y.par_chunks_mut(chunk_size)
         .enumerate()

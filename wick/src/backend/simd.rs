@@ -3,7 +3,9 @@
 // Platform-specific implementations behind cfg gates.
 // The dispatch functions select the best available implementation at compile time.
 
-use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0};
+#[cfg(target_arch = "aarch64")]
+use crate::quant::BlockQ6K;
+use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
