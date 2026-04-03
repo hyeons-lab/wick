@@ -117,9 +117,6 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k]. No inner allocation.
-///
-/// On aarch64, uses integer dot product path: quantizes x to Q8_0 once,
-/// then does Q4_0 × Q8_0 integer dot products per row (avoids f32 in inner loop).
 pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
