@@ -88,9 +88,54 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { model, prompt, .. } => {
-            println!("wick run: model={model}, prompt={prompt:?}");
-            println!("Not yet implemented — coming in Phase 3.");
+        Command::Run {
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            device: _,
+        } => {
+            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
+            let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+            let add_bos = gguf
+                .get_bool("tokenizer.ggml.add_bos_token")
+                .unwrap_or(false);
+
+            let loaded_model = wick::model::load_model(gguf)?;
+
+            let mut tokens = Vec::new();
+            if add_bos {
+                if let Some(bos) = tokenizer.bos_token() {
+                    tokens.push(bos);
+                }
+            }
+            tokens.extend_from_slice(&tokenizer.encode(&prompt));
+
+            eprintln!(
+                "Model: {} | {} layers | hidden={}",
+                loaded_model.config().architecture,
+                loaded_model.config().n_layers,
+                loaded_model.config().hidden_size
+            );
+            eprintln!("Prompt tokens: {}", tokens.len());
+
+            let config = wick::engine::GenerateConfig {
+                max_tokens,
+                sampler: wick::sampler::SamplerConfig {
+                    temperature,
+                    ..Default::default()
+                },
+            };
+
+            let result =
+                wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
+
+            eprintln!();
+            eprintln!("---");
+            eprintln!("Prompt tokens: {}", result.prompt_tokens);
+            eprintln!("Generated tokens: {}", result.generated_tokens);
+            eprintln!("Prefill: {:.1} tok/s", result.prefill_tok_per_sec);
+            eprintln!("Decode: {:.1} tok/s", result.decode_tok_per_sec);
         }
         Command::Inspect { model } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;

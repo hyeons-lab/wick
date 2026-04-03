@@ -3,7 +3,8 @@
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
 use crate::backend::simd::{vec_dot_q4_k_m_f32, vec_dot_q8_0_f32};
-use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32};
+use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q6_k_f32};
+use crate::tensor::DType;
 use std::mem::size_of;
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
@@ -108,6 +109,95 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
             }
             c[i * n + j] = sum;
         }
+    }
+}
+
+// ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
+
+/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k]. No inner allocation.
+pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+
+    for i in 0..m {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ4_0>();
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
+            sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+        }
+        y[i] = sum;
+    }
+}
+
+/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. No inner allocation.
+pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
+
+    for i in 0..m {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ8_0>();
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
+            sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+        }
+        y[i] = sum;
+    }
+}
+
+/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. No inner allocation.
+pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+
+    for i in 0..m {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ6K>();
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
+            sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+        }
+        y[i] = sum;
+    }
+}
+
+/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. No inner allocation.
+pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
+
+    for i in 0..m {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ4KM>();
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4KM) };
+            sum += vec_dot_q4_k_m_f32(block, &x[bi * 256..(bi + 1) * 256]);
+        }
+        y[i] = sum;
+    }
+}
+
+/// Dispatch GEMV based on dtype: y[m] = W[m,k] @ x[k].
+pub fn gemv_dispatch(dtype: DType, data: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    match dtype {
+        DType::Q4_0 => gemv_q4_0_f32(data, x, y, m, k),
+        DType::Q8_0 => gemv_q8_0_f32(data, x, y, m, k),
+        DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
+        DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
+        _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
     }
 }
 
