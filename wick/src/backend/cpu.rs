@@ -185,6 +185,11 @@ pub const GEMV_PAR_THRESHOLD: usize = 256;
 /// Returns (scales, quants). On aarch64, uses NEON-vectorized quantization.
 #[cfg(target_arch = "aarch64")]
 pub fn quantize_f32_to_q8_0(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
+    assert_eq!(
+        x.len() % 32,
+        0,
+        "quantize_f32_to_q8_0: x.len() must be divisible by 32"
+    );
     let n_blocks = x.len() / 32;
     let mut scales = vec![0.0f32; n_blocks];
     let mut quants = vec![0i8; x.len()];
@@ -287,18 +292,27 @@ pub fn gemv_q8_0_f32(
 }
 
 /// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
-/// On aarch64, dequantizes each block to f32 then uses NEON FMA for the dot product.
-pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// On aarch64, quantizes x to Q8_0 then uses integer Q6_K × Q8_0 dot product with vdotq_s32.
+#[allow(unused_variables)]
+pub fn gemv_q6k_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
 
     #[cfg(target_arch = "aarch64")]
     {
-        let mut s = Vec::new();
-        let mut q = Vec::new();
         unsafe {
-            crate::backend::simd::neon::gemv_q6k_f32_neon(a_quant, x, y, m, k, &mut s, &mut q);
+            crate::backend::simd::neon::gemv_q6k_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
     }
 
@@ -416,7 +430,11 @@ pub fn gemv_dispatch(
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
-            gemv_q6k_f32(data, x, y, m, k);
+            {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
+            }
         }
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),

@@ -306,6 +306,11 @@ impl Lfm2Model {
     /// Quantize x to Q8_0 into scratch buffers.
     #[cfg(target_arch = "aarch64")]
     fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
+        assert_eq!(
+            x.len() % 32,
+            0,
+            "quantize_to_scratch: x.len() must be divisible by 32"
+        );
         let nb = x.len() / 32;
         state.scratch.q8_scales.resize(nb, 0.0);
         state.scratch.q8_quants.resize(x.len(), 0);
