@@ -3,7 +3,7 @@
 // Platform-specific implementations behind cfg gates.
 // The dispatch functions select the best available implementation at compile time.
 
-use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
+use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0};
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
@@ -472,6 +472,47 @@ pub(crate) mod neon {
             q8_quants.resize(k, 0);
             quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
             gemv_q8_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+        }
+    }
+
+    /// NEON Q6_K GEMV: dequantize each block to f32, then NEON FMA dot product.
+    /// Much faster than scalar vec_dot since we use NEON for the dot product.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn gemv_q6k_f32_neon(a_quant: &[u8], x: &[f32], y: &mut [f32], _m: usize, k: usize) {
+        unsafe {
+            let blocks_per_row = k / 256;
+            let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+            let a_ptr = a_quant.as_ptr() as usize;
+            let x_ptr = x.as_ptr() as usize;
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let row_start = i * row_bytes;
+                let mut sumv = vdupq_n_f32(0.0);
+
+                for bi in 0..blocks_per_row {
+                    let blk =
+                        &*((a_ptr + row_start + bi * size_of::<BlockQ6K>()) as *const BlockQ6K);
+                    // Dequantize block to f32 (reuse existing function)
+                    let vals = crate::quant::dequantize_q6_k_block(blk);
+
+                    // NEON dot product: sum(vals[j] * x[bi*256 + j])
+                    let x_base = (x_ptr as *const f32).add(bi * 256);
+                    for j in (0..256).step_by(4) {
+                        let v = vld1q_f32(vals.as_ptr().add(j));
+                        let xv = vld1q_f32(x_base.add(j));
+                        sumv = vfmaq_f32(sumv, v, xv);
+                    }
+                }
+
+                *yi = vaddvq_f32(sumv);
+            };
+
+            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                use rayon::prelude::*;
+                y.par_iter_mut().enumerate().for_each(compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
         }
     }
 }

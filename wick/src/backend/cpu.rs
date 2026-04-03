@@ -268,29 +268,41 @@ pub fn gemv_q8_0_f32(
 }
 
 /// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
+/// On aarch64, dequantizes each block to f32 then uses NEON FMA for the dot product.
 pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
-    let blocks_per_row = k / 256;
-    let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
-    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    let compute_row = |(i, yi): (usize, &mut f32)| {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ6K>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
-            sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q6k_f32_neon(a_quant, x, y, m, k);
         }
-        *yi = sum;
-    };
+    }
 
-    if m >= GEMV_PAR_THRESHOLD {
-        y.par_iter_mut().enumerate().for_each(compute_row);
-    } else {
-        y.iter_mut().enumerate().for_each(compute_row);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ6K>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
+                sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+            }
+            *yi = sum;
+        };
+
+        if m >= GEMV_PAR_THRESHOLD {
+            y.par_iter_mut().enumerate().for_each(compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 
