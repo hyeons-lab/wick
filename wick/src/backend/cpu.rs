@@ -116,7 +116,11 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
-/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k]. No inner allocation.
+/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
+///
+/// On aarch64, uses integer dot product: quantizes x to Q8_0 once, then does
+/// Q4_0 × Q8_0 integer dot products per row (matching llama.cpp's computation
+/// model). This is faster than Q8_0 GEMV because Q4_0 reads half the weight data.
 pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -125,6 +129,14 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q4_0_f32_neon(a_quant, x, y, m, k);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;

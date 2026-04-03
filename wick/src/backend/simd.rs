@@ -9,9 +9,10 @@ use half::f16;
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
-mod neon {
+pub(crate) mod neon {
     use super::*;
     use std::arch::aarch64::*;
+    use std::mem::size_of;
 
     /// NEON-optimized Q8_0 dot product with f32 vector.
     #[target_feature(enable = "neon")]
@@ -173,6 +174,156 @@ mod neon {
             }
 
             sumf
+        }
+    }
+
+    /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
+    ///
+    /// Quantizes x to Q8_0 once (NEON-vectorized, f16 scale roundtrip for llama.cpp
+    /// accuracy match), then does Q4_0 × Q8_0 integer dot products per row using
+    /// vmull_s8 + vpaddlq_s16. Processes 2 blocks at a time for ILP.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn gemv_q4_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let blocks_per_row = k / 32;
+            let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+            let n_blocks = k / 32;
+
+            let mut x_scales = vec![0.0f32; n_blocks];
+            let mut x_quants = vec![0i8; k];
+
+            // Step 1: quantize x to Q8_0 (NEON-vectorized, f16 scale roundtrip)
+
+            for bi in 0..n_blocks {
+                let base = bi * 32;
+                let x_ptr = x.as_ptr().add(base);
+
+                // Load 32 f32 values as 8 × float32x4_t
+                let s0 = vld1q_f32(x_ptr);
+                let s1 = vld1q_f32(x_ptr.add(4));
+                let s2 = vld1q_f32(x_ptr.add(8));
+                let s3 = vld1q_f32(x_ptr.add(12));
+                let s4 = vld1q_f32(x_ptr.add(16));
+                let s5 = vld1q_f32(x_ptr.add(20));
+                let s6 = vld1q_f32(x_ptr.add(24));
+                let s7 = vld1q_f32(x_ptr.add(28));
+
+                // Compute max absolute value via tree reduction
+                let a0 = vmaxq_f32(vabsq_f32(s0), vabsq_f32(s1));
+                let a1 = vmaxq_f32(vabsq_f32(s2), vabsq_f32(s3));
+                let a2 = vmaxq_f32(vabsq_f32(s4), vabsq_f32(s5));
+                let a3 = vmaxq_f32(vabsq_f32(s6), vabsq_f32(s7));
+                let a4 = vmaxq_f32(a0, a1);
+                let a5 = vmaxq_f32(a2, a3);
+                let a6 = vmaxq_f32(a4, a5);
+                let amax = vmaxvq_f32(a6);
+
+                let d = amax / 127.0;
+                // f16 roundtrip to match llama.cpp's block_q8_0.d storage
+                let d = f16::from_f32(d).to_f32();
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                x_scales[bi] = d;
+
+                // Quantize: vcvtnq_s32_f32 (round-to-nearest-even, matching llama.cpp)
+                let qp = x_quants.as_mut_ptr().add(base);
+                let srcv = [s0, s1, s2, s3, s4, s5, s6, s7];
+                for j in 0..8 {
+                    let v = vmulq_n_f32(srcv[j], id);
+                    let vi = vcvtnq_s32_f32(v);
+                    *qp.add(4 * j) = vgetq_lane_s32::<0>(vi) as i8;
+                    *qp.add(4 * j + 1) = vgetq_lane_s32::<1>(vi) as i8;
+                    *qp.add(4 * j + 2) = vgetq_lane_s32::<2>(vi) as i8;
+                    *qp.add(4 * j + 3) = vgetq_lane_s32::<3>(vi) as i8;
+                }
+            }
+
+            // Step 2: integer Q4_0 × Q8_0 dot product per row
+            let mask_lo = vdupq_n_u8(0x0F);
+            let offset_8 = vdupq_n_s8(0x8);
+
+            for (i, yi) in y.iter_mut().enumerate() {
+                let row_start = i * row_bytes;
+                let mut sumv0 = vdupq_n_f32(0.0);
+                let mut sumv1 = vdupq_n_f32(0.0);
+
+                // Process 2 blocks at a time for ILP
+                let mut bi = 0usize;
+                while bi + 1 < blocks_per_row {
+                    let q4_off_0 = row_start + bi * size_of::<BlockQ4_0>();
+                    let q4_off_1 = row_start + (bi + 1) * size_of::<BlockQ4_0>();
+                    let b0 = &*(a_quant.as_ptr().add(q4_off_0) as *const BlockQ4_0);
+                    let b1 = &*(a_quant.as_ptr().add(q4_off_1) as *const BlockQ4_0);
+
+                    // Load Q4_0 nibbles
+                    let v0 = vld1q_u8(b0.qs.as_ptr());
+                    let v1 = vld1q_u8(b1.qs.as_ptr());
+
+                    // Extract and offset: 4-bit → signed i8 centered at 0
+                    let v0_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_lo)), offset_8);
+                    let v0_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), offset_8);
+                    let v1_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_lo)), offset_8);
+                    let v1_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), offset_8);
+
+                    // Load Q8_0 quants
+                    let xq_base_0 = bi * 32;
+                    let xq_base_1 = (bi + 1) * 32;
+                    let y0_lo = vld1q_s8(x_quants.as_ptr().add(xq_base_0));
+                    let y0_hi = vld1q_s8(x_quants.as_ptr().add(xq_base_0 + 16));
+                    let y1_lo = vld1q_s8(x_quants.as_ptr().add(xq_base_1));
+                    let y1_hi = vld1q_s8(x_quants.as_ptr().add(xq_base_1 + 16));
+
+                    // Integer dot product: vmull_s8 + vpaddlq_s16
+                    let p0_lo = vmull_s8(vget_low_s8(v0_lo), vget_low_s8(y0_lo));
+                    let p0_lo = vmlal_s8(p0_lo, vget_high_s8(v0_lo), vget_high_s8(y0_lo));
+                    let p0_hi = vmull_s8(vget_low_s8(v0_hi), vget_low_s8(y0_hi));
+                    let p0_hi = vmlal_s8(p0_hi, vget_high_s8(v0_hi), vget_high_s8(y0_hi));
+                    let p_0 = vaddq_s32(vpaddlq_s16(p0_lo), vpaddlq_s16(p0_hi));
+
+                    let p1_lo = vmull_s8(vget_low_s8(v1_lo), vget_low_s8(y1_lo));
+                    let p1_lo = vmlal_s8(p1_lo, vget_high_s8(v1_lo), vget_high_s8(y1_lo));
+                    let p1_hi = vmull_s8(vget_low_s8(v1_hi), vget_low_s8(y1_hi));
+                    let p1_hi = vmlal_s8(p1_hi, vget_high_s8(v1_hi), vget_high_s8(y1_hi));
+                    let p_1 = vaddq_s32(vpaddlq_s16(p1_lo), vpaddlq_s16(p1_hi));
+
+                    // Scale and accumulate
+                    let d0 = f16::from_bits(b0.d).to_f32() * x_scales[bi];
+                    let d1 = f16::from_bits(b1.d).to_f32() * x_scales[bi + 1];
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                    sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+
+                    bi += 2;
+                }
+
+                // Handle odd last block
+                if bi < blocks_per_row {
+                    let q4_off = row_start + bi * size_of::<BlockQ4_0>();
+                    let b = &*(a_quant.as_ptr().add(q4_off) as *const BlockQ4_0);
+                    let v = vld1q_u8(b.qs.as_ptr());
+                    let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                    let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+
+                    let xq_base = bi * 32;
+                    let y_lo = vld1q_s8(x_quants.as_ptr().add(xq_base));
+                    let y_hi = vld1q_s8(x_quants.as_ptr().add(xq_base + 16));
+
+                    let p_lo = vmull_s8(vget_low_s8(v_lo), vget_low_s8(y_lo));
+                    let p_lo = vmlal_s8(p_lo, vget_high_s8(v_lo), vget_high_s8(y_lo));
+                    let p_hi = vmull_s8(vget_low_s8(v_hi), vget_low_s8(y_hi));
+                    let p_hi = vmlal_s8(p_hi, vget_high_s8(v_hi), vget_high_s8(y_hi));
+                    let p = vaddq_s32(vpaddlq_s16(p_lo), vpaddlq_s16(p_hi));
+
+                    let d = f16::from_bits(b.d).to_f32() * x_scales[bi];
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                }
+
+                *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+            }
         }
     }
 }
