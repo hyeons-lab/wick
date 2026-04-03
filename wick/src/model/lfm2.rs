@@ -310,10 +310,41 @@ impl Lfm2Model {
         );
     }
 
-    /// GEMV dispatch without scratch buffers (for non-Q4_0 or when scratch isn't available).
+    /// GEMV dispatch without scratch buffers.
     fn gemv(&self, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
         let data = self.weight_data(wref);
         cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
+    }
+
+    /// GEMV using pre-quantized Q8_0 input (for Q4_0/Q8_0 weights with shared input).
+    /// Falls back to normal gemv for non-quantized weights.
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_preq(&self, wref: &WeightRef, x_f32: &[f32], y: &mut [f32], state: &InferenceState) {
+        let data = self.weight_data(wref);
+        match wref.dtype {
+            DType::Q4_0 => cpu::gemv_q4_0_with_q8(
+                data,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                y,
+                wref.m,
+                wref.k,
+            ),
+            DType::Q8_0 => {
+                // Q8_0 × Q8_0 with pre-quantized input
+                unsafe {
+                    crate::backend::simd::neon::gemv_q8_0_q8_0_neon(
+                        data,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        y,
+                        wref.m,
+                        wref.k,
+                    );
+                }
+            }
+            _ => cpu::gemv_dispatch(wref.dtype, data, x_f32, y, wref.m, wref.k, None),
+        }
     }
 
     /// Q4_0 GEMV with pre-quantized input. Avoids re-quantizing x when
@@ -361,8 +392,36 @@ impl Lfm2Model {
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights[layer].as_ref().unwrap();
 
-        // in_proj: hidden → 3*hidden
+        // in_proj: hidden → 3*hidden (uses pre-quantized Q8_0 data when available)
         let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
+        #[cfg(target_arch = "aarch64")]
+        if in_proj.dtype == DType::Q4_0 || in_proj.dtype == DType::Q8_0 {
+            let data = self.weight_data(in_proj);
+            if in_proj.dtype == DType::Q4_0 {
+                cpu::gemv_q4_0_with_q8(
+                    data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    proj,
+                    in_proj.m,
+                    in_proj.k,
+                );
+            } else {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q8_0_q8_0_neon(
+                        data,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        proj,
+                        in_proj.m,
+                        in_proj.k,
+                    );
+                }
+            }
+        } else {
+            self.gemv(in_proj, hidden, proj);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.gemv(in_proj, hidden, proj);
 
         // Split: b, c, x
@@ -424,10 +483,11 @@ impl Lfm2Model {
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
-        // Q, K, V projections into scratch buffers
+        // Q, K, V projections using pre-quantized hidden state
         let q = &mut state.scratch.q[..cfg.hidden_size];
         let k = &mut state.scratch.k[..kv_dim];
         let v = &mut state.scratch.v[..kv_dim];
+
         self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
         self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
         self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
@@ -540,6 +600,21 @@ impl Model for Lfm2Model {
             // Pre-norm (operator_norm) — copy+norm, keep hidden as residual
             normed.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
+
+            // Pre-quantize normed input for Q4_0 operator GEMVs (shared across all projections)
+            #[cfg(target_arch = "aarch64")]
+            {
+                let n_blocks = normed.len() / 32;
+                state.scratch.q8_scales.resize(n_blocks, 0.0);
+                state.scratch.q8_quants.resize(normed.len(), 0);
+                unsafe {
+                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                        &normed,
+                        &mut state.scratch.q8_scales,
+                        &mut state.scratch.q8_quants,
+                    );
+                }
+            }
 
             // Operator: conv or attention (writes result to state.scratch.out)
             if cfg.block_types[i] == BlockType::GatedConv {

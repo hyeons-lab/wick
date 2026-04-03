@@ -238,16 +238,29 @@ pub(crate) mod neon {
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
                 scales[bi] = d;
 
+                // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
+                // f32→i32 (vcvtnq), then i32→i16→i8 via vqmovn (saturating narrow).
+                // Process 8 values at a time → 4 iterations for 32 values.
                 let qp = quants.as_mut_ptr().add(base);
-                let srcv = [s0, s1, s2, s3, s4, s5, s6, s7];
-                for j in 0..8 {
-                    let v = vmulq_n_f32(srcv[j], id);
-                    let vi = vcvtnq_s32_f32(v);
-                    *qp.add(4 * j) = vgetq_lane_s32::<0>(vi) as i8;
-                    *qp.add(4 * j + 1) = vgetq_lane_s32::<1>(vi) as i8;
-                    *qp.add(4 * j + 2) = vgetq_lane_s32::<2>(vi) as i8;
-                    *qp.add(4 * j + 3) = vgetq_lane_s32::<3>(vi) as i8;
-                }
+                let vi0 = vcvtnq_s32_f32(vmulq_n_f32(s0, id));
+                let vi1 = vcvtnq_s32_f32(vmulq_n_f32(s1, id));
+                let vi2 = vcvtnq_s32_f32(vmulq_n_f32(s2, id));
+                let vi3 = vcvtnq_s32_f32(vmulq_n_f32(s3, id));
+                let vi4 = vcvtnq_s32_f32(vmulq_n_f32(s4, id));
+                let vi5 = vcvtnq_s32_f32(vmulq_n_f32(s5, id));
+                let vi6 = vcvtnq_s32_f32(vmulq_n_f32(s6, id));
+                let vi7 = vcvtnq_s32_f32(vmulq_n_f32(s7, id));
+
+                // i32x4 pairs → i16x8 → i8x8, then store 8 bytes at a time
+                let n16_01 = vcombine_s16(vqmovn_s32(vi0), vqmovn_s32(vi1));
+                let n16_23 = vcombine_s16(vqmovn_s32(vi2), vqmovn_s32(vi3));
+                let n16_45 = vcombine_s16(vqmovn_s32(vi4), vqmovn_s32(vi5));
+                let n16_67 = vcombine_s16(vqmovn_s32(vi6), vqmovn_s32(vi7));
+
+                vst1_s8(qp, vqmovn_s16(n16_01));
+                vst1_s8(qp.add(8), vqmovn_s16(n16_23));
+                vst1_s8(qp.add(16), vqmovn_s16(n16_45));
+                vst1_s8(qp.add(24), vqmovn_s16(n16_67));
             }
             n_blocks
         }
@@ -358,31 +371,24 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON integer GEMV: y[m] = A_q8_0[m,k] @ x_f32[k].
-    /// Quantizes x to Q8_0, then does Q8_0 × Q8_0 integer dot products.
-    /// ~4x fewer instructions per block vs the f32 widening path.
+    /// NEON Q8_0 × Q8_0 GEMV with pre-quantized input (no quantization step).
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemv_q8_0_f32_neon(
+    pub unsafe fn gemv_q8_0_q8_0_neon(
         a_quant: &[u8],
-        x: &[f32],
+        x_scales: &[f32],
+        x_quants: &[i8],
         y: &mut [f32],
         _m: usize,
         k: usize,
-        q8_scales: &mut Vec<f32>,
-        q8_quants: &mut Vec<i8>,
     ) {
         unsafe {
             let n_blocks = k / 32;
             let row_bytes = n_blocks * size_of::<BlockQ8_0>();
 
-            q8_scales.resize(n_blocks, 0.0);
-            q8_quants.resize(k, 0);
-            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-
             let ptrs = GemvPtrs {
                 a: a_quant.as_ptr() as usize,
-                xq: q8_quants.as_ptr() as usize,
-                xs: q8_scales.as_ptr() as usize,
+                xq: x_quants.as_ptr() as usize,
+                xs: x_scales.as_ptr() as usize,
             };
 
             let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
@@ -445,6 +451,27 @@ pub(crate) mod neon {
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
+        }
+    }
+
+    /// NEON integer GEMV: y[m] = A_q8_0[m,k] @ x_f32[k].
+    /// Convenience wrapper: quantizes x then calls gemv_q8_0_q8_0_neon.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q8_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+            gemv_q8_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
         }
     }
 }
