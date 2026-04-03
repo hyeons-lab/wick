@@ -33,6 +33,10 @@ enum Command {
         /// Device to use: cpu, gpu, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
+
+        /// Raw token IDs (comma-separated). Overrides --prompt when set.
+        #[arg(long)]
+        token_ids: Option<String>,
     },
 
     /// Inspect a GGUF model file.
@@ -94,6 +98,7 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             device: _,
+            token_ids,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -103,13 +108,21 @@ fn main() -> Result<()> {
 
             let loaded_model = wick::model::load_model(gguf)?;
 
-            let mut tokens = Vec::new();
-            if add_bos {
-                if let Some(bos) = tokenizer.bos_token() {
-                    tokens.push(bos);
+            let tokens = if let Some(ids) = &token_ids {
+                // Parse comma-separated token IDs
+                ids.split(',')
+                    .map(|s| s.trim().parse::<u32>())
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                let mut toks = Vec::new();
+                if add_bos {
+                    if let Some(bos) = tokenizer.bos_token() {
+                        toks.push(bos);
+                    }
                 }
-            }
-            tokens.extend_from_slice(&tokenizer.encode(&prompt));
+                toks.extend_from_slice(&tokenizer.encode(&prompt));
+                toks
+            };
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",

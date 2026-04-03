@@ -49,6 +49,11 @@ Release build (Apple Silicon Mac):
 | LFM2-VL-450M Q4_0 | 4.4 tok/s | 4.9 tok/s |
 | LFM2.5-VL-1.6B Q4_0 | 1.4 tok/s | 1.6 tok/s |
 
+## Next Steps
+
+- Fix tokenizer GPT-2 space prefix handling (spaces encode as token 0 instead of `Ġ`-prefixed tokens) — pre-existing Phase 2 bug
+- Add Q4_0 SIMD kernels (NEON/AVX2) to close the 6x speed gap vs Q8_0
+
 ## Commits
 
-HEAD — feat: implement LFM2 forward pass, sampling, generation loop, and `wick run` CLI
+HEAD — feat: validate correctness against llama.cpp, add --token-ids flag
