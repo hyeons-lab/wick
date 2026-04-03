@@ -117,6 +117,21 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
+/// Parallel for_each with chunking to prevent over-splitting.
+/// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
+pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
+    use rayon::prelude::*;
+    let chunk_size = (y.len() / rayon::current_num_threads()).max(min_rows);
+    y.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let base = ci * chunk_size;
+            for (j, yi) in chunk.iter_mut().enumerate() {
+                f((base + j, yi));
+            }
+        });
+}
+
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
 ///
 /// On aarch64, uses integer dot product with caller-provided Q8_0 scratch buffers
@@ -263,7 +278,7 @@ pub fn gemv_q8_0_f32(
         };
 
         if m >= GEMV_PAR_THRESHOLD {
-            y.par_iter_mut().enumerate().for_each(compute_row);
+            par_rows(y, 512, compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -304,7 +319,7 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
         };
 
         if m >= GEMV_PAR_THRESHOLD {
-            y.par_iter_mut().enumerate().for_each(compute_row);
+            par_rows(y, 512, compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -332,7 +347,7 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     };
 
     if m >= GEMV_PAR_THRESHOLD {
-        y.par_iter_mut().enumerate().for_each(compute_row);
+        par_rows(y, 512, compute_row);
     } else {
         y.iter_mut().enumerate().for_each(compute_row);
     }

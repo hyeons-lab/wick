@@ -343,7 +343,7 @@ pub(crate) mod neon {
 
             if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
                 use rayon::prelude::*;
-                y.par_iter_mut().enumerate().for_each(compute_row);
+                crate::backend::cpu::par_rows(y, 512, compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
@@ -447,7 +447,7 @@ pub(crate) mod neon {
 
             if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
                 use rayon::prelude::*;
-                y.par_iter_mut().enumerate().for_each(compute_row);
+                crate::backend::cpu::par_rows(y, 512, compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
@@ -603,7 +603,7 @@ pub(crate) mod neon {
 
             if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
                 use rayon::prelude::*;
-                y.par_iter_mut().enumerate().for_each(compute_row);
+                crate::backend::cpu::par_rows(y, 512, compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
