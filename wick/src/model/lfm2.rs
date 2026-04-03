@@ -733,39 +733,48 @@ impl Model for Lfm2Model {
             }
         }
 
-        // 2. Per-layer loop
+        // 2. Per-layer loop — pre-allocate all large buffers outside the loop
+        let mut normed = vec![0.0f32; hs * n];
+        let mut block_out = vec![0.0f32; hs * n];
+        let mut ffn_input = vec![0.0f32; hs * n];
+        let mut ffn_out = vec![0.0f32; hs * n];
+        let mut norm_col = vec![0.0f32; hs];
+        let mut op_col = vec![0.0f32; hs];
+        let mut ffn_col = vec![0.0f32; hs];
+        let mut col = vec![0.0f32; hs];
+        let mut gate_col = vec![0.0f32; cfg.intermediate_size];
+        let mut up_col = vec![0.0f32; cfg.intermediate_size];
+        let mut out_col = vec![0.0f32; hs];
+
         for layer in 0..cfg.n_layers {
             // RMSnorm each column independently
-            let mut normed = vec![0.0f32; hs * n];
             for j in 0..n {
-                // Extract column j
-                let mut col = vec![0.0f32; hs];
                 for i in 0..hs {
-                    col[i] = hidden[i * n + j];
+                    norm_col[i] = hidden[i * n + j];
                 }
-                cpu::rmsnorm(&mut col, &self.attn_norm_weights[layer], cfg.rms_norm_eps);
+                cpu::rmsnorm(
+                    &mut norm_col,
+                    &self.attn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
                 for i in 0..hs {
-                    normed[i * n + j] = col[i];
+                    normed[i * n + j] = norm_col[i];
                 }
             }
 
             // Operator: conv or attention (process tokens sequentially)
-            // This keeps the existing per-token logic for correctness.
-            let mut block_out = vec![0.0f32; hs * n];
+            block_out.fill(0.0);
             for j in 0..n {
-                // Extract normed column j as a slice
-                let mut col = vec![0.0f32; hs];
                 for i in 0..hs {
-                    col[i] = normed[i * n + j];
+                    op_col[i] = normed[i * n + j];
                 }
-                // Pre-quantize this single token for the block functions
                 #[cfg(target_arch = "aarch64")]
-                Self::quantize_to_scratch(&col, state);
+                Self::quantize_to_scratch(&op_col, state);
 
                 if cfg.block_types[layer] == BlockType::GatedConv {
-                    self.forward_conv_block(layer, &col, state);
+                    self.forward_conv_block(layer, &op_col, state);
                 } else {
-                    self.forward_attn_block(layer, &col, start_pos + j, state);
+                    self.forward_attn_block(layer, &op_col, start_pos + j, state);
                 }
 
                 // Copy result from state.scratch.out
@@ -779,26 +788,26 @@ impl Model for Lfm2Model {
                 hidden[i] += block_out[i];
             }
 
-            // FFN: batch GEMM for gate, up, down
             // FFN pre-norm each column
-            let mut ffn_input = vec![0.0f32; hs * n];
             for j in 0..n {
-                let mut col = vec![0.0f32; hs];
                 for i in 0..hs {
-                    col[i] = hidden[i * n + j];
+                    ffn_col[i] = hidden[i * n + j];
                 }
-                cpu::rmsnorm(&mut col, &self.ffn_norm_weights[layer], cfg.rms_norm_eps);
+                cpu::rmsnorm(
+                    &mut ffn_col,
+                    &self.ffn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
                 for i in 0..hs {
-                    ffn_input[i * n + j] = col[i];
+                    ffn_input[i * n + j] = ffn_col[i];
                 }
             }
 
             // FFN per-token using fast integer GEMV path
             let refs = &self.layer_refs[layer];
-            let mut ffn_out = vec![0.0f32; hs * n];
+            ffn_out.fill(0.0);
             for j in 0..n {
                 // Extract FFN input column
-                let mut col = vec![0.0f32; hs];
                 for i in 0..hs {
                     col[i] = ffn_input[i * n + j];
                 }
@@ -807,8 +816,6 @@ impl Model for Lfm2Model {
                 #[cfg(target_arch = "aarch64")]
                 Self::quantize_to_scratch(&col, state);
 
-                let mut gate_col = vec![0.0f32; cfg.intermediate_size];
-                let mut up_col = vec![0.0f32; cfg.intermediate_size];
                 #[cfg(target_arch = "aarch64")]
                 {
                     self.gemv_preq(
@@ -835,7 +842,6 @@ impl Model for Lfm2Model {
                 cpu::silu_mul_inplace(&mut gate_col, &up_col);
 
                 // Down projection
-                let mut out_col = vec![0.0f32; hs];
                 #[cfg(target_arch = "aarch64")]
                 {
                     Self::quantize_to_scratch(&gate_col, state);
