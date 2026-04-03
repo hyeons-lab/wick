@@ -288,27 +288,6 @@ impl Lfm2Model {
         &self.gguf.mmap_data()[wref.start..wref.start + wref.size]
     }
 
-    /// GEMV dispatch with scratch buffers. On aarch64, quantizes x to Q8_0 inside.
-    fn gemv_with_scratch(
-        &self,
-        wref: &WeightRef,
-        x: &[f32],
-        y: &mut [f32],
-        q8_scales: &mut Vec<f32>,
-        q8_quants: &mut Vec<i8>,
-    ) {
-        let data = self.weight_data(wref);
-        cpu::gemv_dispatch(
-            wref.dtype,
-            data,
-            x,
-            y,
-            wref.m,
-            wref.k,
-            Some((q8_scales, q8_quants)),
-        );
-    }
-
     /// GEMV dispatch without scratch buffers.
     fn gemv(&self, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
         let data = self.weight_data(wref);

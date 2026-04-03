@@ -3,8 +3,7 @@
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
 use crate::quant::{
-    BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32,
-    vec_dot_q6_k_f32, vec_dot_q8_0_f32,
+    BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32,
 };
 use crate::tensor::DType;
 use std::mem::size_of;
@@ -196,6 +195,7 @@ pub fn quantize_f32_to_q8_0(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
 /// GEMV with pre-quantized Q8_0 input. Dispatches to Q4_0 or Q8_0 integer path.
 /// For other dtypes, falls back to the regular f32 path.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 pub fn gemv_with_preq(
     dtype: DType,
     a_quant: &[u8],

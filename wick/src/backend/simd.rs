@@ -34,6 +34,7 @@ impl GemvPtrs {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop, unused_unsafe)]
 pub(crate) mod neon {
     use super::*;
     use std::arch::aarch64::*;
