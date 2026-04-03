@@ -211,9 +211,10 @@ fn ggml_type_to_dtype(type_id: u32) -> Result<DType> {
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
         GGML_TYPE_Q4_K => Ok(DType::Q4KM),
         GGML_TYPE_I32 => Ok(DType::I32),
+        GGML_TYPE_Q6_K => Ok(DType::Q6K),
         // Map unsupported-but-parseable types to an error with context
         GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q8_1 | GGML_TYPE_Q2_K
-        | GGML_TYPE_Q3_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_K => {
+        | GGML_TYPE_Q3_K | GGML_TYPE_Q5_K | GGML_TYPE_Q8_K => {
             bail!("quantization type {type_id} not yet supported")
         }
         _ => bail!("unknown GGML type: {type_id}"),
@@ -474,6 +475,45 @@ impl GgufFile {
             }
             _ => None,
         }
+    }
+
+    /// Get an i32 array metadata value.
+    pub fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        match self.metadata.get(key) {
+            Some(GgufValue::Array(arr)) => {
+                let ints: Vec<i32> = arr
+                    .iter()
+                    .filter_map(|v| match v {
+                        GgufValue::I32(i) => Some(*i),
+                        _ => None,
+                    })
+                    .collect();
+                if ints.len() == arr.len() {
+                    Some(ints)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get a boolean metadata value.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.metadata.get(key) {
+            Some(GgufValue::Bool(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Raw access to the memory-mapped data region.
+    pub fn mmap_data(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Get the offset where tensor data begins in the mmap.
+    pub fn data_offset(&self) -> usize {
+        self.data_offset
     }
 
     /// Validate a tensor and return its byte range within the mmap.

@@ -48,6 +48,24 @@ pub struct BlockQ4KM {
 
 const _: () = assert!(size_of::<BlockQ4KM>() == 144);
 
+/// Q6_K quantization block: 256 values in 210 bytes.
+///
+/// Layout (from ggml-common.h):
+///   ql: [u8; 128] — lower 4 bits of 6-bit quants
+///   qh: [u8; 64]  — upper 2 bits of 6-bit quants
+///   scales: [i8; 16] — per-16-element sub-block scales (8-bit signed)
+///   d: f16 (2 bytes) — super-block scale
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ6K {
+    pub ql: [u8; 128],
+    pub qh: [u8; 64],
+    pub scales: [i8; 16],
+    pub d: u16, // f16 stored as raw bits
+}
+
+const _: () = assert!(size_of::<BlockQ6K>() == 210);
+
 // ── Q4_0 dequantization ─────────────────────────────────────────────────────
 
 /// Dequantize a single Q4_0 block to 32 f32 values.
@@ -291,6 +309,103 @@ pub fn vec_dot_q4_k_m_f32_scalar(block: &BlockQ4KM, y: &[f32]) -> f32 {
     }
 
     sumf
+}
+
+// ── Q6_K dequantization ────────────────────────────────────────────────────
+
+/// Dequantize a single Q6_K block to 256 f32 values.
+///
+/// Ported from llama.cpp's `dequantize_row_q6_K`. The 256 values are processed
+/// in two passes of 128 values each. Within each pass, 32 iterations produce
+/// 4 values each by reassembling 6-bit quants from ql (low 4 bits) and qh (high 2 bits).
+pub fn dequantize_q6_k_block(block: &BlockQ6K) -> [f32; 256] {
+    let d = f16::from_bits(block.d).to_f32();
+    let ql = &block.ql;
+    let qh = &block.qh;
+    let sc = &block.scales;
+
+    let mut out = [0.0f32; 256];
+    let mut ql_off = 0usize;
+    let mut qh_off = 0usize;
+    let mut sc_off = 0usize;
+    let mut y_off = 0usize;
+
+    // Two passes of 128 values (n = 0 and n = 128)
+    for _n in 0..2 {
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+            out[y_off + l] = d * sc[sc_off + is] as f32 * q1 as f32;
+            out[y_off + l + 32] = d * sc[sc_off + is + 2] as f32 * q2 as f32;
+            out[y_off + l + 64] = d * sc[sc_off + is + 4] as f32 * q3 as f32;
+            out[y_off + l + 96] = d * sc[sc_off + is + 6] as f32 * q4 as f32;
+        }
+        y_off += 128;
+        ql_off += 64;
+        qh_off += 32;
+        sc_off += 8;
+    }
+
+    out
+}
+
+/// Dequantize a row of Q6_K blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q6_k_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ6K>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 256);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        // SAFETY: BlockQ6K is repr(C, packed) and we've verified the slice length
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ6K) };
+        let values = dequantize_q6_k_block(block);
+        dst[i * 256..(i + 1) * 256].copy_from_slice(&values);
+    }
+}
+
+/// Dot product of a Q6_K block with an f32 vector of length 256. Scalar version.
+pub fn vec_dot_q6_k_f32_scalar(block: &BlockQ6K, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 256);
+    let d = f16::from_bits(block.d).to_f32();
+    let ql = &block.ql;
+    let qh = &block.qh;
+    let sc = &block.scales;
+
+    let mut sumf = 0.0f32;
+    let mut ql_off = 0usize;
+    let mut qh_off = 0usize;
+    let mut sc_off = 0usize;
+    let mut y_off = 0usize;
+
+    for _n in 0..2 {
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+            sumf += sc[sc_off + is] as f32 * q1 as f32 * y[y_off + l];
+            sumf += sc[sc_off + is + 2] as f32 * q2 as f32 * y[y_off + l + 32];
+            sumf += sc[sc_off + is + 4] as f32 * q3 as f32 * y[y_off + l + 64];
+            sumf += sc[sc_off + is + 6] as f32 * q4 as f32 * y[y_off + l + 96];
+        }
+        y_off += 128;
+        ql_off += 64;
+        qh_off += 32;
+        sc_off += 8;
+    }
+
+    sumf * d
+}
+
+/// Dot product of a Q6_K block with an f32 vector. Dispatches to best available impl.
+pub fn vec_dot_q6_k_f32(block: &BlockQ6K, y: &[f32]) -> f32 {
+    vec_dot_q6_k_f32_scalar(block, y)
 }
 
 // ── Dispatch functions ──────────────────────────────────────────────────────
@@ -550,6 +665,70 @@ mod tests {
         assert!(
             (got - expected).abs() < 1e-2,
             "vec_dot mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dequantize_q6_k_basic() {
+        // Create a Q6_K block where all quants reassemble to 0 (offset 32 → value -32+32=0)
+        // and scale d=1.0, sub-block scales=1
+        let mut block = BlockQ6K {
+            ql: [0u8; 128],
+            qh: [0u8; 64],
+            scales: [1i8; 16],
+            d: f16::from_f32(1.0).to_bits(),
+        };
+        // Set ql and qh so that all 6-bit values = 32 (which becomes 32-32 = 0)
+        // 32 in 6 bits = 0b100000 → low 4 bits = 0, high 2 bits = 0b10 = 2
+        // ql stores pairs: ql[l] low nibble for q1, ql[l+32] low nibble for q2
+        //                  ql[l] high nibble for q3, ql[l+32] high nibble for q4
+        // qh[l] bits 0-1 for q1, bits 2-3 for q2, bits 4-5 for q3, bits 6-7 for q4
+        // For value 32: low 4 = 0, high 2 = 2
+        // So ql = 0x00 (both nibbles = 0), qh = 0b10_10_10_10 = 0xAA
+        for b in block.ql.iter_mut() {
+            *b = 0x00;
+        }
+        for b in block.qh.iter_mut() {
+            *b = 0xAA; // bits: 10_10_10_10
+        }
+
+        let out = dequantize_q6_k_block(&block);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.abs() < 1e-5, "expected ~0.0 at {i}, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_vec_dot_q6_k_matches_dequantize() {
+        // Build a Q6_K block with varied values
+        let mut block = BlockQ6K {
+            ql: [0u8; 128],
+            qh: [0u8; 64],
+            scales: [0i8; 16],
+            d: f16::from_f32(0.5).to_bits(),
+        };
+        // Set sub-block scales to small values
+        for (i, s) in block.scales.iter_mut().enumerate() {
+            *s = (i as i8 % 5) + 1;
+        }
+        // Set varied ql values
+        for (i, b) in block.ql.iter_mut().enumerate() {
+            *b = ((i % 13) as u8) | (((i % 9) as u8) << 4);
+        }
+        // Set varied qh values
+        for (i, b) in block.qh.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        let y: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
+
+        let dequantized = dequantize_q6_k_block(&block);
+        let expected: f32 = dequantized.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q6_k_f32(&block, &y);
+
+        assert!(
+            (got - expected).abs() < 1e-2,
+            "vec_dot Q6_K mismatch: got {got}, expected {expected}"
         );
     }
 
