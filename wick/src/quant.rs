@@ -412,7 +412,7 @@ pub fn vec_dot_q6_k_f32(block: &BlockQ6K, y: &[f32]) -> f32 {
 
 /// Dot product of a Q4_0 block with an f32 vector. Dispatches to best available impl.
 pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
-    vec_dot_q4_0_f32_scalar(block, y)
+    crate::backend::simd::vec_dot_q4_0_f32(block, y)
 }
 
 /// Dot product of a Q8_0 block with an f32 vector. Dispatches to best available impl.
