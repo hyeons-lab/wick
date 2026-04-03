@@ -93,14 +93,26 @@ impl Lfm2Model {
             .get_i32_array(&format!("{prefix}.attention.head_count_kv"))
             .context("missing lfm2.attention.head_count_kv")?;
 
+        // Validate kv_heads_array length matches n_layers
+        anyhow::ensure!(
+            kv_heads_array.len() >= n_layers,
+            "head_count_kv array length ({}) < block_count ({n_layers})",
+            kv_heads_array.len()
+        );
+
         // Detect block types from tensor presence
         let mut block_types = Vec::with_capacity(n_layers);
         let mut kv_heads_per_layer = Vec::with_capacity(n_layers);
         for (i, &kv_heads) in kv_heads_array.iter().enumerate().take(n_layers) {
             let is_attn = gguf.tensors.contains_key(&format!("blk.{i}.attn_q.weight"));
             if is_attn {
+                let n_kv = kv_heads as usize;
+                anyhow::ensure!(
+                    n_kv > 0 && n_heads % n_kv == 0,
+                    "layer {i}: n_kv_heads ({n_kv}) must be > 0 and divide n_heads ({n_heads})"
+                );
                 block_types.push(BlockType::Attention);
-                kv_heads_per_layer.push(kv_heads as usize);
+                kv_heads_per_layer.push(n_kv);
             } else {
                 block_types.push(BlockType::GatedConv);
                 kv_heads_per_layer.push(0);
@@ -284,6 +296,11 @@ impl Lfm2Model {
 
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
     fn dequantize_row(&self, wref: &WeightRef, row_idx: usize) -> Vec<f32> {
+        assert!(
+            row_idx < wref.m,
+            "dequantize_row: row_idx {row_idx} out of range (m={})",
+            wref.m
+        );
         let data = self.weight_data(wref);
         let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
         let row_start = row_idx * row_bytes;
@@ -345,11 +362,13 @@ impl Lfm2Model {
         }
 
         // Update rolling buffer: shift left by one slot, append bx
-        if d_conv > 1 {
-            buffer.copy_within(hidden_size.., 0);
+        if d_conv > 0 {
+            if d_conv > 1 {
+                buffer.copy_within(hidden_size.., 0);
+            }
+            let last_slot = (d_conv - 1) * hidden_size;
+            buffer[last_slot..last_slot + hidden_size].copy_from_slice(conv_scratch);
         }
-        let last_slot = (d_conv - 1) * hidden_size;
-        buffer[last_slot..last_slot + hidden_size].copy_from_slice(conv_scratch);
 
         // o = c ⊙ conv_out (second gate), reuse conv_scratch
         for (o, (ci, co)) in conv_scratch.iter_mut().zip(c.iter().zip(out_buf.iter())) {
@@ -477,9 +496,13 @@ impl Model for Lfm2Model {
         let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
 
         // 2. Per-layer loop
+        // Pre-allocate norm buffers outside the loop to avoid per-layer allocation.
+        let hs = cfg.hidden_size;
+        let mut normed = vec![0.0f32; hs];
+        let mut ffn_input = vec![0.0f32; hs];
         for i in 0..cfg.n_layers {
-            // Pre-norm (operator_norm) — norm a copy, keep hidden as residual
-            let mut normed = hidden.clone();
+            // Pre-norm (operator_norm) — copy+norm, keep hidden as residual
+            normed.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
 
             // Operator: conv or attention (writes result to state.scratch.out)
@@ -490,10 +513,10 @@ impl Model for Lfm2Model {
             }
 
             // First residual: hidden += block_out
-            cpu::add_inplace(&mut hidden, &state.scratch.out[..cfg.hidden_size]);
+            cpu::add_inplace(&mut hidden, &state.scratch.out[..hs]);
 
             // FFN pre-norm
-            let mut ffn_input = hidden.clone();
+            ffn_input.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
 
             // SwiGLU FFN using scratch buffers

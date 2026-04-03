@@ -77,6 +77,10 @@ impl InferenceState {
     /// Scratch buffers are pre-allocated to avoid per-token allocations.
     pub fn from_config(config: &ModelConfig) -> Self {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
+        assert!(
+            kernel_size >= 2,
+            "conv_kernel_size must be at least 2, got {kernel_size}"
+        );
         let d_conv = kernel_size - 1;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
             * (config.hidden_size / config.n_heads);

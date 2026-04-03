@@ -39,14 +39,20 @@ impl Sampler {
         Self { config, rng }
     }
 
-    /// Sample a token ID from logits.
+    /// Sample a token ID from logits. Panics if logits is empty.
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
-        // Greedy: argmax
+        assert!(!logits.is_empty(), "cannot sample from empty logits");
+
+        // Greedy: argmax (NaN-safe using total_cmp)
         if self.config.temperature <= 0.0 {
             return logits
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| {
+                    let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
+                    let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
+                    a.total_cmp(&b)
+                })
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
         }
@@ -74,10 +80,10 @@ impl Sampler {
 
     fn apply_top_k(&self, logits: &mut [f32]) {
         let k = self.config.top_k;
-        // Use partial sort to find the k-th largest value in O(n) average
         let mut sorted: Vec<f32> = logits.to_vec();
-        let (_, &mut threshold, _) =
-            sorted.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap());
+        let (_, &mut threshold, _) = sorted.select_nth_unstable_by(k - 1, |a, b| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
         for l in logits.iter_mut() {
             if *l < threshold {
                 *l = f32::NEG_INFINITY;
@@ -86,16 +92,18 @@ impl Sampler {
     }
 
     fn apply_top_p(&self, logits: &mut [f32]) {
-        // Collect only finite indices (respects prior top-k masking)
         let mut indices: Vec<usize> = (0..logits.len())
             .filter(|&i| logits[i].is_finite())
             .collect();
         if indices.is_empty() {
             return;
         }
-        indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        indices.sort_unstable_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        // Compute softmax probabilities over finite logits only
         let max_val = logits[indices[0]];
         let mut probs: Vec<f32> = indices
             .iter()
@@ -106,7 +114,6 @@ impl Sampler {
             *p /= sum;
         }
 
-        // Accumulate until we exceed top_p
         let mut cutoff_idx = probs.len();
         let mut cumsum = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -117,13 +124,15 @@ impl Sampler {
             }
         }
 
-        // Mask everything outside the nucleus
         for &idx in &indices[cutoff_idx..] {
             logits[idx] = f32::NEG_INFINITY;
         }
     }
 
     fn weighted_sample(&mut self, probs: &[f32]) -> u32 {
+        if probs.is_empty() {
+            return 0;
+        }
         let r: f32 = self.rng.r#gen();
         let mut cumsum = 0.0f32;
         for (i, &p) in probs.iter().enumerate() {
@@ -132,7 +141,6 @@ impl Sampler {
                 return i as u32;
             }
         }
-        // Fallback: return last token
         (probs.len() - 1) as u32
     }
 }

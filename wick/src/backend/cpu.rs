@@ -118,8 +118,10 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
     for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
@@ -137,8 +139,10 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
 pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
     for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
@@ -156,8 +160,10 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
 pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
     let blocks_per_row = k / 256;
     let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
     for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
@@ -175,8 +181,10 @@ pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize
 pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 256, 0, "Q4_K_M GEMV: k must be divisible by 256");
     let blocks_per_row = k / 256;
     let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
     for (i, yi) in y.iter_mut().enumerate() {
         let row_start = i * row_bytes;
