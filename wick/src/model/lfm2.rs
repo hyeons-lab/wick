@@ -289,9 +289,31 @@ impl Lfm2Model {
     }
 
     /// GEMV dispatch: y[m] = W[m,k] @ x[k], where W is quantized.
+    /// For Q4_0, uses scratch buffers from InferenceState to avoid per-call allocation.
+    fn gemv_with_scratch(
+        &self,
+        wref: &WeightRef,
+        x: &[f32],
+        y: &mut [f32],
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        let data = self.weight_data(wref);
+        cpu::gemv_dispatch(
+            wref.dtype,
+            data,
+            x,
+            y,
+            wref.m,
+            wref.k,
+            Some((q8_scales, q8_quants)),
+        );
+    }
+
+    /// GEMV dispatch without scratch buffers (for non-Q4_0 or when scratch isn't available).
     fn gemv(&self, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
         let data = self.weight_data(wref);
-        cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k);
+        cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
     }
 
     /// Q4_0 GEMV with pre-quantized input. Avoids re-quantizing x when
@@ -535,64 +557,51 @@ impl Model for Lfm2Model {
 
             // SwiGLU FFN using scratch buffers
             let refs = &self.layer_refs[i];
-
-            // Quantize ffn_input once, use for both gate and up projections (Q4_0 only)
-            #[cfg(target_arch = "aarch64")]
-            let ffn_q8 = if refs.ffn_gate.dtype == DType::Q4_0 {
-                Some(cpu::quantize_f32_to_q8_0(&ffn_input))
-            } else {
-                None
-            };
-
-            #[cfg(target_arch = "aarch64")]
-            if let Some((ref scales, ref quants)) = ffn_q8 {
-                self.gemv_q4_preq(
-                    &refs.ffn_gate,
-                    scales,
-                    quants,
-                    &mut state.scratch.gate[..cfg.intermediate_size],
-                );
-                self.gemv_q4_preq(
+            self.gemv_with_scratch(
+                &refs.ffn_gate,
+                &ffn_input,
+                &mut state.scratch.gate[..cfg.intermediate_size],
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+            );
+            // Reuse the Q8_0 quantization for ffn_up (same input as ffn_gate)
+            if refs.ffn_up.dtype == DType::Q4_0 {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let data = self.weight_data(&refs.ffn_up);
+                    cpu::gemv_q4_0_with_q8(
+                        data,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        &mut state.scratch.up[..cfg.intermediate_size],
+                        refs.ffn_up.m,
+                        refs.ffn_up.k,
+                    );
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                self.gemv(
                     &refs.ffn_up,
-                    scales,
-                    quants,
+                    &ffn_input,
                     &mut state.scratch.up[..cfg.intermediate_size],
                 );
             } else {
-                self.gemv(
-                    &refs.ffn_gate,
-                    &ffn_input,
-                    &mut state.scratch.gate[..cfg.intermediate_size],
-                );
                 self.gemv(
                     &refs.ffn_up,
                     &ffn_input,
                     &mut state.scratch.up[..cfg.intermediate_size],
                 );
             }
-
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                self.gemv(
-                    &refs.ffn_gate,
-                    &ffn_input,
-                    &mut state.scratch.gate[..cfg.intermediate_size],
-                );
-                self.gemv(
-                    &refs.ffn_up,
-                    &ffn_input,
-                    &mut state.scratch.up[..cfg.intermediate_size],
-                );
-            }
-            cpu::silu_inplace(&mut state.scratch.gate[..cfg.intermediate_size]);
-            cpu::mul_inplace(
+            // Fused SiLU + element-wise multiply (one pass instead of two)
+            cpu::silu_mul_inplace(
                 &mut state.scratch.gate[..cfg.intermediate_size],
                 &state.scratch.up[..cfg.intermediate_size],
             );
-            self.gemv(
+            self.gemv_with_scratch(
                 &refs.ffn_down,
                 &state.scratch.gate[..cfg.intermediate_size],
                 &mut state.scratch.out[..cfg.hidden_size],
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
             );
 
             // Second residual: hidden += ffn_out
@@ -604,7 +613,13 @@ impl Model for Lfm2Model {
 
         // 4. Output projection (tied embeddings)
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        self.gemv(&self.embd_ref, &hidden, &mut logits);
+        self.gemv_with_scratch(
+            &self.embd_ref,
+            &hidden,
+            &mut logits,
+            &mut state.scratch.q8_scales,
+            &mut state.scratch.q8_quants,
+        );
 
         // Update sequence length
         state.seq_len += 1;

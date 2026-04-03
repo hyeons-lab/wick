@@ -119,10 +119,17 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
 ///
-/// On aarch64, uses integer dot product: quantizes x to Q8_0 once, then does
-/// Q4_0 × Q8_0 integer dot products per row (matching llama.cpp's computation
-/// model). This is faster than Q8_0 GEMV because Q4_0 reads half the weight data.
-pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// On aarch64, uses integer dot product with caller-provided Q8_0 scratch buffers
+/// to avoid per-call heap allocation. The scratch buffers are resized as needed.
+pub fn gemv_q4_0_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
@@ -133,20 +140,25 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     #[cfg(target_arch = "aarch64")]
     {
         unsafe {
-            crate::backend::simd::neon::gemv_q4_0_f32_neon(a_quant, x, y, m, k);
+            crate::backend::simd::neon::gemv_q4_0_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
     }
 
     #[cfg(not(target_arch = "aarch64"))]
-    for (i, yi) in y.iter_mut().enumerate() {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ4_0>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
-            sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+    {
+        let _ = (q8_scales, q8_quants);
+        for (i, yi) in y.iter_mut().enumerate() {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ4_0>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
+                sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+            }
+            *yi = sum;
         }
-        *yi = sum;
     }
 }
 
@@ -281,10 +293,27 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
 }
 
 /// Dispatch GEMV based on dtype: y[m] = W[m,k] @ x[k].
-pub fn gemv_dispatch(dtype: DType, data: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// For Q4_0, pass scratch buffers to avoid per-call allocation.
+pub fn gemv_dispatch(
+    dtype: DType,
+    data: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+) {
     match dtype {
+        DType::Q4_0 => {
+            if let Some((scales, quants)) = q8_scratch {
+                gemv_q4_0_f32(data, x, y, m, k, scales, quants);
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q4_0_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
         DType::F32 => gemv_f32(data, x, y, m, k),
-        DType::Q4_0 => gemv_q4_0_f32(data, x, y, m, k),
         DType::Q8_0 => gemv_q8_0_f32(data, x, y, m, k),
         DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
@@ -318,6 +347,15 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
 pub fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+/// Fused SiLU activation + element-wise multiply: gate = silu(gate) * up.
+/// Single pass instead of separate silu_inplace + mul_inplace.
+pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        *g = *g / (1.0 + (-*g).exp()) * u;
     }
 }
 

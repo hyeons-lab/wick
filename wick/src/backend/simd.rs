@@ -338,7 +338,7 @@ pub(crate) mod neon {
     }
 
     /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
-    /// Convenience wrapper that quantizes x and then calls gemv_q4_0_q8_0_neon.
+    /// Uses caller-provided scratch buffers to avoid per-call heap allocation.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemv_q4_0_f32_neon(
         a_quant: &[u8],
@@ -346,13 +346,15 @@ pub(crate) mod neon {
         y: &mut [f32],
         _m: usize,
         k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
     ) {
         unsafe {
             let n_blocks = k / 32;
-            let mut x_scales = vec![0.0f32; n_blocks];
-            let mut x_quants = vec![0i8; k];
-            quantize_f32_to_q8_0_neon(x, &mut x_scales, &mut x_quants);
-            gemv_q4_0_q8_0_neon(a_quant, &x_scales, &x_quants, y, _m, k);
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+            gemv_q4_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
         }
     }
 }

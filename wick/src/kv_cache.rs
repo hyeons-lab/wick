@@ -38,6 +38,10 @@ pub struct ScratchBuffers {
     pub out: Vec<f32>,
     /// Scratch for attention scores (grows with seq_len, reused across heads).
     pub scores: Vec<f32>,
+    /// Q8_0 quantization scratch: scales for the input vector (max_k / 32 entries).
+    pub q8_scales: Vec<f32>,
+    /// Q8_0 quantization scratch: quants for the input vector (max_k entries).
+    pub q8_quants: Vec<i8>,
 }
 
 /// Inference state across all layers.
@@ -71,6 +75,8 @@ impl InferenceState {
                 up: Vec::new(),
                 out: Vec::new(),
                 scores: Vec::new(),
+                q8_scales: Vec::new(),
+                q8_quants: Vec::new(),
             },
         }
     }
@@ -117,7 +123,9 @@ impl InferenceState {
                 gate: vec![0.0; config.intermediate_size],
                 up: vec![0.0; config.intermediate_size],
                 out: vec![0.0; config.hidden_size],
-                scores: Vec::new(), // grows with seq_len during inference
+                scores: Vec::new(),
+                q8_scales: Vec::new(),
+                q8_quants: Vec::new(), // grows with seq_len during inference
             },
         }
     }
