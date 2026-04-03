@@ -348,6 +348,8 @@ mod avx2 {
 
 /// Best available Q4_0 dot product.
 pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 32, "Q4_0 vec_dot requires y.len() == 32");
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::vec_dot_q4_0_f32_neon(block, y) }
@@ -370,9 +372,10 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
 
 /// Best available Q8_0 dot product.
 pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 32, "Q8_0 vec_dot requires y.len() == 32");
+
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is always available on aarch64
         unsafe { neon::vec_dot_q8_0_f32_neon(block, y) }
     }
 
@@ -393,6 +396,7 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
 
 /// Best available Q4_K_M dot product.
 pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 256, "Q4_K_M vec_dot requires y.len() == 256");
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::vec_dot_q4_k_m_f32_neon(block, y) }
