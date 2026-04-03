@@ -45,6 +45,8 @@ pub fn generate(
     let mut state = InferenceState::from_config(model_config);
     let mut sampler = Sampler::new(config.sampler.clone());
 
+    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt tokens cannot be empty");
+
     let mut all_tokens = prompt_tokens.to_vec();
 
     // Prefill: process all prompt tokens, capture logits from the last one

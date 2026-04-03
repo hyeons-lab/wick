@@ -294,6 +294,7 @@ impl Lfm2Model {
             DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, &mut out),
             DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, &mut out),
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, &mut out),
+            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, &mut out),
             DType::F32 => {
                 let floats: &[f32] = bytemuck::cast_slice(row_data);
                 out.copy_from_slice(floats);
@@ -303,94 +304,84 @@ impl Lfm2Model {
         out
     }
 
-    /// Process a single conv (recurrent) block.
-    fn forward_conv_block(
-        &self,
-        layer: usize,
-        hidden: &[f32],
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
+    /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
+    fn forward_conv_block(&self, layer: usize, hidden: &[f32], state: &mut InferenceState) {
         let refs = &self.layer_refs[layer];
         let hidden_size = self.config.hidden_size;
         let kernel_size = self.config.conv_kernel_size.unwrap_or(3);
-        let d_conv = kernel_size - 1; // number of buffered past states
+        let d_conv = kernel_size - 1;
         let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights[layer].as_ref().unwrap();
 
         // in_proj: hidden → 3*hidden
-        let proj_size = 3 * hidden_size;
-        let mut proj = vec![0.0f32; proj_size];
-        self.gemv(in_proj, hidden, &mut proj);
+        let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
+        self.gemv(in_proj, hidden, proj);
 
         // Split: b, c, x
-        let b = &proj[0..hidden_size];
-        let c = &proj[hidden_size..2 * hidden_size];
-        let x = &proj[2 * hidden_size..3 * hidden_size];
+        let (b, rest) = proj.split_at(hidden_size);
+        let (c, x) = rest.split_at(hidden_size);
 
         // bx = b ⊙ x (element-wise gate before conv)
-        let bx: Vec<f32> = b.iter().zip(x.iter()).map(|(bi, xi)| bi * xi).collect();
+        let conv_scratch = &mut state.scratch.conv_scratch[..hidden_size];
+        for (out, (bi, xi)) in conv_scratch.iter_mut().zip(b.iter().zip(x.iter())) {
+            *out = bi * xi;
+        }
+        // conv_scratch now holds bx
 
-        // Depthwise conv1d with valid convolution using rolling buffer.
-        // Buffer stores d_conv previous bx values (time-major: [d_conv, hidden]).
-        // Conv weight layout: [hidden, kernel_size] = weight[ch * kernel_size + k].
-        let mut conv_out = vec![0.0f32; hidden_size];
-        if let LayerState::Conv { buffer } = &state.layers[layer] {
-            for ch in 0..hidden_size {
-                let mut sum = 0.0f32;
-                for k in 0..d_conv {
-                    sum += buffer[k * hidden_size + ch] * conv_weight[ch * kernel_size + k];
-                }
-                // Current bx is the last element in the kernel window
-                sum += bx[ch] * conv_weight[ch * kernel_size + d_conv];
-                conv_out[ch] = sum;
+        // Depthwise conv1d with valid convolution using rolling buffer
+        let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+            panic!("expected Conv state for layer {layer}");
+        };
+
+        let out_buf = &mut state.scratch.out[..hidden_size];
+        for ch in 0..hidden_size {
+            let mut sum = 0.0f32;
+            for k in 0..d_conv {
+                sum += buffer[k * hidden_size + ch] * conv_weight[ch * kernel_size + k];
             }
+            sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
+            out_buf[ch] = sum;
         }
 
         // Update rolling buffer: shift left by one slot, append bx
-        if let LayerState::Conv { buffer } = &mut state.layers[layer] {
-            if d_conv > 1 {
-                buffer.copy_within(hidden_size.., 0);
-            }
-            let last_slot = (d_conv - 1) * hidden_size;
-            buffer[last_slot..last_slot + hidden_size].copy_from_slice(&bx);
+        if d_conv > 1 {
+            buffer.copy_within(hidden_size.., 0);
+        }
+        let last_slot = (d_conv - 1) * hidden_size;
+        buffer[last_slot..last_slot + hidden_size].copy_from_slice(conv_scratch);
+
+        // o = c ⊙ conv_out (second gate), reuse conv_scratch
+        for (o, (ci, co)) in conv_scratch.iter_mut().zip(c.iter().zip(out_buf.iter())) {
+            *o = ci * co;
         }
 
-        // o = c ⊙ conv_out (second gate)
-        let o: Vec<f32> = c
-            .iter()
-            .zip(conv_out.iter())
-            .map(|(ci, co)| ci * co)
-            .collect();
-
-        // out_proj: hidden → hidden
-        let mut out = vec![0.0f32; hidden_size];
-        self.gemv(out_proj, &o, &mut out);
-
-        out
+        // out_proj: hidden → hidden, write result into out_buf
+        self.gemv(out_proj, conv_scratch, out_buf);
+        // Result is now in state.scratch.out[..hidden_size]
     }
 
-    /// Process a single attention block.
+    /// Process a single attention block using pre-allocated scratch buffers.
     fn forward_attn_block(
         &self,
         layer: usize,
         hidden: &[f32],
         pos: usize,
         state: &mut InferenceState,
-    ) -> Vec<f32> {
+    ) {
         let refs = &self.layer_refs[layer];
         let cfg = &self.config;
         let head_dim = cfg.hidden_size / cfg.n_heads;
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
-        // Q, K, V projections
-        let mut q = vec![0.0f32; cfg.hidden_size];
-        let mut k = vec![0.0f32; kv_dim];
-        let mut v = vec![0.0f32; kv_dim];
-        self.gemv(refs.attn_q.as_ref().unwrap(), hidden, &mut q);
-        self.gemv(refs.attn_k.as_ref().unwrap(), hidden, &mut k);
-        self.gemv(refs.attn_v.as_ref().unwrap(), hidden, &mut v);
+        // Q, K, V projections into scratch buffers
+        let q = &mut state.scratch.q[..cfg.hidden_size];
+        let k = &mut state.scratch.k[..kv_dim];
+        let v = &mut state.scratch.v[..kv_dim];
+        self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
+        self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
+        self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
 
         // Per-head QK norm (RMSnorm each head slice with shared weights)
         let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
@@ -411,61 +402,63 @@ impl Lfm2Model {
         }
 
         // RoPE
-        cpu::rope(
-            &mut q,
-            &mut k,
-            pos,
-            cfg.n_heads,
-            n_kv_heads,
-            head_dim,
-            cfg.rope_theta,
-        );
+        cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-        // Append K, V to cache
-        state.append_kv(layer, &k, &v);
+        // Append K, V to cache (need temporaries to satisfy borrow checker)
+        let k_to_cache = state.scratch.k[..kv_dim].to_vec();
+        let v_to_cache = state.scratch.v[..kv_dim].to_vec();
+        state.append_kv(layer, &k_to_cache, &v_to_cache);
 
         // GQA: grouped query attention
+        // Compute attention into a local buffer to avoid borrow conflicts with KV cache.
         let group_size = cfg.n_heads / n_kv_heads;
-        let (k_cache, v_cache) = state.kv_cache(layer);
-        // Derive seq_len from actual cache size, not state.seq_len which hasn't
-        // been incremented yet for the current token.
-        let seq_len = k_cache.len() / kv_dim;
-
-        let mut attn_out = vec![0.0f32; cfg.hidden_size];
         let scale = 1.0 / (head_dim as f32).sqrt();
+        {
+            // Access layer cache and scratch directly to avoid whole-state borrow
+            let (k_cache, v_cache) = match &state.layers[layer] {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                } => (key_cache.as_slice(), value_cache.as_slice()),
+                _ => panic!("expected Attention state for layer {layer}"),
+            };
+            let seq_len = k_cache.len() / kv_dim;
+            let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
+            attn_out.fill(0.0);
+            let q = &state.scratch.q[..cfg.hidden_size];
 
-        for h in 0..cfg.n_heads {
-            let kv_h = h / group_size;
-            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+            for h in 0..cfg.n_heads {
+                let kv_h = h / group_size;
+                let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-            // Compute attention scores: Q_h · K_cache^T
-            let mut scores = vec![0.0f32; seq_len];
-            for t in 0..seq_len {
-                let mut dot = 0.0f32;
+                let mut scores = vec![0.0f32; seq_len];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                    }
+                    *score = dot * scale;
+                }
+
+                cpu::softmax_inplace(&mut scores);
+
                 for d in 0..head_dim {
-                    dot += q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                    let mut val = 0.0f32;
+                    for (t, &s) in scores.iter().enumerate() {
+                        val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
+                    }
+                    attn_out[h * head_dim + d] = val;
                 }
-                scores[t] = dot * scale;
             }
-
-            // Softmax
-            cpu::softmax_inplace(&mut scores);
-
-            // Weighted sum of V_cache
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for t in 0..seq_len {
-                    val += scores[t] * v_cache[t * kv_dim + kv_h * head_dim + d];
-                }
-                attn_out[h * head_dim + d] = val;
-            }
-        }
+        } // k_cache/v_cache borrows end here
 
         // Output projection
-        let mut out = vec![0.0f32; cfg.hidden_size];
-        self.gemv(refs.attn_output.as_ref().unwrap(), &attn_out, &mut out);
-
-        out
+        let out = &mut state.scratch.out[..cfg.hidden_size];
+        self.gemv(
+            refs.attn_output.as_ref().unwrap(),
+            &state.scratch.attn_out[..cfg.hidden_size],
+            out,
+        );
     }
 }
 
@@ -485,40 +478,49 @@ impl Model for Lfm2Model {
 
         // 2. Per-layer loop
         for i in 0..cfg.n_layers {
-            // Pre-norm (operator_norm)
-            let prev_cur = hidden.clone();
-            cpu::rmsnorm(&mut hidden, &self.attn_norm_weights[i], cfg.rms_norm_eps);
+            // Pre-norm (operator_norm) — norm a copy, keep hidden as residual
+            let mut normed = hidden.clone();
+            cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
 
-            // Operator: conv or attention
-            let block_out = if cfg.block_types[i] == BlockType::GatedConv {
-                self.forward_conv_block(i, &hidden, state)
+            // Operator: conv or attention (writes result to state.scratch.out)
+            if cfg.block_types[i] == BlockType::GatedConv {
+                self.forward_conv_block(i, &normed, state);
             } else {
-                self.forward_attn_block(i, &hidden, pos, state)
-            };
+                self.forward_attn_block(i, &normed, pos, state);
+            }
 
-            // First residual
-            hidden = prev_cur;
-            cpu::add_inplace(&mut hidden, &block_out);
+            // First residual: hidden += block_out
+            cpu::add_inplace(&mut hidden, &state.scratch.out[..cfg.hidden_size]);
 
             // FFN pre-norm
-            let prev_cur = hidden.clone();
             let mut ffn_input = hidden.clone();
             cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
 
-            // SwiGLU FFN
+            // SwiGLU FFN using scratch buffers
             let refs = &self.layer_refs[i];
-            let mut gate = vec![0.0f32; cfg.intermediate_size];
-            let mut up = vec![0.0f32; cfg.intermediate_size];
-            self.gemv(&refs.ffn_gate, &ffn_input, &mut gate);
-            self.gemv(&refs.ffn_up, &ffn_input, &mut up);
-            cpu::silu_inplace(&mut gate);
-            cpu::mul_inplace(&mut gate, &up);
-            let mut ffn_out = vec![0.0f32; cfg.hidden_size];
-            self.gemv(&refs.ffn_down, &gate, &mut ffn_out);
+            self.gemv(
+                &refs.ffn_gate,
+                &ffn_input,
+                &mut state.scratch.gate[..cfg.intermediate_size],
+            );
+            self.gemv(
+                &refs.ffn_up,
+                &ffn_input,
+                &mut state.scratch.up[..cfg.intermediate_size],
+            );
+            cpu::silu_inplace(&mut state.scratch.gate[..cfg.intermediate_size]);
+            cpu::mul_inplace(
+                &mut state.scratch.gate[..cfg.intermediate_size],
+                &state.scratch.up[..cfg.intermediate_size],
+            );
+            self.gemv(
+                &refs.ffn_down,
+                &state.scratch.gate[..cfg.intermediate_size],
+                &mut state.scratch.out[..cfg.hidden_size],
+            );
 
-            // Second residual
-            hidden = prev_cur;
-            cpu::add_inplace(&mut hidden, &ffn_out);
+            // Second residual: hidden += ffn_out
+            cpu::add_inplace(&mut hidden, &state.scratch.out[..cfg.hidden_size]);
         }
 
         // 3. Output norm (token_embd_norm is the output norm, not embedding norm)
