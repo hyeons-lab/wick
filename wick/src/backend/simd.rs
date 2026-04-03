@@ -475,36 +475,78 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON Q6_K GEMV: dequantize each block to f32, then NEON FMA dot product.
-    /// Much faster than scalar vec_dot since we use NEON for the dot product.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn gemv_q6k_f32_neon(a_quant: &[u8], x: &[f32], y: &mut [f32], _m: usize, k: usize) {
+    /// NEON Q6_K × Q8_0 integer GEMV with pre-quantized input.
+    ///
+    /// Extracts 6-bit quants as i8, dots with Q8_0 input using vdotq_s32.
+    /// 16 sub-blocks of 16 values per Q6_K block, each with its own scale.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q6k_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
         unsafe {
             let blocks_per_row = k / 256;
             let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
-            let a_ptr = a_quant.as_ptr() as usize;
-            let x_ptr = x.as_ptr() as usize;
+            let a_base = a_quant.as_ptr() as usize;
+            let xq_base = x_quants.as_ptr() as usize;
+            let xs_base = x_scales.as_ptr() as usize;
 
             let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
                 let row_start = i * row_bytes;
-                let mut sumv = vdupq_n_f32(0.0);
+                let mut sumf = 0.0f32;
 
                 for bi in 0..blocks_per_row {
                     let blk =
-                        &*((a_ptr + row_start + bi * size_of::<BlockQ6K>()) as *const BlockQ6K);
-                    // Dequantize block to f32 (reuse existing function)
-                    let vals = crate::quant::dequantize_q6_k_block(blk);
+                        &*((a_base + row_start + bi * size_of::<BlockQ6K>()) as *const BlockQ6K);
+                    let d = f16::from_bits(blk.d).to_f32();
+                    let ql = blk.ql.as_ptr();
+                    let qh = blk.qh.as_ptr();
+                    let sc = blk.scales.as_ptr();
+                    let xq_off = bi * 256;
 
-                    // NEON dot product: sum(vals[j] * x[bi*256 + j])
-                    let x_base = (x_ptr as *const f32).add(bi * 256);
-                    for j in (0..256).step_by(4) {
-                        let v = vld1q_f32(vals.as_ptr().add(j));
-                        let xv = vld1q_f32(x_base.add(j));
-                        sumv = vfmaq_f32(sumv, v, xv);
+                    // Extract all 256 6-bit quants as i8 (centered: subtract 32)
+                    let mut q_buf = [0i8; 256];
+                    let mut ql_p = 0usize;
+                    let mut qh_p = 0usize;
+                    let mut y_p = 0usize;
+                    for _pass in 0..2 {
+                        for l in 0..32 {
+                            let ql_lo = *ql.add(ql_p + l);
+                            let ql_hi = *ql.add(ql_p + l + 32);
+                            let qh_v = *qh.add(qh_p + l);
+                            q_buf[y_p + l] = ((ql_lo & 0xF) | (((qh_v) & 3) << 4)) as i8 - 32;
+                            q_buf[y_p + l + 32] =
+                                ((ql_hi & 0xF) | (((qh_v >> 2) & 3) << 4)) as i8 - 32;
+                            q_buf[y_p + l + 64] =
+                                ((ql_lo >> 4) | (((qh_v >> 4) & 3) << 4)) as i8 - 32;
+                            q_buf[y_p + l + 96] =
+                                ((ql_hi >> 4) | (((qh_v >> 6) & 3) << 4)) as i8 - 32;
+                        }
+                        y_p += 128;
+                        ql_p += 64;
+                        qh_p += 32;
+                    }
+
+                    // Integer dot product: 16 sub-blocks of 16 values each
+                    // Scale mapping: q_buf[si*16..(si+1)*16] uses scales[si]
+                    let z = vdupq_n_s32(0);
+                    for si in 0..16 {
+                        let sub_sc = *sc.add(si) as f32;
+                        let qv = vld1q_s8(q_buf.as_ptr().add(si * 16));
+                        let xv = vld1q_s8((xq_base as *const i8).add(xq_off + si * 16));
+                        let p = vdotq_s32(z, qv, xv);
+                        let isum = vaddvq_s32(p);
+                        let q8_bi = (xq_off + si * 16) / 32;
+                        let d_q8 = *(xs_base as *const f32).add(q8_bi);
+                        sumf += d * sub_sc * d_q8 * isum as f32;
                     }
                 }
 
-                *yi = vaddvq_f32(sumv);
+                *yi = sumf;
             };
 
             if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
@@ -513,6 +555,18 @@ pub(crate) mod neon {
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
+        }
+    }
+
+    /// NEON Q6_K GEMV: quantizes x to Q8_0, then calls integer path.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q6k_f32_neon(a_quant: &[u8], x: &[f32], y: &mut [f32], _m: usize, k: usize) {
+        unsafe {
+            let n_blocks = k / 32;
+            let mut xs = vec![0.0f32; n_blocks];
+            let mut xq = vec![0i8; k];
+            quantize_f32_to_q8_0_neon(x, &mut xs, &mut xq);
+            gemv_q6k_q8_0_neon(a_quant, &xs, &xq, y, _m, k);
         }
     }
 }

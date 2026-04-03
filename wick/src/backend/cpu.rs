@@ -196,6 +196,9 @@ pub fn gemv_with_preq(
         DType::Q8_0 => unsafe {
             crate::backend::simd::neon::gemv_q8_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
         },
+        DType::Q6K => unsafe {
+            crate::backend::simd::neon::gemv_q6k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
         _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
     }
 }
