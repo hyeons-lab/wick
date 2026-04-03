@@ -508,23 +508,51 @@ pub(crate) mod neon {
                     let sc = blk.scales.as_ptr();
                     let xq_off = bi * 256;
 
-                    // Extract all 256 6-bit quants as i8 (centered: subtract 32)
+                    // Extract all 256 6-bit quants as i8 using NEON vector ops.
+                    // Process 16 values at a time using vand/vshr/vorr on uint8x16.
                     let mut q_buf = [0i8; 256];
+                    let mask_0f = vdupq_n_u8(0x0F);
+                    let mask_03 = vdupq_n_u8(0x03);
+                    let offset_32 = vdupq_n_s8(32);
+
                     let mut ql_p = 0usize;
                     let mut qh_p = 0usize;
                     let mut y_p = 0usize;
                     for _pass in 0..2 {
-                        for l in 0..32 {
-                            let ql_lo = *ql.add(ql_p + l);
-                            let ql_hi = *ql.add(ql_p + l + 32);
-                            let qh_v = *qh.add(qh_p + l);
-                            q_buf[y_p + l] = ((ql_lo & 0xF) | (((qh_v) & 3) << 4)) as i8 - 32;
-                            q_buf[y_p + l + 32] =
-                                ((ql_hi & 0xF) | (((qh_v >> 2) & 3) << 4)) as i8 - 32;
-                            q_buf[y_p + l + 64] =
-                                ((ql_lo >> 4) | (((qh_v >> 4) & 3) << 4)) as i8 - 32;
-                            q_buf[y_p + l + 96] =
-                                ((ql_hi >> 4) | (((qh_v >> 6) & 3) << 4)) as i8 - 32;
+                        // Process 16 values at a time (l=0..15, then l=16..31)
+                        for half in 0..2 {
+                            let l_off = half * 16;
+                            let ql_lo_v = vld1q_u8(ql.add(ql_p + l_off));
+                            let ql_hi_v = vld1q_u8(ql.add(ql_p + l_off + 32));
+                            let qh_v = vld1q_u8(qh.add(qh_p + l_off));
+
+                            // q1: (ql_lo & 0xF) | ((qh >> 0) & 3) << 4
+                            let q1 = vorrq_u8(
+                                vandq_u8(ql_lo_v, mask_0f),
+                                vshlq_n_u8::<4>(vandq_u8(qh_v, mask_03)),
+                            );
+                            // q2: (ql_hi & 0xF) | ((qh >> 2) & 3) << 4
+                            let q2 = vorrq_u8(
+                                vandq_u8(ql_hi_v, mask_0f),
+                                vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh_v), mask_03)),
+                            );
+                            // q3: (ql_lo >> 4) | ((qh >> 4) & 3) << 4
+                            let q3 = vorrq_u8(
+                                vshrq_n_u8::<4>(ql_lo_v),
+                                vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh_v), mask_03)),
+                            );
+                            // q4: (ql_hi >> 4) | ((qh >> 6) & 3) << 4
+                            let q4 = vorrq_u8(
+                                vshrq_n_u8::<4>(ql_hi_v),
+                                vshlq_n_u8::<4>(vshrq_n_u8::<6>(qh_v)),
+                            );
+
+                            // Subtract 32 and store
+                            let qp = q_buf.as_mut_ptr().add(y_p + l_off);
+                            vst1q_s8(qp, vsubq_s8(vreinterpretq_s8_u8(q1), offset_32));
+                            vst1q_s8(qp.add(32), vsubq_s8(vreinterpretq_s8_u8(q2), offset_32));
+                            vst1q_s8(qp.add(64), vsubq_s8(vreinterpretq_s8_u8(q3), offset_32));
+                            vst1q_s8(qp.add(96), vsubq_s8(vreinterpretq_s8_u8(q4), offset_32));
                         }
                         y_p += 128;
                         ql_p += 64;
