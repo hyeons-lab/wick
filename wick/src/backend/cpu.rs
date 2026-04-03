@@ -153,6 +153,35 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
 /// Minimum output dimension to use parallel GEMV (avoid rayon overhead for small ops).
 pub const GEMV_PAR_THRESHOLD: usize = 256;
 
+/// Quantize f32 vector to Q8_0 format for use with `gemv_q4_0_with_q8`.
+/// Returns (scales, quants). On aarch64, uses NEON-vectorized quantization.
+#[cfg(target_arch = "aarch64")]
+pub fn quantize_f32_to_q8_0(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
+    let n_blocks = x.len() / 32;
+    let mut scales = vec![0.0f32; n_blocks];
+    let mut quants = vec![0i8; x.len()];
+    unsafe {
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(x, &mut scales, &mut quants);
+    }
+    (scales, quants)
+}
+
+/// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
+/// the same input is used for multiple weight matrices (e.g., ffn_gate + ffn_up).
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q4_0_with_q8(
+    a_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k);
+    }
+}
+
 /// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. Parallelized across rows.
 pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);

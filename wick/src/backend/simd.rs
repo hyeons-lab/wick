@@ -198,34 +198,23 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
-    ///
-    /// Quantizes x to Q8_0 once (NEON-vectorized, f16 scale roundtrip for llama.cpp
-    /// accuracy match), then does Q4_0 × Q8_0 integer dot products per row using
-    /// vdotq_s32 (ARM dotprod). Processes 2 blocks at a time for ILP.
-    #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemv_q4_0_f32_neon(
-        a_quant: &[u8],
+    /// Quantize f32 vector to Q8_0 format (NEON-vectorized, f16 scale roundtrip).
+    /// Stores scales and quants into caller-provided buffers.
+    /// Returns the number of blocks written.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn quantize_f32_to_q8_0_neon(
         x: &[f32],
-        y: &mut [f32],
-        _m: usize,
-        k: usize,
-    ) {
+        scales: &mut [f32],
+        quants: &mut [i8],
+    ) -> usize {
         unsafe {
-            let blocks_per_row = k / 32;
-            let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+            let k = x.len();
             let n_blocks = k / 32;
-
-            let mut x_scales = vec![0.0f32; n_blocks];
-            let mut x_quants = vec![0i8; k];
-
-            // Step 1: quantize x to Q8_0 (NEON-vectorized, f16 scale roundtrip)
 
             for bi in 0..n_blocks {
                 let base = bi * 32;
                 let x_ptr = x.as_ptr().add(base);
 
-                // Load 32 f32 values as 8 × float32x4_t
                 let s0 = vld1q_f32(x_ptr);
                 let s1 = vld1q_f32(x_ptr.add(4));
                 let s2 = vld1q_f32(x_ptr.add(8));
@@ -235,7 +224,6 @@ pub(crate) mod neon {
                 let s6 = vld1q_f32(x_ptr.add(24));
                 let s7 = vld1q_f32(x_ptr.add(28));
 
-                // Compute max absolute value via tree reduction
                 let a0 = vmaxq_f32(vabsq_f32(s0), vabsq_f32(s1));
                 let a1 = vmaxq_f32(vabsq_f32(s2), vabsq_f32(s3));
                 let a2 = vmaxq_f32(vabsq_f32(s4), vabsq_f32(s5));
@@ -246,13 +234,11 @@ pub(crate) mod neon {
                 let amax = vmaxvq_f32(a6);
 
                 let d = amax / 127.0;
-                // f16 roundtrip to match llama.cpp's block_q8_0.d storage
-                let d = f16::from_f32(d).to_f32();
+                let d = f16::from_f32(d).to_f32(); // f16 roundtrip
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                x_scales[bi] = d;
+                scales[bi] = d;
 
-                // Quantize: vcvtnq_s32_f32 (round-to-nearest-even, matching llama.cpp)
-                let qp = x_quants.as_mut_ptr().add(base);
+                let qp = quants.as_mut_ptr().add(base);
                 let srcv = [s0, s1, s2, s3, s4, s5, s6, s7];
                 for j in 0..8 {
                     let v = vmulq_n_f32(srcv[j], id);
@@ -263,8 +249,25 @@ pub(crate) mod neon {
                     *qp.add(4 * j + 3) = vgetq_lane_s32::<3>(vi) as i8;
                 }
             }
+            n_blocks
+        }
+    }
 
-            // Step 2: integer Q4_0 × Q8_0 dot product per row
+    /// NEON integer GEMV using pre-quantized Q8_0 input.
+    /// Call `quantize_f32_to_q8_0_neon` first, then call this for each weight matrix.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_0_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let blocks_per_row = k / 32;
+            let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+
             let ptrs = GemvPtrs {
                 a: a_quant.as_ptr() as usize,
                 xq: x_quants.as_ptr() as usize,
@@ -331,6 +334,25 @@ pub(crate) mod neon {
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
+        }
+    }
+
+    /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
+    /// Convenience wrapper that quantizes x and then calls gemv_q4_0_q8_0_neon.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            let mut x_scales = vec![0.0f32; n_blocks];
+            let mut x_quants = vec![0i8; k];
+            quantize_f32_to_q8_0_neon(x, &mut x_scales, &mut x_quants);
+            gemv_q4_0_q8_0_neon(a_quant, &x_scales, &x_quants, y, _m, k);
         }
     }
 }

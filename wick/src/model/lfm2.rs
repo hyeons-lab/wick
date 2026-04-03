@@ -294,6 +294,14 @@ impl Lfm2Model {
         cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k);
     }
 
+    /// Q4_0 GEMV with pre-quantized input. Avoids re-quantizing x when
+    /// multiple weight matrices share the same input (e.g., ffn_gate + ffn_up).
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_q4_preq(&self, wref: &WeightRef, x_scales: &[f32], x_quants: &[i8], y: &mut [f32]) {
+        let data = self.weight_data(wref);
+        cpu::gemv_q4_0_with_q8(data, x_scales, x_quants, y, wref.m, wref.k);
+    }
+
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
     fn dequantize_row(&self, wref: &WeightRef, row_idx: usize) -> Vec<f32> {
         assert!(
@@ -527,16 +535,55 @@ impl Model for Lfm2Model {
 
             // SwiGLU FFN using scratch buffers
             let refs = &self.layer_refs[i];
-            self.gemv(
-                &refs.ffn_gate,
-                &ffn_input,
-                &mut state.scratch.gate[..cfg.intermediate_size],
-            );
-            self.gemv(
-                &refs.ffn_up,
-                &ffn_input,
-                &mut state.scratch.up[..cfg.intermediate_size],
-            );
+
+            // Quantize ffn_input once, use for both gate and up projections (Q4_0 only)
+            #[cfg(target_arch = "aarch64")]
+            let ffn_q8 = if refs.ffn_gate.dtype == DType::Q4_0 {
+                Some(cpu::quantize_f32_to_q8_0(&ffn_input))
+            } else {
+                None
+            };
+
+            #[cfg(target_arch = "aarch64")]
+            if let Some((ref scales, ref quants)) = ffn_q8 {
+                self.gemv_q4_preq(
+                    &refs.ffn_gate,
+                    scales,
+                    quants,
+                    &mut state.scratch.gate[..cfg.intermediate_size],
+                );
+                self.gemv_q4_preq(
+                    &refs.ffn_up,
+                    scales,
+                    quants,
+                    &mut state.scratch.up[..cfg.intermediate_size],
+                );
+            } else {
+                self.gemv(
+                    &refs.ffn_gate,
+                    &ffn_input,
+                    &mut state.scratch.gate[..cfg.intermediate_size],
+                );
+                self.gemv(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &mut state.scratch.up[..cfg.intermediate_size],
+                );
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                self.gemv(
+                    &refs.ffn_gate,
+                    &ffn_input,
+                    &mut state.scratch.gate[..cfg.intermediate_size],
+                );
+                self.gemv(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &mut state.scratch.up[..cfg.intermediate_size],
+                );
+            }
             cpu::silu_inplace(&mut state.scratch.gate[..cfg.intermediate_size]);
             cpu::mul_inplace(
                 &mut state.scratch.gate[..cfg.intermediate_size],
