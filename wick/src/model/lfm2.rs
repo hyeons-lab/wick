@@ -303,6 +303,65 @@ impl Lfm2Model {
         cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
     }
 
+    /// Batched GEMM with pre-quantized Q8_0 input columns.
+    /// Dispatches to Q4_0 or Q8_0 GEMM kernel based on weight dtype.
+    /// Returns true if GEMM was performed, false if dtype is unsupported.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_preq(
+        &self,
+        wref: &WeightRef,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        let data = self.weight_data(wref);
+        match wref.dtype {
+            DType::Q4_0 => unsafe {
+                crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            DType::Q8_0 => unsafe {
+                crate::backend::simd::neon::gemm_q8_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            _ => false,
+        }
+    }
+
+    /// Quantize all N columns of a column-major matrix [dim × n] to Q8_0.
+    /// `col` is a scratch buffer of size `dim`.
+    #[cfg(target_arch = "aarch64")]
+    fn quantize_columns(
+        mat: &[f32],
+        dim: usize,
+        n: usize,
+        col: &mut [f32],
+        scales: &mut [f32],
+        quants: &mut [i8],
+    ) {
+        let nb = dim / 32;
+        for j in 0..n {
+            for i in 0..dim {
+                col[i] = mat[i * n + j];
+            }
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &col[..dim],
+                    &mut scales[j * nb..(j + 1) * nb],
+                    &mut quants[j * dim..(j + 1) * dim],
+                );
+            }
+        }
+    }
+
     /// Quantize x to Q8_0 into scratch buffers.
     #[cfg(target_arch = "aarch64")]
     fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
@@ -806,40 +865,31 @@ impl Model for Lfm2Model {
                 // --- Conv: batch in_proj + out_proj via GEMM ---
                 let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
                 let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
-                if in_proj.dtype == DType::Q4_0 {
+                if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
                     // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
-                    // Quantize all N normed columns
-                    for j in 0..n {
-                        for i in 0..hs {
-                            col[i] = normed[i * n + j];
-                        }
-                        unsafe {
-                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                                &col,
-                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
-                                &mut bq_quants[j * hs..(j + 1) * hs],
-                            );
-                        }
-                    }
-                    let in_data = self.weight_data(in_proj);
-                    unsafe {
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            in_data,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut proj_mat,
-                            3 * hs,
-                            n,
-                            hs,
-                        );
-                    }
+                    Self::quantize_columns(
+                        &normed,
+                        hs,
+                        n,
+                        &mut col,
+                        &mut bq_scales,
+                        &mut bq_quants,
+                    );
+                    self.gemm_preq(
+                        in_proj,
+                        &bq_scales,
+                        &bq_quants,
+                        &mut proj_mat,
+                        3 * hs,
+                        n,
+                        hs,
+                    );
 
                     // Phase 2: Per-token sequential conv using pre-computed projections
                     let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
                     let d_conv = kernel_size - 1;
                     let conv_weight = self.conv_weights[layer].as_ref().unwrap();
                     for j in 0..n {
-                        // Extract (b, c, x) from proj_mat column j
                         let proj = &mut state.scratch.conv_proj[..3 * hs];
                         for i in 0..hs {
                             proj[i] = proj_mat[i * n + j];
@@ -849,13 +899,11 @@ impl Model for Lfm2Model {
                         let (b, rest) = proj.split_at(hs);
                         let (c_slice, x_slice) = rest.split_at(hs);
 
-                        // bx = b ⊙ x
                         let conv_scratch = &mut state.scratch.conv_scratch[..hs];
                         for i in 0..hs {
                             conv_scratch[i] = b[i] * x_slice[i];
                         }
 
-                        // Depthwise conv1d with rolling buffer
                         let LayerState::Conv { buffer } = &mut state.layers[layer] else {
                             panic!("expected Conv state for layer {layer}");
                         };
@@ -868,7 +916,6 @@ impl Model for Lfm2Model {
                             sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
                             out_buf[ch] = sum;
                         }
-                        // Update rolling buffer
                         if d_conv > 0 {
                             if d_conv > 1 {
                                 buffer.copy_within(hs.., 0);
@@ -877,38 +924,21 @@ impl Model for Lfm2Model {
                             buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
                         }
 
-                        // o = c ⊙ conv_out → store into out_proj_input
                         for i in 0..hs {
                             out_proj_input[i * n + j] = c_slice[i] * out_buf[i];
                         }
                     }
 
                     // Phase 3: Batch out_proj GEMM
-                    // Quantize out_proj_input columns
-                    for j in 0..n {
-                        for i in 0..hs {
-                            col[i] = out_proj_input[i * n + j];
-                        }
-                        unsafe {
-                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                                &col,
-                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
-                                &mut bq_quants[j * hs..(j + 1) * hs],
-                            );
-                        }
-                    }
-                    let out_data = self.weight_data(out_proj);
-                    unsafe {
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            out_data,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut block_out,
-                            hs,
-                            n,
-                            hs,
-                        );
-                    }
+                    Self::quantize_columns(
+                        &out_proj_input,
+                        hs,
+                        n,
+                        &mut col,
+                        &mut bq_scales,
+                        &mut bq_quants,
+                    );
+                    self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
                     true
                 } else {
                     false
@@ -916,53 +946,39 @@ impl Model for Lfm2Model {
             } else {
                 // --- Attention: batch Q/K/V + output projections via GEMM ---
                 let attn_q_ref = refs.attn_q.as_ref().unwrap();
-                if attn_q_ref.dtype == DType::Q4_0 {
+                if matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0) {
                     let head_dim = hs / cfg.n_heads;
                     let n_kv_heads = cfg.kv_heads_per_layer[layer];
                     let kv_dim = n_kv_heads * head_dim;
 
                     // Phase 1: Batch Q/K/V GEMM
-                    // Quantize all N normed columns (reuse from conv if same layer — but
-                    // layers are either conv or attn, so always need to quantize here)
-                    for j in 0..n {
-                        for i in 0..hs {
-                            col[i] = normed[i * n + j];
-                        }
-                        unsafe {
-                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                                &col,
-                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
-                                &mut bq_quants[j * hs..(j + 1) * hs],
-                            );
-                        }
-                    }
-                    // Q: hs × n, K: kv_dim × n, V: kv_dim × n
-                    let q_data = self.weight_data(attn_q_ref);
-                    let k_data = self.weight_data(refs.attn_k.as_ref().unwrap());
-                    let v_data = self.weight_data(refs.attn_v.as_ref().unwrap());
-                    unsafe {
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            q_data, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs,
-                        );
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            k_data,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut k_mat[..kv_dim * n],
-                            kv_dim,
-                            n,
-                            hs,
-                        );
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            v_data,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut v_mat[..kv_dim * n],
-                            kv_dim,
-                            n,
-                            hs,
-                        );
-                    }
+                    Self::quantize_columns(
+                        &normed,
+                        hs,
+                        n,
+                        &mut col,
+                        &mut bq_scales,
+                        &mut bq_quants,
+                    );
+                    self.gemm_preq(attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs);
+                    self.gemm_preq(
+                        refs.attn_k.as_ref().unwrap(),
+                        &bq_scales,
+                        &bq_quants,
+                        &mut k_mat[..kv_dim * n],
+                        kv_dim,
+                        n,
+                        hs,
+                    );
+                    self.gemm_preq(
+                        refs.attn_v.as_ref().unwrap(),
+                        &bq_scales,
+                        &bq_quants,
+                        &mut v_mat[..kv_dim * n],
+                        kv_dim,
+                        n,
+                        hs,
+                    );
 
                     // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
                     let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
@@ -1055,30 +1071,23 @@ impl Model for Lfm2Model {
                     }
 
                     // Phase 3: Batch output projection GEMM
-                    for j in 0..n {
-                        for i in 0..hs {
-                            col[i] = out_proj_input[i * n + j];
-                        }
-                        unsafe {
-                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                                &col,
-                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
-                                &mut bq_quants[j * hs..(j + 1) * hs],
-                            );
-                        }
-                    }
-                    let out_data = self.weight_data(refs.attn_output.as_ref().unwrap());
-                    unsafe {
-                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                            out_data,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut block_out,
-                            hs,
-                            n,
-                            hs,
-                        );
-                    }
+                    Self::quantize_columns(
+                        &out_proj_input,
+                        hs,
+                        n,
+                        &mut col,
+                        &mut bq_scales,
+                        &mut bq_quants,
+                    );
+                    self.gemm_preq(
+                        refs.attn_output.as_ref().unwrap(),
+                        &bq_scales,
+                        &bq_quants,
+                        &mut block_out,
+                        hs,
+                        n,
+                        hs,
+                    );
                     true
                 } else {
                     false
@@ -1131,47 +1140,24 @@ impl Model for Lfm2Model {
                 }
             }
 
-            // FFN: batched GEMM on aarch64 Q4_0 (reads weights once for all n tokens)
+            // FFN: batched GEMM on aarch64 Q4_0/Q8_0 (reads weights once for all n tokens)
             let refs = &self.layer_refs[layer];
             #[cfg(target_arch = "aarch64")]
-            let used_gemm = if refs.ffn_gate.dtype == DType::Q4_0 {
+            let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0) {
                 // Pre-quantize all n columns to Q8_0
-                for j in 0..n {
-                    for i in 0..hs {
-                        col[i] = ffn_input[i * n + j];
-                    }
-                    unsafe {
-                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                            &col,
-                            &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
-                            &mut bq_quants[j * hs..(j + 1) * hs],
-                        );
-                    }
-                }
+                Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
 
                 // Gate + Up via batched GEMM
-                let gate_data = self.weight_data(&refs.ffn_gate);
-                let up_data = self.weight_data(&refs.ffn_up);
-                unsafe {
-                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                        gate_data,
-                        &bq_scales,
-                        &bq_quants,
-                        &mut gate_mat,
-                        is,
-                        n,
-                        hs,
-                    );
-                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                        up_data,
-                        &bq_scales,
-                        &bq_quants,
-                        &mut up_mat,
-                        is,
-                        n,
-                        hs,
-                    );
-                }
+                self.gemm_preq(
+                    &refs.ffn_gate,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut gate_mat,
+                    is,
+                    n,
+                    hs,
+                );
+                self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
 
                 // Fused SiLU+mul (row-major is×n)
                 for idx in 0..is * n {
@@ -1180,32 +1166,25 @@ impl Model for Lfm2Model {
                 }
 
                 // Re-quantize gate_mat columns for down projection
-                for j in 0..n {
-                    for i in 0..is {
-                        inter_col[i] = gate_mat[i * n + j];
-                    }
-                    unsafe {
-                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                            &inter_col,
-                            &mut dq_scales[j * nb_is..(j + 1) * nb_is],
-                            &mut dq_quants[j * is..(j + 1) * is],
-                        );
-                    }
-                }
+                Self::quantize_columns(
+                    &gate_mat,
+                    is,
+                    n,
+                    &mut inter_col,
+                    &mut dq_scales,
+                    &mut dq_quants,
+                );
 
                 // Down via batched GEMM
-                let down_data = self.weight_data(&refs.ffn_down);
-                unsafe {
-                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                        down_data,
-                        &dq_scales,
-                        &dq_quants,
-                        &mut ffn_out,
-                        hs,
-                        n,
-                        is,
-                    );
-                }
+                self.gemm_preq(
+                    &refs.ffn_down,
+                    &dq_scales,
+                    &dq_quants,
+                    &mut ffn_out,
+                    hs,
+                    n,
+                    is,
+                );
                 true
             } else {
                 false

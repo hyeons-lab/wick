@@ -30,18 +30,20 @@ Improve prefill (prompt processing) throughput by using batched GEMM instead of 
 - 13f3234 — chore: remove patch artifact files
 - 5a322d4 — perf: hoist all allocations outside per-layer/per-token loops in prefill
 - 3ace668 — perf: batched FFN GEMM — 1.6-2.6x faster prefill
-- HEAD — perf: batched conv/attn projections via GEMM — 2.5x total prefill speedup
+- a882007 — perf: batched conv/attn projections via GEMM — 2.5x total prefill speedup
+- HEAD — perf: Q8_0 GEMM + refactored GEMM dispatch
 
 ## Research & Discoveries
 
 - For small N (6 tokens), GEMM overhead dominates and there's no speedup
 - For N=32: 450M sees 1.6x FFN-only speedup, 1.6B sees 2.6x
 - Batching conv/attn projections adds another 1.6x on top of FFN GEMM
-- Total speedup from all GEMM: 450M 2.5x (148→365), 1.6B 3.4x (37→125)
-- Q8_0 model doesn't benefit yet — no Q8_0 GEMM kernel implemented
+- Total speedup from all GEMM: 450M Q4_0 2.5x (148→365), 1.6B Q4_0 3.4x (37→125)
+- Q8_0 GEMM is faster than Q4_0 GEMM: no nibble extraction overhead
+- Q8_0 prefill: 450M 399 tok/s (2.9x), 1.6B 133 tok/s (4.4x)
+- gemm_preq + quantize_columns helpers dedup GEMM dispatch across conv/attn/FFN
 
 ## Next Steps
 
-- Add Q8_0×Q8_0 GEMM kernel for Q8_0 model prefill
 - Add Q6_K×Q8_0 GEMM kernel for output projection batching
 - Consider interleaved Q8_0 layout for block-first GEMM at large N

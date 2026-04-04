@@ -718,6 +718,90 @@ pub(crate) mod neon {
         }
     }
 
+    /// Batched GEMM: C[m, n] = A_q8_0[m, k] @ B_q8_0[k, n].
+    ///
+    /// Same layout as gemm_q4_0_q8_0_neon but with Q8_0 weight blocks.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q8_0_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ8_0>();
+
+            let a_ptr = a_quant.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+
+            let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
+                let row_start = i * row_bytes;
+                let a_base = a_ptr as *const u8;
+
+                for j in 0..n {
+                    let mut sumv0 = vdupq_n_f32(0.0);
+                    let mut sumv1 = vdupq_n_f32(0.0);
+                    let xq_base = (bq_ptr as *const i8).add(j * k);
+                    let xs_base = (bs_ptr as *const f32).add(j * nb);
+
+                    let mut bi = 0usize;
+                    while bi + 1 < nb {
+                        let wb0 = &*(a_base.add(row_start + bi * size_of::<BlockQ8_0>())
+                            as *const BlockQ8_0);
+                        let wb1 = &*(a_base.add(row_start + (bi + 1) * size_of::<BlockQ8_0>())
+                            as *const BlockQ8_0);
+
+                        let w0_lo = vld1q_s8(wb0.quants.as_ptr());
+                        let w0_hi = vld1q_s8(wb0.quants.as_ptr().add(16));
+                        let w1_lo = vld1q_s8(wb1.quants.as_ptr());
+                        let w1_hi = vld1q_s8(wb1.quants.as_ptr().add(16));
+
+                        let x0_lo = vld1q_s8(xq_base.add(bi * 32));
+                        let x0_hi = vld1q_s8(xq_base.add(bi * 32 + 16));
+                        let x1_lo = vld1q_s8(xq_base.add((bi + 1) * 32));
+                        let x1_hi = vld1q_s8(xq_base.add((bi + 1) * 32 + 16));
+
+                        let z = vdupq_n_s32(0);
+                        let p_0 = vdotq_s32(vdotq_s32(z, w0_lo, x0_lo), w0_hi, x0_hi);
+                        let p_1 = vdotq_s32(vdotq_s32(z, w1_lo, x1_lo), w1_hi, x1_hi);
+
+                        let d0 = f16::from_bits(wb0.delta).to_f32() * *xs_base.add(bi);
+                        let d1 = f16::from_bits(wb1.delta).to_f32() * *xs_base.add(bi + 1);
+                        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+                        bi += 2;
+                    }
+
+                    if bi < nb {
+                        let wb = &*(a_base.add(row_start + bi * size_of::<BlockQ8_0>())
+                            as *const BlockQ8_0);
+                        let w_lo = vld1q_s8(wb.quants.as_ptr());
+                        let w_hi = vld1q_s8(wb.quants.as_ptr().add(16));
+                        let x_lo = vld1q_s8(xq_base.add(bi * 32));
+                        let x_hi = vld1q_s8(xq_base.add(bi * 32 + 16));
+                        let z = vdupq_n_s32(0);
+                        let p = vdotq_s32(vdotq_s32(z, w_lo, x_lo), w_hi, x_hi);
+                        let d = f16::from_bits(wb.delta).to_f32() * *xs_base.add(bi);
+                        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                    }
+
+                    row_out[j] = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+                }
+            };
+
+            if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+    }
+
     /// NEON Q6_K GEMV: quantizes x to Q8_0 using scratch, then calls integer path.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemv_q6k_f32_neon(
