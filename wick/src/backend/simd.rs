@@ -345,6 +345,15 @@ pub(crate) mod neon {
 
                 let mut bi = 0usize;
                 while bi + 1 < blocks_per_row {
+                    // Prefetch next weight block pair
+                    if bi + 3 < blocks_per_row {
+                        _prefetch(
+                            ptrs.a().add(row_start + (bi + 2) * size_of::<BlockQ4_0>())
+                                as *const i8,
+                            _PREFETCH_READ,
+                            _PREFETCH_LOCALITY2,
+                        );
+                    }
                     let b0 = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ4_0>())
                         as *const BlockQ4_0);
                     let b1 = &*(ptrs.a().add(row_start + (bi + 1) * size_of::<BlockQ4_0>())
@@ -446,13 +455,19 @@ pub(crate) mod neon {
 
                 let mut bi = 0usize;
                 while bi + 1 < n_blocks {
-                    // Weight block 0
+                    if bi + 3 < n_blocks {
+                        _prefetch(
+                            ptrs.a().add(row_start + (bi + 2) * size_of::<BlockQ8_0>())
+                                as *const i8,
+                            _PREFETCH_READ,
+                            _PREFETCH_LOCALITY2,
+                        );
+                    }
                     let wb0 = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ8_0>())
                         as *const BlockQ8_0);
                     let wb1 = &*(ptrs.a().add(row_start + (bi + 1) * size_of::<BlockQ8_0>())
                         as *const BlockQ8_0);
 
-                    // Load weight quants (32 i8 per block = 2 × int8x16_t)
                     let w0_lo = vld1q_s8(wb0.quants.as_ptr());
                     let w0_hi = vld1q_s8(wb0.quants.as_ptr().add(16));
                     let w1_lo = vld1q_s8(wb1.quants.as_ptr());
@@ -725,8 +740,94 @@ pub(crate) mod neon {
                 let bs = bs_ptr as *const f32;
                 let bsz = size_of::<BlockQ4_0>();
 
-                // Process 4 columns at a time (amortizes Q4_0 decode)
+                // Process 8 columns at a time (halves Q4_0 decode count vs 4-col)
                 let mut j = 0usize;
+                while j + 8 <= n {
+                    let mut s0a = vdupq_n_f32(0.0);
+                    let mut s0b = vdupq_n_f32(0.0);
+                    let mut s1a = vdupq_n_f32(0.0);
+                    let mut s1b = vdupq_n_f32(0.0);
+                    let mut s2a = vdupq_n_f32(0.0);
+                    let mut s2b = vdupq_n_f32(0.0);
+                    let mut s3a = vdupq_n_f32(0.0);
+                    let mut s3b = vdupq_n_f32(0.0);
+                    let mut s4a = vdupq_n_f32(0.0);
+                    let mut s4b = vdupq_n_f32(0.0);
+                    let mut s5a = vdupq_n_f32(0.0);
+                    let mut s5b = vdupq_n_f32(0.0);
+                    let mut s6a = vdupq_n_f32(0.0);
+                    let mut s6b = vdupq_n_f32(0.0);
+                    let mut s7a = vdupq_n_f32(0.0);
+                    let mut s7b = vdupq_n_f32(0.0);
+                    let xq = [
+                        bq.add(j * k),
+                        bq.add((j + 1) * k),
+                        bq.add((j + 2) * k),
+                        bq.add((j + 3) * k),
+                        bq.add((j + 4) * k),
+                        bq.add((j + 5) * k),
+                        bq.add((j + 6) * k),
+                        bq.add((j + 7) * k),
+                    ];
+                    let xs = [
+                        bs.add(j * nb),
+                        bs.add((j + 1) * nb),
+                        bs.add((j + 2) * nb),
+                        bs.add((j + 3) * nb),
+                        bs.add((j + 4) * nb),
+                        bs.add((j + 5) * nb),
+                        bs.add((j + 6) * nb),
+                        bs.add((j + 7) * nb),
+                    ];
+
+                    let mut bi = 0usize;
+                    while bi + 1 < nb {
+                        if bi + 3 < nb {
+                            _prefetch(
+                                a.add(rs + (bi + 2) * bsz) as *const i8,
+                                _PREFETCH_READ,
+                                _PREFETCH_LOCALITY2,
+                            );
+                        }
+                        let (w0l, w0h, w1l, w1h, d0, d1) = decode_q4_pair!(
+                            a,
+                            rs + bi * bsz,
+                            rs + (bi + 1) * bsz,
+                            mask_lo,
+                            offset_8
+                        );
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[0], xs[0], bi, s0a, s0b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[1], xs[1], bi, s1a, s1b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[2], xs[2], bi, s2a, s2b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[3], xs[3], bi, s3a, s3b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[4], xs[4], bi, s4a, s4b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[5], xs[5], bi, s5a, s5b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[6], xs[6], bi, s6a, s6b);
+                        gemm_dot_pair!(w0l, w0h, w1l, w1h, d0, d1, xq[7], xs[7], bi, s7a, s7b);
+                        bi += 2;
+                    }
+                    if bi < nb {
+                        let (wl, wh, d) = decode_q4_single!(a, rs + bi * bsz, mask_lo, offset_8);
+                        gemm_dot_single!(wl, wh, d, xq[0], xs[0], bi, s0a);
+                        gemm_dot_single!(wl, wh, d, xq[1], xs[1], bi, s1a);
+                        gemm_dot_single!(wl, wh, d, xq[2], xs[2], bi, s2a);
+                        gemm_dot_single!(wl, wh, d, xq[3], xs[3], bi, s3a);
+                        gemm_dot_single!(wl, wh, d, xq[4], xs[4], bi, s4a);
+                        gemm_dot_single!(wl, wh, d, xq[5], xs[5], bi, s5a);
+                        gemm_dot_single!(wl, wh, d, xq[6], xs[6], bi, s6a);
+                        gemm_dot_single!(wl, wh, d, xq[7], xs[7], bi, s7a);
+                    }
+                    row_out[j] = vaddvq_f32(s0a) + vaddvq_f32(s0b);
+                    row_out[j + 1] = vaddvq_f32(s1a) + vaddvq_f32(s1b);
+                    row_out[j + 2] = vaddvq_f32(s2a) + vaddvq_f32(s2b);
+                    row_out[j + 3] = vaddvq_f32(s3a) + vaddvq_f32(s3b);
+                    row_out[j + 4] = vaddvq_f32(s4a) + vaddvq_f32(s4b);
+                    row_out[j + 5] = vaddvq_f32(s5a) + vaddvq_f32(s5b);
+                    row_out[j + 6] = vaddvq_f32(s6a) + vaddvq_f32(s6b);
+                    row_out[j + 7] = vaddvq_f32(s7a) + vaddvq_f32(s7b);
+                    j += 8;
+                }
+                // 4-column remainder
                 while j + 4 <= n {
                     let mut s0a = vdupq_n_f32(0.0);
                     let mut s0b = vdupq_n_f32(0.0);
@@ -748,7 +849,6 @@ pub(crate) mod neon {
                         bs.add((j + 2) * nb),
                         bs.add((j + 3) * nb),
                     );
-
                     let mut bi = 0usize;
                     while bi + 1 < nb {
                         let (w0l, w0h, w1l, w1h, d0, d1) = decode_q4_pair!(
