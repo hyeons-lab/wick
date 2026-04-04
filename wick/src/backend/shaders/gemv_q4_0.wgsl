@@ -1,19 +1,12 @@
 // Q4_0 GEMV: y[m] = dequant(A_q4_0[m, k]) × x[k]
 //
 // Q4_0 block layout (18 bytes per 32 elements):
-//   bytes 0-1: f16 scale (delta)
-//   bytes 2-17: 16 bytes of packed 4-bit nibbles
-//   Each byte encodes 2 elements: lo nibble = elem[i], hi nibble = elem[i+16]
+//   bytes 0-1:  f16 scale (delta)
+//   bytes 2-17: 16 bytes of packed 4-bit nibbles (32 elements)
+//     Each byte encodes 2 elements: lo nibble = elem[i], hi nibble = elem[i+16]
 //   Dequantized: val = (nibble - 8) * delta
 //
-// Weight buffer is raw bytes accessed as array<u32>.
-// Each row has nb = k/32 blocks, row_bytes = nb * 18.
-//
-// Bind group 0:
-//   @binding(0) a: array<u32>     (quantized weights as u32 words)
-//   @binding(1) x: array<f32>     (input vector, k elements)
-//   @binding(2) y: array<f32>     (output vector, m elements, read-write)
-//   @binding(3) params: vec2<u32> (m, k)
+// Optimized: 128 threads/workgroup, process 8 nibbles per u32 word load.
 //
 // Dispatch: (min(m, 65535), ceil(m/65535), 1) — one workgroup per row
 
@@ -22,22 +15,9 @@
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
-var<workgroup> shared_sums: array<f32, 64>;
+var<workgroup> shared_sums: array<f32, 128>;
 
-// Extract a u8 from a u32 word at byte position (0-3)
-fn extract_byte(word: u32, byte_idx: u32) -> u32 {
-    return (word >> (byte_idx * 8u)) & 0xFFu;
-}
-
-// Decode f16 from two bytes (little-endian)
-fn decode_f16(lo: u32, hi: u32) -> f32 {
-    let bits = lo | (hi << 8u);
-    // Use bitcast via unpack2x16float which interprets u32 as two f16 values
-    let pair = unpack2x16float(bits);
-    return pair.x;
-}
-
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(128, 1, 1)
 fn gemv_q4_0(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -49,62 +29,95 @@ fn gemv_q4_0(
 
     if row >= m { return; }
 
-    let nb = k / 32u;                    // blocks per row
-    let block_bytes = 18u;               // Q4_0 block size in bytes
-    let row_start_byte = row * nb * block_bytes;
+    let nb = k / 32u;
+    // Each row = nb blocks × 18 bytes = nb × 4.5 u32 words
+    // We'll read using byte offsets and convert to word indices
+    let row_start_byte = row * nb * 18u;
 
     var partial_sum: f32 = 0.0;
 
-    // Each thread processes blocks in stride-64 pattern
+    // Each thread processes blocks in stride-128 pattern
     var bi = tid;
     while bi < nb {
-        // Byte offset of this block within the weight buffer
-        let block_byte = row_start_byte + bi * block_bytes;
-        // Convert to u32 word offset and remainder
+        let block_byte = row_start_byte + bi * 18u;
         let word_off = block_byte / 4u;
         let byte_rem = block_byte % 4u;
 
-        // Read f16 scale (2 bytes at block start)
-        // The scale spans bytes [byte_rem, byte_rem+1] within u32 words
+        // Read 5 consecutive u32 words to cover all 18 bytes of the block
+        // (2 scale bytes + 16 nibble bytes, with up to 3 bytes of prefix alignment)
         let w0 = a[word_off];
-        var scale_lo: u32;
-        var scale_hi: u32;
-        if byte_rem <= 2u {
-            scale_lo = extract_byte(w0, byte_rem);
-            scale_hi = extract_byte(w0, byte_rem + 1u);
-        } else {
-            // byte_rem == 3: scale straddles two u32 words
-            scale_lo = extract_byte(w0, 3u);
-            scale_hi = extract_byte(a[word_off + 1u], 0u);
-        }
-        let delta = decode_f16(scale_lo, scale_hi);
+        let w1 = a[word_off + 1u];
+        let w2 = a[word_off + 2u];
+        let w3 = a[word_off + 3u];
+        let w4 = a[word_off + 4u];
 
-        // Read 16 bytes of nibbles starting at block_byte + 2
-        let qs_byte = block_byte + 2u;
+        // Extract f16 scale from bytes [byte_rem, byte_rem+1]
+        // Use unpack2x16float which reads 2 f16 values from a u32.
+        // We need the f16 at offset byte_rem within the word sequence.
+        var scale_bits: u32;
+        if byte_rem == 0u {
+            scale_bits = w0 & 0xFFFFu;
+        } else if byte_rem == 1u {
+            scale_bits = (w0 >> 8u) & 0xFFFFu;
+        } else if byte_rem == 2u {
+            scale_bits = (w0 >> 16u) & 0xFFFFu;
+        } else {
+            // byte_rem == 3: straddles w0 and w1
+            scale_bits = ((w0 >> 24u) & 0xFFu) | ((w1 & 0xFFu) << 8u);
+        }
+        let delta = unpack2x16float(scale_bits).x;
+
+        // Build a logical 16-byte sequence of nibbles starting at byte_rem+2
+        // The nibble bytes are at positions [byte_rem+2 .. byte_rem+18] across w0-w4.
+        // For efficiency, we reconstruct a 16-byte stream as 4 u32 words.
+        let nib_start = byte_rem + 2u;
+        var n0: u32;
+        var n1: u32;
+        var n2: u32;
+        var n3: u32;
+        if nib_start == 2u {
+            // nibbles start at byte 2 of w0: [w0>>16|w1<<16, w1>>16|w2<<16, w2>>16|w3<<16, w3>>16|w4<<16]
+            n0 = (w0 >> 16u) | (w1 << 16u);
+            n1 = (w1 >> 16u) | (w2 << 16u);
+            n2 = (w2 >> 16u) | (w3 << 16u);
+            n3 = (w3 >> 16u) | (w4 << 16u);
+        } else if nib_start == 3u {
+            n0 = (w0 >> 24u) | (w1 << 8u);
+            n1 = (w1 >> 24u) | (w2 << 8u);
+            n2 = (w2 >> 24u) | (w3 << 8u);
+            n3 = (w3 >> 24u) | (w4 << 8u);
+        } else if nib_start == 4u {
+            n0 = w1;
+            n1 = w2;
+            n2 = w3;
+            n3 = w4;
+        } else {
+            // nib_start == 5
+            n0 = (w1 >> 8u) | (w2 << 24u);
+            n1 = (w2 >> 8u) | (w3 << 24u);
+            n2 = (w3 >> 8u) | (w4 << 24u);
+            // For nib_start==5, we need byte 21 which requires w5
+            n3 = (w4 >> 8u) | (a[word_off + 5u] << 24u);
+        }
+
+        // Each u32 contains 4 packed bytes = 8 nibbles
+        // Process n0, n1, n2, n3 — total 32 elements (16 lo + 16 hi nibbles)
         let col_base = bi * 32u;
 
-        for (var qi = 0u; qi < 16u; qi += 1u) {
-            let abs_byte = qs_byte + qi;
-            let qw = a[abs_byte / 4u];
-            let qb = extract_byte(qw, abs_byte % 4u);
+        // n0: bytes 0-3 of nibble data → elements 0-3 (lo) + 16-19 (hi)
+        partial_sum += process_4bytes(n0, col_base, 0u, delta);
+        partial_sum += process_4bytes(n1, col_base, 4u, delta);
+        partial_sum += process_4bytes(n2, col_base, 8u, delta);
+        partial_sum += process_4bytes(n3, col_base, 12u, delta);
 
-            let lo_nibble = qb & 0xFu;
-            let hi_nibble = (qb >> 4u) & 0xFu;
-
-            let val_lo = (f32(lo_nibble) - 8.0) * delta;
-            let val_hi = (f32(hi_nibble) - 8.0) * delta;
-
-            partial_sum += val_lo * x[col_base + qi];
-            partial_sum += val_hi * x[col_base + qi + 16u];
-        }
-
-        bi += 64u;
+        bi += 128u;
     }
 
-    // Workgroup reduction
+    // Workgroup reduction (8 steps for 128 threads)
     shared_sums[tid] = partial_sum;
     workgroupBarrier();
-
+    if tid < 64u { shared_sums[tid] += shared_sums[tid + 64u]; }
+    workgroupBarrier();
     if tid < 32u { shared_sums[tid] += shared_sums[tid + 32u]; }
     workgroupBarrier();
     if tid < 16u { shared_sums[tid] += shared_sums[tid + 16u]; }
@@ -121,4 +134,35 @@ fn gemv_q4_0(
     if tid == 0u {
         y[row] = shared_sums[0];
     }
+}
+
+// Process 4 packed nibble bytes: extract 8 nibbles, dequantize, multiply by x, accumulate.
+// `word` contains 4 bytes, each with 2 nibbles.
+// `col_base` is the base column index for this block.
+// `offset` is the byte offset within the block (0, 4, 8, or 12).
+fn process_4bytes(word: u32, col_base: u32, offset: u32, delta: f32) -> f32 {
+    // Extract 4 bytes
+    let b0 = word & 0xFFu;
+    let b1 = (word >> 8u) & 0xFFu;
+    let b2 = (word >> 16u) & 0xFFu;
+    let b3 = (word >> 24u) & 0xFFu;
+
+    // Each byte: lo nibble = element[offset+i], hi nibble = element[offset+i+16]
+    let lo0 = (f32(b0 & 0xFu) - 8.0) * delta;
+    let hi0 = (f32((b0 >> 4u) & 0xFu) - 8.0) * delta;
+    let lo1 = (f32(b1 & 0xFu) - 8.0) * delta;
+    let hi1 = (f32((b1 >> 4u) & 0xFu) - 8.0) * delta;
+    let lo2 = (f32(b2 & 0xFu) - 8.0) * delta;
+    let hi2 = (f32((b2 >> 4u) & 0xFu) - 8.0) * delta;
+    let lo3 = (f32(b3 & 0xFu) - 8.0) * delta;
+    let hi3 = (f32((b3 >> 4u) & 0xFu) - 8.0) * delta;
+
+    return lo0 * x[col_base + offset + 0u]
+         + lo1 * x[col_base + offset + 1u]
+         + lo2 * x[col_base + offset + 2u]
+         + lo3 * x[col_base + offset + 3u]
+         + hi0 * x[col_base + offset + 16u + 0u]
+         + hi1 * x[col_base + offset + 16u + 1u]
+         + hi2 * x[col_base + offset + 16u + 2u]
+         + hi3 * x[col_base + offset + 16u + 3u];
 }
