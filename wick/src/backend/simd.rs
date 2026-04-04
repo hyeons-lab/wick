@@ -1516,6 +1516,66 @@ mod tests {
         }
     }
 
+    /// Helper: run GEMM and compare against sequential GEMV for given dimensions.
+    #[cfg(target_arch = "aarch64")]
+    fn assert_gemm_q4_0_matches_gemv(m: usize, k: usize, n: usize) {
+        let weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let a_bytes = build_q4_0_matrix(&weights, m, k);
+        let inputs: Vec<Vec<f32>> = (0..n)
+            .map(|j| {
+                (0..k)
+                    .map(|i| ((i * 13 + j * 7 + 5) % 23) as f32 * 0.2 - 2.3)
+                    .collect()
+            })
+            .collect();
+        let (b_scales, b_quants) = quantize_input_columns(&inputs, k);
+
+        let mut gemm_out = vec![0.0f32; m * n];
+        unsafe {
+            neon::gemm_q4_0_q8_0_neon(&a_bytes, &b_scales, &b_quants, &mut gemm_out, m, n, k);
+        }
+        for j in 0..n {
+            let col_scales = &b_scales[j * (k / 32)..(j + 1) * (k / 32)];
+            let col_quants = &b_quants[j * k..(j + 1) * k];
+            let mut gemv_out = vec![0.0f32; m];
+            unsafe {
+                neon::gemv_q4_0_q8_0_neon(&a_bytes, col_scales, col_quants, &mut gemv_out, m, k);
+            }
+            for i in 0..m {
+                let diff = (gemm_out[i * n + j] - gemv_out[i]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "GEMM/GEMV Q4_0 mismatch at [{i},{j}] (m={m},k={k},n={n}): gemm={}, gemv={}, diff={diff}",
+                    gemm_out[i * n + j],
+                    gemv_out[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_8col() {
+        // n=8: exact 8-column path, no remainder
+        assert_gemm_q4_0_matches_gemv(8, 64, 8);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_8col_plus_remainder() {
+        // n=11: 8-column path (1 iter) + 3-column remainder (exercises all code paths)
+        assert_gemm_q4_0_matches_gemv(8, 64, 11);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_16col() {
+        // n=16: two iterations of 8-column path
+        assert_gemm_q4_0_matches_gemv(8, 64, 16);
+    }
+
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_gemm_q4_0_single_column() {
