@@ -4,7 +4,9 @@
 // The full forward pass runs in a single CommandEncoder per token — only the
 // logits vector is read back to CPU.
 
-use anyhow::{Context, Result};
+use std::cell::Cell;
+
+use anyhow::Result;
 
 use crate::backend::wgpu::{GpuContext, shaders};
 use crate::gguf::GgufFile;
@@ -58,8 +60,10 @@ struct GpuState {
     kv_caches: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     /// Per conv layer: rolling buffer.
     conv_buffers: Vec<Option<wgpu::Buffer>>,
-    seq_len: usize,
+    seq_len: Cell<usize>,
     max_seq_len: usize,
+    /// Pre-dequantized embedding rows (CPU-side cache for fast lookup).
+    embedding_f32: Vec<f32>,
 }
 
 pub struct GpuLfm2Model {
@@ -129,48 +133,43 @@ impl GpuLfm2Model {
 
         // Dequantize + upload all weights
         // (This is the f32-first approach — upload dequantized weights)
-        let embedding = Self::upload_dequantized_weight(&ctx, &cpu_model, "token_embd.weight")?;
+        let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
+        let embedding_f32 = emb_tensor.to_f32_vec();
+        let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
+
+        // Upload per-layer weights using WeightRef-based dequantization
+        let upload_wref = |wref: &super::lfm2::WeightRef, name: &str| -> wgpu::Buffer {
+            let f32_data = cpu_model.dequantize_weight(wref);
+            ctx.upload_f32(&f32_data, name)
+        };
 
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            let lw = cpu_model.layer_weight_info(i);
+            let refs = &cpu_model.layer_refs()[i];
             let attn_norm = ctx.upload_f32(cpu_model.attn_norm_weight(i), &format!("l{i}.anorm"));
             let ffn_norm = ctx.upload_f32(cpu_model.ffn_norm_weight(i), &format!("l{i}.fnorm"));
 
-            let ffn_gate = Self::upload_dequantized_weight(
-                &ctx,
-                &cpu_model,
-                &format!("blk.{i}.ffn_gate.weight"),
-            )?;
-            let ffn_up = Self::upload_dequantized_weight(
-                &ctx,
-                &cpu_model,
-                &format!("blk.{i}.ffn_up.weight"),
-            )?;
-            let ffn_down = Self::upload_dequantized_weight(
-                &ctx,
-                &cpu_model,
-                &format!("blk.{i}.ffn_down.weight"),
-            )?;
+            let ffn_gate = upload_wref(&refs.ffn_gate, &format!("l{i}.ffn_gate"));
+            let ffn_up = upload_wref(&refs.ffn_up, &format!("l{i}.ffn_up"));
+            let ffn_down = upload_wref(&refs.ffn_down, &format!("l{i}.ffn_down"));
 
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 
             let (conv_in_proj, conv_in_proj_m, conv_out_proj, conv_out_proj_m, conv_weight) =
                 if is_conv {
-                    let inp = Self::upload_dequantized_weight(
-                        &ctx,
-                        &cpu_model,
-                        &format!("blk.{i}.ssm_in.weight"),
-                    )?;
-                    let outp = Self::upload_dequantized_weight(
-                        &ctx,
-                        &cpu_model,
-                        &format!("blk.{i}.ssm_out.weight"),
-                    )?;
-                    let cw =
-                        ctx.upload_f32(cpu_model.conv_weight(i).unwrap(), &format!("l{i}.conv_w"));
-                    (Some(inp), 3 * hs as u32, Some(outp), hs as u32, Some(cw))
+                    let ip = refs.shortconv_in_proj.as_ref().unwrap();
+                    let op = refs.shortconv_out_proj.as_ref().unwrap();
+                    (
+                        Some(upload_wref(ip, &format!("l{i}.conv_ip"))),
+                        ip.m as u32,
+                        Some(upload_wref(op, &format!("l{i}.conv_op"))),
+                        op.m as u32,
+                        Some(ctx.upload_f32(
+                            cpu_model.conv_weight(i).unwrap(),
+                            &format!("l{i}.conv_w"),
+                        )),
+                    )
                 } else {
                     (None, 0, None, 0, None)
                 };
@@ -186,46 +185,26 @@ impl GpuLfm2Model {
                 attn_q_norm,
                 attn_k_norm,
             ) = if !is_conv {
-                let head_dim = hs / config.n_heads;
-                let kv_dim = config.kv_heads_per_layer[i] * head_dim;
-                let q = Self::upload_dequantized_weight(
-                    &ctx,
-                    &cpu_model,
-                    &format!("blk.{i}.attn_q.weight"),
-                )?;
-                let k = Self::upload_dequantized_weight(
-                    &ctx,
-                    &cpu_model,
-                    &format!("blk.{i}.attn_k.weight"),
-                )?;
-                let v = Self::upload_dequantized_weight(
-                    &ctx,
-                    &cpu_model,
-                    &format!("blk.{i}.attn_v.weight"),
-                )?;
-                let o = Self::upload_dequantized_weight(
-                    &ctx,
-                    &cpu_model,
-                    &format!("blk.{i}.attn_output.weight"),
-                )?;
-                let qn = ctx.upload_f32(
-                    cpu_model.attn_q_norm_weight(i).unwrap(),
-                    &format!("l{i}.qnorm"),
-                );
-                let kn = ctx.upload_f32(
-                    cpu_model.attn_k_norm_weight(i).unwrap(),
-                    &format!("l{i}.knorm"),
-                );
+                let qr = refs.attn_q.as_ref().unwrap();
+                let kr = refs.attn_k.as_ref().unwrap();
+                let vr = refs.attn_v.as_ref().unwrap();
+                let or = refs.attn_output.as_ref().unwrap();
                 (
-                    Some(q),
-                    hs as u32,
-                    Some(k),
-                    kv_dim as u32,
-                    Some(v),
-                    kv_dim as u32,
-                    Some(o),
-                    Some(qn),
-                    Some(kn),
+                    Some(upload_wref(qr, &format!("l{i}.attn_q"))),
+                    qr.m as u32,
+                    Some(upload_wref(kr, &format!("l{i}.attn_k"))),
+                    kr.m as u32,
+                    Some(upload_wref(vr, &format!("l{i}.attn_v"))),
+                    vr.m as u32,
+                    Some(upload_wref(or, &format!("l{i}.attn_o"))),
+                    Some(ctx.upload_f32(
+                        cpu_model.attn_q_norm_weight(i).unwrap(),
+                        &format!("l{i}.qn"),
+                    )),
+                    Some(ctx.upload_f32(
+                        cpu_model.attn_k_norm_weight(i).unwrap(),
+                        &format!("l{i}.kn"),
+                    )),
                 )
             } else {
                 (None, 0, None, 0, None, 0, None, None, None)
@@ -235,12 +214,12 @@ impl GpuLfm2Model {
                 attn_norm,
                 ffn_norm,
                 ffn_gate,
-                ffn_gate_m: lw.ffn_gate_m as u32,
-                ffn_gate_k: lw.ffn_gate_k as u32,
+                ffn_gate_m: refs.ffn_gate.m as u32,
+                ffn_gate_k: refs.ffn_gate.k as u32,
                 ffn_up,
                 ffn_down,
-                ffn_down_m: lw.ffn_down_m as u32,
-                ffn_down_k: lw.ffn_down_k as u32,
+                ffn_down_m: refs.ffn_down.m as u32,
+                ffn_down_k: refs.ffn_down.k as u32,
                 conv_in_proj,
                 conv_in_proj_m,
                 conv_out_proj,
@@ -300,8 +279,9 @@ impl GpuLfm2Model {
         let gpu_state = GpuState {
             kv_caches,
             conv_buffers,
-            seq_len: 0,
+            seq_len: Cell::new(0),
             max_seq_len,
+            embedding_f32,
         };
 
         Ok(Self {
@@ -331,25 +311,604 @@ impl GpuLfm2Model {
         })
     }
 
-    /// Dequantize a weight tensor to f32 and upload to GPU.
-    fn upload_dequantized_weight(
-        ctx: &GpuContext,
-        model: &super::lfm2::Lfm2Model,
-        tensor_name: &str,
-    ) -> Result<wgpu::Buffer> {
-        let tensor = model.gguf().get_tensor(tensor_name)?;
-        let f32_data = tensor.to_f32_vec();
-        Ok(ctx.upload_f32(&f32_data, tensor_name))
+    // ── GPU dispatch helpers ────────────────────────────────────────────
+
+    /// Dispatch GEMV: y[m] = A[m,k] × x[k]
+    fn dispatch_gemv(
+        &self,
+        weight: &wgpu::Buffer,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        let params = [m, k];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "gemv_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.gemv_f32.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        // wgpu max dispatch per dimension is 65535; use y-dimension for overflow
+        let dispatch_x = m.min(65535);
+        let dispatch_y = (m + 65534) / 65535;
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.gemv_f32);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch rmsnorm in-place on a buffer.
+    fn dispatch_rmsnorm(&self, x: &wgpu::Buffer, weight: &wgpu::Buffer, n: u32, eps: f32) {
+        let params = [n, eps.to_bits(), 0u32, 0u32];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "rms_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.rmsnorm);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch element-wise add: a += b
+    fn dispatch_add(&self, a: &wgpu::Buffer, b: &wgpu::Buffer, n: u32) {
+        let params = [n, 0u32];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "add_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.add_inplace);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch fused silu_mul: gate = silu(gate) * up
+    fn dispatch_silu_mul(&self, gate: &wgpu::Buffer, up: &wgpu::Buffer, n: u32) {
+        let params = [n, 0u32];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "silu_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gate.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: up.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.silu_mul_inplace);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch RoPE on Q and K buffers.
+    fn dispatch_rope(
+        &self,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        pos: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        freq_base: f32,
+    ) {
+        let params: [u32; 5] = [pos, n_heads, n_kv_heads, head_dim, freq_base.to_bits()];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "rope_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.rope.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.rope);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((max_pairs + 255) / 256, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch fused attention for all heads.
+    fn dispatch_attention(
+        &self,
+        q: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        kv_dim: u32,
+        seq_len: u32,
+        scale: f32,
+    ) {
+        let params: [u32; 8] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            seq_len,
+            scale.to_bits(),
+            0,
+            0,
+        ];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "attn_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.attention.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: v_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.scores_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.attention);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n_heads, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Dispatch conv1d depthwise with rolling buffer update.
+    fn dispatch_conv1d(
+        &self,
+        input: &wgpu::Buffer,
+        buffer: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        hidden_size: u32,
+        kernel_size: u32,
+        d_conv: u32,
+    ) {
+        let params = [hidden_size, kernel_size, d_conv, 0u32];
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "conv_p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.conv1d.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipelines.conv1d);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((hidden_size + 255) / 256, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Copy n f32 elements between GPU buffers at given byte offsets.
+    fn copy_buffer(
+        &self,
+        src: &wgpu::Buffer,
+        src_offset: u64,
+        dst: &wgpu::Buffer,
+        dst_offset: u64,
+        n_floats: u64,
+    ) {
+        let size = n_floats * 4;
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+        self.ctx.queue.submit(Some(enc.finish()));
     }
 }
 
 impl Model for GpuLfm2Model {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        // GPU forward is self-contained — ignores the CPU InferenceState.
-        // TODO: implement full GPU forward pass using compute dispatches.
-        // For now, return zeros to validate the integration compiles.
-        let _ = (tokens, pos, state);
-        vec![0.0f32; self.config.vocab_size]
+        assert_eq!(tokens.len(), 1, "GPU forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let hs32 = hs as u32;
+
+        // 1. Embedding lookup from CPU cache (4KB upload per token — negligible)
+        let emb_offset = token_id * hs;
+        self.ctx.queue.write_buffer(
+            &self.hidden_buf,
+            0,
+            bytemuck::cast_slice(&self.gpu_state.embedding_f32[emb_offset..emb_offset + hs]),
+        );
+
+        // 2. Per-layer loop
+        for i in 0..cfg.n_layers {
+            let lw = &self.layers[i];
+
+            // Copy hidden → normed, then rmsnorm in-place
+            self.copy_buffer(&self.hidden_buf, 0, &self.normed_buf, 0, hs as u64);
+            self.dispatch_rmsnorm(&self.normed_buf, &lw.attn_norm, hs32, cfg.rms_norm_eps);
+
+            // Operator: conv or attention
+            if cfg.block_types[i] == BlockType::GatedConv {
+                // Conv block: in_proj → gate → conv1d → second gate → out_proj
+                let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
+                let d_conv = kernel_size - 1;
+
+                // in_proj: normed → conv_proj_buf [3*hs]
+                self.dispatch_gemv(
+                    lw.conv_in_proj.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.conv_proj_buf,
+                    lw.conv_in_proj_m,
+                    hs32,
+                );
+
+                // Element-wise: bx = b * x (first hs elements × last hs elements)
+                // b is conv_proj[0..hs], x is conv_proj[2*hs..3*hs]
+                // Need a custom element-wise mul. For V1, read back and do on CPU.
+                self.ctx.device.poll(wgpu::Maintain::Wait);
+                let proj = self.ctx.download_f32(&self.conv_proj_buf, 3 * hs);
+                let b = &proj[..hs];
+                let c = &proj[hs..2 * hs];
+                let x = &proj[2 * hs..3 * hs];
+                let bx: Vec<f32> = b.iter().zip(x.iter()).map(|(bi, xi)| bi * xi).collect();
+                self.ctx
+                    .queue
+                    .write_buffer(&self.conv_bx_buf, 0, bytemuck::cast_slice(&bx));
+
+                // Conv1d depthwise
+                let conv_buf = self.gpu_state.conv_buffers[i].as_ref().unwrap();
+                self.dispatch_conv1d(
+                    &self.conv_bx_buf,
+                    conv_buf,
+                    lw.conv_weight.as_ref().unwrap(),
+                    &self.conv_out_buf,
+                    hs32,
+                    kernel_size,
+                    d_conv,
+                );
+
+                // Second gate: out = c * conv_out — read back, compute, upload
+                self.ctx.device.poll(wgpu::Maintain::Wait);
+                let conv_out = self.ctx.download_f32(&self.conv_out_buf, hs);
+                let gated: Vec<f32> = c
+                    .iter()
+                    .zip(conv_out.iter())
+                    .map(|(ci, co)| ci * co)
+                    .collect();
+                self.ctx
+                    .queue
+                    .write_buffer(&self.conv_gate_buf, 0, bytemuck::cast_slice(&gated));
+
+                // out_proj: conv_gate → out_buf
+                self.dispatch_gemv(
+                    lw.conv_out_proj.as_ref().unwrap(),
+                    &self.conv_gate_buf,
+                    &self.out_buf,
+                    lw.conv_out_proj_m,
+                    hs32,
+                );
+            } else {
+                // Attention block
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
+                let kv_dim = (n_kv_heads * head_dim) as u32;
+                let n_heads = cfg.n_heads as u32;
+
+                // Q, K, V projections
+                self.dispatch_gemv(
+                    lw.attn_q.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.q_buf,
+                    lw.attn_q_m,
+                    hs32,
+                );
+                self.dispatch_gemv(
+                    lw.attn_k.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.k_buf,
+                    lw.attn_k_m,
+                    hs32,
+                );
+                self.dispatch_gemv(
+                    lw.attn_v.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.v_buf,
+                    lw.attn_v_m,
+                    hs32,
+                );
+
+                // Per-head QK norm — for V1, do on CPU
+                self.ctx.device.poll(wgpu::Maintain::Wait);
+                let mut q_data = self.ctx.download_f32(&self.q_buf, hs);
+                let mut k_data = self.ctx.download_f32(&self.k_buf, kv_dim as usize);
+                let qn = lw.attn_q_norm.as_ref().unwrap();
+                let kn = lw.attn_k_norm.as_ref().unwrap();
+                let qn_w = self.ctx.download_f32(qn, head_dim as usize);
+                let kn_w = self.ctx.download_f32(kn, head_dim as usize);
+                for h in 0..n_heads as usize {
+                    crate::backend::cpu::rmsnorm(
+                        &mut q_data[h * head_dim as usize..(h + 1) * head_dim as usize],
+                        &qn_w,
+                        cfg.rms_norm_eps,
+                    );
+                }
+                for h in 0..n_kv_heads as usize {
+                    crate::backend::cpu::rmsnorm(
+                        &mut k_data[h * head_dim as usize..(h + 1) * head_dim as usize],
+                        &kn_w,
+                        cfg.rms_norm_eps,
+                    );
+                }
+
+                // RoPE on CPU (simpler for V1)
+                crate::backend::cpu::rope(
+                    &mut q_data,
+                    &mut k_data,
+                    pos,
+                    cfg.n_heads,
+                    n_kv_heads as usize,
+                    head_dim as usize,
+                    cfg.rope_theta,
+                );
+
+                // Upload Q, K back to GPU
+                self.ctx
+                    .queue
+                    .write_buffer(&self.q_buf, 0, bytemuck::cast_slice(&q_data));
+                self.ctx
+                    .queue
+                    .write_buffer(&self.k_buf, 0, bytemuck::cast_slice(&k_data));
+
+                // Append K, V to GPU KV cache
+                let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
+                let seq_len = self.gpu_state.seq_len.get();
+                let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
+                self.copy_buffer(&self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
+
+                // V: download, upload to cache (need v_buf data)
+                self.ctx.device.poll(wgpu::Maintain::Wait);
+                let v_data = self.ctx.download_f32(&self.v_buf, kv_dim as usize);
+                self.ctx
+                    .queue
+                    .write_buffer(v_cache, kv_offset, bytemuck::cast_slice(&v_data));
+
+                // Fused attention
+                let attn_seq_len = (seq_len + 1) as u32;
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                self.dispatch_attention(
+                    &self.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.attn_out_buf,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    attn_seq_len,
+                    scale,
+                );
+
+                // Output projection
+                self.dispatch_gemv(
+                    lw.attn_output.as_ref().unwrap(),
+                    &self.attn_out_buf,
+                    &self.out_buf,
+                    hs32,
+                    hs32,
+                );
+            }
+
+            // First residual: hidden += out
+            self.dispatch_add(&self.hidden_buf, &self.out_buf, hs32);
+
+            // FFN pre-norm: copy hidden → ffn_input, rmsnorm
+            self.copy_buffer(&self.hidden_buf, 0, &self.ffn_input_buf, 0, hs as u64);
+            self.dispatch_rmsnorm(&self.ffn_input_buf, &lw.ffn_norm, hs32, cfg.rms_norm_eps);
+
+            // SwiGLU FFN
+            self.dispatch_gemv(
+                &lw.ffn_gate,
+                &self.ffn_input_buf,
+                &self.gate_buf,
+                lw.ffn_gate_m,
+                lw.ffn_gate_k,
+            );
+            self.dispatch_gemv(
+                &lw.ffn_up,
+                &self.ffn_input_buf,
+                &self.up_buf,
+                lw.ffn_gate_m,
+                lw.ffn_gate_k,
+            );
+            self.dispatch_silu_mul(&self.gate_buf, &self.up_buf, lw.ffn_gate_m);
+            self.dispatch_gemv(
+                &lw.ffn_down,
+                &self.gate_buf,
+                &self.out_buf,
+                lw.ffn_down_m,
+                lw.ffn_down_k,
+            );
+
+            // Second residual: hidden += ffn_out
+            self.dispatch_add(&self.hidden_buf, &self.out_buf, hs32);
+        }
+
+        // 3. Output norm
+        self.dispatch_rmsnorm(&self.hidden_buf, &self.output_norm, hs32, cfg.rms_norm_eps);
+
+        // 4. Output projection (tied embeddings)
+        self.dispatch_gemv(
+            &self.embedding,
+            &self.hidden_buf,
+            &self.logits_buf,
+            cfg.vocab_size as u32,
+            hs32,
+        );
+
+        // 5. Update seq_len and read back logits
+        self.gpu_state.seq_len.set(self.gpu_state.seq_len.get() + 1);
+        state.seq_len += 1;
+        self.ctx.device.poll(wgpu::Maintain::Wait);
+        self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
     }
 
     fn config(&self) -> &ModelConfig {

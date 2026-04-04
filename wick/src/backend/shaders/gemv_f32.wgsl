@@ -25,7 +25,7 @@ fn gemv_f32(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
-    let row = wid.x;
+    let row = wid.x + wid.y * 65535u;
     let m = params.x;
     let k = params.y;
     let tid = lid.x;

@@ -15,28 +15,26 @@ use crate::tensor::DType;
 /// Pre-resolved reference to a quantized weight in the mmap.
 /// Computed once at load time to avoid HashMap lookups during inference.
 #[derive(Debug, Clone)]
-struct WeightRef {
-    start: usize, // byte offset into mmap
-    size: usize,  // byte size
-    dtype: DType,
-    m: usize, // output dim (rows = shape[1] in GGUF order)
-    k: usize, // input dim (elements per row = shape[0] in GGUF order)
+pub struct WeightRef {
+    pub start: usize,
+    pub size: usize,
+    pub dtype: DType,
+    pub m: usize,
+    pub k: usize,
 }
 
 /// Per-layer weight references for quantized tensors.
 #[derive(Debug, Clone)]
-struct LayerWeightRefs {
-    ffn_gate: WeightRef,
-    ffn_up: WeightRef,
-    ffn_down: WeightRef,
-    // Conv-specific (None for attention layers)
-    shortconv_in_proj: Option<WeightRef>,
-    shortconv_out_proj: Option<WeightRef>,
-    // Attention-specific (None for conv layers)
-    attn_q: Option<WeightRef>,
-    attn_k: Option<WeightRef>,
-    attn_v: Option<WeightRef>,
-    attn_output: Option<WeightRef>,
+pub struct LayerWeightRefs {
+    pub ffn_gate: WeightRef,
+    pub ffn_up: WeightRef,
+    pub ffn_down: WeightRef,
+    pub shortconv_in_proj: Option<WeightRef>,
+    pub shortconv_out_proj: Option<WeightRef>,
+    pub attn_q: Option<WeightRef>,
+    pub attn_k: Option<WeightRef>,
+    pub attn_v: Option<WeightRef>,
+    pub attn_output: Option<WeightRef>,
 }
 
 /// Dimensions for a layer's weight matrices (for GPU model construction).
@@ -329,6 +327,43 @@ impl Lfm2Model {
             ffn_down_m: refs.ffn_down.m,
             ffn_down_k: refs.ffn_down.k,
         }
+    }
+
+    /// Dequantize a weight matrix to f32 given a WeightRef.
+    pub fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
+        let mut out = vec![0.0f32; wref.m * wref.k];
+        let data = self.weight_data(wref);
+        let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
+        for row in 0..wref.m {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            let row_out = &mut out[row * wref.k..(row + 1) * wref.k];
+            self.dequantize_row_into_slice(wref, row_data, row_out);
+        }
+        out
+    }
+
+    fn dequantize_row_into_slice(&self, wref: &WeightRef, row_data: &[u8], out: &mut [f32]) {
+        match wref.dtype {
+            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
+            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
+            DType::F32 => {
+                let floats: &[f32] = bytemuck::cast_slice(row_data);
+                out.copy_from_slice(floats);
+            }
+            _ => panic!("unsupported dtype: {:?}", wref.dtype),
+        }
+    }
+
+    /// Access the per-layer weight refs (for GPU model construction).
+    pub fn layer_refs(&self) -> &[LayerWeightRefs] {
+        &self.layer_refs
+    }
+
+    /// Access the embedding weight ref.
+    pub fn embd_ref(&self) -> &WeightRef {
+        &self.embd_ref
     }
 
     // ── Internal methods ────────────────────────────────────────────────

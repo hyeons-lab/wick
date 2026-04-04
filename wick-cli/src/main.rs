@@ -84,6 +84,23 @@ enum Command {
     },
 }
 
+fn load_model_for_device(
+    gguf: wick::gguf::GgufFile,
+    device: &str,
+) -> Result<Box<dyn wick::model::Model>> {
+    match device {
+        #[cfg(feature = "gpu")]
+        "gpu" => {
+            eprintln!("Using GPU backend");
+            wick::model::load_model_gpu(gguf)
+        }
+        "cpu" => wick::model::load_model(gguf),
+        "auto" | _ => wick::model::load_model(gguf),
+        #[cfg(not(feature = "gpu"))]
+        "gpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -97,7 +114,7 @@ fn main() -> Result<()> {
             prompt,
             max_tokens,
             temperature,
-            device: _,
+            device,
             token_ids,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
@@ -106,7 +123,7 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
 
-            let loaded_model = wick::model::load_model(gguf)?;
+            let loaded_model = load_model_for_device(gguf, &device)?;
 
             let tokens = if let Some(ids) = &token_ids {
                 // Parse comma-separated token IDs
