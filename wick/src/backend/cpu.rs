@@ -630,6 +630,7 @@ unsafe fn attn_scores_neon(
     seq_len: usize,
 ) {
     use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
     unsafe {
         let q_ptr = q_head.as_ptr();
         let k_ptr = k_cache.as_ptr();
@@ -649,7 +650,6 @@ unsafe fn attn_scores_neon(
                 sum1 = vfmaq_f32(sum1, q1, k1);
                 d += 8;
             }
-            // Handle remaining 4 elements (head_dim is typically 64 or 128, always divisible by 8)
             if d + 4 <= head_dim {
                 let q0 = vld1q_f32(q_ptr.add(d));
                 let k0 = vld1q_f32(k_ptr.add(k_off + d));
@@ -657,7 +657,6 @@ unsafe fn attn_scores_neon(
                 d += 4;
             }
             let mut total = vaddvq_f32(vaddq_f32(sum0, sum1));
-            // Scalar tail for non-multiple-of-4 head_dim
             while d < head_dim {
                 total += *q_ptr.add(d) * *k_ptr.add(k_off + d);
                 d += 1;
@@ -680,13 +679,12 @@ unsafe fn attn_values_neon(
     seq_len: usize,
 ) {
     use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
     unsafe {
         let v_ptr = v_cache.as_ptr();
         let out_ptr = attn_out.as_mut_ptr();
 
-        // Zero accumulators: head_dim/4 NEON registers (8 for head_dim=64)
         // T-outer loop: load scores[t] once, FMA across all d chunks.
-        // This reads scores seq_len times total (vs head_dim/8 × seq_len with d-outer).
         let n_vec = head_dim / 4;
         let n_tail = head_dim % 4;
 
