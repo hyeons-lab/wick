@@ -14,18 +14,19 @@ Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF
 |-------|-------|------:|
 | LFM2-450M | Q4_0 | 119 |
 | LFM2-450M | Q8_0 | 107 |
-| LFM2.5-1.6B | Q4_0 | 63 |
+| LFM2.5-1.6B | Q4_0 | 57 |
+| LFM2.5-1.6B | Q8_0 | 51 |
 
 ### Prefill (prompt processing)
 
 | Model | Quant | 32 tok | 117 tok |
 |-------|-------|-------:|--------:|
 | LFM2-450M | Q4_0 | 475 | 539 |
-| LFM2-450M | Q8_0 | 399 | — |
-| LFM2.5-1.6B | Q4_0 | 160 | — |
-| LFM2.5-1.6B | Q8_0 | 133 | — |
+| LFM2-450M | Q8_0 | 407 | 451 |
+| LFM2.5-1.6B | Q4_0 | 160 | 191 |
+| LFM2.5-1.6B | Q8_0 | 131 | 158 |
 
-Q4_0 is faster than Q8_0 for prefill (less weight data to read), matching llama.cpp behavior.
+Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
 
 ### Key optimizations
 
