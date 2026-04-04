@@ -133,6 +133,33 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
+/// Like `par_rows` but for GEMM output where each "row" is `n` contiguous f32 elements.
+/// `f` receives (row_index, &mut [f32; n]).
+pub fn par_rows_n(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
+    let m = y.len() / n;
+    let rows_per_chunk = (m / rayon::current_num_threads()).max(min_rows);
+    let elems_per_chunk = rows_per_chunk * n;
+    y.par_chunks_mut(elems_per_chunk)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let base_row = ci * rows_per_chunk;
+            for (j, row) in chunk.chunks_mut(n).enumerate() {
+                f((base_row + j, row));
+            }
+        });
+}
+
 #[allow(clippy::ptr_arg)]
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
 ///
@@ -806,5 +833,24 @@ mod tests {
         let b = vec![4.0, 5.0, 6.0];
         mul_inplace(&mut a, &b);
         assert_eq!(a, vec![4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn test_par_rows_n_basic() {
+        // 3 rows × 2 columns, each row doubles its index
+        let mut out = vec![0.0f32; 6];
+        par_rows_n(&mut out, 2, 1, |(i, row)| {
+            row[0] = i as f32;
+            row[1] = i as f32 * 2.0;
+        });
+        assert_eq!(out, vec![0.0, 0.0, 1.0, 2.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn test_par_rows_n_empty() {
+        let mut out: Vec<f32> = vec![];
+        par_rows_n(&mut out, 3, 1, |(_i, _row)| {
+            panic!("should not be called");
+        });
     }
 }

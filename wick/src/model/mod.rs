@@ -39,6 +39,23 @@ pub trait Model: Send {
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
 
+    /// Batched forward pass for prefill: process all prompt tokens at once.
+    /// Implementations may use GEMM for linear projections. Returns logits for the LAST token only.
+    /// Default: falls back to sequential single-token `forward()` calls.
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        // Default: fall back to sequential single-token forward
+        let mut logits = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            logits = self.forward(&[token], start_pos + i, state);
+        }
+        logits
+    }
+
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
 }
