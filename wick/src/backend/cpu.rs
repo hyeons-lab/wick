@@ -635,25 +635,34 @@ unsafe fn attn_scores_neon(
         let q_ptr = q_head.as_ptr();
         let k_ptr = k_cache.as_ptr();
 
+        // Pre-load Q vectors once (constant across all timesteps).
+        // Max 32 float32x4 = head_dim up to 128. Stack array avoids heap alloc.
+        const MAX_Q_VECS: usize = 32;
+        let n_q_vecs = head_dim / 4;
+        debug_assert!(n_q_vecs <= MAX_Q_VECS, "head_dim > 128 not supported");
+        let mut q_vecs = [vdupq_n_f32(0.0); MAX_Q_VECS];
+        for i in 0..n_q_vecs {
+            q_vecs[i] = vld1q_f32(q_ptr.add(i * 4));
+        }
+
         for t in 0..seq_len {
             let k_off = t * kv_dim + kv_h_offset;
             let mut sum0 = vdupq_n_f32(0.0);
             let mut sum1 = vdupq_n_f32(0.0);
 
             let mut d = 0usize;
+            let mut qi = 0usize;
             while d + 8 <= head_dim {
-                let q0 = vld1q_f32(q_ptr.add(d));
-                let q1 = vld1q_f32(q_ptr.add(d + 4));
                 let k0 = vld1q_f32(k_ptr.add(k_off + d));
                 let k1 = vld1q_f32(k_ptr.add(k_off + d + 4));
-                sum0 = vfmaq_f32(sum0, q0, k0);
-                sum1 = vfmaq_f32(sum1, q1, k1);
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
+                sum1 = vfmaq_f32(sum1, q_vecs[qi + 1], k1);
                 d += 8;
+                qi += 2;
             }
             if d + 4 <= head_dim {
-                let q0 = vld1q_f32(q_ptr.add(d));
                 let k0 = vld1q_f32(k_ptr.add(k_off + d));
-                sum0 = vfmaq_f32(sum0, q0, k0);
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
                 d += 4;
             }
             let mut total = vaddvq_f32(vaddq_f32(sum0, sum1));
@@ -684,36 +693,35 @@ unsafe fn attn_values_neon(
         let v_ptr = v_cache.as_ptr();
         let out_ptr = attn_out.as_mut_ptr();
 
-        // T-outer loop: load scores[t] once, FMA across all d chunks.
+        // Accumulate in registers (not memory) across all timesteps, store once at end.
+        // Max 32 float32x4 = head_dim up to 128.
+        const MAX_ACC_VECS: usize = 32;
         let n_vec = head_dim / 4;
         let n_tail = head_dim % 4;
-
-        // Zero output first (we accumulate into it)
-        let mut d = 0usize;
-        while d + 4 <= head_dim {
-            vst1q_f32(out_ptr.add(d), vdupq_n_f32(0.0));
-            d += 4;
-        }
-        for dd in d..head_dim {
-            *out_ptr.add(dd) = 0.0;
-        }
+        debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 128 not supported");
+        let mut acc = [vdupq_n_f32(0.0); MAX_ACC_VECS];
 
         for t in 0..seq_len {
             let s = vdupq_n_f32(scores[t]);
             let v_base = t * kv_dim + kv_h_offset;
+            for i in 0..n_vec {
+                let v = vld1q_f32(v_ptr.add(v_base + i * 4));
+                acc[i] = vfmaq_f32(acc[i], s, v);
+            }
+        }
 
-            // Process all head_dim in chunks of 4
-            let mut d = 0usize;
-            for _ in 0..n_vec {
-                let acc = vld1q_f32(out_ptr.add(d));
-                let v = vld1q_f32(v_ptr.add(v_base + d));
-                vst1q_f32(out_ptr.add(d), vfmaq_f32(acc, s, v));
-                d += 4;
+        // Store accumulators to output
+        for i in 0..n_vec {
+            vst1q_f32(out_ptr.add(i * 4), acc[i]);
+        }
+        // Scalar tail
+        let tail_start = n_vec * 4;
+        for dd in 0..n_tail {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val += scores[t] * *v_ptr.add(t * kv_dim + kv_h_offset + tail_start + dd);
             }
-            // Scalar tail
-            for dd in 0..n_tail {
-                *out_ptr.add(d + dd) += scores[t] * *v_ptr.add(v_base + d + dd);
-            }
+            *out_ptr.add(tail_start + dd) = val;
         }
     }
 }
