@@ -20,7 +20,9 @@ serde_json.workspace = true
 rand.workspace = true
 regex.workspace = true
 rayon.workspace = true
+wgpu = { workspace = true, optional = true }
+pollster = { version = "0.4", optional = true }
 
 [features]
 default = []
-gpu = []
+gpu = ["dep:wgpu", "dep:pollster"]
