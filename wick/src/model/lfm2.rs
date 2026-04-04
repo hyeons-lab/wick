@@ -329,6 +329,11 @@ impl Lfm2Model {
         }
     }
 
+    /// Get raw weight bytes for a WeightRef (for GPU quantized upload).
+    pub fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+        self.weight_data(wref)
+    }
+
     /// Dequantize a weight matrix to f32 given a WeightRef.
     pub fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
         let mut out = vec![0.0f32; wref.m * wref.k];

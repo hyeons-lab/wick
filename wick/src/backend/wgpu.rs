@@ -46,7 +46,9 @@ impl GpuContext {
         let adapter_name = adapter.get_info().name.clone();
         let backend = format!("{:?}", adapter.get_info().backend);
 
-        let has_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let profile_requested = std::env::var("WICK_GPU_PROFILE").as_deref() == Ok("1");
+        let has_timestamps =
+            profile_requested && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let mut features = wgpu::Features::empty();
         if has_timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;

@@ -12,32 +12,33 @@ use crate::backend::wgpu::{GpuContext, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::{BlockType, Model, ModelConfig};
+use crate::tensor::DType;
 
-/// GPU buffer handles for one layer's weights (all f32, dequantized at load).
+/// A weight matrix on GPU — tracks buffer + dtype for dispatch.
+struct GpuWeight {
+    buf: wgpu::Buffer,
+    dtype: DType,
+    m: u32, // output rows
+    k: u32, // input cols
+}
+
+/// GPU buffer handles for one layer's weights.
+/// Q4_0/Q8_0 weights are uploaded quantized; f32 norms uploaded as-is.
 struct GpuLayerWeights {
     attn_norm: wgpu::Buffer,
     ffn_norm: wgpu::Buffer,
-    ffn_gate: wgpu::Buffer,
-    ffn_gate_m: u32,
-    ffn_gate_k: u32,
-    ffn_up: wgpu::Buffer,
-    ffn_down: wgpu::Buffer,
-    ffn_down_m: u32,
-    ffn_down_k: u32,
+    ffn_gate: GpuWeight,
+    ffn_up: GpuWeight,
+    ffn_down: GpuWeight,
     // Conv-specific
-    conv_in_proj: Option<wgpu::Buffer>,
-    conv_in_proj_m: u32,
-    conv_out_proj: Option<wgpu::Buffer>,
-    conv_out_proj_m: u32,
+    conv_in_proj: Option<GpuWeight>,
+    conv_out_proj: Option<GpuWeight>,
     conv_weight: Option<wgpu::Buffer>,
     // Attention-specific
-    attn_q: Option<wgpu::Buffer>,
-    attn_q_m: u32,
-    attn_k: Option<wgpu::Buffer>,
-    attn_k_m: u32,
-    attn_v: Option<wgpu::Buffer>,
-    attn_v_m: u32,
-    attn_output: Option<wgpu::Buffer>,
+    attn_q: Option<GpuWeight>,
+    attn_k: Option<GpuWeight>,
+    attn_v: Option<GpuWeight>,
+    attn_output: Option<GpuWeight>,
     attn_q_norm: Option<wgpu::Buffer>,
     attn_k_norm: Option<wgpu::Buffer>,
 }
@@ -46,6 +47,7 @@ struct GpuLayerWeights {
 #[allow(dead_code)]
 struct GpuPipelines {
     gemv_f32: wgpu::ComputePipeline,
+    gemv_q4_0: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
@@ -121,6 +123,7 @@ impl GpuLfm2Model {
         // Create pipelines
         let pipelines = GpuPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
+            gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
             silu_mul_inplace: ctx.create_pipeline(
@@ -135,17 +138,28 @@ impl GpuLfm2Model {
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise", "conv1d"),
         };
 
-        // Dequantize + upload all weights
-        // (This is the f32-first approach — upload dequantized weights)
+        // Upload weights: Q4_0 stays quantized, others dequantized to f32
         let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
         let embedding_f32 = emb_tensor.to_f32_vec();
         let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
 
-        // Upload per-layer weights using WeightRef-based dequantization
-        let upload_wref = |wref: &super::lfm2::WeightRef, name: &str| -> wgpu::Buffer {
-            let f32_data = cpu_model.dequantize_weight(wref);
-            ctx.upload_f32(&f32_data, name)
+        let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
+            let buf = if wref.dtype == DType::Q4_0 {
+                // Upload raw quantized bytes — shader dequantizes on the fly
+                let data = cpu_model.weight_bytes(wref);
+                ctx.upload_storage(data, name)
+            } else {
+                // Dequantize to f32 for unsupported quant types
+                let f32_data = cpu_model.dequantize_weight(wref);
+                ctx.upload_f32(&f32_data, name)
+            };
+            GpuWeight {
+                buf,
+                dtype: wref.dtype,
+                m: wref.m as u32,
+                k: wref.k as u32,
+            }
         };
 
         let mut layers = Vec::with_capacity(config.n_layers);
@@ -154,53 +168,36 @@ impl GpuLfm2Model {
             let attn_norm = ctx.upload_f32(cpu_model.attn_norm_weight(i), &format!("l{i}.anorm"));
             let ffn_norm = ctx.upload_f32(cpu_model.ffn_norm_weight(i), &format!("l{i}.fnorm"));
 
-            let ffn_gate = upload_wref(&refs.ffn_gate, &format!("l{i}.ffn_gate"));
-            let ffn_up = upload_wref(&refs.ffn_up, &format!("l{i}.ffn_up"));
-            let ffn_down = upload_wref(&refs.ffn_down, &format!("l{i}.ffn_down"));
+            let ffn_gate = upload_weight(&refs.ffn_gate, &format!("l{i}.ffn_gate"));
+            let ffn_up = upload_weight(&refs.ffn_up, &format!("l{i}.ffn_up"));
+            let ffn_down = upload_weight(&refs.ffn_down, &format!("l{i}.ffn_down"));
 
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 
-            let (conv_in_proj, conv_in_proj_m, conv_out_proj, conv_out_proj_m, conv_weight) =
-                if is_conv {
-                    let ip = refs.shortconv_in_proj.as_ref().unwrap();
-                    let op = refs.shortconv_out_proj.as_ref().unwrap();
-                    (
-                        Some(upload_wref(ip, &format!("l{i}.conv_ip"))),
-                        ip.m as u32,
-                        Some(upload_wref(op, &format!("l{i}.conv_op"))),
-                        op.m as u32,
-                        Some(ctx.upload_f32(
-                            cpu_model.conv_weight(i).unwrap(),
-                            &format!("l{i}.conv_w"),
-                        )),
-                    )
-                } else {
-                    (None, 0, None, 0, None)
-                };
+            let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
+                let ip = refs.shortconv_in_proj.as_ref().unwrap();
+                let op = refs.shortconv_out_proj.as_ref().unwrap();
+                (
+                    Some(upload_weight(ip, &format!("l{i}.conv_ip"))),
+                    Some(upload_weight(op, &format!("l{i}.conv_op"))),
+                    Some(
+                        ctx.upload_f32(cpu_model.conv_weight(i).unwrap(), &format!("l{i}.conv_w")),
+                    ),
+                )
+            } else {
+                (None, None, None)
+            };
 
-            let (
-                attn_q,
-                attn_q_m,
-                attn_k,
-                attn_k_m,
-                attn_v,
-                attn_v_m,
-                attn_output,
-                attn_q_norm,
-                attn_k_norm,
-            ) = if !is_conv {
+            let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = if !is_conv {
                 let qr = refs.attn_q.as_ref().unwrap();
                 let kr = refs.attn_k.as_ref().unwrap();
                 let vr = refs.attn_v.as_ref().unwrap();
                 let or = refs.attn_output.as_ref().unwrap();
                 (
-                    Some(upload_wref(qr, &format!("l{i}.attn_q"))),
-                    qr.m as u32,
-                    Some(upload_wref(kr, &format!("l{i}.attn_k"))),
-                    kr.m as u32,
-                    Some(upload_wref(vr, &format!("l{i}.attn_v"))),
-                    vr.m as u32,
-                    Some(upload_wref(or, &format!("l{i}.attn_o"))),
+                    Some(upload_weight(qr, &format!("l{i}.attn_q"))),
+                    Some(upload_weight(kr, &format!("l{i}.attn_k"))),
+                    Some(upload_weight(vr, &format!("l{i}.attn_v"))),
+                    Some(upload_weight(or, &format!("l{i}.attn_o"))),
                     Some(ctx.upload_f32(
                         cpu_model.attn_q_norm_weight(i).unwrap(),
                         &format!("l{i}.qn"),
@@ -211,30 +208,21 @@ impl GpuLfm2Model {
                     )),
                 )
             } else {
-                (None, 0, None, 0, None, 0, None, None, None)
+                (None, None, None, None, None, None)
             };
 
             layers.push(GpuLayerWeights {
                 attn_norm,
                 ffn_norm,
                 ffn_gate,
-                ffn_gate_m: refs.ffn_gate.m as u32,
-                ffn_gate_k: refs.ffn_gate.k as u32,
                 ffn_up,
                 ffn_down,
-                ffn_down_m: refs.ffn_down.m as u32,
-                ffn_down_k: refs.ffn_down.k as u32,
                 conv_in_proj,
-                conv_in_proj_m,
                 conv_out_proj,
-                conv_out_proj_m,
                 conv_weight,
                 attn_q,
-                attn_q_m,
                 attn_k,
-                attn_k_m,
                 attn_v,
-                attn_v_m,
                 attn_output,
                 attn_q_norm,
                 attn_k_norm,
@@ -350,7 +338,61 @@ impl GpuLfm2Model {
 
     // ── Encode helpers (add passes to an existing encoder) ────────────
 
-    fn encode_gemv(
+    /// Encode GEMV dispatch — selects Q4_0 or f32 pipeline based on weight dtype.
+    fn encode_gemv_weight(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        w: &GpuWeight,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) {
+        let pipeline = match w.dtype {
+            DType::Q4_0 => &self.pipelines.gemv_q4_0,
+            _ => &self.pipelines.gemv_f32,
+        };
+        let label = match w.dtype {
+            DType::Q4_0 => "gemv_q4",
+            _ => "gemv_f32",
+        };
+        let params_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&[w.m, w.k]), "p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w.buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            pipeline,
+            &bg,
+            (w.m.min(65535), w.m.div_ceil(65535), 1),
+            label,
+        );
+    }
+
+    /// Encode f32 GEMV (for tied embeddings output projection which stays f32).
+    fn encode_gemv_f32(
         &self,
         enc: &mut wgpu::CommandEncoder,
         weight: &wgpu::Buffer,
@@ -390,7 +432,7 @@ impl GpuLfm2Model {
             &self.pipelines.gemv_f32,
             &bg,
             (m.min(65535), m.div_ceil(65535), 1),
-            "gemv",
+            "gemv_f32",
         );
     }
 
@@ -652,13 +694,11 @@ impl Model for GpuLfm2Model {
                     hs32,
                     cfg.rms_norm_eps,
                 );
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.conv_in_proj.as_ref().unwrap(),
                     &self.normed_buf,
                     &self.conv_proj_buf,
-                    lw.conv_in_proj_m,
-                    hs32,
                 );
                 // bx = b * x: copy b → conv_bx, copy x → conv_out (temp), mul_inplace
                 self.encode_copy(
@@ -714,13 +754,11 @@ impl Model for GpuLfm2Model {
                     "mul",
                 );
                 // out_proj + residual
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.conv_out_proj.as_ref().unwrap(),
                     &self.conv_gate_buf,
                     &self.out_buf,
-                    lw.conv_out_proj_m,
-                    hs32,
                 );
                 self.encode_elementwise(
                     &mut enc,
@@ -755,29 +793,23 @@ impl Model for GpuLfm2Model {
                     hs32,
                     cfg.rms_norm_eps,
                 );
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.attn_q.as_ref().unwrap(),
                     &self.normed_buf,
                     &self.q_buf,
-                    lw.attn_q_m,
-                    hs32,
                 );
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.attn_k.as_ref().unwrap(),
                     &self.normed_buf,
                     &self.k_buf,
-                    lw.attn_k_m,
-                    hs32,
                 );
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.attn_v.as_ref().unwrap(),
                     &self.normed_buf,
                     &self.v_buf,
-                    lw.attn_v_m,
-                    hs32,
                 );
                 self.submit_and_wait(enc);
 
@@ -842,13 +874,11 @@ impl Model for GpuLfm2Model {
                     attn_seq_len,
                     scale,
                 );
-                self.encode_gemv(
+                self.encode_gemv_weight(
                     &mut enc,
                     lw.attn_output.as_ref().unwrap(),
                     &self.attn_out_buf,
                     &self.out_buf,
-                    hs32,
-                    hs32,
                 );
                 self.encode_elementwise(
                     &mut enc,
@@ -878,38 +908,17 @@ impl Model for GpuLfm2Model {
                 hs32,
                 cfg.rms_norm_eps,
             );
-            self.encode_gemv(
-                &mut enc,
-                &lw.ffn_gate,
-                &self.ffn_input_buf,
-                &self.gate_buf,
-                lw.ffn_gate_m,
-                lw.ffn_gate_k,
-            );
-            self.encode_gemv(
-                &mut enc,
-                &lw.ffn_up,
-                &self.ffn_input_buf,
-                &self.up_buf,
-                lw.ffn_gate_m,
-                lw.ffn_gate_k,
-            );
+            self.encode_gemv_weight(&mut enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
+            self.encode_gemv_weight(&mut enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
             self.encode_elementwise(
                 &mut enc,
                 &self.pipelines.silu_mul_inplace,
                 &self.gate_buf,
                 &self.up_buf,
-                lw.ffn_gate_m,
+                lw.ffn_gate.m,
                 "silu_mul",
             );
-            self.encode_gemv(
-                &mut enc,
-                &lw.ffn_down,
-                &self.gate_buf,
-                &self.out_buf,
-                lw.ffn_down_m,
-                lw.ffn_down_k,
-            );
+            self.encode_gemv_weight(&mut enc, &lw.ffn_down, &self.gate_buf, &self.out_buf);
             self.encode_elementwise(
                 &mut enc,
                 &self.pipelines.add_inplace,
@@ -930,7 +939,7 @@ impl Model for GpuLfm2Model {
             hs32,
             cfg.rms_norm_eps,
         );
-        self.encode_gemv(
+        self.encode_gemv_f32(
             &mut enc,
             &self.embedding,
             &self.hidden_buf,
