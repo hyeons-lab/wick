@@ -358,6 +358,97 @@ mod tests {
     }
 
     #[test]
+    fn bench_gpu_gemv_f32() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // Benchmark at realistic FFN sizes: 2816×1024 (gate projection)
+        let m = 2816u32;
+        let k = 1024u32;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 997) as f32 * 0.001 - 0.5)
+            .collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 + 7) % 251) as f32 * 0.01 - 1.25)
+            .collect();
+
+        let a_buf = ctx.upload_f32(&a, "A");
+        let x_buf = ctx.upload_f32(&x, "x");
+        let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
+        let params = [m, k];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32");
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        // Warmup
+        for _ in 0..5 {
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(m, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+        }
+        ctx.device.poll(wgpu::Maintain::Wait);
+
+        // Timed: 100 iterations of single GEMV dispatch
+        let iters = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(m, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+        }
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let elapsed = start.elapsed();
+
+        let us_per_gemv = elapsed.as_micros() as f64 / iters as f64;
+        let gflops = (2.0 * m as f64 * k as f64) / (us_per_gemv * 1e3);
+
+        // CPU reference timing (use black_box to prevent dead-code elimination)
+        let mut cpu_y = vec![0.0f32; m as usize];
+        let cpu_iters = 1000;
+        let cpu_start = std::time::Instant::now();
+        for _ in 0..cpu_iters {
+            for i in 0..m as usize {
+                let mut sum = 0.0f32;
+                for j in 0..k as usize {
+                    sum += a[i * k as usize + j] * x[j];
+                }
+                cpu_y[i] = sum;
+            }
+            std::hint::black_box(&cpu_y);
+        }
+        let cpu_elapsed = cpu_start.elapsed();
+        let cpu_us = cpu_elapsed.as_micros() as f64 / cpu_iters as f64;
+        let cpu_gflops = (2.0 * m as f64 * k as f64) / (cpu_us * 1e3);
+
+        println!(
+            "GEMV f32 {m}×{k}: GPU={us_per_gemv:.0}µs ({gflops:.1} GFLOPS), CPU(scalar)={cpu_us:.0}µs ({cpu_gflops:.1} GFLOPS), speedup={:.1}x",
+            cpu_us / us_per_gemv
+        );
+    }
+
+    #[test]
     fn test_gpu_elementwise_add() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
