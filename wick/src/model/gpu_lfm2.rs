@@ -43,6 +43,7 @@ struct GpuLayerWeights {
 }
 
 /// Compute pipelines for all shader entry points.
+#[allow(dead_code)]
 struct GpuPipelines {
     gemv_f32: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
@@ -56,6 +57,7 @@ struct GpuPipelines {
 }
 
 /// GPU-resident inference state (KV cache + conv rolling buffers).
+#[allow(dead_code)]
 struct GpuState {
     /// Per attention layer: (key_cache, value_cache) buffers, pre-allocated.
     kv_caches: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
@@ -387,7 +389,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemv_f32,
             &bg,
-            (m.min(65535), (m + 65534) / 65535, 1),
+            (m.min(65535), m.div_ceil(65535), 1),
             "gemv",
         );
     }
@@ -460,7 +462,7 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        self.encode(enc, pipeline, &bg, ((n + 255) / 256, 1, 1), label);
+        self.encode(enc, pipeline, &bg, (n.div_ceil(256), 1, 1), label);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -579,7 +581,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.conv1d,
             &bg,
-            ((hs + 255) / 256, 1, 1),
+            (hs.div_ceil(256), 1, 1),
             "conv1d",
         );
     }
