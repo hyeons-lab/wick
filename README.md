@@ -28,6 +28,18 @@ Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF
 
 Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
 
+### GPU backend (experimental, wgpu/Metal)
+
+Cross-platform GPU inference via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows, WebGPU in browsers). Feature-gated behind `gpu`.
+
+| Backend | Decode | Notes |
+|---------|-------:|-------|
+| wick CPU (NEON Q4_0) | 97 tok/s | Optimized NEON integer kernels |
+| **wick GPU (wgpu Metal)** | **49 tok/s** | Full WGSL compute pipeline |
+| llama.cpp (native Metal) | 171 tok/s | Reference, hand-tuned MSL |
+
+On Apple Silicon with unified memory, our CPU NEON path outperforms wgpu GPU because NEON's integer `vdotq_s32` dot products are extremely efficient and there's no GPU dispatch overhead. The wgpu backend value is cross-platform support (Linux/Windows discrete GPUs, WebGPU) where NEON isn't available.
+
 ### Key optimizations
 
 - **Batched GEMM prefill** — reads each weight matrix once for all N tokens (vs N times with per-token GEMV)
