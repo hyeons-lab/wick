@@ -7,12 +7,26 @@
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
-/// GPU compute context: device, queue, and pipeline cache.
+/// GPU compute context: device, queue, and optional timestamp profiling.
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
+    /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
+    pub profiler: Option<GpuProfiler>,
+}
+
+/// GPU timestamp profiler — records per-dispatch timing.
+pub struct GpuProfiler {
+    query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    read_buf: wgpu::Buffer,
+    timestamp_period: f32, // nanoseconds per tick
+    /// (label, start_idx, end_idx) for each recorded span.
+    spans: std::cell::RefCell<Vec<(String, u32, u32)>>,
+    next_query: std::cell::Cell<u32>,
+    max_queries: u32,
 }
 
 impl GpuContext {
@@ -32,10 +46,16 @@ impl GpuContext {
         let adapter_name = adapter.get_info().name.clone();
         let backend = format!("{:?}", adapter.get_info().backend);
 
+        let has_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let mut features = wgpu::Features::empty();
+        if has_timestamps {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wick-gpu"),
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 256 * 1024 * 1024, // 256MB
                     max_buffer_size: 2 * 1024 * 1024 * 1024,            // 2GB
@@ -46,6 +66,42 @@ impl GpuContext {
             None,
         ))
         .map_err(|e| anyhow::anyhow!("failed to request GPU device: {e}"))?;
+
+        let profiler = if has_timestamps {
+            let max_queries = 512u32; // enough for ~16 layers × ~16 dispatches
+            let timestamp_period = queue.get_timestamp_period();
+            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("profiler"),
+                ty: wgpu::QueryType::Timestamp,
+                count: max_queries,
+            });
+            let buf_size = (max_queries as u64) * 8; // u64 per timestamp
+            let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("profiler-resolve"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("profiler-read"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            tracing::info!("GPU timestamp profiling enabled (period={timestamp_period}ns/tick)");
+            Some(GpuProfiler {
+                query_set,
+                resolve_buf,
+                read_buf,
+                timestamp_period,
+                spans: std::cell::RefCell::new(Vec::new()),
+                next_query: std::cell::Cell::new(0),
+                max_queries,
+            })
+        } else {
+            tracing::info!("GPU timestamp profiling not available");
+            None
+        };
 
         tracing::info!(
             adapter = %adapter_name,
@@ -58,6 +114,7 @@ impl GpuContext {
             queue,
             adapter_name,
             backend,
+            profiler,
         })
     }
 
@@ -145,6 +202,99 @@ impl GpuContext {
                 compilation_options: Default::default(),
                 cache: None,
             })
+    }
+
+    /// Get timestamp_writes for a compute pass (if profiling enabled).
+    /// Returns (begin_query_idx, end_query_idx) for later resolution.
+    pub fn begin_profile_span(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let profiler = self.profiler.as_ref()?;
+        let idx = profiler.next_query.get();
+        if idx + 2 > profiler.max_queries {
+            return None; // out of query slots
+        }
+        profiler.next_query.set(idx + 2);
+        profiler
+            .spans
+            .borrow_mut()
+            .push((label.to_string(), idx, idx + 1));
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &profiler.query_set,
+            beginning_of_pass_write_index: Some(idx),
+            end_of_pass_write_index: Some(idx + 1),
+        })
+    }
+
+    /// Reset profiler for a new forward pass.
+    pub fn reset_profiler(&self) {
+        if let Some(profiler) = &self.profiler {
+            profiler.next_query.set(0);
+            profiler.spans.borrow_mut().clear();
+        }
+    }
+
+    /// Resolve timestamps and print per-span timings.
+    pub fn finish_profiler(&self) {
+        let profiler = match &self.profiler {
+            Some(p) => p,
+            None => return,
+        };
+        let n_queries = profiler.next_query.get();
+        if n_queries == 0 {
+            return;
+        }
+
+        // Resolve queries → resolve_buf, then copy → read_buf
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.resolve_query_set(&profiler.query_set, 0..n_queries, &profiler.resolve_buf, 0);
+        enc.copy_buffer_to_buffer(
+            &profiler.resolve_buf,
+            0,
+            &profiler.read_buf,
+            0,
+            (n_queries as u64) * 8,
+        );
+        self.queue.submit(Some(enc.finish()));
+
+        let slice = profiler.read_buf.slice(..((n_queries as u64) * 8));
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let timestamps: &[u64] = bytemuck::cast_slice(&data);
+
+        let period_ns = profiler.timestamp_period as f64;
+        let spans = profiler.spans.borrow();
+
+        // Aggregate by label
+        let mut totals: std::collections::HashMap<String, (f64, usize)> =
+            std::collections::HashMap::new();
+        for (label, start_idx, end_idx) in spans.iter() {
+            let start = timestamps[*start_idx as usize];
+            let end = timestamps[*end_idx as usize];
+            let us = (end.wrapping_sub(start)) as f64 * period_ns / 1000.0;
+            let entry = totals.entry(label.clone()).or_insert((0.0, 0));
+            entry.0 += us;
+            entry.1 += 1;
+        }
+
+        let mut sorted: Vec<_> = totals.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        let total_us: f64 = sorted.iter().map(|(_, (us, _))| us).sum();
+
+        eprintln!("── GPU Profile ({total_us:.0}µs total) ──");
+        for (label, (us, count)) in &sorted {
+            let pct = us / total_us * 100.0;
+            eprintln!("  {label:20} {us:8.0}µs ({count:3}×) {pct:5.1}%");
+        }
+
+        drop(data);
+        profiler.read_buf.unmap();
     }
 }
 

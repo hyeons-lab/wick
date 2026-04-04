@@ -313,6 +313,28 @@ impl GpuLfm2Model {
 
     // ── GPU dispatch helpers ────────────────────────────────────────────
 
+    /// Generic dispatch: create encoder, begin profiled compute pass, set pipeline + bind group, dispatch.
+    fn dispatch(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: (u32, u32, u32),
+        label: &str,
+    ) {
+        let ts = self.ctx.begin_profile_span(label);
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: ts,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
     /// Dispatch GEMV: y[m] = A[m,k] × x[k]
     fn dispatch_gemv(
         &self,
@@ -351,17 +373,14 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        // wgpu max dispatch per dimension is 65535; use y-dimension for overflow
         let dispatch_x = m.min(65535);
         let dispatch_y = (m + 65534) / 65535;
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.gemv_f32);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(
+            &self.pipelines.gemv_f32,
+            &bg,
+            (dispatch_x, dispatch_y, 1),
+            "gemv",
+        );
     }
 
     /// Dispatch rmsnorm in-place on a buffer.
@@ -391,14 +410,7 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.rmsnorm);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(&self.pipelines.rmsnorm, &bg, (1, 1, 1), "rmsnorm");
     }
 
     /// Dispatch element-wise add: a += b
@@ -428,14 +440,12 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.add_inplace);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(
+            &self.pipelines.add_inplace,
+            &bg,
+            ((n + 255) / 256, 1, 1),
+            "add",
+        );
     }
 
     /// Dispatch fused silu_mul: gate = silu(gate) * up
@@ -465,14 +475,12 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.silu_mul_inplace);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(
+            &self.pipelines.silu_mul_inplace,
+            &bg,
+            ((n + 255) / 256, 1, 1),
+            "silu_mul",
+        );
     }
 
     /// Dispatch RoPE on Q and K buffers.
@@ -512,14 +520,12 @@ impl GpuLfm2Model {
                 ],
             });
         let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.rope);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((max_pairs + 255) / 256, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(
+            &self.pipelines.rope,
+            &bg,
+            ((max_pairs + 255) / 256, 1, 1),
+            "rope",
+        );
     }
 
     /// Dispatch fused attention for all heads.
@@ -582,14 +588,7 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.attention);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(n_heads, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(&self.pipelines.attention, &bg, (n_heads, 1, 1), "attention");
     }
 
     /// Dispatch conv1d depthwise with rolling buffer update.
@@ -636,14 +635,12 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines.conv1d);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((hidden_size + 255) / 256, 1, 1);
-        }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.dispatch(
+            &self.pipelines.conv1d,
+            &bg,
+            ((hidden_size + 255) / 256, 1, 1),
+            "conv1d",
+        );
     }
 
     /// Copy n f32 elements between GPU buffers at given byte offsets.
@@ -669,6 +666,8 @@ impl Model for GpuLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
+
+        self.ctx.reset_profiler();
 
         // 1. Embedding lookup from CPU cache (4KB upload per token — negligible)
         let emb_offset = token_id * hs;
@@ -904,10 +903,11 @@ impl Model for GpuLfm2Model {
             hs32,
         );
 
-        // 5. Update seq_len and read back logits
+        // 5. Update seq_len, profile, and read back logits
         self.gpu_state.seq_len.set(self.gpu_state.seq_len.get() + 1);
         state.seq_len += 1;
         self.ctx.device.poll(wgpu::Maintain::Wait);
+        self.ctx.finish_profiler();
         self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
     }
 
