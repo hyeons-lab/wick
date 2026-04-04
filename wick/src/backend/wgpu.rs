@@ -942,8 +942,8 @@ mod tests {
             Err(_) => return,
         };
 
-        // Build a small Q4_0 weight matrix (4 rows × 64 elements)
-        let m = 4u32;
+        // Build a small Q4_0 weight matrix (8 rows × 64 elements — matches shader ROWS_PER_WG)
+        let m = 8u32;
         let k = 64u32;
         let nb = k / 32;
 
@@ -1026,8 +1026,8 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            // Shader processes 4 rows per workgroup
-            pass.dispatch_workgroups(m.div_ceil(4), 1, 1);
+            // Shader processes 8 rows per workgroup
+            pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 

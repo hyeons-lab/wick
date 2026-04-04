@@ -393,11 +393,11 @@ impl GpuLfm2Model {
             });
         // Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
         let workgroups_x = match w.dtype {
-            DType::Q4_0 => w.m.div_ceil(4).min(65535),
+            DType::Q4_0 => w.m.div_ceil(8).min(65535),
             _ => w.m.min(65535),
         };
         let workgroups_y = match w.dtype {
-            DType::Q4_0 => w.m.div_ceil(4).div_ceil(65535),
+            DType::Q4_0 => w.m.div_ceil(8).div_ceil(65535),
             _ => w.m.div_ceil(65535),
         };
         self.encode(enc, pipeline, &bg, (workgroups_x, workgroups_y, 1), label);
