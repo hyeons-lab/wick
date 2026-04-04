@@ -39,8 +39,9 @@ pub trait Model: Send {
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
 
-    /// Batched forward pass for prefill: process all tokens through each layer
-    /// using GEMM instead of sequential GEMV. Returns logits for the LAST token only.
+    /// Batched forward pass for prefill: process all prompt tokens at once.
+    /// Implementations may use GEMM for linear projections. Returns logits for the LAST token only.
+    /// Default: falls back to sequential single-token `forward()` calls.
     fn forward_prefill(
         &self,
         tokens: &[u32],

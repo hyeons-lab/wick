@@ -384,6 +384,12 @@ impl Lfm2Model {
 
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
     fn dequantize_row(&self, wref: &WeightRef, row_idx: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; wref.k];
+        self.dequantize_row_into(wref, row_idx, &mut out);
+        out
+    }
+
+    fn dequantize_row_into(&self, wref: &WeightRef, row_idx: usize, out: &mut [f32]) {
         assert!(
             row_idx < wref.m,
             "dequantize_row: row_idx {row_idx} out of range (m={})",
@@ -394,19 +400,17 @@ impl Lfm2Model {
         let row_start = row_idx * row_bytes;
         let row_data = &data[row_start..row_start + row_bytes];
 
-        let mut out = vec![0.0f32; wref.k];
         match wref.dtype {
-            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, &mut out),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, &mut out),
-            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, &mut out),
-            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, &mut out),
+            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
+            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
             DType::F32 => {
                 let floats: &[f32] = bytemuck::cast_slice(row_data);
                 out.copy_from_slice(floats);
             }
             _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
         }
-        out
     }
 
     /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
@@ -782,13 +786,24 @@ impl Model for Lfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let n = tokens.len();
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill requires at least one token"
+        );
 
-        // 1. Embed all tokens → hidden[hs, n] (column-major: column j = token j's embedding)
+        // 1. Embed all tokens → hidden[hs × n] with stride n (token j at indices [j, n+j, 2n+j, ...])
         let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
         for (j, &token_id) in tokens.iter().enumerate() {
-            let emb = self.dequantize_row(&self.embd_ref, token_id as usize);
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
             for i in 0..hs {
-                hidden[i * n + j] = emb[i]; // column-major
+                hidden[i * n + j] = emb_buf[i];
             }
         }
 
@@ -983,6 +998,15 @@ impl Model for Lfm2Model {
                         );
 
                         // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
+                        // Pre-reserve KV cache to avoid repeated reallocations
+                        if let LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                        } = &mut state.layers[layer]
+                        {
+                            key_cache.reserve(n * kv_dim);
+                            value_cache.reserve(n * kv_dim);
+                        }
                         let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
                         let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
                         let group_size = cfg.n_heads / n_kv_heads;
@@ -1164,10 +1188,7 @@ impl Model for Lfm2Model {
                 self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
 
                 // Fused SiLU+mul (row-major is×n)
-                for idx in 0..is * n {
-                    let g = gate_mat[idx];
-                    gate_mat[idx] = g / (1.0 + (-g).exp()) * up_mat[idx];
-                }
+                cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
                 // Re-quantize gate_mat columns for down projection
                 Self::quantize_columns(
@@ -1273,6 +1294,18 @@ impl Model for Lfm2Model {
         cpu::rmsnorm(&mut last_hidden, &self.output_norm_weight, cfg.rms_norm_eps);
 
         let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&last_hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &last_hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.gemv(&self.embd_ref, &last_hidden, &mut logits);
 
         logits
