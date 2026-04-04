@@ -267,4 +267,221 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_gpu_gemv_f32_realistic() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // Realistic LFM2 FFN gate: 2816 × 1024
+        let m = 2816u32;
+        let k = 1024u32;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 997) as f32 * 0.001 - 0.5)
+            .collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 + 7) % 251) as f32 * 0.01 - 1.25)
+            .collect();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; m as usize];
+        for i in 0..m as usize {
+            for j in 0..k as usize {
+                expected[i] += a[i * k as usize + j] * x[j];
+            }
+        }
+
+        // GPU
+        let a_buf = ctx.upload_f32(&a, "A");
+        let x_buf = ctx.upload_f32(&x, "x");
+        let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
+        let params = [m, k];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32");
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(m, 1, 1);
+        }
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let result = ctx.download_f32(&y_buf, m as usize);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..m as usize {
+            let diff = (expected[i] - result[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.1, // wider tolerance for large dot products
+                "GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+        println!(
+            "GPU GEMV 2816×1024: max_diff={max_diff:.6}, all {} rows match",
+            m
+        );
+    }
+
+    #[test]
+    fn test_gpu_elementwise_add() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n = 1024u32;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.05).collect();
+        let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+        let a_buf = ctx.create_storage_rw((n as u64) * 4, "a");
+        ctx.queue.write_buffer(&a_buf, 0, bytemuck::cast_slice(&a));
+        let b_buf = ctx.upload_f32(&b, "b");
+        let params = [n, 0u32];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add_inplace");
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+        }
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let result = ctx.download_f32(&a_buf, n as usize);
+        for i in 0..n as usize {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(diff < 1e-5, "add mismatch at {i}: {diff}");
+        }
+    }
+
+    #[test]
+    fn test_gpu_silu_mul() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n = 512u32;
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.02).collect();
+        let up: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let expected: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+
+        let gate_buf = ctx.create_storage_rw((n as u64) * 4, "gate");
+        ctx.queue
+            .write_buffer(&gate_buf, 0, bytemuck::cast_slice(&gate));
+        let up_buf = ctx.upload_f32(&up, "up");
+        let params = [n, 0u32];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace", "silu_mul");
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gate_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: up_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+        }
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let result = ctx.download_f32(&gate_buf, n as usize);
+        for i in 0..n as usize {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "silu_mul mismatch at {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
 }
