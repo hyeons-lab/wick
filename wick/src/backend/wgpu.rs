@@ -153,6 +153,11 @@ impl GpuContext {
 pub mod shaders {
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
+    pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
+    pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
+    pub const ROPE: &str = include_str!("shaders/rope.wgsl");
+    pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
+    pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -635,6 +640,132 @@ mod tests {
             assert!(
                 diff < 1e-4,
                 "silu_mul mismatch at {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_rmsnorm() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n = 1024u32;
+        let eps = 1e-5f32;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 512.0) * 0.01).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.8 + (i as f32 % 7.0) * 0.05).collect();
+
+        // CPU reference
+        let mut expected = x.clone();
+        crate::backend::cpu::rmsnorm(&mut expected, &weight, eps);
+
+        // GPU
+        let x_buf = ctx.create_storage_rw((n as u64) * 4, "x");
+        ctx.queue.write_buffer(&x_buf, 0, bytemuck::cast_slice(&x));
+        let w_buf = ctx.upload_f32(&weight, "w");
+        let params = [n, eps.to_bits(), 0u32, 0u32];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let result = ctx.download_f32(&x_buf, n as usize);
+        for i in 0..n as usize {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "rmsnorm mismatch at {i}: cpu={}, gpu={}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_softmax() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n = 128u32;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 64.0) * 0.1).collect();
+
+        // CPU reference
+        let mut expected = x.clone();
+        crate::backend::cpu::softmax_inplace(&mut expected);
+
+        // GPU
+        let x_buf = ctx.create_storage_rw((n as u64) * 4, "x");
+        ctx.queue.write_buffer(&x_buf, 0, bytemuck::cast_slice(&x));
+        let params = [n, 0u32];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let result = ctx.download_f32(&x_buf, n as usize);
+        let sum: f32 = result.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "softmax sum should be 1.0, got {sum}"
+        );
+        for i in 0..n as usize {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-5,
+                "softmax mismatch at {i}: cpu={}, gpu={}",
                 expected[i],
                 result[i]
             );
