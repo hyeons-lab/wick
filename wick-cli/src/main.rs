@@ -94,10 +94,19 @@ fn load_model_for_device(
             eprintln!("Using GPU backend");
             wick::model::load_model_gpu(gguf)
         }
-        "cpu" => wick::model::load_model(gguf),
-        "auto" | _ => wick::model::load_model(gguf),
         #[cfg(not(feature = "gpu"))]
         "gpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
+        "cpu" => wick::model::load_model(gguf),
+        _ => {
+            // "auto" or unknown: try GPU if available, fall back to CPU
+            #[cfg(feature = "gpu")]
+            {
+                eprintln!("Using GPU backend (auto)");
+                return wick::model::load_model_gpu(gguf);
+            }
+            #[cfg(not(feature = "gpu"))]
+            wick::model::load_model(gguf)
+        }
     }
 }
 

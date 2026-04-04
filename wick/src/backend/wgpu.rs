@@ -233,7 +233,6 @@ impl GpuContext {
     }
 
     /// Resolve timestamps and print per-span timings.
-    /// Resolve timestamps and print per-span timings.
     /// Only prints if WICK_GPU_PROFILE=1 env var is set.
     pub fn finish_profiler(&self) {
         if std::env::var("WICK_GPU_PROFILE").as_deref() != Ok("1") {

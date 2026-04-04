@@ -609,6 +609,14 @@ impl Model for GpuLfm2Model {
 
         self.ctx.reset_profiler();
 
+        // Bounds check: KV cache capacity
+        assert!(
+            self.gpu_state.seq_len.get() < self.gpu_state.max_seq_len,
+            "GPU seq_len {} exceeds max_seq_len {}",
+            self.gpu_state.seq_len.get(),
+            self.gpu_state.max_seq_len,
+        );
+
         // 1. Embedding lookup from CPU cache (4KB upload per token)
         let emb_offset = token_id * hs;
         self.ctx.queue.write_buffer(
@@ -812,19 +820,13 @@ impl Model for GpuLfm2Model {
                     .queue
                     .write_buffer(&self.k_buf, 0, bytemuck::cast_slice(&k_data));
 
-                // Append V to cache (V doesn't need CPU processing)
+                // Encoder 2: KV cache copy (K+V on GPU, no CPU roundtrip) + attention + out_proj + residual
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
                 let seq_len = self.gpu_state.seq_len.get();
                 let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
-                self.ctx.queue.write_buffer(
-                    v_cache,
-                    kv_offset,
-                    bytemuck::cast_slice(&self.ctx.download_f32(&self.v_buf, kv_dim as usize)),
-                );
-
-                // Encoder 2: KV cache copy + attention + out_proj + residual (5 dispatches)
                 let mut enc = self.new_encoder();
                 self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
+                self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
                 let attn_seq_len = (seq_len + 1) as u32;
                 let scale = 1.0 / (head_dim as f32).sqrt();
                 self.encode_attention(
