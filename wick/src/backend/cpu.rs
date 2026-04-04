@@ -171,6 +171,29 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
+/// Like `par_rows` but for GEMM output where each "row" is `n` contiguous f32 elements.
+/// `f` receives (row_index, &mut [f32; n]).
+pub fn par_rows_n(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
+    let m = y.len() / n;
+    let rows_per_chunk = (m / rayon::current_num_threads()).max(min_rows);
+    let elems_per_chunk = rows_per_chunk * n;
+    y.par_chunks_mut(elems_per_chunk)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let base_row = ci * rows_per_chunk;
+            for (j, row) in chunk.chunks_mut(n).enumerate() {
+                f((base_row + j, row));
+            }
+        });
+}
+
 #[allow(clippy::ptr_arg)]
 /// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
 ///

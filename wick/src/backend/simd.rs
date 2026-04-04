@@ -619,6 +619,105 @@ pub(crate) mod neon {
         }
     }
 
+    /// Batched GEMM: C[m, n] = A_q4_0[m, k] @ B_q8_0[k, n].
+    ///
+    /// `b_scales` layout: n columns × blocks_per_col, i.e. b_scales[j * nb + b]
+    /// `b_quants` layout: n columns × k elements, i.e. b_quants[j * k + b*32..]
+    /// `out` layout: row-major m × n, i.e. out[i * n + j]
+    ///
+    /// Reads each weight row once and dots against all n Q8_0 columns.
+    /// Parallelized across output rows with rayon.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q4_0_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ4_0>();
+
+            // Wrap pointers for Send+Sync in rayon closures
+            let a_ptr = a_quant.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+
+            // Process rows in chunks for rayon.
+            // Column-first: for each column, do full dot product. Weight data stays
+            // in L2 cache across columns since we process all columns for same row.
+            let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
+                let mask_lo = vdupq_n_u8(0x0F);
+                let offset_8 = vdupq_n_s8(0x8);
+                let row_start = i * row_bytes;
+                let a_base = a_ptr as *const u8;
+
+                for j in 0..n {
+                    let mut sumv0 = vdupq_n_f32(0.0);
+                    let mut sumv1 = vdupq_n_f32(0.0);
+                    let xq_base = (bq_ptr as *const i8).add(j * k);
+                    let xs_base = (bs_ptr as *const f32).add(j * nb);
+
+                    let mut bi = 0usize;
+                    while bi + 1 < nb {
+                        let b0 = &*(a_base.add(row_start + bi * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+                        let b1 = &*(a_base.add(row_start + (bi + 1) * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+
+                        let v0 = vld1q_u8(b0.qs.as_ptr());
+                        let v1 = vld1q_u8(b1.qs.as_ptr());
+                        let v0_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_lo)), offset_8);
+                        let v0_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), offset_8);
+                        let v1_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_lo)), offset_8);
+                        let v1_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), offset_8);
+
+                        let y0_lo = vld1q_s8(xq_base.add(bi * 32));
+                        let y0_hi = vld1q_s8(xq_base.add(bi * 32 + 16));
+                        let y1_lo = vld1q_s8(xq_base.add((bi + 1) * 32));
+                        let y1_hi = vld1q_s8(xq_base.add((bi + 1) * 32 + 16));
+
+                        let z = vdupq_n_s32(0);
+                        let p_0 = vdotq_s32(vdotq_s32(z, v0_lo, y0_lo), v0_hi, y0_hi);
+                        let p_1 = vdotq_s32(vdotq_s32(z, v1_lo, y1_lo), v1_hi, y1_hi);
+
+                        let d0 = f16::from_bits(b0.d).to_f32() * *xs_base.add(bi);
+                        let d1 = f16::from_bits(b1.d).to_f32() * *xs_base.add(bi + 1);
+                        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+                        bi += 2;
+                    }
+
+                    if bi < nb {
+                        let b = &*(a_base.add(row_start + bi * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+                        let v = vld1q_u8(b.qs.as_ptr());
+                        let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                        let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+                        let y_lo = vld1q_s8(xq_base.add(bi * 32));
+                        let y_hi = vld1q_s8(xq_base.add(bi * 32 + 16));
+                        let z = vdupq_n_s32(0);
+                        let p = vdotq_s32(vdotq_s32(z, v_lo, y_lo), v_hi, y_hi);
+                        let d = f16::from_bits(b.d).to_f32() * *xs_base.add(bi);
+                        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                    }
+
+                    row_out[j] = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+                }
+            };
+
+            // out is m × n row-major: chunk by n elements per row
+            if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+    }
+
     /// NEON Q6_K GEMV: quantizes x to Q8_0 using scratch, then calls integer path.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemv_q6k_f32_neon(

@@ -745,6 +745,27 @@ impl Model for Lfm2Model {
         let mut gate_col = vec![0.0f32; cfg.intermediate_size];
         let mut up_col = vec![0.0f32; cfg.intermediate_size];
         let mut out_col = vec![0.0f32; hs];
+        // Pre-allocated GEMM buffers (reused across layers)
+        #[cfg(target_arch = "aarch64")]
+        let is = cfg.intermediate_size;
+        #[cfg(target_arch = "aarch64")]
+        let nb_hs = hs / 32;
+        #[cfg(target_arch = "aarch64")]
+        let nb_is = is / 32;
+        #[cfg(target_arch = "aarch64")]
+        let mut bq_scales = vec![0.0f32; n * nb_hs];
+        #[cfg(target_arch = "aarch64")]
+        let mut bq_quants = vec![0i8; n * hs];
+        #[cfg(target_arch = "aarch64")]
+        let mut gate_mat = vec![0.0f32; is * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut up_mat = vec![0.0f32; is * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut dq_scales = vec![0.0f32; n * nb_is];
+        #[cfg(target_arch = "aarch64")]
+        let mut dq_quants = vec![0i8; n * is];
+        #[cfg(target_arch = "aarch64")]
+        let mut inter_col = vec![0.0f32; is];
 
         for layer in 0..cfg.n_layers {
             // RMSnorm each column independently
@@ -803,61 +824,141 @@ impl Model for Lfm2Model {
                 }
             }
 
-            // FFN per-token using fast integer GEMV path
+            // FFN: batched GEMM on aarch64 Q4_0 (reads weights once for all n tokens)
             let refs = &self.layer_refs[layer];
-            ffn_out.fill(0.0);
-            for j in 0..n {
-                // Extract FFN input column
-                for i in 0..hs {
-                    col[i] = ffn_input[i * n + j];
+            #[cfg(target_arch = "aarch64")]
+            let used_gemm = if refs.ffn_gate.dtype == DType::Q4_0 {
+                // Pre-quantize all n columns to Q8_0
+                for j in 0..n {
+                    for i in 0..hs {
+                        col[i] = ffn_input[i * n + j];
+                    }
+                    unsafe {
+                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                            &col,
+                            &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
+                            &mut bq_quants[j * hs..(j + 1) * hs],
+                        );
+                    }
                 }
 
-                // Gate + Up (share quantized input)
-                #[cfg(target_arch = "aarch64")]
-                Self::quantize_to_scratch(&col, state);
-
-                #[cfg(target_arch = "aarch64")]
-                {
-                    self.gemv_preq(
-                        &refs.ffn_gate,
-                        &col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut gate_col,
+                // Gate + Up via batched GEMM
+                let gate_data = self.weight_data(&refs.ffn_gate);
+                let up_data = self.weight_data(&refs.ffn_up);
+                unsafe {
+                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                        gate_data,
+                        &bq_scales,
+                        &bq_quants,
+                        &mut gate_mat,
+                        is,
+                        n,
+                        hs,
                     );
-                    self.gemv_preq(
-                        &refs.ffn_up,
-                        &col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut up_col,
-                    );
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    self.gemv(&refs.ffn_gate, &col, &mut gate_col);
-                    self.gemv(&refs.ffn_up, &col, &mut up_col);
-                }
-
-                cpu::silu_mul_inplace(&mut gate_col, &up_col);
-
-                // Down projection
-                #[cfg(target_arch = "aarch64")]
-                {
-                    Self::quantize_to_scratch(&gate_col, state);
-                    self.gemv_preq(
-                        &refs.ffn_down,
-                        &gate_col,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut out_col,
+                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                        up_data,
+                        &bq_scales,
+                        &bq_quants,
+                        &mut up_mat,
+                        is,
+                        n,
+                        hs,
                     );
                 }
-                #[cfg(not(target_arch = "aarch64"))]
-                self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
 
-                for i in 0..hs {
-                    ffn_out[i * n + j] = out_col[i];
+                // Fused SiLU+mul (row-major is×n)
+                for idx in 0..is * n {
+                    let g = gate_mat[idx];
+                    gate_mat[idx] = g / (1.0 + (-g).exp()) * up_mat[idx];
+                }
+
+                // Re-quantize gate_mat columns for down projection
+                for j in 0..n {
+                    for i in 0..is {
+                        inter_col[i] = gate_mat[i * n + j];
+                    }
+                    unsafe {
+                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                            &inter_col,
+                            &mut dq_scales[j * nb_is..(j + 1) * nb_is],
+                            &mut dq_quants[j * is..(j + 1) * is],
+                        );
+                    }
+                }
+
+                // Down via batched GEMM
+                let down_data = self.weight_data(&refs.ffn_down);
+                unsafe {
+                    crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                        down_data,
+                        &dq_scales,
+                        &dq_quants,
+                        &mut ffn_out,
+                        hs,
+                        n,
+                        is,
+                    );
+                }
+                true
+            } else {
+                false
+            };
+
+            // Fallback: per-token GEMV (non-aarch64, or non-Q4_0 weights)
+            #[cfg(target_arch = "aarch64")]
+            let need_fallback = !used_gemm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let need_fallback = true;
+            if need_fallback {
+                ffn_out.fill(0.0);
+                for j in 0..n {
+                    for i in 0..hs {
+                        col[i] = ffn_input[i * n + j];
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        Self::quantize_to_scratch(&col, state);
+                        self.gemv_preq(
+                            &refs.ffn_gate,
+                            &col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut gate_col,
+                        );
+                        self.gemv_preq(
+                            &refs.ffn_up,
+                            &col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut up_col,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        self.gemv(&refs.ffn_gate, &col, &mut gate_col);
+                        self.gemv(&refs.ffn_up, &col, &mut up_col);
+                    }
+
+                    cpu::silu_mul_inplace(&mut gate_col, &up_col);
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        Self::quantize_to_scratch(&gate_col, state);
+                        self.gemv_preq(
+                            &refs.ffn_down,
+                            &gate_col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut out_col,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
+
+                    for i in 0..hs {
+                        ffn_out[i * n + j] = out_col[i];
+                    }
                 }
             }
 
