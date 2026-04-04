@@ -6,7 +6,7 @@
 //     Each byte encodes 2 elements: lo nibble = elem[i], hi nibble = elem[i+16]
 //   Dequantized: val = (nibble - 8) * delta
 //
-// Optimized: 128 threads/workgroup, process 8 nibbles per u32 word load.
+// Optimized: 32 threads/workgroup = 1 subgroup, pure subgroup reduction.
 //
 // Dispatch: (min(m, 65535), ceil(m/65535), 1) — one workgroup per row
 
@@ -15,9 +15,7 @@
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
-var<workgroup> shared_sums: array<f32, 128>;
-
-@compute @workgroup_size(128, 1, 1)
+@compute @workgroup_size(32, 1, 1)
 fn gemv_q4_0(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -110,29 +108,13 @@ fn gemv_q4_0(
         partial_sum += process_4bytes(n2, col_base, 8u, delta);
         partial_sum += process_4bytes(n3, col_base, 12u, delta);
 
-        bi += 128u;
+        bi += 32u;
     }
 
-    // Workgroup reduction (8 steps for 128 threads)
-    shared_sums[tid] = partial_sum;
-    workgroupBarrier();
-    if tid < 64u { shared_sums[tid] += shared_sums[tid + 64u]; }
-    workgroupBarrier();
-    if tid < 32u { shared_sums[tid] += shared_sums[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { shared_sums[tid] += shared_sums[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { shared_sums[tid] += shared_sums[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { shared_sums[tid] += shared_sums[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { shared_sums[tid] += shared_sums[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { shared_sums[tid] += shared_sums[tid + 1u]; }
-    workgroupBarrier();
-
+    // Single subgroup reduction — no workgroup barriers needed
+    let total = subgroupAdd(partial_sum);
     if tid == 0u {
-        y[row] = shared_sums[0];
+        y[row] = total;
     }
 }
 

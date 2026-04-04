@@ -49,9 +49,13 @@ impl GpuContext {
         let profile_requested = std::env::var("WICK_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
             profile_requested && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let has_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         let mut features = wgpu::Features::empty();
         if has_timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if has_subgroup {
+            features |= wgpu::Features::SUBGROUP;
         }
 
         let (device, queue) = pollster::block_on(adapter.request_device(
@@ -108,6 +112,7 @@ impl GpuContext {
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
+            subgroup = has_subgroup,
             "GPU initialized"
         );
 
