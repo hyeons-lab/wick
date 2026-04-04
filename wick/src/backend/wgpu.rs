@@ -385,10 +385,22 @@ mod tests {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -442,9 +454,62 @@ mod tests {
         let cpu_us = cpu_elapsed.as_micros() as f64 / cpu_iters as f64;
         let cpu_gflops = (2.0 * m as f64 * k as f64) / (cpu_us * 1e3);
 
+        // NEON Q4_0 GEMV timing (the actual decode hot path)
+        #[cfg(target_arch = "aarch64")]
+        let neon_q4_us = {
+            // Build synthetic Q4_0 weight data inline
+            let nb = k as usize / 32;
+            let mut q4_bytes = Vec::new();
+            for row in 0..m as usize {
+                for b in 0..nb {
+                    let start = row * k as usize + b * 32;
+                    let block = &a[start..start + 32];
+                    let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                    let d = amax / 7.0;
+                    let d_f16 = half::f16::from_f32(d);
+                    q4_bytes.extend_from_slice(&d_f16.to_bits().to_le_bytes());
+                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                    let mut qs = [0u8; 16];
+                    for i in 0..16 {
+                        let lo = ((block[i] * id + 8.5) as u8).min(15);
+                        let hi = ((block[16 + i] * id + 8.5) as u8).min(15);
+                        qs[i] = lo | (hi << 4);
+                    }
+                    q4_bytes.extend_from_slice(&qs);
+                }
+            }
+            let mut q4_y = vec![0.0f32; m as usize];
+            let mut q8s = Vec::new();
+            let mut q8q = Vec::new();
+            let q4_iters = 1000;
+            let q4_start = std::time::Instant::now();
+            for _ in 0..q4_iters {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q4_0_f32_neon(
+                        &q4_bytes, &x, &mut q4_y, m as usize, k as usize, &mut q8s, &mut q8q,
+                    );
+                }
+                std::hint::black_box(&q4_y);
+            }
+            let q4_elapsed = q4_start.elapsed();
+            q4_elapsed.as_micros() as f64 / q4_iters as f64
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let neon_q4_us = 0.0;
+        let neon_q4_gflops = if neon_q4_us > 0.0 {
+            (2.0 * m as f64 * k as f64) / (neon_q4_us * 1e3)
+        } else {
+            0.0
+        };
+
         println!(
-            "GEMV f32 {m}×{k}: GPU={us_per_gemv:.0}µs ({gflops:.1} GFLOPS), CPU(scalar)={cpu_us:.0}µs ({cpu_gflops:.1} GFLOPS), speedup={:.1}x",
-            cpu_us / us_per_gemv
+            "GEMV {m}×{k}:\n  GPU(f32 Metal)     = {us_per_gemv:.0}µs ({gflops:.1} GFLOPS)\n  CPU(scalar f32)    = {cpu_us:.0}µs ({cpu_gflops:.1} GFLOPS)\n  CPU(NEON Q4_0)     = {neon_q4_us:.0}µs ({neon_q4_gflops:.1} GFLOPS)\n  GPU vs scalar:  {:.1}x\n  GPU vs NEON Q4_0: {:.1}x",
+            cpu_us / us_per_gemv,
+            if neon_q4_us > 0.0 {
+                neon_q4_us / us_per_gemv
+            } else {
+                0.0
+            },
         );
     }
 
