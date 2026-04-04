@@ -534,7 +534,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
 
 /// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
 /// `k_cache` has stride `kv_dim` between timesteps; each key starts at offset `kv_h_offset`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn attn_scores(
     q_head: &[f32],
     k_cache: &[f32],
