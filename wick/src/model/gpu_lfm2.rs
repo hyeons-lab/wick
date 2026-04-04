@@ -14,12 +14,15 @@ use crate::kv_cache::InferenceState;
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
 
-/// A weight matrix on GPU — tracks buffer + dtype for dispatch.
+/// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     buf: wgpu::Buffer,
     dtype: DType,
     m: u32, // output rows
-    k: u32, // input cols
+    #[allow(dead_code)]
+    k: u32, // input cols (stored in params_buf for shader access)
+    /// Pre-allocated params buffer with [m, k] — eliminates per-dispatch allocation.
+    params_buf: wgpu::Buffer,
 }
 
 /// GPU buffer handles for one layer's weights.
@@ -152,19 +155,22 @@ impl GpuLfm2Model {
 
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
             let buf = if wref.dtype == DType::Q4_0 {
-                // Upload raw quantized bytes — shader dequantizes on the fly
                 let data = cpu_model.weight_bytes(wref);
                 ctx.upload_storage(data, name)
             } else {
-                // Dequantize to f32 for unsupported quant types
                 let f32_data = cpu_model.dequantize_weight(wref);
                 ctx.upload_f32(&f32_data, name)
             };
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]),
+                &format!("{name}.params"),
+            );
             GpuWeight {
                 buf,
                 dtype: wref.dtype,
                 m: wref.m as u32,
                 k: wref.k as u32,
+                params_buf,
             }
         };
 
@@ -360,9 +366,6 @@ impl GpuLfm2Model {
             DType::Q4_0 => "gemv_q4",
             _ => "gemv_f32",
         };
-        let params_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&[w.m, w.k]), "p");
         let bg = self
             .ctx
             .device
@@ -384,17 +387,20 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: params_buf.as_entire_binding(),
+                        resource: w.params_buf.as_entire_binding(),
                     },
                 ],
             });
-        self.encode(
-            enc,
-            pipeline,
-            &bg,
-            (w.m.min(65535), w.m.div_ceil(65535), 1),
-            label,
-        );
+        // Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
+        let workgroups_x = match w.dtype {
+            DType::Q4_0 => w.m.div_ceil(4).min(65535),
+            _ => w.m.min(65535),
+        };
+        let workgroups_y = match w.dtype {
+            DType::Q4_0 => w.m.div_ceil(4).div_ceil(65535),
+            _ => w.m.div_ceil(65535),
+        };
+        self.encode(enc, pipeline, &bg, (workgroups_x, workgroups_y, 1), label);
     }
 
     /// Encode f32 GEMV (for tied embeddings output projection which stays f32).

@@ -1026,7 +1026,8 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m, 1, 1);
+            // Shader processes 4 rows per workgroup
+            pass.dispatch_workgroups(m.div_ceil(4), 1, 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 
@@ -1034,12 +1035,12 @@ mod tests {
         for i in 0..m as usize {
             let diff = (expected[i] - result[i]).abs();
             assert!(
-                diff < 0.5, // wider tolerance for quantized
+                diff < 0.5,
                 "Q4_0 GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
                 expected[i],
                 result[i]
             );
         }
-        println!("Q4_0 GEMV {m}×{k}: all rows match (max_diff checked)");
+        println!("Q4_0 GEMV {m}×{k}: all rows match");
     }
 }
