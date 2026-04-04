@@ -599,12 +599,12 @@ impl Lfm2Model {
             let q = &state.scratch.q[..cfg.hidden_size];
             let scores = &mut state.scratch.scores;
 
+            scores.resize(seq_len, 0.0);
             for h in 0..cfg.n_heads {
                 let kv_h = h / group_size;
                 let q_head = &q[h * head_dim..(h + 1) * head_dim];
                 let kv_h_offset = kv_h * head_dim;
 
-                scores.resize(seq_len, 0.0);
                 cpu::attn_scores(
                     q_head,
                     k_cache,
@@ -1070,11 +1070,11 @@ impl Model for Lfm2Model {
                             let q = &state.scratch.q[..hs];
                             let scores = &mut state.scratch.scores;
 
+                            scores.resize(seq_len, 0.0);
                             for h in 0..cfg.n_heads {
                                 let kv_h = h / group_size;
                                 let q_head = &q[h * head_dim..(h + 1) * head_dim];
                                 let kv_h_offset = kv_h * head_dim;
-                                scores.resize(seq_len, 0.0);
                                 cpu::attn_scores(
                                     q_head,
                                     k_cache,

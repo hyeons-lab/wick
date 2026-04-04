@@ -603,12 +603,15 @@ pub fn attn_values(
         );
     }
     #[cfg(not(target_arch = "aarch64"))]
-    for d in 0..head_dim {
-        let mut val = 0.0f32;
+    {
+        attn_out[..head_dim].fill(0.0);
         for t in 0..seq_len {
-            val += scores[t] * v_cache[t * kv_dim + kv_h_offset + d];
+            let s = scores[t];
+            let v_base = t * kv_dim + kv_h_offset;
+            for d in 0..head_dim {
+                attn_out[d] += s * v_cache[v_base + d];
+            }
         }
-        attn_out[d] = val;
     }
 }
 
