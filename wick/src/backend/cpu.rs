@@ -576,6 +576,7 @@ pub fn attn_scores(
 
 /// Compute weighted sum of V cache for one head: attn_out[d] = sum_t(scores[t] * v[t,d]).
 /// `v_cache` has stride `kv_dim` between timesteps; each value starts at offset `kv_h_offset`.
+#[allow(clippy::needless_range_loop)]
 pub fn attn_values(
     scores: &[f32],
     v_cache: &[f32],
