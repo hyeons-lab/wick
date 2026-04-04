@@ -647,19 +647,111 @@ pub(crate) mod neon {
             let bs_ptr = b_scales.as_ptr() as usize;
 
             // Process rows in chunks for rayon.
-            // Column-first: for each column, do full dot product. Weight data stays
-            // in L2 cache across columns since we process all columns for same row.
+            // Hybrid approach: process columns in groups of 4, decoding each weight
+            // block pair once per group. This amortizes nibble extraction (4x fewer
+            // decodes) while keeping Q8_0 column data cache-friendly.
             let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
                 let mask_lo = vdupq_n_u8(0x0F);
                 let offset_8 = vdupq_n_s8(0x8);
                 let row_start = i * row_bytes;
                 let a_base = a_ptr as *const u8;
+                let bq_base = bq_ptr as *const i8;
+                let bs_base = bs_ptr as *const f32;
 
-                for j in 0..n {
+                // Process 4 columns at a time
+                let mut j = 0usize;
+                while j + 4 <= n {
+                    let mut s0a = vdupq_n_f32(0.0);
+                    let mut s0b = vdupq_n_f32(0.0);
+                    let mut s1a = vdupq_n_f32(0.0);
+                    let mut s1b = vdupq_n_f32(0.0);
+                    let mut s2a = vdupq_n_f32(0.0);
+                    let mut s2b = vdupq_n_f32(0.0);
+                    let mut s3a = vdupq_n_f32(0.0);
+                    let mut s3b = vdupq_n_f32(0.0);
+
+                    let xq0 = bq_base.add(j * k);
+                    let xq1 = bq_base.add((j + 1) * k);
+                    let xq2 = bq_base.add((j + 2) * k);
+                    let xq3 = bq_base.add((j + 3) * k);
+                    let xs0 = bs_base.add(j * nb);
+                    let xs1 = bs_base.add((j + 1) * nb);
+                    let xs2 = bs_base.add((j + 2) * nb);
+                    let xs3 = bs_base.add((j + 3) * nb);
+
+                    let mut bi = 0usize;
+                    while bi + 1 < nb {
+                        // Decode weight block pair ONCE
+                        let b0 = &*(a_base.add(row_start + bi * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+                        let b1 = &*(a_base.add(row_start + (bi + 1) * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+                        let v0 = vld1q_u8(b0.qs.as_ptr());
+                        let v1 = vld1q_u8(b1.qs.as_ptr());
+                        let v0_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_lo)), offset_8);
+                        let v0_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), offset_8);
+                        let v1_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_lo)), offset_8);
+                        let v1_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), offset_8);
+                        let d0_w = f16::from_bits(b0.d).to_f32();
+                        let d1_w = f16::from_bits(b1.d).to_f32();
+
+                        // Dot against 4 columns with shared decoded weights
+                        macro_rules! dot4 {
+                            ($xq:expr, $xs:expr, $sa:expr, $sb:expr) => {
+                                let y0_lo = vld1q_s8($xq.add(bi * 32));
+                                let y0_hi = vld1q_s8($xq.add(bi * 32 + 16));
+                                let y1_lo = vld1q_s8($xq.add((bi + 1) * 32));
+                                let y1_hi = vld1q_s8($xq.add((bi + 1) * 32 + 16));
+                                let z = vdupq_n_s32(0);
+                                let p0 = vdotq_s32(vdotq_s32(z, v0_lo, y0_lo), v0_hi, y0_hi);
+                                let p1 = vdotq_s32(vdotq_s32(z, v1_lo, y1_lo), v1_hi, y1_hi);
+                                $sa = vmlaq_n_f32($sa, vcvtq_f32_s32(p0), d0_w * *$xs.add(bi));
+                                $sb = vmlaq_n_f32($sb, vcvtq_f32_s32(p1), d1_w * *$xs.add(bi + 1));
+                            };
+                        }
+                        dot4!(xq0, xs0, s0a, s0b);
+                        dot4!(xq1, xs1, s1a, s1b);
+                        dot4!(xq2, xs2, s2a, s2b);
+                        dot4!(xq3, xs3, s3a, s3b);
+                        bi += 2;
+                    }
+
+                    // Handle odd trailing block
+                    if bi < nb {
+                        let b = &*(a_base.add(row_start + bi * size_of::<BlockQ4_0>())
+                            as *const BlockQ4_0);
+                        let v = vld1q_u8(b.qs.as_ptr());
+                        let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                        let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+                        let d_w = f16::from_bits(b.d).to_f32();
+                        macro_rules! dot1 {
+                            ($xq:expr, $xs:expr, $sa:expr) => {
+                                let y_lo = vld1q_s8($xq.add(bi * 32));
+                                let y_hi = vld1q_s8($xq.add(bi * 32 + 16));
+                                let z = vdupq_n_s32(0);
+                                let p = vdotq_s32(vdotq_s32(z, v_lo, y_lo), v_hi, y_hi);
+                                $sa = vmlaq_n_f32($sa, vcvtq_f32_s32(p), d_w * *$xs.add(bi));
+                            };
+                        }
+                        dot1!(xq0, xs0, s0a);
+                        dot1!(xq1, xs1, s1a);
+                        dot1!(xq2, xs2, s2a);
+                        dot1!(xq3, xs3, s3a);
+                    }
+
+                    row_out[j] = vaddvq_f32(s0a) + vaddvq_f32(s0b);
+                    row_out[j + 1] = vaddvq_f32(s1a) + vaddvq_f32(s1b);
+                    row_out[j + 2] = vaddvq_f32(s2a) + vaddvq_f32(s2b);
+                    row_out[j + 3] = vaddvq_f32(s3a) + vaddvq_f32(s3b);
+                    j += 4;
+                }
+
+                // Handle remaining columns (< 4)
+                while j < n {
                     let mut sumv0 = vdupq_n_f32(0.0);
                     let mut sumv1 = vdupq_n_f32(0.0);
-                    let xq_base = (bq_ptr as *const i8).add(j * k);
-                    let xs_base = (bs_ptr as *const f32).add(j * nb);
+                    let xq_base = bq_base.add(j * k);
+                    let xs_base = bs_base.add(j * nb);
 
                     let mut bi = 0usize;
                     while bi + 1 < nb {
@@ -667,7 +759,6 @@ pub(crate) mod neon {
                             as *const BlockQ4_0);
                         let b1 = &*(a_base.add(row_start + (bi + 1) * size_of::<BlockQ4_0>())
                             as *const BlockQ4_0);
-
                         let v0 = vld1q_u8(b0.qs.as_ptr());
                         let v1 = vld1q_u8(b1.qs.as_ptr());
                         let v0_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_lo)), offset_8);
@@ -690,7 +781,6 @@ pub(crate) mod neon {
                         sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
                         bi += 2;
                     }
-
                     if bi < nb {
                         let b = &*(a_base.add(row_start + bi * size_of::<BlockQ4_0>())
                             as *const BlockQ4_0);
@@ -704,8 +794,8 @@ pub(crate) mod neon {
                         let d = f16::from_bits(b.d).to_f32() * *xs_base.add(bi);
                         sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
                     }
-
                     row_out[j] = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+                    j += 1;
                 }
             };
 
