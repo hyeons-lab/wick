@@ -32,13 +32,19 @@ Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read p
 
 Cross-platform GPU inference via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows, WebGPU in browsers). Feature-gated behind `gpu`.
 
-| Backend | Decode | Notes |
-|---------|-------:|-------|
-| wick CPU (NEON Q4_0) | 97 tok/s | Optimized NEON integer kernels |
-| **wick GPU (wgpu Metal)** | **49 tok/s** | Full WGSL compute pipeline |
-| llama.cpp (native Metal) | 171 tok/s | Reference, hand-tuned MSL |
+| Backend | Prefill | Decode |
+|---------|--------:|-------:|
+| llama.cpp (native Metal, reference) | 655 tok/s | 158 tok/s |
+| wick CPU (NEON Q4_0) | 197 tok/s | 98 tok/s |
+| **wick GPU (wgpu Metal)** | **38 tok/s** | **51 tok/s** |
 
-On Apple Silicon with unified memory, our CPU NEON path outperforms wgpu GPU because NEON's integer `vdotq_s32` dot products are extremely efficient and there's no GPU dispatch overhead. The wgpu backend value is cross-platform support (Linux/Windows discrete GPUs, WebGPU) where NEON isn't available.
+The wgpu GPU backend is **3x slower than llama.cpp's native Metal** and **2x slower than our own NEON CPU path** on Apple Silicon. The gap comes from:
+- wgpu's per-dispatch validation/state-tracking overhead (Rust-side)
+- WGSL → MSL translation produces less optimal code than hand-written MSL
+- No simdgroup matrix ops in WGSL (llama.cpp uses them for GEMV)
+- Shared memory bus on Apple Silicon means GPU gets no bandwidth advantage
+
+The wgpu backend's value is **portability** — it runs on Linux/Windows discrete GPUs and WebGPU browsers where NEON isn't available. On M-series Macs, use the CPU backend for best performance.
 
 ### Key optimizations
 
