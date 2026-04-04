@@ -1,6 +1,9 @@
 pub mod lfm2;
 pub mod llama;
 
+#[cfg(feature = "gpu")]
+pub mod gpu_lfm2;
+
 use anyhow::{Result, bail};
 
 use crate::gguf::GgufFile;
@@ -69,5 +72,18 @@ pub fn load_model(gguf: GgufFile) -> Result<Box<dyn Model>> {
     match arch.as_str() {
         "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf(gguf)?)),
         other => bail!("unsupported architecture: {other}"),
+    }
+}
+
+/// Load a model with GPU acceleration.
+#[cfg(feature = "gpu")]
+pub fn load_model_gpu(gguf: GgufFile) -> Result<Box<dyn Model>> {
+    let arch = gguf
+        .get_str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string();
+    match arch.as_str() {
+        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf(gguf)?)),
+        other => bail!("unsupported architecture for GPU: {other}"),
     }
 }

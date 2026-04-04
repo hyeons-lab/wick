@@ -39,6 +39,14 @@ struct LayerWeightRefs {
     attn_output: Option<WeightRef>,
 }
 
+/// Dimensions for a layer's weight matrices (for GPU model construction).
+pub struct LayerWeightDims {
+    pub ffn_gate_m: usize,
+    pub ffn_gate_k: usize,
+    pub ffn_down_m: usize,
+    pub ffn_down_k: usize,
+}
+
 // ── LFM2 Model ─────────────────────────────────────────────────────────────
 
 pub struct Lfm2Model {
@@ -281,6 +289,49 @@ impl Lfm2Model {
             k,
         })
     }
+
+    // ── Public accessors for GPU model construction ───────────────────────
+
+    pub fn gguf(&self) -> &GgufFile {
+        &self.gguf
+    }
+
+    pub fn output_norm_weight(&self) -> &[f32] {
+        &self.output_norm_weight
+    }
+
+    pub fn attn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.attn_norm_weights[layer]
+    }
+
+    pub fn ffn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.ffn_norm_weights[layer]
+    }
+
+    pub fn attn_q_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_q_norm_weights[layer].as_deref()
+    }
+
+    pub fn attn_k_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_k_norm_weights[layer].as_deref()
+    }
+
+    pub fn conv_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.conv_weights[layer].as_deref()
+    }
+
+    /// Returns (ffn_gate_m, ffn_gate_k, ffn_down_m, ffn_down_k) for a layer.
+    pub fn layer_weight_info(&self, layer: usize) -> LayerWeightDims {
+        let refs = &self.layer_refs[layer];
+        LayerWeightDims {
+            ffn_gate_m: refs.ffn_gate.m,
+            ffn_gate_k: refs.ffn_gate.k,
+            ffn_down_m: refs.ffn_down.m,
+            ffn_down_k: refs.ffn_down.k,
+        }
+    }
+
+    // ── Internal methods ────────────────────────────────────────────────
 
     /// Get the raw bytes for a pre-resolved weight.
     #[inline]
