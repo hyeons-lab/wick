@@ -596,7 +596,6 @@ impl Lfm2Model {
             };
             let seq_len = k_cache.len() / kv_dim;
             let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
-            attn_out.fill(0.0);
             let q = &state.scratch.q[..cfg.hidden_size];
             let scores = &mut state.scratch.scores;
 
@@ -1068,7 +1067,6 @@ impl Model for Lfm2Model {
                             };
                             let seq_len = k_cache.len() / kv_dim;
                             let attn_out = &mut state.scratch.attn_out[..hs];
-                            attn_out.fill(0.0);
                             let q = &state.scratch.q[..hs];
                             let scores = &mut state.scratch.scores;
 
