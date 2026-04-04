@@ -803,15 +803,16 @@ impl Model for Lfm2Model {
         let mut gate_col = vec![0.0f32; cfg.intermediate_size];
         let mut up_col = vec![0.0f32; cfg.intermediate_size];
         let mut out_col = vec![0.0f32; hs];
-        // Batched projection buffers for conv/attn input projections
-        // Conv in_proj: hs → 3*hs, Attn Q: hs → hs, K/V: hs → kv_dim
-        // Use max(3*hs, hs+2*kv_dim) for the projection matrix
+        // Batched projection buffers for conv/attn input projections (aarch64 only)
+        #[cfg(target_arch = "aarch64")]
         let max_kv_dim =
             cfg.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / cfg.n_heads);
+        #[cfg(target_arch = "aarch64")]
         let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
-        let mut proj_mat = vec![0.0f32; proj_rows * n]; // batched projection output
-        let mut out_proj_input = vec![0.0f32; hs * n]; // input to batched out_proj
-        // Attn GEMM buffers: Q is hs×n, K/V are max_kv_dim×n
+        #[cfg(target_arch = "aarch64")]
+        let mut proj_mat = vec![0.0f32; proj_rows * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut out_proj_input = vec![0.0f32; hs * n];
         #[cfg(target_arch = "aarch64")]
         let mut q_mat = vec![0.0f32; hs * n];
         #[cfg(target_arch = "aarch64")]
@@ -857,240 +858,243 @@ impl Model for Lfm2Model {
             }
 
             // Operator: conv or attention — batch projections via GEMM, sequential core
-            let refs = &self.layer_refs[layer];
             let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
 
             #[cfg(target_arch = "aarch64")]
-            let used_block_gemm = if is_conv {
-                // --- Conv: batch in_proj + out_proj via GEMM ---
-                let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
-                let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
-                if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
-                    // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
-                    Self::quantize_columns(
-                        &normed,
-                        hs,
-                        n,
-                        &mut col,
-                        &mut bq_scales,
-                        &mut bq_quants,
-                    );
-                    self.gemm_preq(
-                        in_proj,
-                        &bq_scales,
-                        &bq_quants,
-                        &mut proj_mat,
-                        3 * hs,
-                        n,
-                        hs,
-                    );
+            let used_block_gemm = {
+                let refs = &self.layer_refs[layer];
+                if is_conv {
+                    // --- Conv: batch in_proj + out_proj via GEMM ---
+                    let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
+                    let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
+                    if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
+                        // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
+                        Self::quantize_columns(
+                            &normed,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(
+                            in_proj,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut proj_mat,
+                            3 * hs,
+                            n,
+                            hs,
+                        );
 
-                    // Phase 2: Per-token sequential conv using pre-computed projections
-                    let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
-                    let d_conv = kernel_size - 1;
-                    let conv_weight = self.conv_weights[layer].as_ref().unwrap();
-                    for j in 0..n {
-                        let proj = &mut state.scratch.conv_proj[..3 * hs];
-                        for i in 0..hs {
-                            proj[i] = proj_mat[i * n + j];
-                            proj[hs + i] = proj_mat[(hs + i) * n + j];
-                            proj[2 * hs + i] = proj_mat[(2 * hs + i) * n + j];
-                        }
-                        let (b, rest) = proj.split_at(hs);
-                        let (c_slice, x_slice) = rest.split_at(hs);
-
-                        let conv_scratch = &mut state.scratch.conv_scratch[..hs];
-                        for i in 0..hs {
-                            conv_scratch[i] = b[i] * x_slice[i];
-                        }
-
-                        let LayerState::Conv { buffer } = &mut state.layers[layer] else {
-                            panic!("expected Conv state for layer {layer}");
-                        };
-                        let out_buf = &mut state.scratch.out[..hs];
-                        for ch in 0..hs {
-                            let mut sum = 0.0f32;
-                            for k in 0..d_conv {
-                                sum += buffer[k * hs + ch] * conv_weight[ch * kernel_size + k];
+                        // Phase 2: Per-token sequential conv using pre-computed projections
+                        let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
+                        let d_conv = kernel_size - 1;
+                        let conv_weight = self.conv_weights[layer].as_ref().unwrap();
+                        for j in 0..n {
+                            let proj = &mut state.scratch.conv_proj[..3 * hs];
+                            for i in 0..hs {
+                                proj[i] = proj_mat[i * n + j];
+                                proj[hs + i] = proj_mat[(hs + i) * n + j];
+                                proj[2 * hs + i] = proj_mat[(2 * hs + i) * n + j];
                             }
-                            sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
-                            out_buf[ch] = sum;
-                        }
-                        if d_conv > 0 {
-                            if d_conv > 1 {
-                                buffer.copy_within(hs.., 0);
+                            let (b, rest) = proj.split_at(hs);
+                            let (c_slice, x_slice) = rest.split_at(hs);
+
+                            let conv_scratch = &mut state.scratch.conv_scratch[..hs];
+                            for i in 0..hs {
+                                conv_scratch[i] = b[i] * x_slice[i];
                             }
-                            let last_slot = (d_conv - 1) * hs;
-                            buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+
+                            let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+                                panic!("expected Conv state for layer {layer}");
+                            };
+                            let out_buf = &mut state.scratch.out[..hs];
+                            for ch in 0..hs {
+                                let mut sum = 0.0f32;
+                                for k in 0..d_conv {
+                                    sum += buffer[k * hs + ch] * conv_weight[ch * kernel_size + k];
+                                }
+                                sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
+                                out_buf[ch] = sum;
+                            }
+                            if d_conv > 0 {
+                                if d_conv > 1 {
+                                    buffer.copy_within(hs.., 0);
+                                }
+                                let last_slot = (d_conv - 1) * hs;
+                                buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                            }
+
+                            for i in 0..hs {
+                                out_proj_input[i * n + j] = c_slice[i] * out_buf[i];
+                            }
                         }
 
-                        for i in 0..hs {
-                            out_proj_input[i * n + j] = c_slice[i] * out_buf[i];
-                        }
+                        // Phase 3: Batch out_proj GEMM
+                        Self::quantize_columns(
+                            &out_proj_input,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
+                        true
+                    } else {
+                        false
                     }
-
-                    // Phase 3: Batch out_proj GEMM
-                    Self::quantize_columns(
-                        &out_proj_input,
-                        hs,
-                        n,
-                        &mut col,
-                        &mut bq_scales,
-                        &mut bq_quants,
-                    );
-                    self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
-                    true
                 } else {
-                    false
-                }
-            } else {
-                // --- Attention: batch Q/K/V + output projections via GEMM ---
-                let attn_q_ref = refs.attn_q.as_ref().unwrap();
-                if matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0) {
-                    let head_dim = hs / cfg.n_heads;
-                    let n_kv_heads = cfg.kv_heads_per_layer[layer];
-                    let kv_dim = n_kv_heads * head_dim;
+                    // --- Attention: batch Q/K/V + output projections via GEMM ---
+                    let attn_q_ref = refs.attn_q.as_ref().unwrap();
+                    if matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0) {
+                        let head_dim = hs / cfg.n_heads;
+                        let n_kv_heads = cfg.kv_heads_per_layer[layer];
+                        let kv_dim = n_kv_heads * head_dim;
 
-                    // Phase 1: Batch Q/K/V GEMM
-                    Self::quantize_columns(
-                        &normed,
-                        hs,
-                        n,
-                        &mut col,
-                        &mut bq_scales,
-                        &mut bq_quants,
-                    );
-                    self.gemm_preq(attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs);
-                    self.gemm_preq(
-                        refs.attn_k.as_ref().unwrap(),
-                        &bq_scales,
-                        &bq_quants,
-                        &mut k_mat[..kv_dim * n],
-                        kv_dim,
-                        n,
-                        hs,
-                    );
-                    self.gemm_preq(
-                        refs.attn_v.as_ref().unwrap(),
-                        &bq_scales,
-                        &bq_quants,
-                        &mut v_mat[..kv_dim * n],
-                        kv_dim,
-                        n,
-                        hs,
-                    );
+                        // Phase 1: Batch Q/K/V GEMM
+                        Self::quantize_columns(
+                            &normed,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs);
+                        self.gemm_preq(
+                            refs.attn_k.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut k_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
+                        self.gemm_preq(
+                            refs.attn_v.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut v_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
 
-                    // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
-                    let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
-                    let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
-                    let group_size = cfg.n_heads / n_kv_heads;
-                    let scale = 1.0 / (head_dim as f32).sqrt();
+                        // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
+                        let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
+                        let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
+                        let group_size = cfg.n_heads / n_kv_heads;
+                        let scale = 1.0 / (head_dim as f32).sqrt();
 
-                    for j in 0..n {
-                        let pos = start_pos + j;
-                        // Extract Q, K, V for this token
-                        let q = &mut state.scratch.q[..hs];
-                        let k = &mut state.scratch.k[..kv_dim];
-                        let v = &mut state.scratch.v[..kv_dim];
-                        for i in 0..hs {
-                            q[i] = q_mat[i * n + j];
-                        }
-                        for i in 0..kv_dim {
-                            k[i] = k_mat[i * n + j];
-                            v[i] = v_mat[i * n + j];
-                        }
+                        for j in 0..n {
+                            let pos = start_pos + j;
+                            // Extract Q, K, V for this token
+                            let q = &mut state.scratch.q[..hs];
+                            let k = &mut state.scratch.k[..kv_dim];
+                            let v = &mut state.scratch.v[..kv_dim];
+                            for i in 0..hs {
+                                q[i] = q_mat[i * n + j];
+                            }
+                            for i in 0..kv_dim {
+                                k[i] = k_mat[i * n + j];
+                                v[i] = v_mat[i * n + j];
+                            }
 
-                        // QK norm
-                        for h in 0..cfg.n_heads {
-                            cpu::rmsnorm(
-                                &mut q[h * head_dim..(h + 1) * head_dim],
-                                q_norm,
-                                cfg.rms_norm_eps,
-                            );
-                        }
-                        for h in 0..n_kv_heads {
-                            cpu::rmsnorm(
-                                &mut k[h * head_dim..(h + 1) * head_dim],
-                                k_norm,
-                                cfg.rms_norm_eps,
-                            );
-                        }
+                            // QK norm
+                            for h in 0..cfg.n_heads {
+                                cpu::rmsnorm(
+                                    &mut q[h * head_dim..(h + 1) * head_dim],
+                                    q_norm,
+                                    cfg.rms_norm_eps,
+                                );
+                            }
+                            for h in 0..n_kv_heads {
+                                cpu::rmsnorm(
+                                    &mut k[h * head_dim..(h + 1) * head_dim],
+                                    k_norm,
+                                    cfg.rms_norm_eps,
+                                );
+                            }
 
-                        // RoPE
-                        cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+                            // RoPE
+                            cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-                        // Append K, V to cache
-                        if let LayerState::Attention {
-                            key_cache,
-                            value_cache,
-                        } = &mut state.layers[layer]
-                        {
-                            key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                            value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
-                        }
-
-                        // Attention scores + weighted values
-                        let (k_cache, v_cache) = match &state.layers[layer] {
-                            LayerState::Attention {
+                            // Append K, V to cache
+                            if let LayerState::Attention {
                                 key_cache,
                                 value_cache,
-                            } => (key_cache.as_slice(), value_cache.as_slice()),
-                            _ => panic!("expected Attention state for layer {layer}"),
-                        };
-                        let seq_len = k_cache.len() / kv_dim;
-                        let attn_out = &mut state.scratch.attn_out[..hs];
-                        attn_out.fill(0.0);
-                        let q = &state.scratch.q[..hs];
-                        let scores = &mut state.scratch.scores;
+                            } = &mut state.layers[layer]
+                            {
+                                key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                                value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                            }
 
-                        for h in 0..cfg.n_heads {
-                            let kv_h = h / group_size;
-                            let q_head = &q[h * head_dim..(h + 1) * head_dim];
-                            scores.resize(seq_len, 0.0);
-                            for (t, score) in scores.iter_mut().enumerate() {
-                                let mut dot = 0.0f32;
+                            // Attention scores + weighted values
+                            let (k_cache, v_cache) = match &state.layers[layer] {
+                                LayerState::Attention {
+                                    key_cache,
+                                    value_cache,
+                                } => (key_cache.as_slice(), value_cache.as_slice()),
+                                _ => panic!("expected Attention state for layer {layer}"),
+                            };
+                            let seq_len = k_cache.len() / kv_dim;
+                            let attn_out = &mut state.scratch.attn_out[..hs];
+                            attn_out.fill(0.0);
+                            let q = &state.scratch.q[..hs];
+                            let scores = &mut state.scratch.scores;
+
+                            for h in 0..cfg.n_heads {
+                                let kv_h = h / group_size;
+                                let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                                scores.resize(seq_len, 0.0);
+                                for (t, score) in scores.iter_mut().enumerate() {
+                                    let mut dot = 0.0f32;
+                                    for d in 0..head_dim {
+                                        dot +=
+                                            q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                                    }
+                                    *score = dot * scale;
+                                }
+                                cpu::softmax_inplace(scores);
                                 for d in 0..head_dim {
-                                    dot += q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                                    let mut val = 0.0f32;
+                                    for (t, &s) in scores.iter().enumerate() {
+                                        val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
+                                    }
+                                    attn_out[h * head_dim + d] = val;
                                 }
-                                *score = dot * scale;
                             }
-                            cpu::softmax_inplace(scores);
-                            for d in 0..head_dim {
-                                let mut val = 0.0f32;
-                                for (t, &s) in scores.iter().enumerate() {
-                                    val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
-                                }
-                                attn_out[h * head_dim + d] = val;
+
+                            // Store attn output for batched output projection
+                            for i in 0..hs {
+                                out_proj_input[i * n + j] = attn_out[i];
                             }
                         }
 
-                        // Store attn output for batched output projection
-                        for i in 0..hs {
-                            out_proj_input[i * n + j] = attn_out[i];
-                        }
+                        // Phase 3: Batch output projection GEMM
+                        Self::quantize_columns(
+                            &out_proj_input,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(
+                            refs.attn_output.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                        );
+                        true
+                    } else {
+                        false
                     }
-
-                    // Phase 3: Batch output projection GEMM
-                    Self::quantize_columns(
-                        &out_proj_input,
-                        hs,
-                        n,
-                        &mut col,
-                        &mut bq_scales,
-                        &mut bq_quants,
-                    );
-                    self.gemm_preq(
-                        refs.attn_output.as_ref().unwrap(),
-                        &bq_scales,
-                        &bq_quants,
-                        &mut block_out,
-                        hs,
-                        n,
-                        hs,
-                    );
-                    true
-                } else {
-                    false
                 }
             };
 
