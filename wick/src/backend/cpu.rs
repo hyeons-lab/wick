@@ -530,6 +530,185 @@ pub fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+// ── Attention score/value computation ───────────────────────────────────────
+
+/// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
+/// `k_cache` has stride `kv_dim` between timesteps; each key starts at offset `kv_h_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_scores(
+    q_head: &[f32],
+    k_cache: &[f32],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_scores_neon(
+            q_head,
+            k_cache,
+            scores,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for t in 0..seq_len {
+        let mut dot = 0.0f32;
+        let k_off = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            dot += q_head[d] * k_cache[k_off + d];
+        }
+        scores[t] = dot * scale;
+    }
+}
+
+/// Compute weighted sum of V cache for one head: attn_out[d] = sum_t(scores[t] * v[t,d]).
+/// `v_cache` has stride `kv_dim` between timesteps; each value starts at offset `kv_h_offset`.
+pub fn attn_values(
+    scores: &[f32],
+    v_cache: &[f32],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_values_neon(
+            scores,
+            v_cache,
+            attn_out,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for d in 0..head_dim {
+        let mut val = 0.0f32;
+        for t in 0..seq_len {
+            val += scores[t] * v_cache[t * kv_dim + kv_h_offset + d];
+        }
+        attn_out[d] = val;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_scores_neon(
+    q_head: &[f32],
+    k_cache: &[f32],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let q_ptr = q_head.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+
+        for t in 0..seq_len {
+            let k_off = t * kv_dim + kv_h_offset;
+            let mut sum0 = vdupq_n_f32(0.0);
+            let mut sum1 = vdupq_n_f32(0.0);
+
+            let mut d = 0usize;
+            while d + 8 <= head_dim {
+                let q0 = vld1q_f32(q_ptr.add(d));
+                let q1 = vld1q_f32(q_ptr.add(d + 4));
+                let k0 = vld1q_f32(k_ptr.add(k_off + d));
+                let k1 = vld1q_f32(k_ptr.add(k_off + d + 4));
+                sum0 = vfmaq_f32(sum0, q0, k0);
+                sum1 = vfmaq_f32(sum1, q1, k1);
+                d += 8;
+            }
+            // Handle remaining 4 elements (head_dim is typically 64 or 128, always divisible by 8)
+            if d + 4 <= head_dim {
+                let q0 = vld1q_f32(q_ptr.add(d));
+                let k0 = vld1q_f32(k_ptr.add(k_off + d));
+                sum0 = vfmaq_f32(sum0, q0, k0);
+                d += 4;
+            }
+            let mut total = vaddvq_f32(vaddq_f32(sum0, sum1));
+            // Scalar tail for non-multiple-of-4 head_dim
+            while d < head_dim {
+                total += *q_ptr.add(d) * *k_ptr.add(k_off + d);
+                d += 1;
+            }
+            scores[t] = total * scale;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_values_neon(
+    scores: &[f32],
+    v_cache: &[f32],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = attn_out.as_mut_ptr();
+
+        // Process head_dim in chunks of 8 (two float32x4)
+        let mut d = 0usize;
+        while d + 8 <= head_dim {
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            for t in 0..seq_len {
+                let s = vdupq_n_f32(scores[t]);
+                let v_off = t * kv_dim + kv_h_offset + d;
+                let v0 = vld1q_f32(v_ptr.add(v_off));
+                let v1 = vld1q_f32(v_ptr.add(v_off + 4));
+                acc0 = vfmaq_f32(acc0, s, v0);
+                acc1 = vfmaq_f32(acc1, s, v1);
+            }
+            vst1q_f32(out_ptr.add(d), acc0);
+            vst1q_f32(out_ptr.add(d + 4), acc1);
+            d += 8;
+        }
+        if d + 4 <= head_dim {
+            let mut acc0 = vdupq_n_f32(0.0);
+            for t in 0..seq_len {
+                let s = vdupq_n_f32(scores[t]);
+                let v0 = vld1q_f32(v_ptr.add(t * kv_dim + kv_h_offset + d));
+                acc0 = vfmaq_f32(acc0, s, v0);
+            }
+            vst1q_f32(out_ptr.add(d), acc0);
+            d += 4;
+        }
+        // Scalar tail
+        while d < head_dim {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val += scores[t] * *v_ptr.add(t * kv_dim + kv_h_offset + d);
+            }
+            *out_ptr.add(d) = val;
+            d += 1;
+        }
+    }
+}
+
 // ── Positional encoding ─────────────────────────────────────────────────────
 
 /// Apply Rotary Position Embedding (RoPE) to Q and K vectors.
