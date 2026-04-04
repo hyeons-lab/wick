@@ -739,12 +739,26 @@ impl Model for Lfm2Model {
         let mut ffn_input = vec![0.0f32; hs * n];
         let mut ffn_out = vec![0.0f32; hs * n];
         let mut norm_col = vec![0.0f32; hs];
-        let mut op_col = vec![0.0f32; hs];
         let mut ffn_col = vec![0.0f32; hs];
         let mut col = vec![0.0f32; hs];
         let mut gate_col = vec![0.0f32; cfg.intermediate_size];
         let mut up_col = vec![0.0f32; cfg.intermediate_size];
         let mut out_col = vec![0.0f32; hs];
+        // Batched projection buffers for conv/attn input projections
+        // Conv in_proj: hs → 3*hs, Attn Q: hs → hs, K/V: hs → kv_dim
+        // Use max(3*hs, hs+2*kv_dim) for the projection matrix
+        let max_kv_dim =
+            cfg.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / cfg.n_heads);
+        let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
+        let mut proj_mat = vec![0.0f32; proj_rows * n]; // batched projection output
+        let mut out_proj_input = vec![0.0f32; hs * n]; // input to batched out_proj
+        // Attn GEMM buffers: Q is hs×n, K/V are max_kv_dim×n
+        #[cfg(target_arch = "aarch64")]
+        let mut q_mat = vec![0.0f32; hs * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut k_mat = vec![0.0f32; max_kv_dim * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut v_mat = vec![0.0f32; max_kv_dim * n];
         // Pre-allocated GEMM buffers (reused across layers)
         #[cfg(target_arch = "aarch64")]
         let is = cfg.intermediate_size;
@@ -783,24 +797,317 @@ impl Model for Lfm2Model {
                 }
             }
 
-            // Operator: conv or attention (process tokens sequentially)
-            block_out.fill(0.0);
-            for j in 0..n {
-                for i in 0..hs {
-                    op_col[i] = normed[i * n + j];
-                }
-                #[cfg(target_arch = "aarch64")]
-                Self::quantize_to_scratch(&op_col, state);
+            // Operator: conv or attention — batch projections via GEMM, sequential core
+            let refs = &self.layer_refs[layer];
+            let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
 
-                if cfg.block_types[layer] == BlockType::GatedConv {
-                    self.forward_conv_block(layer, &op_col, state);
+            #[cfg(target_arch = "aarch64")]
+            let used_block_gemm = if is_conv {
+                // --- Conv: batch in_proj + out_proj via GEMM ---
+                let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
+                let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
+                if in_proj.dtype == DType::Q4_0 {
+                    // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
+                    // Quantize all N normed columns
+                    for j in 0..n {
+                        for i in 0..hs {
+                            col[i] = normed[i * n + j];
+                        }
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &col,
+                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
+                                &mut bq_quants[j * hs..(j + 1) * hs],
+                            );
+                        }
+                    }
+                    let in_data = self.weight_data(in_proj);
+                    unsafe {
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            in_data,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut proj_mat,
+                            3 * hs,
+                            n,
+                            hs,
+                        );
+                    }
+
+                    // Phase 2: Per-token sequential conv using pre-computed projections
+                    let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
+                    let d_conv = kernel_size - 1;
+                    let conv_weight = self.conv_weights[layer].as_ref().unwrap();
+                    for j in 0..n {
+                        // Extract (b, c, x) from proj_mat column j
+                        let proj = &mut state.scratch.conv_proj[..3 * hs];
+                        for i in 0..hs {
+                            proj[i] = proj_mat[i * n + j];
+                            proj[hs + i] = proj_mat[(hs + i) * n + j];
+                            proj[2 * hs + i] = proj_mat[(2 * hs + i) * n + j];
+                        }
+                        let (b, rest) = proj.split_at(hs);
+                        let (c_slice, x_slice) = rest.split_at(hs);
+
+                        // bx = b ⊙ x
+                        let conv_scratch = &mut state.scratch.conv_scratch[..hs];
+                        for i in 0..hs {
+                            conv_scratch[i] = b[i] * x_slice[i];
+                        }
+
+                        // Depthwise conv1d with rolling buffer
+                        let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+                            panic!("expected Conv state for layer {layer}");
+                        };
+                        let out_buf = &mut state.scratch.out[..hs];
+                        for ch in 0..hs {
+                            let mut sum = 0.0f32;
+                            for k in 0..d_conv {
+                                sum += buffer[k * hs + ch] * conv_weight[ch * kernel_size + k];
+                            }
+                            sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
+                            out_buf[ch] = sum;
+                        }
+                        // Update rolling buffer
+                        if d_conv > 0 {
+                            if d_conv > 1 {
+                                buffer.copy_within(hs.., 0);
+                            }
+                            let last_slot = (d_conv - 1) * hs;
+                            buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                        }
+
+                        // o = c ⊙ conv_out → store into out_proj_input
+                        for i in 0..hs {
+                            out_proj_input[i * n + j] = c_slice[i] * out_buf[i];
+                        }
+                    }
+
+                    // Phase 3: Batch out_proj GEMM
+                    // Quantize out_proj_input columns
+                    for j in 0..n {
+                        for i in 0..hs {
+                            col[i] = out_proj_input[i * n + j];
+                        }
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &col,
+                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
+                                &mut bq_quants[j * hs..(j + 1) * hs],
+                            );
+                        }
+                    }
+                    let out_data = self.weight_data(out_proj);
+                    unsafe {
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            out_data,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                        );
+                    }
+                    true
                 } else {
-                    self.forward_attn_block(layer, &op_col, start_pos + j, state);
+                    false
                 }
+            } else {
+                // --- Attention: batch Q/K/V + output projections via GEMM ---
+                let attn_q_ref = refs.attn_q.as_ref().unwrap();
+                if attn_q_ref.dtype == DType::Q4_0 {
+                    let head_dim = hs / cfg.n_heads;
+                    let n_kv_heads = cfg.kv_heads_per_layer[layer];
+                    let kv_dim = n_kv_heads * head_dim;
 
-                // Copy result from state.scratch.out
-                for i in 0..hs {
-                    block_out[i * n + j] = state.scratch.out[i];
+                    // Phase 1: Batch Q/K/V GEMM
+                    // Quantize all N normed columns (reuse from conv if same layer — but
+                    // layers are either conv or attn, so always need to quantize here)
+                    for j in 0..n {
+                        for i in 0..hs {
+                            col[i] = normed[i * n + j];
+                        }
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &col,
+                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
+                                &mut bq_quants[j * hs..(j + 1) * hs],
+                            );
+                        }
+                    }
+                    // Q: hs × n, K: kv_dim × n, V: kv_dim × n
+                    let q_data = self.weight_data(attn_q_ref);
+                    let k_data = self.weight_data(refs.attn_k.as_ref().unwrap());
+                    let v_data = self.weight_data(refs.attn_v.as_ref().unwrap());
+                    unsafe {
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            q_data, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs,
+                        );
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            k_data,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut k_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            v_data,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut v_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
+                    }
+
+                    // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
+                    let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
+                    let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
+                    let group_size = cfg.n_heads / n_kv_heads;
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+
+                    for j in 0..n {
+                        let pos = start_pos + j;
+                        // Extract Q, K, V for this token
+                        let q = &mut state.scratch.q[..hs];
+                        let k = &mut state.scratch.k[..kv_dim];
+                        let v = &mut state.scratch.v[..kv_dim];
+                        for i in 0..hs {
+                            q[i] = q_mat[i * n + j];
+                        }
+                        for i in 0..kv_dim {
+                            k[i] = k_mat[i * n + j];
+                            v[i] = v_mat[i * n + j];
+                        }
+
+                        // QK norm
+                        for h in 0..cfg.n_heads {
+                            cpu::rmsnorm(
+                                &mut q[h * head_dim..(h + 1) * head_dim],
+                                q_norm,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                        for h in 0..n_kv_heads {
+                            cpu::rmsnorm(
+                                &mut k[h * head_dim..(h + 1) * head_dim],
+                                k_norm,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+
+                        // RoPE
+                        cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+
+                        // Append K, V to cache
+                        if let LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                        } = &mut state.layers[layer]
+                        {
+                            key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                            value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                        }
+
+                        // Attention scores + weighted values
+                        let (k_cache, v_cache) = match &state.layers[layer] {
+                            LayerState::Attention {
+                                key_cache,
+                                value_cache,
+                            } => (key_cache.as_slice(), value_cache.as_slice()),
+                            _ => panic!("expected Attention state for layer {layer}"),
+                        };
+                        let seq_len = k_cache.len() / kv_dim;
+                        let attn_out = &mut state.scratch.attn_out[..hs];
+                        attn_out.fill(0.0);
+                        let q = &state.scratch.q[..hs];
+                        let scores = &mut state.scratch.scores;
+
+                        for h in 0..cfg.n_heads {
+                            let kv_h = h / group_size;
+                            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                            scores.resize(seq_len, 0.0);
+                            for (t, score) in scores.iter_mut().enumerate() {
+                                let mut dot = 0.0f32;
+                                for d in 0..head_dim {
+                                    dot += q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                                }
+                                *score = dot * scale;
+                            }
+                            cpu::softmax_inplace(scores);
+                            for d in 0..head_dim {
+                                let mut val = 0.0f32;
+                                for (t, &s) in scores.iter().enumerate() {
+                                    val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
+                                }
+                                attn_out[h * head_dim + d] = val;
+                            }
+                        }
+
+                        // Store attn output for batched output projection
+                        for i in 0..hs {
+                            out_proj_input[i * n + j] = attn_out[i];
+                        }
+                    }
+
+                    // Phase 3: Batch output projection GEMM
+                    for j in 0..n {
+                        for i in 0..hs {
+                            col[i] = out_proj_input[i * n + j];
+                        }
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &col,
+                                &mut bq_scales[j * nb_hs..(j + 1) * nb_hs],
+                                &mut bq_quants[j * hs..(j + 1) * hs],
+                            );
+                        }
+                    }
+                    let out_data = self.weight_data(refs.attn_output.as_ref().unwrap());
+                    unsafe {
+                        crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                            out_data,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+
+            // Fallback: per-token sequential path (non-aarch64 or non-Q4_0)
+            #[cfg(target_arch = "aarch64")]
+            let need_block_fallback = !used_block_gemm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let need_block_fallback = true;
+            if need_block_fallback {
+                block_out.fill(0.0);
+                for j in 0..n {
+                    for i in 0..hs {
+                        col[i] = normed[i * n + j];
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    Self::quantize_to_scratch(&col, state);
+
+                    if is_conv {
+                        self.forward_conv_block(layer, &col, state);
+                    } else {
+                        self.forward_attn_block(layer, &col, start_pos + j, state);
+                    }
+
+                    for i in 0..hs {
+                        block_out[i * n + j] = state.scratch.out[i];
+                    }
                 }
             }
 
