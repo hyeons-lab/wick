@@ -52,6 +52,7 @@ struct GpuPipelines {
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
+    per_head_rmsnorm: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
@@ -132,6 +133,11 @@ impl GpuLfm2Model {
                 "silu_mul",
             ),
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
+            per_head_rmsnorm: ctx.create_pipeline(
+                shaders::PER_HEAD_RMSNORM,
+                "per_head_rmsnorm",
+                "per_head_rmsnorm",
+            ),
             softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax"),
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
@@ -469,6 +475,94 @@ impl GpuLfm2Model {
                 ],
             });
         self.encode(enc, &self.pipelines.rmsnorm, &bg, (1, 1, 1), "rmsnorm");
+    }
+
+    fn encode_per_head_rmsnorm(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        x: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        head_dim: u32,
+        n_heads: u32,
+        eps: f32,
+    ) {
+        let params_buf = self.ctx.upload_storage(
+            bytemuck::cast_slice(&[head_dim, eps.to_bits(), 0u32, 0u32]),
+            "p",
+        );
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.per_head_rmsnorm,
+            &bg,
+            (n_heads, 1, 1),
+            "per_head_rmsnorm",
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rope(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        pos: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        freq_base: f32,
+    ) {
+        let params: [u32; 5] = [pos, n_heads, n_kv_heads, head_dim, freq_base.to_bits()];
+        let params_buf = self.ctx.upload_storage(bytemuck::cast_slice(&params), "p");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.rope.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
+        self.encode(
+            enc,
+            &self.pipelines.rope,
+            &bg,
+            (max_pairs.div_ceil(256), 1, 1),
+            "rope",
+        );
     }
 
     fn encode_elementwise(
@@ -811,52 +905,39 @@ impl Model for GpuLfm2Model {
                     &self.normed_buf,
                     &self.v_buf,
                 );
-                self.submit_and_wait(enc);
 
-                // CPU: QK norm + RoPE (download Q/K, process, upload)
-                let mut q_data = self.ctx.download_f32(&self.q_buf, hs);
-                let mut k_data = self.ctx.download_f32(&self.k_buf, kv_dim as usize);
-                let qn_w = self
-                    .ctx
-                    .download_f32(lw.attn_q_norm.as_ref().unwrap(), head_dim as usize);
-                let kn_w = self
-                    .ctx
-                    .download_f32(lw.attn_k_norm.as_ref().unwrap(), head_dim as usize);
-                for h in 0..n_heads as usize {
-                    crate::backend::cpu::rmsnorm(
-                        &mut q_data[h * head_dim as usize..(h + 1) * head_dim as usize],
-                        &qn_w,
-                        cfg.rms_norm_eps,
-                    );
-                }
-                for h in 0..n_kv_heads as usize {
-                    crate::backend::cpu::rmsnorm(
-                        &mut k_data[h * head_dim as usize..(h + 1) * head_dim as usize],
-                        &kn_w,
-                        cfg.rms_norm_eps,
-                    );
-                }
-                crate::backend::cpu::rope(
-                    &mut q_data,
-                    &mut k_data,
-                    pos,
-                    cfg.n_heads,
-                    n_kv_heads as usize,
-                    head_dim as usize,
+                // GPU: per-head QK norm + RoPE (no CPU roundtrip)
+                self.encode_per_head_rmsnorm(
+                    &mut enc,
+                    &self.q_buf,
+                    lw.attn_q_norm.as_ref().unwrap(),
+                    head_dim,
+                    n_heads,
+                    cfg.rms_norm_eps,
+                );
+                self.encode_per_head_rmsnorm(
+                    &mut enc,
+                    &self.k_buf,
+                    lw.attn_k_norm.as_ref().unwrap(),
+                    head_dim,
+                    n_kv_heads,
+                    cfg.rms_norm_eps,
+                );
+                self.encode_rope(
+                    &mut enc,
+                    &self.q_buf,
+                    &self.k_buf,
+                    pos as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
                     cfg.rope_theta,
                 );
-                self.ctx
-                    .queue
-                    .write_buffer(&self.q_buf, 0, bytemuck::cast_slice(&q_data));
-                self.ctx
-                    .queue
-                    .write_buffer(&self.k_buf, 0, bytemuck::cast_slice(&k_data));
 
-                // Encoder 2: KV cache copy (K+V on GPU, no CPU roundtrip) + attention + out_proj + residual
+                // KV cache copy (K+V on GPU) + attention + out_proj + residual
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
                 let seq_len = self.gpu_state.seq_len.get();
                 let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
-                let mut enc = self.new_encoder();
                 self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
                 self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
                 let attn_seq_len = (seq_len + 1) as u32;

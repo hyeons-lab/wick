@@ -311,6 +311,7 @@ pub mod shaders {
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
+    pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
