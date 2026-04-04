@@ -20,6 +20,14 @@ fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256, 1, 1)
+fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let n = params.x;
+    if i >= n { return; }
+    a[i] = a[i] * b[i];
+}
+
+@compute @workgroup_size(256, 1, 1)
 fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let n = params.x;
