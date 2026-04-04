@@ -1,4 +1,7 @@
-#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_dotprod))]
+#![cfg_attr(
+    target_arch = "aarch64",
+    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch)
+)]
 
 pub mod backend;
 pub mod engine;
