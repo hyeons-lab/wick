@@ -3,6 +3,7 @@
     feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch)
 )]
 
+pub mod audio_engine;
 pub mod backend;
 pub mod engine;
 pub mod gguf;

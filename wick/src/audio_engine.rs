@@ -6,11 +6,11 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::kv_cache::InferenceState;
+use crate::model::Model;
 use crate::model::audio_decoder::{
     AudioDecoderWeights, DepthformerState, DetokenizerState, DetokenizerWeights,
     detokenize_to_spectrum, embed_audio_token, istft_to_pcm, sample_audio_frame,
 };
-use crate::model::Model;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
 
@@ -166,12 +166,8 @@ pub fn generate_audio(
             }
 
             // Detokenize to PCM.
-            let spectrum = detokenize_to_spectrum(
-                detok_weights,
-                decoder_weights,
-                &mut detok_state,
-                &codes,
-            );
+            let spectrum =
+                detokenize_to_spectrum(detok_weights, decoder_weights, &mut detok_state, &codes);
             let pcm = istft_to_pcm(
                 &spectrum,
                 detok_weights.config.n_fft,
@@ -192,10 +188,7 @@ pub fn generate_audio(
             pos += 1;
 
             // Check if we should switch back to text.
-            if matches!(config.mode, AudioMode::Interleaved)
-                && modality_budget == 0
-                && !text_done
-            {
+            if matches!(config.mode, AudioMode::Interleaved) && modality_budget == 0 && !text_done {
                 modality = Modality::Text;
                 modality_budget = 6;
             }
