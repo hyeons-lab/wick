@@ -108,7 +108,7 @@ fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::mode
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => {
             eprintln!("Using native Metal backend");
-            wick::model::load_model_metal(open()?)
+            wick::model::load_model_metal(open()?, path)
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         "metal" => {
@@ -137,7 +137,7 @@ fn load_model_auto(path: &Path) -> Result<Box<dyn wick::model::Model>> {
 
     // Try Metal first (macOS/iOS only).
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    match wick::model::load_model_metal(open()?) {
+    match wick::model::load_model_metal(open()?, path) {
         Ok(m) => {
             eprintln!("Using native Metal backend (auto)");
             return Ok(m);
@@ -167,7 +167,7 @@ fn load_model_auto(path: &Path) -> Result<Box<dyn wick::model::Model>> {
 /// (p10, p50, p90, mean, stddev)
 fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     assert!(!xs.is_empty());
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.sort_by(|a, b| a.total_cmp(b));
     let n = xs.len();
     let p = |q: f64| {
         let idx = ((n as f64 - 1.0) * q).round() as usize;

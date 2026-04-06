@@ -72,7 +72,12 @@ pub fn generate(
     let mut pos = prompt_tokens.len();
 
     // Seed the loop with the first token from prefill logits.
-    let mut next_token = sampler.sample(&mut logits);
+    // Skip if max_tokens=0 — no decode work needed.
+    let mut next_token = if config.max_tokens > 0 {
+        sampler.sample(&mut logits)
+    } else {
+        0
+    };
     loop {
         if generated >= config.max_tokens {
             break;

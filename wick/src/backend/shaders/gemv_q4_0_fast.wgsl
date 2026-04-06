@@ -7,8 +7,7 @@
 //  - Pre-scaled y values eliminate per-element bit shifts
 //  - Sumy bias hoisting: delta * (sumy * -8 + acc)
 //
-// 32 threads, 4 rows per WG. Uses workgroup memory for reduction
-// (no subgroup ops required for portability).
+// 32 threads (1 subgroup), 4 rows per WG. Reduction via subgroupAdd.
 // Dispatch: ceil(m/4) workgroups.
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;

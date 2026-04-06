@@ -8,12 +8,12 @@
 //   bytes 0-1:  f16 scale (delta)
 //   bytes 2-17: 16 bytes of packed 4-bit nibbles (32 elements)
 //
-// Strategy: Each workgroup processes 4 output rows simultaneously.
+// Strategy: Each workgroup processes 8 output rows simultaneously.
 // This reuses loaded x values across 4 rows, reducing x reads by 4x.
 // 32 threads per workgroup (one subgroup), each thread processes blocks
 // in stride-32 pattern. Subgroup reduction for final sum per row.
 //
-// Dispatch: (ceil(m / 4), 1, 1) workgroups
+// Dispatch: (ceil(m / 8), 1, 1) workgroups
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;

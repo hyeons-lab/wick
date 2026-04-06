@@ -58,13 +58,16 @@ impl GpuContext {
             features |= wgpu::Features::SUBGROUP;
         }
 
+        // Use the adapter's actual limits instead of hardcoding. This avoids
+        // failures on GPUs with smaller max_buffer_size (integrated, mobile).
+        let adapter_limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wick-gpu"),
                 required_features: features,
                 required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 256 * 1024 * 1024, // 256MB
-                    max_buffer_size: 2 * 1024 * 1024 * 1024,            // 2GB
+                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                    max_buffer_size: adapter_limits.max_buffer_size,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

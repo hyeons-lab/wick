@@ -6,7 +6,7 @@
 use std::cell::{Cell, RefCell};
 
 use anyhow::Result;
-use metal::{Buffer, ComputePipelineState, MTLSize, NSUInteger};
+use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{MetalContext, shaders};
 use crate::gguf::GgufFile;
@@ -14,9 +14,10 @@ use crate::kv_cache::InferenceState;
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
 
-/// A weight matrix on GPU.
+/// A weight matrix on GPU — references the shared mmap buffer via byte offset.
 struct MetalWeight {
-    buf: Buffer,
+    /// Byte offset into the shared mmap_buf where this weight's data starts.
+    mmap_offset: u64,
     dtype: DType,
     m: u32,
     #[allow(dead_code)]
@@ -90,10 +91,6 @@ struct MetalState {
     conv_buffers: Vec<Option<Buffer>>,
     seq_len: Cell<usize>,
     max_seq_len: usize,
-    /// Raw Q6_K embedding bytes for per-token dequantization.
-    /// On Metal unified memory, we could read from the GPU buffer directly,
-    /// but keeping a separate copy avoids lifetime coupling with the Buffer.
-    embedding_q6k_bytes: Vec<u8>,
     embedding_hidden_size: usize,
 }
 
@@ -123,7 +120,7 @@ pub struct MetalLfm2Model {
     /// token_embd.weight as Q6_K natively in the GGUF (52 MB) — we upload
     /// those bytes directly and GEMV-decode on GPU. Avoids dequantization
     /// at load AND preserves original model precision.
-    embedding_q6k: Buffer,
+    embedding_q6k_offset: u64,
     output_norm: Buffer,
 
     layers: Vec<MetalLayerWeights>,
@@ -148,13 +145,24 @@ pub struct MetalLfm2Model {
     conv_out_buf: Buffer,
     conv_gate_buf: Buffer,
     state: MetalState,
+    /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
+    /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
+    /// first mmap inside cpu_model, so this costs zero extra memory.
+    #[allow(dead_code)]
+    _mmap: memmap2::Mmap,
+    /// Metal buffer wrapping the mmap'd tensor data region via
+    /// newBufferWithBytesNoCopy. All weights reference this buffer
+    /// via byte offsets instead of having their own copied buffers.
+    mmap_buf: Buffer,
+    mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
 }
 
 impl MetalLfm2Model {
-    pub fn from_gguf(gguf: GgufFile) -> Result<Self> {
+    pub fn from_gguf(gguf: GgufFile, path: &std::path::Path) -> Result<Self> {
         let ctx = MetalContext::new()?;
+        let data_offset = gguf.data_offset();
         let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf)?;
         let config = cpu_model.config().clone();
         let hs = config.hidden_size;
@@ -211,29 +219,43 @@ impl MetalLfm2Model {
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32")?,
         };
 
-        // Upload weights. GPU gets ORIGINAL Q6_K bytes from the GGUF directly.
-        // CPU-side per-token embedding: dequantize one Q6_K row on-the-fly
-        // instead of storing a full f32 copy (saves 256-512 MB).
-        let emb_bytes = cpu_model.gguf().tensor_data("token_embd.weight")?;
-        let mut emb_padded = emb_bytes.to_vec();
-        emb_padded.extend_from_slice(&[0u8; 16]); // safety pad for GPU reads
-        let embedding_q6k = ctx.upload_bytes(&emb_padded);
+        // Open a second mmap of the same file for the no-copy Metal buffer.
+        // The OS deduplicates physical pages — zero extra memory.
+        let mmap_file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&mmap_file)? };
+        let mmap_len = mmap.len() as u64;
+        // Page-align the buffer length for Metal's newBufferWithBytesNoCopy.
+        let page_size = 16384u64; // Apple Silicon uses 16KB pages
+        let aligned_len = (mmap_len + page_size - 1) & !(page_size - 1);
+        // SAFETY:
+        // - mmap pointer is page-aligned (OS mmap guarantee)
+        // - aligned_len may exceed file size, but POSIX guarantees "the system
+        //   shall always zero-fill any partial page at the end of an object"
+        //   so bytes past file end within the last page are valid (zero-filled)
+        // - The mmap (_mmap field) outlives the Metal buffer
+        let mmap_buf = ctx.device.new_buffer_with_bytes_no_copy(
+            mmap.as_ptr() as *const _,
+            aligned_len,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+
+        // Embedding Q6K: reference mmap directly via offset (no copy).
+        let emb_data = cpu_model.gguf().tensor_data("token_embd.weight")?;
+        let mmap_base = cpu_model.gguf().mmap_data().as_ptr() as usize;
+        let embedding_q6k_offset = (emb_data.as_ptr() as usize - mmap_base) as u64;
+
+        // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
+        // tensor data region in a usable format (f32 vs mmap'd bytes).
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight());
 
         let upload_weight = |wref: &super::lfm2::WeightRef| -> MetalWeight {
-            let buf = if wref.dtype == DType::Q4_0 {
-                // Pad by 8 bytes so GEMV shader reads past end safely.
-                let mut data = cpu_model.weight_bytes(wref).to_vec();
-                data.extend_from_slice(&[0u8; 8]);
-                ctx.upload_bytes(&data)
-            } else {
-                let f32_data = cpu_model.dequantize_weight(wref);
-                ctx.upload_f32(&f32_data)
-            };
+            // Use byte offset into the shared mmap buffer instead of copying.
+            let mmap_offset = wref.start as u64;
             let params_buf =
                 ctx.upload_bytes(bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]));
             MetalWeight {
-                buf,
+                mmap_offset,
                 dtype: wref.dtype,
                 m: wref.m as u32,
                 k: wref.k as u32,
@@ -374,15 +396,17 @@ impl MetalLfm2Model {
             config,
             pipelines,
             params,
-            embedding_q6k,
+            embedding_q6k_offset,
             output_norm,
             layers,
+            _mmap: mmap,
+            mmap_buf,
+            mmap_data_offset: data_offset,
             state: MetalState {
                 kv_caches,
                 conv_buffers,
                 seq_len: Cell::new(0),
                 max_seq_len,
-                embedding_q6k_bytes: emb_bytes.to_vec(),
                 embedding_hidden_size: hs,
             },
             profile_timer: if std::env::var("WICK_PROFILE").as_deref() == Ok("timing") {
@@ -413,12 +437,13 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
 
 impl MetalLfm2Model {
     /// Dequantize one embedding row from Q6_K bytes into `dst`.
+    /// Dequantize one embedding row from Q6_K mmap data.
     fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
         let hs = self.state.embedding_hidden_size;
         debug_assert_eq!(dst.len(), hs);
         let row_bytes = hs / 256 * 210; // Q6_K: 210 bytes per 256 elements
-        let start = token_id * row_bytes;
-        let row_data = &self.state.embedding_q6k_bytes[start..start + row_bytes];
+        let mmap_start = self.embedding_q6k_offset as usize + token_id * row_bytes;
+        let row_data = &self._mmap[mmap_start..mmap_start + row_bytes];
         crate::quant::dequantize_q6_k_row(row_data, dst);
     }
 
@@ -515,8 +540,8 @@ impl MetalLfm2Model {
         let m = w_gate.m;
         let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_slim_gate_up);
-        enc.set_buffer(0, Some(&w_gate.buf), 0);
-        enc.set_buffer(1, Some(&w_up.buf), 0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
         enc.set_buffer(2, Some(x), 0);
         enc.set_buffer(3, Some(y_gate), 0);
         enc.set_buffer(4, Some(y_up), 0);
@@ -545,8 +570,8 @@ impl MetalLfm2Model {
         let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
         let params: [u32; 4] = [w_gate.m, w_gate.k, self.config.rms_norm_eps.to_bits(), 0];
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_rmsnorm_gate_up);
-        enc.set_buffer(0, Some(&w_gate.buf), 0);
-        enc.set_buffer(1, Some(&w_up.buf), 0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
         enc.set_buffer(2, Some(hidden), 0);
         enc.set_buffer(3, Some(norm_w), 0);
         enc.set_buffer(4, Some(y_gate), 0);
@@ -634,7 +659,7 @@ impl MetalLfm2Model {
         };
         let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
         enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(input), 0);
         enc.set_buffer(2, Some(output), output_off_bytes);
         enc.set_buffer(3, Some(&w.params_buf), 0);
@@ -654,7 +679,7 @@ impl MetalLfm2Model {
         let groups = m.div_ceil(4);
         let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
-        enc.set_buffer(0, Some(&self.embedding_q6k), 0);
+        enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_q6k_offset);
         enc.set_buffer(1, Some(input), 0);
         enc.set_buffer(2, Some(output), 0);
         enc.set_buffer(3, Some(&self.params.gemv_output), 0);
