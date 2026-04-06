@@ -49,6 +49,17 @@ kernel void mul_out(
     dst[gid] = a[gid] * b[gid];
 }
 
+// Cast f32 → f16 (for writing to f16 KV cache).
+kernel void cast_f32_to_f16(
+    const device float* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    const device Params& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) return;
+    dst[gid] = half(src[gid]);
+}
+
 kernel void silu_mul_inplace(
     device float* a [[buffer(0)]],
     const device float* b [[buffer(1)]],

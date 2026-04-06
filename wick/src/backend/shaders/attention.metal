@@ -28,8 +28,8 @@ struct Params {
 
 kernel void attention(
     const device float* q [[buffer(0)]],
-    const device float* k_cache [[buffer(1)]],
-    const device float* v_cache [[buffer(2)]],
+    const device half* k_cache [[buffer(1)]],
+    const device half* v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
     const device Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
@@ -66,10 +66,10 @@ kernel void attention(
     for (uint t = tid; t < seq_len; t += 256u) {
         float acc = 0.0f;
         uint k_base = t * kv_dim + kv_h_offset;
-        const device float4* k4 = (device const float4*) (k_cache + k_base);
+        const device half4* k4 = (device const half4*) (k_cache + k_base);
         #pragma clang loop unroll(full)
         for (uint d = 0u; d < hd4; d++) {
-            float4 kk = k4[d];
+            float4 kk = float4(k4[d]);
             float4 qq = float4(q_shared[d * 4u + 0u],
                                q_shared[d * 4u + 1u],
                                q_shared[d * 4u + 2u],
@@ -138,20 +138,20 @@ kernel void attention(
     // Per-lane partial accumulators (up to 8 dims).
     float po[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (dims_per_lane == 2u) {
-        // head_dim=64: each lane owns 2 contiguous dims → one float2 load per tt.
+        // head_dim=64: each lane owns 2 contiguous dims → one half2 load per tt.
         for (uint tt = t_start; tt < t_end; tt++) {
             float s = scores[tt];
             uint v_base = tt * kv_dim + kv_h_offset + simd_lane * 2u;
-            float2 v2 = *((device const float2*) (v_cache + v_base));
+            float2 v2 = float2(*((device const half2*) (v_cache + v_base)));
             po[0] += s * v2.x;
             po[1] += s * v2.y;
         }
     } else if (dims_per_lane == 4u) {
-        // head_dim=128: float4 load per tt.
+        // head_dim=128: half4 load per tt.
         for (uint tt = t_start; tt < t_end; tt++) {
             float s = scores[tt];
             uint v_base = tt * kv_dim + kv_h_offset + simd_lane * 4u;
-            float4 v4 = *((device const float4*) (v_cache + v_base));
+            float4 v4 = float4(*((device const half4*) (v_cache + v_base)));
             po[0] += s * v4.x;
             po[1] += s * v4.y;
             po[2] += s * v4.z;

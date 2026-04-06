@@ -62,6 +62,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_q4_0_fast_rmsnorm_gate_up: ComputePipelineState,
     memcpy_f32: ComputePipelineState,
+    cast_f32_to_f16: ComputePipelineState,
     #[allow(dead_code)]
     add_inplace: ComputePipelineState,
     #[allow(dead_code)]
@@ -132,6 +133,8 @@ pub struct MetalLfm2Model {
     gate_buf: Buffer,
     up_buf: Buffer,
     q_buf: Buffer,
+    k_buf: Buffer, // [max_kv_dim] scratch for K projection before f16 cast
+    v_buf: Buffer, // [max_kv_dim] scratch for V projection before f16 cast
     attn_out_buf: Buffer,
     // Split-K attention scratch (sized for max n_splits = 8).
     splitk_partials_out: Buffer,
@@ -187,6 +190,7 @@ impl MetalLfm2Model {
             gemv_q4_0_fast_rmsnorm_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_rmsnorm_gate_up")?,
             memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
+            cast_f32_to_f16: ctx.create_pipeline(shaders::ELEMENTWISE, "cast_f32_to_f16")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
@@ -301,8 +305,10 @@ impl MetalLfm2Model {
             if config.block_types[i] == BlockType::Attention {
                 let head_dim = hs / config.n_heads;
                 let kv_dim = config.kv_heads_per_layer[i] * head_dim;
-                let k_cache = make_buf(max_seq_len * kv_dim);
-                let v_cache = make_buf(max_seq_len * kv_dim);
+                // f16 KV cache: halves memory vs f32. K/V projections produce
+                // f32 which is cast to f16 before writing to cache.
+                let k_cache = ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
+                let v_cache = ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
                 kv_caches.push(Some((k_cache, v_cache)));
                 conv_buffers.push(None);
             } else {
@@ -345,6 +351,14 @@ impl MetalLfm2Model {
             gate_buf: make_buf(is),
             up_buf: make_buf(is),
             q_buf: make_buf(hs),
+            k_buf: make_buf(
+                config.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
+                    * (hs / config.n_heads),
+            ),
+            v_buf: make_buf(
+                config.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
+                    * (hs / config.n_heads),
+            ),
             attn_out_buf: make_buf(hs),
             splitk_partials_out: make_buf(config.n_heads * 8 * (hs / config.n_heads)),
             splitk_partials_max: make_buf(config.n_heads * 8),
@@ -681,6 +695,27 @@ impl MetalLfm2Model {
 
     /// Fused per-head RMSnorm + RoPE for Q and K. Replaces 3 dispatches with 1.
     #[allow(clippy::too_many_arguments)]
+    /// Cast n_elements of f32 from src into f16 at dst+dst_off_bytes.
+    fn encode_cast_f32_to_f16(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        n_elements: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.pipelines.cast_f32_to_f16);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), dst_off_bytes);
+        let params: [u32; 2] = [n_elements, 0];
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
+    }
+
     fn encode_qk_norm_rope(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1390,36 +1425,35 @@ impl MetalLfm2Model {
 
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
-                let kv_offset = (pos * kv_dim as usize * 4) as u64;
+                // f16 KV cache: byte offset is 2 bytes per element.
+                let kv_offset = (pos * kv_dim as usize * 2) as u64;
 
+                // Q/K/V → f32 scratch buffers.
                 self.encode_gemv_weight(
                     enc,
                     lw.attn_q.as_ref().unwrap(),
                     &self.normed_buf,
                     &self.q_buf,
                 );
-                // Write K/V projections DIRECTLY into KV cache at position offset.
-                self.encode_gemv_weight_offset(
+                self.encode_gemv_weight(
                     enc,
                     lw.attn_k.as_ref().unwrap(),
                     &self.normed_buf,
-                    k_cache,
-                    kv_offset,
+                    &self.k_buf,
                 );
-                self.encode_gemv_weight_offset(
+                self.encode_gemv_weight(
                     enc,
                     lw.attn_v.as_ref().unwrap(),
                     &self.normed_buf,
-                    v_cache,
-                    kv_offset,
+                    &self.v_buf,
                 );
 
-                // Fused QK norm + RoPE (3 dispatches → 1).
+                // Fused QK norm + RoPE on f32 scratch.
                 self.encode_qk_norm_rope(
                     enc,
                     &self.q_buf,
-                    k_cache,
-                    kv_offset,
+                    &self.k_buf,
+                    0, // k_buf starts at offset 0
                     lw.attn_q_norm.as_ref().unwrap(),
                     lw.attn_k_norm.as_ref().unwrap(),
                     pos as u32,
@@ -1427,6 +1461,10 @@ impl MetalLfm2Model {
                     n_heads,
                     n_kv_heads,
                 );
+
+                // Cast f32 K/V → f16 cache.
+                self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, kv_offset, kv_dim);
+                self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, kv_offset, kv_dim);
 
                 self.encode_attention(
                     enc,
@@ -1545,7 +1583,7 @@ impl MetalLfm2Model {
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
-                let kv_offset = (pos * kv_dim as usize * 4) as u64;
+                let kv_offset = (pos * kv_dim as usize * 2) as u64; // f16 = 2 bytes
 
                 self.gpu_sampled_pass(timer, cb, "attn_norm_qkv", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
@@ -1555,27 +1593,25 @@ impl MetalLfm2Model {
                         &self.normed_buf,
                         &self.q_buf,
                     );
-                    self.encode_gemv_weight_offset(
+                    self.encode_gemv_weight(
                         enc,
                         lw.attn_k.as_ref().unwrap(),
                         &self.normed_buf,
-                        k_cache,
-                        kv_offset,
+                        &self.k_buf,
                     );
-                    self.encode_gemv_weight_offset(
+                    self.encode_gemv_weight(
                         enc,
                         lw.attn_v.as_ref().unwrap(),
                         &self.normed_buf,
-                        v_cache,
-                        kv_offset,
+                        &self.v_buf,
                     );
                 });
                 self.gpu_sampled_pass(timer, cb, "attn_qk_rope", |enc| {
                     self.encode_qk_norm_rope(
                         enc,
                         &self.q_buf,
-                        k_cache,
-                        kv_offset,
+                        &self.k_buf,
+                        0,
                         lw.attn_q_norm.as_ref().unwrap(),
                         lw.attn_k_norm.as_ref().unwrap(),
                         pos as u32,
@@ -1583,6 +1619,9 @@ impl MetalLfm2Model {
                         n_heads,
                         n_kv_heads,
                     );
+                    // Cast f32 K/V → f16 cache.
+                    self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, kv_offset, kv_dim);
+                    self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, kv_offset, kv_dim);
                 });
                 self.gpu_sampled_pass(timer, cb, "attn_kernel", |enc| {
                     self.encode_attention(
@@ -1711,9 +1750,9 @@ impl MetalLfm2Model {
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
-                let kv_offset = (pos * kv_dim as usize * 4) as u64;
+                let kv_offset = (pos * kv_dim as usize * 2) as u64; // f16 = 2 bytes
 
-                // attn rmsnorm + Q/K/V projection GEMVs.
+                // attn rmsnorm + Q/K/V projection GEMVs → f32 scratch.
                 self.profile_segment(timer, "attn_norm_qkv", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
                     self.encode_gemv_weight(
@@ -1722,28 +1761,26 @@ impl MetalLfm2Model {
                         &self.normed_buf,
                         &self.q_buf,
                     );
-                    self.encode_gemv_weight_offset(
+                    self.encode_gemv_weight(
                         enc,
                         lw.attn_k.as_ref().unwrap(),
                         &self.normed_buf,
-                        k_cache,
-                        kv_offset,
+                        &self.k_buf,
                     );
-                    self.encode_gemv_weight_offset(
+                    self.encode_gemv_weight(
                         enc,
                         lw.attn_v.as_ref().unwrap(),
                         &self.normed_buf,
-                        v_cache,
-                        kv_offset,
+                        &self.v_buf,
                     );
                 });
-                // fused qk norm + rope.
+                // fused qk norm + rope on f32 scratch, then cast to f16 cache.
                 self.profile_segment(timer, "attn_qk_rope", |enc| {
                     self.encode_qk_norm_rope(
                         enc,
                         &self.q_buf,
-                        k_cache,
-                        kv_offset,
+                        &self.k_buf,
+                        0,
                         lw.attn_q_norm.as_ref().unwrap(),
                         lw.attn_k_norm.as_ref().unwrap(),
                         pos as u32,
@@ -1751,6 +1788,8 @@ impl MetalLfm2Model {
                         n_heads,
                         n_kv_heads,
                     );
+                    self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, kv_offset, kv_dim);
+                    self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, kv_offset, kv_dim);
                 });
                 // attention kernel.
                 self.profile_segment(timer, "attn_kernel", |enc| {
