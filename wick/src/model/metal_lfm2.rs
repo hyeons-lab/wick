@@ -89,7 +89,11 @@ struct MetalState {
     conv_buffers: Vec<Option<Buffer>>,
     seq_len: Cell<usize>,
     max_seq_len: usize,
-    embedding_f32: Vec<f32>,
+    /// Raw Q6_K embedding bytes for per-token dequantization.
+    /// On Metal unified memory, we could read from the GPU buffer directly,
+    /// but keeping a separate copy avoids lifetime coupling with the Buffer.
+    embedding_q6k_bytes: Vec<u8>,
+    embedding_hidden_size: usize,
 }
 
 /// Pre-allocated params buffers — values either written once at init (shape params)
@@ -203,11 +207,9 @@ impl MetalLfm2Model {
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32")?,
         };
 
-        // Upload weights. Still need f32 embedding for CPU-side per-token row
-        // lookup; the GPU gets the ORIGINAL Q6_K bytes from the GGUF directly
-        // (no dequantize + re-quantize round trip).
-        let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
-        let embedding_f32 = emb_tensor.to_f32_vec();
+        // Upload weights. GPU gets ORIGINAL Q6_K bytes from the GGUF directly.
+        // CPU-side per-token embedding: dequantize one Q6_K row on-the-fly
+        // instead of storing a full f32 copy (saves 256-512 MB).
         let emb_bytes = cpu_model.gguf().tensor_data("token_embd.weight")?;
         let mut emb_padded = emb_bytes.to_vec();
         emb_padded.extend_from_slice(&[0u8; 16]); // safety pad for GPU reads
@@ -366,7 +368,8 @@ impl MetalLfm2Model {
                 conv_buffers,
                 seq_len: Cell::new(0),
                 max_seq_len,
-                embedding_f32,
+                embedding_q6k_bytes: emb_bytes.to_vec(),
+                embedding_hidden_size: hs,
             },
             profile_timer: if std::env::var("WICK_PROFILE").as_deref() == Ok("timing") {
                 Some(CategoryTimer::new())
@@ -395,6 +398,16 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
 }
 
 impl MetalLfm2Model {
+    /// Dequantize one embedding row from Q6_K bytes into `dst`.
+    fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
+        let hs = self.state.embedding_hidden_size;
+        debug_assert_eq!(dst.len(), hs);
+        let row_bytes = hs / 256 * 210; // Q6_K: 210 bytes per 256 elements
+        let start = token_id * row_bytes;
+        let row_data = &self.state.embedding_q6k_bytes[start..start + row_bytes];
+        crate::quant::dequantize_q6_k_row(row_data, dst);
+    }
+
     fn dispatch(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -910,12 +923,10 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len,
         );
 
-        // 1. Write embedding row directly into hidden_buf (unified memory).
-        let emb_offset = token_id * hs;
-        let src = &self.state.embedding_f32[emb_offset..emb_offset + hs];
+        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
         unsafe {
-            let dst = self.hidden_buf.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, hs);
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
         }
 
         let pos = self.state.seq_len.get();
@@ -990,11 +1001,9 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len,
         );
 
-        let emb_offset = token_id * hs;
-        let src = &self.state.embedding_f32[emb_offset..emb_offset + hs];
         unsafe {
-            let dst = self.hidden_buf.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, hs);
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
         }
 
         let pos = self.state.seq_len.get();
@@ -1044,11 +1053,10 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Stage all N embedding rows into one GPU buffer up front.
+        // Stage all N embedding rows (dequantized from Q6_K) into one GPU buffer.
         let mut stage = vec![0.0f32; hs * n];
         for (i, &t) in tokens.iter().enumerate() {
-            let off = (t as usize) * hs;
-            stage[i * hs..(i + 1) * hs].copy_from_slice(&self.state.embedding_f32[off..off + hs]);
+            self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
         }
         let emb_staging = self.ctx.upload_f32(&stage);
 
