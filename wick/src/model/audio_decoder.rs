@@ -1007,6 +1007,10 @@ pub fn detokenize_to_spectrum(
 ///
 /// Input: [n_frames × n_fft_bins × 2] where each pair is (log_abs, angle).
 /// Output: PCM float32 samples at the configured sample rate.
+/// Streaming ISTFT matching llama.cpp's `mtmd_audio_streaming_istft`.
+///
+/// Processes frames one at a time with shift-and-accumulate overlap buffers.
+/// Each frame produces exactly `hop_length` output samples.
 pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
     let n_fft_bins = n_fft / 2 + 1;
     let frame_size = n_fft_bins * 2;
@@ -1015,20 +1019,18 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
         return vec![];
     }
 
-    let output_len = (n_frames - 1) * hop_length;
-    let mut output = vec![0.0f32; output_len + n_fft];
-    let mut window_sum = vec![0.0f32; output_len + n_fft];
-
-    // Hann window.
+    // Periodic Hann window: w[n] = 0.5 * (1 - cos(2π*n/N)).
     let hann: Vec<f32> = (0..n_fft)
-        .map(|i| {
-            let t = std::f32::consts::PI * i as f32 / n_fft as f32;
-            t.sin().powi(2)
-        })
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
         .collect();
 
+    // Streaming overlap buffers (size = n_fft).
+    let mut overlap_buf = vec![0.0f32; n_fft];
+    let mut window_sum = vec![0.0f32; n_fft];
+    let mut output = Vec::with_capacity(n_frames * hop_length);
+
     for i in 0..n_frames {
-        // Extract complex spectrum: (log_abs, angle) → complex.
+        // Convert (log_abs, angle) → interleaved complex.
         let mut complex = vec![(0.0f32, 0.0f32); n_fft];
         for j in 0..n_fft_bins {
             let log_abs = spectrum[i * frame_size + j];
@@ -1036,30 +1038,37 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
             let mag = log_abs.exp();
             complex[j] = (mag * angle.cos(), mag * angle.sin());
         }
-        // Mirror for negative frequencies.
+        // Mirror negative frequencies (conjugate).
         for j in 1..n_fft_bins - 1 {
             complex[n_fft - j] = (complex[j].0, -complex[j].1);
         }
 
-        // IFFT via rustfft (O(n log n)) or naive DFT fallback.
+        // IFFT.
         let time_domain = ifft_frame(&complex, n_fft);
 
-        // Window + overlap-add.
-        let offset = i * hop_length;
-        for n in 0..n_fft {
-            output[offset + n] += time_domain[n] * hann[n];
-            window_sum[offset + n] += hann[n] * hann[n];
+        // Add to overlap buffer with Hann window.
+        for j in 0..n_fft {
+            overlap_buf[j] += time_domain[j] * hann[j];
+            window_sum[j] += hann[j] * hann[j];
         }
+
+        // Extract hop_length samples with normalization.
+        for k in 0..hop_length {
+            let sample = if window_sum[k] > 1e-8 {
+                overlap_buf[k] / window_sum[k]
+            } else {
+                overlap_buf[k]
+            };
+            output.push(sample);
+        }
+
+        // Shift buffers left by hop_length.
+        overlap_buf.copy_within(hop_length..n_fft, 0);
+        overlap_buf[n_fft - hop_length..].fill(0.0);
+        window_sum.copy_within(hop_length..n_fft, 0);
+        window_sum[n_fft - hop_length..].fill(0.0);
     }
 
-    // Normalize by window sum.
-    for i in 0..output.len() {
-        if window_sum[i] > 1e-8 {
-            output[i] /= window_sum[i];
-        }
-    }
-
-    output.truncate(output_len);
     output
 }
 
