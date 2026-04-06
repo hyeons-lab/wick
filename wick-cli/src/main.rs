@@ -102,11 +102,13 @@ enum Command {
 }
 
 fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::model::Model>> {
+    let open = || wick::gguf::GgufFile::open(path);
+
     match device {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => {
             eprintln!("Using native Metal backend");
-            wick::model::load_model_metal(wick::gguf::GgufFile::open(path)?)
+            wick::model::load_model_metal(open()?)
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         "metal" => {
@@ -115,36 +117,51 @@ fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::mode
         #[cfg(feature = "gpu")]
         "gpu" | "wgpu" => {
             eprintln!("Using wgpu GPU backend");
-            wick::model::load_model_gpu(wick::gguf::GgufFile::open(path)?)
+            wick::model::load_model_gpu(open()?)
         }
         #[cfg(not(feature = "gpu"))]
         "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
-        "cpu" => wick::model::load_model(wick::gguf::GgufFile::open(path)?),
-        _ => {
-            // "auto": metal > wgpu > cpu, with runtime fallback.
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            {
-                eprintln!("Using native Metal backend (auto)");
-                return wick::model::load_model_metal(wick::gguf::GgufFile::open(path)?);
-            }
-            #[cfg(all(feature = "gpu", not(all(feature = "metal", target_os = "macos"))))]
-            {
-                match wick::model::load_model_gpu(wick::gguf::GgufFile::open(path)?) {
-                    Ok(m) => {
-                        eprintln!("Using wgpu GPU backend (auto)");
-                        return Ok(m);
-                    }
-                    Err(e) => {
-                        eprintln!("wgpu GPU unavailable ({e}), falling back to CPU");
-                    }
-                }
-            }
-            #[allow(unreachable_code)]
-            {
-                wick::model::load_model(wick::gguf::GgufFile::open(path)?)
-            }
+        "cpu" => {
+            eprintln!("Using CPU backend");
+            wick::model::load_model(open()?)
+        }
+        _ => load_model_auto(path),
+    }
+}
+
+/// Auto device selection: metal > wgpu > cpu, with runtime fallback.
+/// Each attempt opens the GGUF fresh so a failed GPU init doesn't
+/// consume the file handle needed for the CPU fallback.
+fn load_model_auto(path: &Path) -> Result<Box<dyn wick::model::Model>> {
+    let open = || wick::gguf::GgufFile::open(path);
+
+    // Try Metal first (macOS/iOS only).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    match wick::model::load_model_metal(open()?) {
+        Ok(m) => {
+            eprintln!("Using native Metal backend (auto)");
+            return Ok(m);
+        }
+        Err(e) => {
+            eprintln!("Metal unavailable ({e}), trying next backend");
         }
     }
+
+    // Try wgpu (any platform with Vulkan/Metal/DX12).
+    #[cfg(feature = "gpu")]
+    match open().and_then(wick::model::load_model_gpu) {
+        Ok(m) => {
+            eprintln!("Using wgpu GPU backend (auto)");
+            return Ok(m);
+        }
+        Err(e) => {
+            eprintln!("wgpu GPU unavailable ({e}), falling back to CPU");
+        }
+    }
+
+    // CPU fallback — always available.
+    eprintln!("Using CPU backend (auto)");
+    wick::model::load_model(open()?)
 }
 
 /// (p10, p50, p90, mean, stddev)
