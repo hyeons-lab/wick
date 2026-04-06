@@ -382,3 +382,117 @@ pub fn depthformer_forward(
     state.n_past += 1;
     cur
 }
+
+// ── DecoderModel: 8-codebook audio frame sampling ───────────────────────
+
+/// Sample one audio frame (8 codes) from an LLM embedding.
+///
+/// Runs 8 sequential passes through the depthformer, one per codebook.
+/// Each pass projects the LLM embedding into the depthformer input,
+/// optionally adds the previous codebook's token embedding, runs the
+/// depthformer, and samples a token from the codebook's logits.
+pub fn sample_audio_frame(
+    weights: &AudioDecoderWeights,
+    state: &mut DepthformerState,
+    embedding: &[f32],
+    temperature: f32,
+    top_k: usize,
+) -> [i32; 8] {
+    let cfg = &weights.decoder_config;
+    let df_cfg = &weights.depthformer_config;
+    let mut token = [0i32; 8];
+    let mut prev_token: i32 = -1;
+
+    state.reset();
+
+    for j in 0..cfg.n_codebook {
+        let cb = &weights.depth_embeddings[j];
+        let n_embd_d = cb.embedding.cols; // depthformer input dim per codebook
+
+        // 1. Project LLM embedding → depthformer input for codebook j.
+        //    depth_linear.weight is [n_embd_llm, n_codebook * n_embd_d],
+        //    slice rows [j*n_embd_d .. (j+1)*n_embd_d].
+        let mut depthformer_in = vec![0.0; n_embd_d];
+        let w = &weights.depth_linear_w;
+        let row_start = j * n_embd_d;
+        for (r, out) in depthformer_in.iter_mut().enumerate() {
+            let row = &w.data[(row_start + r) * w.cols..(row_start + r + 1) * w.cols];
+            *out = row.iter().zip(embedding).map(|(a, b)| a * b).sum::<f32>()
+                + weights.depth_linear_b[row_start + r];
+        }
+
+        // 2. Add previous codebook's token embedding (if j > 0).
+        if j > 0 && prev_token >= 0 {
+            let prev_cb = &weights.depth_embeddings[j - 1];
+            let tok = prev_token as usize;
+            let emb_row = &prev_cb.embedding.data[tok * n_embd_d..(tok + 1) * n_embd_d];
+            for (d, e) in depthformer_in.iter_mut().zip(emb_row) {
+                *d += e;
+            }
+        }
+
+        // 3. Run depthformer.
+        let hidden = depthformer_forward(weights, state, &depthformer_in);
+
+        // 4. RMSnorm → to_logits → sample.
+        let mut normed = hidden;
+        cpu::rmsnorm(&mut normed, &cb.norm, cfg.rms_norm_eps);
+
+        let mut logits = vec![0.0; cfg.n_vocab];
+        cb.to_logits.gemv(&normed, &mut logits);
+
+        // Sample (greedy if temperature <= 0, otherwise top-k).
+        let sampled = if temperature <= 0.0 {
+            crate::sampler::cpu_argmax(&logits) as i32
+        } else {
+            // Temperature scaling + top-k sampling.
+            let inv_temp = 1.0 / temperature;
+            for l in &mut logits {
+                *l *= inv_temp;
+            }
+            cpu::softmax_inplace(&mut logits);
+            // Simple top-k: find top-k, sample from them.
+            let mut indices: Vec<usize> = (0..logits.len()).collect();
+            indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            indices.truncate(top_k.min(logits.len()));
+            let sum: f32 = indices.iter().map(|&i| logits[i]).sum();
+            let mut r = rand::random::<f32>() * sum;
+            let mut picked = indices[0];
+            for &i in &indices {
+                r -= logits[i];
+                if r <= 0.0 {
+                    picked = i;
+                    break;
+                }
+            }
+            picked as i32
+        };
+
+        token[j] = sampled;
+        prev_token = sampled;
+    }
+
+    token
+}
+
+/// Convert 8 audio codes back into an embedding for feeding to the LLM.
+///
+/// Each code indexes into audio_embedding.embedding.weight (with per-codebook
+/// offsets), and the embeddings are summed to produce a single vector.
+pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec<f32> {
+    let emb = &weights.audio_embedding.embedding;
+    let n_codebook = weights.decoder_config.n_codebook;
+    let n_vocab = 2049; // per-codebook vocab size
+    let emb_dim = emb.cols;
+    let mut result = vec![0.0f32; emb_dim];
+
+    for (j, &code) in codes.iter().enumerate() {
+        let offset_idx = j * n_vocab + code as usize;
+        let row = &emb.data[offset_idx * emb_dim..(offset_idx + 1) * emb_dim];
+        for (r, e) in result.iter_mut().zip(row) {
+            *r += e;
+        }
+    }
+
+    result
+}
