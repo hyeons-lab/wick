@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::tensor::DType;
 
@@ -216,4 +217,168 @@ impl AudioDecoderWeights {
             audio_embedding,
         })
     }
+}
+
+// ── Depthformer runtime ─────────────────────────────────────────────────
+
+/// KV cache for one depthformer layer.
+struct LayerKvCache {
+    /// [max_seq × n_head_kv × head_dim] for K and V.
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+/// Runtime state for the depthformer (reset per audio frame).
+pub struct DepthformerState {
+    kv: Vec<LayerKvCache>,
+    n_past: usize,
+}
+
+impl DepthformerState {
+    pub fn new(cfg: &DepthformerConfig) -> Self {
+        let cache_size = cfg.max_seq_len * cfg.n_head_kv * cfg.n_embd_head;
+        let kv = (0..cfg.n_layer)
+            .map(|_| LayerKvCache {
+                k: vec![0.0; cache_size],
+                v: vec![0.0; cache_size],
+            })
+            .collect();
+        Self { kv, n_past: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        for layer in &mut self.kv {
+            layer.k.fill(0.0);
+            layer.v.fill(0.0);
+        }
+        self.n_past = 0;
+    }
+}
+
+/// Apply RoPE (neox style) to a single head's Q or K vector in-place.
+fn apply_rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+    let half = head_dim / 2;
+    for i in 0..half {
+        let freq = 1.0 / freq_base.powf(i as f32 / half as f32);
+        let theta = pos as f32 * freq;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let x0 = x[i];
+        let x1 = x[i + half];
+        x[i] = x0 * cos_t - x1 * sin_t;
+        x[i + half] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+/// Run one forward pass through the depthformer (1 token, n_embd input → n_embd output).
+pub fn depthformer_forward(
+    weights: &AudioDecoderWeights,
+    state: &mut DepthformerState,
+    input: &[f32],
+) -> Vec<f32> {
+    let cfg = &weights.depthformer_config;
+    let n_embd = cfg.n_embd;
+    let n_head = cfg.n_head;
+    let n_kv = cfg.n_head_kv;
+    let hd = cfg.n_embd_head;
+    let pos = state.n_past;
+
+    let mut cur = input.to_vec();
+    assert_eq!(cur.len(), n_embd);
+
+    for (il, lw) in weights.depthformer_layers.iter().enumerate() {
+        let residual = cur.clone();
+
+        // 1. RMSnorm.
+        cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+
+        // 2. Fused QKV projection → split.
+        let qkv_dim = (n_head + 2 * n_kv) * hd;
+        let mut qkv = vec![0.0; qkv_dim];
+        lw.wqkv.gemv(&cur, &mut qkv);
+
+        let q_dim = n_head * hd;
+        let k_dim = n_kv * hd;
+        let mut q = qkv[..q_dim].to_vec();
+        let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
+        let v = qkv[q_dim + k_dim..].to_vec();
+
+        // 3. Per-head RMSnorm on Q and K.
+        for h in 0..n_head {
+            let s = &mut q[h * hd..(h + 1) * hd];
+            cpu::rmsnorm(s, &lw.q_norm, cfg.rms_norm_eps);
+        }
+        for h in 0..n_kv {
+            let s = &mut k[h * hd..(h + 1) * hd];
+            cpu::rmsnorm(s, &lw.k_norm, cfg.rms_norm_eps);
+        }
+
+        // 4. RoPE on Q and K.
+        for h in 0..n_head {
+            apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
+        for h in 0..n_kv {
+            apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
+
+        // 5. Write K, V to cache at position n_past.
+        let kv = &mut state.kv[il];
+        for h in 0..n_kv {
+            let cache_off = pos * n_kv * hd + h * hd;
+            kv.k[cache_off..cache_off + hd].copy_from_slice(&k[h * hd..(h + 1) * hd]);
+            kv.v[cache_off..cache_off + hd].copy_from_slice(&v[h * hd..(h + 1) * hd]);
+        }
+
+        // 6. Attention: Q×K → softmax → ×V (GQA with group_size = n_head/n_kv).
+        let seq_len = pos + 1;
+        let group_size = n_head / n_kv;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut attn_out = vec![0.0; n_head * hd];
+
+        for h in 0..n_head {
+            let kv_h = h / group_size;
+            let q_head = &q[h * hd..(h + 1) * hd];
+
+            // Q×K scores.
+            let mut scores = vec![0.0f32; seq_len];
+            for t in 0..seq_len {
+                let k_off = t * n_kv * hd + kv_h * hd;
+                let k_t = &kv.k[k_off..k_off + hd];
+                scores[t] = q_head.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            cpu::softmax_inplace(&mut scores);
+
+            // Weighted V sum.
+            let out = &mut attn_out[h * hd..(h + 1) * hd];
+            for t in 0..seq_len {
+                let v_off = t * n_kv * hd + kv_h * hd;
+                let v_t = &kv.v[v_off..v_off + hd];
+                let s = scores[t];
+                for d in 0..hd {
+                    out[d] += s * v_t[d];
+                }
+            }
+        }
+
+        // 7. Out projection + residual.
+        let mut proj = vec![0.0; n_embd];
+        lw.wo.gemv(&attn_out, &mut proj);
+        cur = residual.iter().zip(&proj).map(|(r, p)| r + p).collect();
+
+        // 8. FFN: RMSnorm → SwiGLU(w1, w3) → w2 → residual.
+        let ffn_residual = cur.clone();
+        cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
+
+        let mut gate = vec![0.0; cfg.ffn_dim];
+        let mut up = vec![0.0; cfg.ffn_dim];
+        lw.w1.gemv(&cur, &mut gate);
+        lw.w3.gemv(&cur, &mut up);
+        cpu::silu_mul_inplace(&mut gate, &up);
+
+        let mut down = vec![0.0; n_embd];
+        lw.w2.gemv(&gate, &mut down);
+        cur = ffn_residual.iter().zip(&down).map(|(r, d)| r + d).collect();
+    }
+
+    state.n_past += 1;
+    cur
 }
