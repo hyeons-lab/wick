@@ -101,15 +101,12 @@ enum Command {
     },
 }
 
-fn load_model_for_device(
-    gguf: wick::gguf::GgufFile,
-    device: &str,
-) -> Result<Box<dyn wick::model::Model>> {
+fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::model::Model>> {
     match device {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => {
             eprintln!("Using native Metal backend");
-            wick::model::load_model_metal(gguf)
+            wick::model::load_model_metal(wick::gguf::GgufFile::open(path)?)
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         "metal" => {
@@ -118,25 +115,34 @@ fn load_model_for_device(
         #[cfg(feature = "gpu")]
         "gpu" | "wgpu" => {
             eprintln!("Using wgpu GPU backend");
-            wick::model::load_model_gpu(gguf)
+            wick::model::load_model_gpu(wick::gguf::GgufFile::open(path)?)
         }
         #[cfg(not(feature = "gpu"))]
         "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
-        "cpu" => wick::model::load_model(gguf),
+        "cpu" => wick::model::load_model(wick::gguf::GgufFile::open(path)?),
         _ => {
-            // "auto" or unknown: metal > wgpu > cpu
+            // "auto": metal > wgpu > cpu, with runtime fallback.
             #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 eprintln!("Using native Metal backend (auto)");
-                wick::model::load_model_metal(gguf)
+                return wick::model::load_model_metal(wick::gguf::GgufFile::open(path)?);
             }
             #[cfg(all(feature = "gpu", not(all(feature = "metal", target_os = "macos"))))]
             {
-                eprintln!("Using wgpu GPU backend (auto)");
-                wick::model::load_model_gpu(gguf)
+                match wick::model::load_model_gpu(wick::gguf::GgufFile::open(path)?) {
+                    Ok(m) => {
+                        eprintln!("Using wgpu GPU backend (auto)");
+                        return Ok(m);
+                    }
+                    Err(e) => {
+                        eprintln!("wgpu GPU unavailable ({e}), falling back to CPU");
+                    }
+                }
             }
-            #[cfg(all(not(feature = "gpu"), not(all(feature = "metal", target_os = "macos"))))]
-            wick::model::load_model(gguf)
+            #[allow(unreachable_code)]
+            {
+                wick::model::load_model(wick::gguf::GgufFile::open(path)?)
+            }
         }
     }
 }
@@ -177,7 +183,7 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
 
-            let loaded_model = load_model_for_device(gguf, &device)?;
+            let loaded_model = load_model_for_device(Path::new(&model), &device)?;
 
             let tokens = if let Some(ids) = &token_ids {
                 // Parse comma-separated token IDs
@@ -256,7 +262,7 @@ fn main() -> Result<()> {
             let add_bos = gguf
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
-            let loaded_model = load_model_for_device(gguf, &device)?;
+            let loaded_model = load_model_for_device(Path::new(&model), &device)?;
 
             let mut tokens = Vec::new();
             if add_bos {
