@@ -82,6 +82,10 @@ pub fn generate(
         if generated >= config.max_tokens {
             break;
         }
+        // Stop before exceeding the model's context window.
+        if pos >= model_config.max_seq_len {
+            break;
+        }
         all_tokens.push(next_token);
         generated += 1;
 

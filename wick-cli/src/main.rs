@@ -37,6 +37,11 @@ enum Command {
         /// Raw token IDs (comma-separated). Overrides --prompt when set.
         #[arg(long)]
         token_ids: Option<String>,
+
+        /// Max context window size (KV cache). Default 4096. Larger values use more
+        /// memory. Context >4096 auto-switches to flash attention (~14% slower).
+        #[arg(long, default_value_t = 4096)]
+        context_size: usize,
     },
 
     /// Inspect a GGUF model file.
@@ -98,17 +103,25 @@ enum Command {
         /// Device to use: cpu, gpu, metal, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
+
+        /// Max context window size (KV cache). Default 4096.
+        #[arg(long, default_value_t = 4096)]
+        context_size: usize,
     },
 }
 
-fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::model::Model>> {
+fn load_model_for_device(
+    path: &Path,
+    device: &str,
+    context_size: usize,
+) -> Result<Box<dyn wick::model::Model>> {
     let open = || wick::gguf::GgufFile::open(path);
 
     match device {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => {
             eprintln!("Using native Metal backend");
-            wick::model::load_model_metal(open()?, path)
+            wick::model::load_model_metal(open()?, path, context_size)
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         "metal" => {
@@ -125,19 +138,17 @@ fn load_model_for_device(path: &Path, device: &str) -> Result<Box<dyn wick::mode
             eprintln!("Using CPU backend");
             wick::model::load_model(open()?)
         }
-        _ => load_model_auto(path),
+        _ => load_model_auto(path, context_size),
     }
 }
 
 /// Auto device selection: metal > wgpu > cpu, with runtime fallback.
-/// Each attempt opens the GGUF fresh so a failed GPU init doesn't
-/// consume the file handle needed for the CPU fallback.
-fn load_model_auto(path: &Path) -> Result<Box<dyn wick::model::Model>> {
+fn load_model_auto(path: &Path, context_size: usize) -> Result<Box<dyn wick::model::Model>> {
     let open = || wick::gguf::GgufFile::open(path);
 
     // Try Metal first (macOS/iOS only).
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    match wick::model::load_model_metal(open()?, path) {
+    match wick::model::load_model_metal(open()?, path, context_size) {
         Ok(m) => {
             eprintln!("Using native Metal backend (auto)");
             return Ok(m);
@@ -193,6 +204,7 @@ fn main() -> Result<()> {
             temperature,
             device,
             token_ids,
+            context_size,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -200,7 +212,7 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
 
-            let loaded_model = load_model_for_device(Path::new(&model), &device)?;
+            let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
 
             let tokens = if let Some(ids) = &token_ids {
                 // Parse comma-separated token IDs
@@ -266,6 +278,7 @@ fn main() -> Result<()> {
             warmup,
             max_tokens,
             device,
+            context_size,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("WICK_PROFILE").is_ok() {
@@ -279,7 +292,7 @@ fn main() -> Result<()> {
             let add_bos = gguf
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
-            let loaded_model = load_model_for_device(Path::new(&model), &device)?;
+            let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
 
             let mut tokens = Vec::new();
             if add_bos {

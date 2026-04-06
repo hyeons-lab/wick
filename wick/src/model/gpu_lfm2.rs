@@ -138,6 +138,8 @@ impl GpuLfm2Model {
         let is = config.intermediate_size;
         let max_kv_dim =
             config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / config.n_heads);
+        // WGSL attention uses device-memory scores (no TG limit).
+        // Clamp to model's context_length.
         let max_seq_len = config.max_seq_len;
 
         tracing::info!(

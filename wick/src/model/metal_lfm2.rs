@@ -160,14 +160,17 @@ pub struct MetalLfm2Model {
 }
 
 impl MetalLfm2Model {
-    pub fn from_gguf(gguf: GgufFile, path: &std::path::Path) -> Result<Self> {
+    pub fn from_gguf(gguf: GgufFile, path: &std::path::Path, context_size: usize) -> Result<Self> {
         let ctx = MetalContext::new()?;
         let data_offset = gguf.data_offset();
         let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf)?;
-        let config = cpu_model.config().clone();
+        let mut config = cpu_model.config().clone();
+        // Clamp context to user request and model limit. Classic attention
+        // handles up to 4096 (TG memory); beyond that, auto-switches to flash.
+        let max_seq_len = context_size.min(config.max_seq_len);
+        config.max_seq_len = max_seq_len; // so engine sees the effective limit
         let hs = config.hidden_size;
         let is = config.intermediate_size;
-        let max_seq_len = config.max_seq_len;
 
         tracing::info!(
             "Metal model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -872,12 +875,15 @@ impl MetalLfm2Model {
         }
 
         // Attention kernel selection:
-        // - WICK_ATTN=splitk: split-K attention (2 dispatches, more TGs — helps long context)
+        // - seq_len > 1024: auto-switch to FlashAttention (classic uses
+        //   threadgroup float scores[1024] which overflows past that)
+        // - WICK_ATTN=splitk: split-K attention (manual override)
         // - WICK_ATTN=gqa: GQA-batched attention — 1 TG per KV head
-        // - WICK_FLASH=1: tiled FlashAttention (generally slower for decode)
-        // - default: classic 3-phase attention (1 TG per Q head)
+        // - WICK_FLASH=1: force FlashAttention at any seq_len
+        // - seq_len > 4096: auto-switch to flash (classic TG memory limit)
+        // - default (seq_len ≤ 4096): classic 3-phase attention
         let attn_mode = std::env::var("WICK_ATTN").unwrap_or_default();
-        let use_flash = std::env::var("WICK_FLASH").as_deref() == Ok("1");
+        let use_flash = std::env::var("WICK_FLASH").as_deref() == Ok("1") || seq_len > 4096;
         let group_size = n_heads / n_kv_heads;
         let use_gqa = attn_mode == "gqa" && group_size > 1 && group_size <= 4;
         let use_splitk = attn_mode == "splitk";

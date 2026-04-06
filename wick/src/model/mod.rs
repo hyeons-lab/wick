@@ -103,13 +103,21 @@ pub fn load_model_gpu(gguf: GgufFile) -> Result<Box<dyn Model>> {
 
 /// Load a model with native Metal acceleration.
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn load_model_metal(gguf: GgufFile, path: &std::path::Path) -> Result<Box<dyn Model>> {
+pub fn load_model_metal(
+    gguf: GgufFile,
+    path: &std::path::Path,
+    context_size: usize,
+) -> Result<Box<dyn Model>> {
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(gguf, path)?)),
+        "lfm2" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(
+            gguf,
+            path,
+            context_size,
+        )?)),
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }

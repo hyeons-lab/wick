@@ -9,10 +9,10 @@ using namespace metal;
 // raise it (tradeoff: 4 bytes per slot per active threadgroup of shared
 // memory, which is plentiful on Apple GPUs).
 
-// Caps per-TG threadgroup memory usage. 1024 covers LFM2's max_seq_len.
-// At head_dim=128 and 1024 scores, total TG memory ≈ 6 KB which allows
-// ~5 concurrent TGs per SM on M1 Max (vs 1 at the old 17 KB footprint).
-constant constexpr uint MAX_SEQ_LEN = 1024;
+// Caps per-TG threadgroup memory. 4096 scores = 16 KB; total TG memory
+// ≈ 20.6 KB (within Apple Silicon's 32 KB limit). For seq_len > 4096,
+// the Rust side auto-switches to flash attention.
+constant constexpr uint MAX_SEQ_LEN = 4096;
 constant constexpr uint MAX_HEAD_DIM = 128;
 
 struct Params {
