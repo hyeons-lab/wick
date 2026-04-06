@@ -149,3 +149,4 @@ pub fn load_model_metal(
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }
+pub mod audio_decoder;
