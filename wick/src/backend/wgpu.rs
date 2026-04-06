@@ -49,13 +49,16 @@ impl GpuContext {
         let profile_requested = std::env::var("WICK_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
             profile_requested && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let has_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
-        let mut features = wgpu::Features::empty();
+        // Subgroup ops (subgroupAdd) are required by all WGSL compute kernels.
+        // Fail clearly if the adapter doesn't support them.
+        anyhow::ensure!(
+            adapter.features().contains(wgpu::Features::SUBGROUP),
+            "GPU adapter does not support subgroup operations (required for WGSL kernels). \
+             Use --device cpu instead."
+        );
+        let mut features = wgpu::Features::SUBGROUP;
         if has_timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
-        }
-        if has_subgroup {
-            features |= wgpu::Features::SUBGROUP;
         }
 
         // Use the adapter's actual limits instead of hardcoding. This avoids
@@ -111,7 +114,7 @@ impl GpuContext {
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
-            subgroup = has_subgroup,
+            subgroup = true,  // required — checked above
             "GPU initialized"
         );
 
@@ -523,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow microbenchmark — run explicitly with --ignored
     fn bench_gpu_gemv_f32() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,

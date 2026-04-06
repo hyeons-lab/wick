@@ -3,17 +3,23 @@
 // Bypasses wgpu's WGSL→MSL translation and per-dispatch validation overhead.
 // Uses the `metal` crate directly for access to MTL APIs.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use metal::{
     Buffer, CommandQueue, ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor,
-    Device, MTLResourceOptions, MTLStorageMode,
+    Device, Library, MTLResourceOptions, MTLStorageMode,
 };
 
-/// Metal compute context: device, command queue, compiled shader library.
+/// Metal compute context: device, command queue, compiled shader library cache.
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
     pub device_name: String,
+    /// Cache compiled MSL libraries by source pointer address.
+    /// Since sources are `include_str!` statics, pointer identity = source identity.
+    library_cache: RefCell<HashMap<usize, Library>>,
 }
 
 impl MetalContext {
@@ -26,6 +32,7 @@ impl MetalContext {
             device,
             queue,
             device_name,
+            library_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -55,12 +62,21 @@ impl MetalContext {
     }
 
     /// Compile an MSL source string into a compute pipeline.
+    /// Libraries are cached by source pointer — multiple entry points from the
+    /// same `include_str!` source share one compilation.
     pub fn create_pipeline(&self, src: &str, entry: &str) -> Result<ComputePipelineState> {
-        let opts = metal::CompileOptions::new();
-        let library = self
-            .device
-            .new_library_with_source(src, &opts)
-            .map_err(|e| anyhow::anyhow!("MSL compile failed: {e}"))?;
+        let key = src.as_ptr() as usize;
+        let mut cache = self.library_cache.borrow_mut();
+        let library = cache
+            .entry(key)
+            .or_insert_with(|| {
+                let opts = metal::CompileOptions::new();
+                self.device
+                    .new_library_with_source(src, &opts)
+                    .expect("MSL compile failed")
+            })
+            .clone();
+        drop(cache);
         let function = library
             .get_function(entry, None)
             .map_err(|e| anyhow::anyhow!("entry point '{entry}' not found: {e}"))?;

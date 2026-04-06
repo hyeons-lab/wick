@@ -15,7 +15,7 @@ use crate::tensor::DType;
 /// Pre-resolved reference to a quantized weight in the mmap.
 /// Computed once at load time to avoid HashMap lookups during inference.
 #[derive(Debug, Clone)]
-pub struct WeightRef {
+pub(crate) struct WeightRef {
     pub start: usize,
     pub size: usize,
     pub dtype: DType,
@@ -25,7 +25,7 @@ pub struct WeightRef {
 
 /// Per-layer weight references for quantized tensors.
 #[derive(Debug, Clone)]
-pub struct LayerWeightRefs {
+pub(crate) struct LayerWeightRefs {
     pub ffn_gate: WeightRef,
     pub ffn_up: WeightRef,
     pub ffn_down: WeightRef,

@@ -5,7 +5,7 @@ use rand::rngs::StdRng;
 use crate::backend::cpu;
 
 /// NaN-safe CPU argmax. NaN values compare as -inf (never selected).
-pub fn cpu_argmax(logits: &[f32]) -> u32 {
+pub(crate) fn cpu_argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
