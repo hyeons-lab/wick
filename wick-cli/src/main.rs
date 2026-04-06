@@ -143,7 +143,10 @@ fn load_model_for_device(
 }
 
 /// Auto device selection: metal > wgpu > cpu, with runtime fallback.
-fn load_model_auto(path: &Path, context_size: usize) -> Result<Box<dyn wick::model::Model>> {
+fn load_model_auto(
+    path: &Path,
+    #[allow(unused)] context_size: usize,
+) -> Result<Box<dyn wick::model::Model>> {
     let open = || wick::gguf::GgufFile::open(path);
 
     // Try Metal first (macOS/iOS only).
