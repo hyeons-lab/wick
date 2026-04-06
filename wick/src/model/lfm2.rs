@@ -330,12 +330,12 @@ impl Lfm2Model {
     }
 
     /// Get raw weight bytes for a WeightRef (for GPU quantized upload).
-    pub fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+    pub(crate) fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
         self.weight_data(wref)
     }
 
     /// Dequantize a weight matrix to f32 given a WeightRef.
-    pub fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
+    pub(crate) fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
         let mut out = vec![0.0f32; wref.m * wref.k];
         let data = self.weight_data(wref);
         let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
@@ -362,12 +362,12 @@ impl Lfm2Model {
     }
 
     /// Access the per-layer weight refs (for GPU model construction).
-    pub fn layer_refs(&self) -> &[LayerWeightRefs] {
+    pub(crate) fn layer_refs(&self) -> &[LayerWeightRefs] {
         &self.layer_refs
     }
 
     /// Access the embedding weight ref.
-    pub fn embd_ref(&self) -> &WeightRef {
+    pub(crate) fn embd_ref(&self) -> &WeightRef {
         &self.embd_ref
     }
 
