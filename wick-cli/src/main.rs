@@ -50,6 +50,11 @@ enum Command {
         /// Output WAV file for generated audio.
         #[arg(long)]
         audio_out: Option<String>,
+
+        /// System prompt (used with --vocoder for audio mode selection).
+        /// E.g. "Perform TTS." or "Respond with interleaved text and audio."
+        #[arg(long)]
+        system: Option<String>,
     },
 
     /// Inspect a GGUF model file.
@@ -249,6 +254,7 @@ fn main() -> Result<()> {
             context_size,
             vocoder,
             audio_out,
+            system,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -259,10 +265,40 @@ fn main() -> Result<()> {
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
 
             let tokens = if let Some(ids) = &token_ids {
-                // Parse comma-separated token IDs
                 ids.split(',')
                     .map(|s| s.trim().parse::<u32>())
                     .collect::<Result<Vec<_>, _>>()?
+            } else if system.is_some() || vocoder.is_some() {
+                // Use chat template when --system or --vocoder is set.
+                anyhow::ensure!(
+                    system.is_some(),
+                    "--system is required with --vocoder. Supported:\n  \
+                     \"Respond with interleaved text and audio.\"\n  \
+                     \"Perform TTS. <voice description>\"\n  \
+                     \"Perform ASR.\" (not yet supported — requires audio encoder)"
+                );
+                let sys = system.as_deref().unwrap();
+                let messages = vec![
+                    wick::tokenizer::ChatMessage {
+                        role: "system".into(),
+                        content: sys.into(),
+                    },
+                    wick::tokenizer::ChatMessage {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                    },
+                ];
+                let formatted = wick::tokenizer::apply_chat_template(&tokenizer, &messages, true)?;
+                eprintln!("Chat template applied ({} chars)", formatted.len());
+                let mut toks = tokenizer.encode(&formatted);
+                // The chat template usually includes BOS, don't double-add.
+                if add_bos
+                    && tokenizer.bos_token().is_some()
+                    && toks.first() != tokenizer.bos_token().as_ref()
+                {
+                    toks.insert(0, tokenizer.bos_token().unwrap());
+                }
+                toks
             } else {
                 let mut toks = Vec::new();
                 if add_bos {
@@ -291,6 +327,13 @@ fn main() -> Result<()> {
                     wick::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf)?;
 
                 let mut all_pcm = Vec::new();
+                let sys = system.as_deref().unwrap(); // validated above
+                let mode = if sys == "Respond with interleaved text and audio." {
+                    wick::audio_engine::AudioMode::Interleaved
+                } else {
+                    // "Perform TTS.*" and other prompts use sequential mode.
+                    wick::audio_engine::AudioMode::Sequential
+                };
                 let audio_config = wick::audio_engine::AudioGenerateConfig {
                     max_tokens,
                     sampler: wick::sampler::SamplerConfig {
@@ -299,7 +342,7 @@ fn main() -> Result<()> {
                     },
                     audio_temperature: 0.8,
                     audio_top_k: 4,
-                    mode: wick::audio_engine::AudioMode::Sequential,
+                    mode,
                 };
 
                 let result = wick::audio_engine::generate_audio(
