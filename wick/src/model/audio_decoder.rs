@@ -702,3 +702,372 @@ impl DetokenizerWeights {
         })
     }
 }
+
+// ── Detokenizer forward pass ────────────────────────────────────────────
+
+/// Runtime state for the detokenizer's LFM2 backbone.
+pub struct DetokenizerState {
+    /// Per-layer conv rolling buffer [d_conv, n_embd].
+    conv_bufs: Vec<Vec<f32>>,
+    /// Per-layer KV cache for attention layers.
+    attn_kv: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+    n_past: usize,
+}
+
+impl DetokenizerState {
+    pub fn new(cfg: &DetokenizerConfig) -> Self {
+        let mut conv_bufs = Vec::new();
+        let mut attn_kv = Vec::new();
+        let kv_size = cfg.swa_window_size * cfg.n_head_kv * cfg.n_embd_head;
+        for &is_conv in &cfg.layer_is_conv {
+            if is_conv {
+                conv_bufs.push(vec![0.0; cfg.d_conv * cfg.n_embd]);
+                attn_kv.push(None);
+            } else {
+                conv_bufs.push(vec![]); // placeholder
+                attn_kv.push(Some((vec![0.0; kv_size], vec![0.0; kv_size])));
+            }
+        }
+        Self {
+            conv_bufs,
+            attn_kv,
+            n_past: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for buf in &mut self.conv_bufs {
+            buf.fill(0.0);
+        }
+        for kv in &mut self.attn_kv {
+            if let Some((k, v)) = kv {
+                k.fill(0.0);
+                v.fill(0.0);
+            }
+        }
+        self.n_past = 0;
+    }
+}
+
+/// Embed 8 audio codes into a single vector for the detokenizer.
+/// Looks up each code with per-codebook offset, averages across codebooks.
+fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32> {
+    let n_codes = weights.config.n_codes;
+    let emb = &weights.emb_weight;
+    let emb_dim = emb.cols;
+    let n_vocab_per_cb = emb.rows / n_codes;
+
+    let mut result = vec![0.0f32; emb_dim];
+    for (j, &code) in codes.iter().enumerate() {
+        let idx = j * n_vocab_per_cb + code as usize;
+        let row = &emb.data[idx * emb_dim..(idx + 1) * emb_dim];
+        for (r, e) in result.iter_mut().zip(row) {
+            *r += e;
+        }
+    }
+    // Mean across codebooks.
+    let scale = 1.0 / n_codes as f32;
+    for r in &mut result {
+        *r *= scale;
+    }
+    result
+}
+
+/// Linear interpolation upsample: 1 token → n_up tokens.
+fn upsample(input: &[f32], n_embd: usize, n_up: usize) -> Vec<f32> {
+    let n_in = input.len() / n_embd;
+    let n_out = n_in * n_up;
+    let mut output = vec![0.0; n_out * n_embd];
+    for i in 0..n_out {
+        let src_f = i as f32 / n_up as f32;
+        let src_i = src_f as usize;
+        let frac = src_f - src_i as f32;
+        let i0 = src_i.min(n_in - 1);
+        let i1 = (src_i + 1).min(n_in - 1);
+        for d in 0..n_embd {
+            output[i * n_embd + d] =
+                input[i0 * n_embd + d] * (1.0 - frac) + input[i1 * n_embd + d] * frac;
+        }
+    }
+    output
+}
+
+/// Process one token through a conv block (gated short conv).
+fn detok_conv_block(
+    lw: &DetokLayerWeights,
+    conv_buf: &mut [f32],
+    cur: &[f32],
+    n_embd: usize,
+    d_conv: usize,
+) -> Vec<f32> {
+    // in_proj → [b, c, x] chunks.
+    let chunk_size = n_embd;
+    let mut bcx = vec![0.0; 3 * chunk_size];
+    lw.conv_in_proj.as_ref().unwrap().gemv(cur, &mut bcx);
+
+    let b = &bcx[..chunk_size];
+    let c = &bcx[chunk_size..2 * chunk_size];
+    let x = &bcx[2 * chunk_size..];
+
+    // bx = b * x
+    let mut bx: Vec<f32> = b.iter().zip(x).map(|(bi, xi)| bi * xi).collect();
+
+    // conv1d with rolling buffer: concat [conv_buf, bx], convolve, update buf.
+    let kernel_size = d_conv + 1;
+    let conv_w = lw.conv_weight.as_ref().unwrap();
+    let mut conv_out = vec![0.0; chunk_size];
+    // The rolling buffer has d_conv previous bx vectors.
+    // Kernel applies: sum over k of weight[k] * input[pos - d_conv + k]
+    for ch in 0..chunk_size {
+        let mut sum = 0.0;
+        for k in 0..d_conv {
+            sum += conv_buf[k * n_embd + ch] * conv_w[k * n_embd + ch];
+        }
+        sum += bx[ch] * conv_w[d_conv * n_embd + ch];
+        conv_out[ch] = sum;
+    }
+
+    // Update rolling buffer: shift left, append bx.
+    if d_conv > 1 {
+        let row_size = n_embd;
+        for k in 0..d_conv - 1 {
+            let src = (k + 1) * row_size;
+            let dst = k * row_size;
+            conv_buf.copy_within(src..src + row_size, dst);
+        }
+    }
+    conv_buf[(d_conv - 1) * n_embd..d_conv * n_embd].copy_from_slice(&bx);
+
+    // y = c * conv_out
+    let y: Vec<f32> = c.iter().zip(&conv_out).map(|(ci, co)| ci * co).collect();
+
+    // out_proj
+    let mut out = vec![0.0; n_embd];
+    lw.conv_out_proj.as_ref().unwrap().gemv(&y, &mut out);
+    out
+}
+
+/// Process one token through an attention block.
+fn detok_attn_block(
+    lw: &DetokLayerWeights,
+    kv: &mut (Vec<f32>, Vec<f32>),
+    cur: &[f32],
+    pos: usize,
+    cfg: &DetokenizerConfig,
+) -> Vec<f32> {
+    let n_embd = cfg.n_embd;
+    let n_head = cfg.n_head;
+    let n_kv = cfg.n_head_kv;
+    let hd = cfg.n_embd_head;
+
+    let mut q = vec![0.0; n_head * hd];
+    let mut k = vec![0.0; n_kv * hd];
+    let mut v = vec![0.0; n_kv * hd];
+    lw.wq.as_ref().unwrap().gemv(cur, &mut q);
+    lw.wk.as_ref().unwrap().gemv(cur, &mut k);
+    lw.wv.as_ref().unwrap().gemv(cur, &mut v);
+
+    // Per-head norm + RoPE.
+    let q_norm = lw.q_norm.as_ref().unwrap();
+    let k_norm = lw.k_norm.as_ref().unwrap();
+    for h in 0..n_head {
+        cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
+        apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+    }
+    for h in 0..n_kv {
+        cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
+        apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+    }
+
+    // Write to KV cache (ring buffer for SWA).
+    let (k_cache, v_cache) = kv;
+    let kv_stride = n_kv * hd;
+    let write_pos = pos % cfg.swa_window_size;
+    k_cache[write_pos * kv_stride..(write_pos + 1) * kv_stride].copy_from_slice(&k);
+    v_cache[write_pos * kv_stride..(write_pos + 1) * kv_stride].copy_from_slice(&v);
+
+    // Attention with sliding window.
+    let kv_start = if pos + 1 > cfg.swa_window_size {
+        pos + 1 - cfg.swa_window_size
+    } else {
+        0
+    };
+    let kv_len = pos + 1 - kv_start;
+    let group_size = n_head / n_kv;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut attn_out = vec![0.0; n_head * hd];
+
+    for h in 0..n_head {
+        let kv_h = h / group_size;
+        let q_head = &q[h * hd..(h + 1) * hd];
+        let mut scores = vec![0.0f32; kv_len];
+        for t in 0..kv_len {
+            let cache_pos = (kv_start + t) % cfg.swa_window_size;
+            let k_off = cache_pos * kv_stride + kv_h * hd;
+            let k_t = &k_cache[k_off..k_off + hd];
+            scores[t] = q_head.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale;
+        }
+        cpu::softmax_inplace(&mut scores);
+
+        let out = &mut attn_out[h * hd..(h + 1) * hd];
+        for t in 0..kv_len {
+            let cache_pos = (kv_start + t) % cfg.swa_window_size;
+            let v_off = cache_pos * kv_stride + kv_h * hd;
+            let v_t = &v_cache[v_off..v_off + hd];
+            let s = scores[t];
+            for d in 0..hd {
+                out[d] += s * v_t[d];
+            }
+        }
+    }
+
+    let mut proj = vec![0.0; n_embd];
+    lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+    proj
+}
+
+/// Run the detokenizer: codes → spectrogram frames (before ISTFT).
+///
+/// Returns raw spectrogram data as [n_frames × n_fft_bins × 2] (log_abs, angle).
+pub fn detokenize_to_spectrum(
+    weights: &DetokenizerWeights,
+    detok_weights: &AudioDecoderWeights,
+    state: &mut DetokenizerState,
+    codes: &[i32],
+) -> Vec<f32> {
+    let cfg = &weights.config;
+    let n_embd = cfg.n_embd;
+
+    // 1. Embed codes → single vector.
+    let embedding = detok_embed_codes(weights, codes);
+
+    // 2. Upsample 1 → 6 tokens.
+    let tokens = upsample(&embedding, n_embd, 6);
+    let n_tokens = tokens.len() / n_embd;
+
+    // 3. LFM2 backbone: process each token sequentially.
+    let mut outputs = Vec::with_capacity(n_tokens * n_embd);
+    for t in 0..n_tokens {
+        let pos = state.n_past + t;
+        let mut cur = tokens[t * n_embd..(t + 1) * n_embd].to_vec();
+
+        for (il, lw) in weights.layers.iter().enumerate() {
+            let residual = cur.clone();
+            cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+
+            let block_out = if cfg.layer_is_conv[il] {
+                detok_conv_block(lw, &mut state.conv_bufs[il], &cur, n_embd, cfg.d_conv)
+            } else {
+                detok_attn_block(lw, state.attn_kv[il].as_mut().unwrap(), &cur, pos, cfg)
+            };
+
+            cur = residual
+                .iter()
+                .zip(&block_out)
+                .map(|(r, b)| r + b)
+                .collect();
+
+            // FFN.
+            let ffn_residual = cur.clone();
+            cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
+            let mut gate = vec![0.0; cfg.ffn_dim];
+            let mut up = vec![0.0; cfg.ffn_dim];
+            lw.ffn_w1.gemv(&cur, &mut gate);
+            lw.ffn_w3.gemv(&cur, &mut up);
+            cpu::silu_mul_inplace(&mut gate, &up);
+            let mut down = vec![0.0; n_embd];
+            lw.ffn_w2.gemv(&gate, &mut down);
+            cur = ffn_residual.iter().zip(&down).map(|(r, d)| r + d).collect();
+        }
+
+        // Output norm.
+        cpu::rmsnorm(&mut cur, &weights.output_norm, cfg.rms_norm_eps);
+        outputs.extend_from_slice(&cur);
+    }
+
+    state.n_past += n_tokens;
+
+    // 4. Linear projection → spectrogram.
+    let lin_out_dim = weights.lin_w.rows; // n_fft_bins * 2 = 1282
+    let mut spectrum = Vec::with_capacity(n_tokens * lin_out_dim);
+    for t in 0..n_tokens {
+        let hidden = &outputs[t * n_embd..(t + 1) * n_embd];
+        let mut frame = vec![0.0; lin_out_dim];
+        weights.lin_w.gemv(hidden, &mut frame);
+        for (f, b) in frame.iter_mut().zip(&weights.lin_b) {
+            *f += b;
+        }
+        spectrum.extend_from_slice(&frame);
+    }
+
+    spectrum
+}
+
+/// Convert spectrogram frames to PCM audio samples via ISTFT.
+///
+/// Input: [n_frames × n_fft_bins × 2] where each pair is (log_abs, angle).
+/// Output: PCM float32 samples at the configured sample rate.
+pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+    let n_fft_bins = n_fft / 2 + 1;
+    let frame_size = n_fft_bins * 2;
+    let n_frames = spectrum.len() / frame_size;
+    if n_frames == 0 {
+        return vec![];
+    }
+
+    let output_len = (n_frames - 1) * hop_length;
+    let mut output = vec![0.0f32; output_len + n_fft];
+    let mut window_sum = vec![0.0f32; output_len + n_fft];
+
+    // Hann window.
+    let hann: Vec<f32> = (0..n_fft)
+        .map(|i| {
+            let t = std::f32::consts::PI * i as f32 / n_fft as f32;
+            t.sin().powi(2)
+        })
+        .collect();
+
+    for i in 0..n_frames {
+        // Extract complex spectrum: (log_abs, angle) → complex.
+        let mut complex = vec![(0.0f32, 0.0f32); n_fft];
+        for j in 0..n_fft_bins {
+            let log_abs = spectrum[i * frame_size + j];
+            let angle = spectrum[i * frame_size + n_fft_bins + j];
+            let mag = log_abs.exp();
+            complex[j] = (mag * angle.cos(), mag * angle.sin());
+        }
+        // Mirror for negative frequencies.
+        for j in 1..n_fft_bins - 1 {
+            complex[n_fft - j] = (complex[j].0, -complex[j].1);
+        }
+
+        // IFFT (simple DFT — n_fft=1280 is small enough).
+        let mut time_domain = vec![0.0f32; n_fft];
+        let inv_n = 1.0 / n_fft as f32;
+        for n in 0..n_fft {
+            let mut sum = 0.0f32;
+            for k in 0..n_fft {
+                let angle = 2.0 * std::f32::consts::PI * k as f32 * n as f32 * inv_n;
+                sum += complex[k].0 * angle.cos() - complex[k].1 * angle.sin();
+            }
+            time_domain[n] = sum * inv_n;
+        }
+
+        // Window + overlap-add.
+        let offset = i * hop_length;
+        for n in 0..n_fft {
+            output[offset + n] += time_domain[n] * hann[n];
+            window_sum[offset + n] += hann[n] * hann[n];
+        }
+    }
+
+    // Normalize by window sum.
+    for i in 0..output.len() {
+        if window_sum[i] > 1e-8 {
+            output[i] /= window_sum[i];
+        }
+    }
+
+    output.truncate(output_len);
+    output
+}
