@@ -115,6 +115,9 @@ pub struct GpuLfm2Model {
     rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
     elementwise_hs_params: wgpu::Buffer, // [hs, 0]
     elementwise_is_params: wgpu::Buffer, // [intermediate_size, 0]
+    conv1d_params: wgpu::Buffer,         // [hs, kernel_size, d_conv, 0]
+    per_head_norm_params: wgpu::Buffer,  // [head_dim, eps_bits, 0, 0]
+    rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_bx_buf: wgpu::Buffer,   // [hidden_size]
@@ -327,6 +330,19 @@ impl GpuLfm2Model {
             ctx.upload_storage(bytemuck::cast_slice(&[hs as u32, 0u32]), "ew_hs_params");
         let elementwise_is_params =
             ctx.upload_storage(bytemuck::cast_slice(&[is as u32, 0u32]), "ew_is_params");
+        let kernel_size = config.conv_kernel_size.unwrap_or(3) as u32;
+        let d_conv = kernel_size - 1;
+        let head_dim = (hs / config.n_heads) as u32;
+        let conv1d_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[hs as u32, kernel_size, d_conv, 0u32]),
+            "conv1d_params",
+        );
+        let per_head_norm_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[head_dim, config.rms_norm_eps.to_bits(), 0u32, 0u32]),
+            "ph_norm_params",
+        );
+        // rope_params is updated per token via queue.write_buffer — needs COPY_DST.
+        let rope_params = ctx.create_storage_rw(5 * 4, "rope_params");
 
         let mut model = Self {
             ctx,
@@ -351,6 +367,9 @@ impl GpuLfm2Model {
             rmsnorm_hs_params,
             elementwise_hs_params,
             elementwise_is_params,
+            conv1d_params,
+            per_head_norm_params,
+            rope_params,
             conv_proj_buf,
             conv_bx_buf,
             conv_out_buf,
@@ -905,11 +924,7 @@ impl Model for GpuLfm2Model {
                 let d_conv = kernel_size - 1;
                 let conv_buf = self.gpu_state.conv_buffers[i].as_ref().unwrap();
 
-                // Pre-create BGs for conv block.
-                let norm_p = self.ctx.upload_storage(
-                    bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
-                    "p",
-                );
+                // Pre-create BGs for conv block (using pre-allocated params).
                 let norm_bg = self
                     .ctx
                     .device
@@ -927,7 +942,7 @@ impl Model for GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: norm_p.as_entire_binding(),
+                                resource: self.rmsnorm_hs_params.as_entire_binding(),
                             },
                         ],
                     });
@@ -1006,10 +1021,7 @@ impl Model for GpuLfm2Model {
                             },
                         ],
                     });
-                let conv_p = self.ctx.upload_storage(
-                    bytemuck::cast_slice(&[hs32, kernel_size, d_conv, 0u32]),
-                    "p",
-                );
+                let conv_p = &self.conv1d_params;
                 let conv_bg = self
                     .ctx
                     .device
@@ -1156,10 +1168,6 @@ impl Model for GpuLfm2Model {
                 let n_heads = cfg.n_heads as u32;
 
                 // Pre-create all BGs before opening passes.
-                let norm_p = self.ctx.upload_storage(
-                    bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
-                    "p",
-                );
                 let norm_bg = self
                     .ctx
                     .device
@@ -1177,7 +1185,7 @@ impl Model for GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: norm_p.as_entire_binding(),
+                                resource: self.rmsnorm_hs_params.as_entire_binding(),
                             },
                         ],
                     });
@@ -1208,10 +1216,6 @@ impl Model for GpuLfm2Model {
                         &v_bg_tmp
                     }
                 };
-                let qn_p = self.ctx.upload_storage(
-                    bytemuck::cast_slice(&[head_dim, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
-                    "p",
-                );
                 let qn_bg = self
                     .ctx
                     .device
@@ -1229,7 +1233,7 @@ impl Model for GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: qn_p.as_entire_binding(),
+                                resource: self.per_head_norm_params.as_entire_binding(),
                             },
                         ],
                     });
@@ -1250,20 +1254,20 @@ impl Model for GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: qn_p.as_entire_binding(),
+                                resource: self.per_head_norm_params.as_entire_binding(),
                             },
                         ],
                     });
-                let rope_params: [u32; 5] = [
+                let rope_data: [u32; 5] = [
                     pos as u32,
                     n_heads,
                     n_kv_heads,
                     head_dim,
                     cfg.rope_theta.to_bits(),
                 ];
-                let rope_p = self
-                    .ctx
-                    .upload_storage(bytemuck::cast_slice(&rope_params), "p");
+                self.ctx
+                    .queue
+                    .write_buffer(&self.rope_params, 0, bytemuck::cast_slice(&rope_data));
                 let rope_bg = self
                     .ctx
                     .device
@@ -1281,7 +1285,7 @@ impl Model for GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: rope_p.as_entire_binding(),
+                                resource: self.rope_params.as_entire_binding(),
                             },
                         ],
                     });
@@ -1431,10 +1435,7 @@ impl Model for GpuLfm2Model {
             );
             // FFN: batch 6 dispatches into ONE compute pass.
             // Pre-create bind groups before opening the pass.
-            let norm_params = self.ctx.upload_storage(
-                bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
-                "p",
-            );
+            let norm_params = &self.rmsnorm_hs_params;
             let norm_bg = self
                 .ctx
                 .device

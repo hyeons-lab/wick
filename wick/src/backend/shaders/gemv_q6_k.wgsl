@@ -1,6 +1,9 @@
+// NOTE: Uses subgroupAdd without `enable subgroups;` — see gemv_q4_0.wgsl.
+//
 // Q6_K GEMV — Metal kernel layout with per-byte reads.
-// Correct but slow due to per-byte u32 load+shift+mask overhead.
-// TODO: optimize with u32 bulk loads once correctness is validated.
+// Correct but slow due to per-byte u32 load+shift+mask overhead (regresses
+// vs f32 on macOS wgpu). NOT wired into production — kept for future
+// optimization on targets where byte extraction is cheaper.
 //
 // NR=2 rows per WG, 32 threads. Dispatch: ceil(m/2).
 

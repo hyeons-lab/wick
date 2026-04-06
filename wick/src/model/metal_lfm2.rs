@@ -152,7 +152,7 @@ impl MetalLfm2Model {
         let config = cpu_model.config().clone();
         let hs = config.hidden_size;
         let is = config.intermediate_size;
-        let max_seq_len = 1024usize;
+        let max_seq_len = config.max_seq_len;
 
         tracing::info!(
             "Metal model: {} layers, hs={hs}, is={is}, vocab={}",

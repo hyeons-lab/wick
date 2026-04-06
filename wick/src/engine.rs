@@ -74,6 +74,9 @@ pub fn generate(
     // Seed the loop with the first token from prefill logits.
     let mut next_token = sampler.sample(&mut logits);
     loop {
+        if generated >= config.max_tokens {
+            break;
+        }
         all_tokens.push(next_token);
         generated += 1;
 
@@ -87,10 +90,6 @@ pub fn generate(
             let piece = tokenizer.decode(&[next_token]);
             print!("{piece}");
             std::io::stdout().flush()?;
-        }
-
-        if generated >= config.max_tokens {
-            break;
         }
 
         // Forward pass for next token. Greedy: token-id only (4-byte read);

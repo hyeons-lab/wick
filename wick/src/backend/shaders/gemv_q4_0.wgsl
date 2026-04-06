@@ -1,3 +1,7 @@
+// NOTE: Uses subgroupAdd without `enable subgroups;` — the directive
+// breaks compilation on macOS wgpu (naga), but the bare builtin works.
+// For non-Apple targets, add `enable subgroups;` or use a workgroup fallback.
+//
 // Q4_0 GEMV: y[m] = dequant(A_q4_0[m, k]) × x[k]
 //
 // Q4_0 block layout (18 bytes per 32 elements):

@@ -1,3 +1,5 @@
+// NOTE: Uses subgroupAdd without `enable subgroups;` — see gemv_q4_0.wgsl.
+//
 // Fast Q4_0 GEMV ported from Metal/llama.cpp algorithm.
 //
 // Key optimizations vs gemv_q4_0.wgsl:
