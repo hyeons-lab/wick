@@ -1041,17 +1041,8 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
             complex[n_fft - j] = (complex[j].0, -complex[j].1);
         }
 
-        // IFFT (simple DFT — n_fft=1280 is small enough).
-        let mut time_domain = vec![0.0f32; n_fft];
-        let inv_n = 1.0 / n_fft as f32;
-        for n in 0..n_fft {
-            let mut sum = 0.0f32;
-            for k in 0..n_fft {
-                let angle = 2.0 * std::f32::consts::PI * k as f32 * n as f32 * inv_n;
-                sum += complex[k].0 * angle.cos() - complex[k].1 * angle.sin();
-            }
-            time_domain[n] = sum * inv_n;
-        }
+        // IFFT via rustfft (O(n log n)) or naive DFT fallback.
+        let time_domain = ifft_frame(&complex, n_fft);
 
         // Window + overlap-add.
         let offset = i * hop_length;
@@ -1070,4 +1061,37 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
 
     output.truncate(output_len);
     output
+}
+
+/// Inverse FFT of one frame. Uses rustfft when the `audio` feature is enabled,
+/// otherwise falls back to naive O(n²) DFT.
+fn ifft_frame(complex: &[(f32, f32)], n_fft: usize) -> Vec<f32> {
+    #[cfg(feature = "audio")]
+    {
+        use rustfft::{FftPlanner, num_complex::Complex32};
+        let mut planner = FftPlanner::new();
+        let ifft = planner.plan_fft_inverse(n_fft);
+        let mut buf: Vec<Complex32> = complex
+            .iter()
+            .map(|&(re, im)| Complex32::new(re, im))
+            .collect();
+        ifft.process(&mut buf);
+        let inv_n = 1.0 / n_fft as f32;
+        buf.iter().map(|c| c.re * inv_n).collect()
+    }
+    #[cfg(not(feature = "audio"))]
+    {
+        // Naive O(n²) DFT fallback.
+        let inv_n = 1.0 / n_fft as f32;
+        (0..n_fft)
+            .map(|n| {
+                let mut sum = 0.0f32;
+                for k in 0..n_fft {
+                    let angle = 2.0 * std::f32::consts::PI * k as f32 * n as f32 * inv_n;
+                    sum += complex[k].0 * angle.cos() - complex[k].1 * angle.sin();
+                }
+                sum * inv_n
+            })
+            .collect()
+    }
 }
