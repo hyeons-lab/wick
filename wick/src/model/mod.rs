@@ -90,6 +90,17 @@ pub trait Model: Send {
         unimplemented!("forward_from_embedding not supported by this backend")
     }
 
+    /// Forward pass with embedding input, returning hidden state (not logits).
+    /// Used in audio mode: embedding → layers → hidden state → sample audio → embed → loop.
+    fn forward_hidden_from_embedding(
+        &self,
+        _embedding: &[f32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        unimplemented!("forward_hidden_from_embedding not supported by this backend")
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///

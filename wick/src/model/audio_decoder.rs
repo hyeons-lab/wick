@@ -948,48 +948,135 @@ pub fn detokenize_to_spectrum(
     let tokens = upsample(&embedding, n_embd, 6);
     let n_tokens = tokens.len() / n_embd;
 
-    // 3. LFM2 backbone: process each token sequentially.
-    let mut outputs = Vec::with_capacity(n_tokens * n_embd);
-    for t in 0..n_tokens {
-        let pos = state.n_past + t;
-        let mut cur = tokens[t * n_embd..(t + 1) * n_embd].to_vec();
+    // 3. LFM2 backbone: layer-by-layer with all n_tokens.
+    //    Conv layers: sequential (rolling buffer). Attention: batch (all tokens visible).
+    let mut hidden = tokens.clone(); // [n_tokens × n_embd] flat
 
-        for (il, lw) in weights.layers.iter().enumerate() {
-            let residual = cur.clone();
-            cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+    for (il, lw) in weights.layers.iter().enumerate() {
+        let mut new_hidden = Vec::with_capacity(n_tokens * n_embd);
 
-            let block_out = if cfg.layer_is_conv[il] {
-                detok_conv_block(lw, &mut state.conv_bufs[il], &cur, n_embd, cfg.d_conv)
-            } else {
-                detok_attn_block(lw, state.attn_kv[il].as_mut().unwrap(), &cur, pos, cfg)
-            };
+        if cfg.layer_is_conv[il] {
+            for t in 0..n_tokens {
+                let mut cur = hidden[t * n_embd..(t + 1) * n_embd].to_vec();
+                let residual = cur.clone();
+                cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+                let out = detok_conv_block(lw, &mut state.conv_bufs[il], &cur, n_embd, cfg.d_conv);
+                cur = residual.iter().zip(&out).map(|(r, o)| r + o).collect();
+                let ffn_res = cur.clone();
+                cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
+                let mut gate = vec![0.0; cfg.ffn_dim];
+                let mut up = vec![0.0; cfg.ffn_dim];
+                lw.ffn_w1.gemv(&cur, &mut gate);
+                lw.ffn_w3.gemv(&cur, &mut up);
+                cpu::silu_mul_inplace(&mut gate, &up);
+                let mut down = vec![0.0; n_embd];
+                lw.ffn_w2.gemv(&gate, &mut down);
+                cur = ffn_res.iter().zip(&down).map(|(r, d)| r + d).collect();
+                new_hidden.extend_from_slice(&cur);
+            }
+        } else {
+            // Attention: write ALL tokens' K/V, then each token attends to ALL.
+            let kv = state.attn_kv[il].as_mut().unwrap();
+            let n_head = cfg.n_head;
+            let n_kv = cfg.n_head_kv;
+            let hd = cfg.n_embd_head;
+            let group_size = n_head / n_kv;
+            let scale = 1.0 / (hd as f32).sqrt();
+            let kv_stride = n_kv * hd;
+            let mut all_q = vec![0.0f32; n_tokens * n_head * hd];
 
-            cur = residual
-                .iter()
-                .zip(&block_out)
-                .map(|(r, b)| r + b)
-                .collect();
+            for t in 0..n_tokens {
+                let pos = state.n_past + t;
+                let mut cur = hidden[t * n_embd..(t + 1) * n_embd].to_vec();
+                cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+                let mut q = vec![0.0; n_head * hd];
+                let mut k = vec![0.0; n_kv * hd];
+                let mut v = vec![0.0; n_kv * hd];
+                lw.wq.as_ref().unwrap().gemv(&cur, &mut q);
+                lw.wk.as_ref().unwrap().gemv(&cur, &mut k);
+                lw.wv.as_ref().unwrap().gemv(&cur, &mut v);
+                for h in 0..n_head {
+                    cpu::rmsnorm(
+                        &mut q[h * hd..(h + 1) * hd],
+                        lw.q_norm.as_ref().unwrap(),
+                        cfg.rms_norm_eps,
+                    );
+                    apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+                }
+                for h in 0..n_kv {
+                    cpu::rmsnorm(
+                        &mut k[h * hd..(h + 1) * hd],
+                        lw.k_norm.as_ref().unwrap(),
+                        cfg.rms_norm_eps,
+                    );
+                    apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+                }
+                let wp = pos % cfg.swa_window_size;
+                kv.0[wp * kv_stride..(wp + 1) * kv_stride].copy_from_slice(&k);
+                kv.1[wp * kv_stride..(wp + 1) * kv_stride].copy_from_slice(&v);
+                all_q[t * n_head * hd..(t + 1) * n_head * hd].copy_from_slice(&q);
+            }
 
-            // FFN.
-            let ffn_residual = cur.clone();
-            cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
-            let mut gate = vec![0.0; cfg.ffn_dim];
-            let mut up = vec![0.0; cfg.ffn_dim];
-            lw.ffn_w1.gemv(&cur, &mut gate);
-            lw.ffn_w3.gemv(&cur, &mut up);
-            cpu::silu_mul_inplace(&mut gate, &up);
-            let mut down = vec![0.0; n_embd];
-            lw.ffn_w2.gemv(&gate, &mut down);
-            cur = ffn_residual.iter().zip(&down).map(|(r, d)| r + d).collect();
+            for t in 0..n_tokens {
+                let q = &all_q[t * n_head * hd..(t + 1) * n_head * hd];
+                let kv_end = state.n_past + n_tokens;
+                let kv_start = kv_end.saturating_sub(cfg.swa_window_size);
+                let kv_len = kv_end - kv_start;
+                let mut attn_out = vec![0.0; n_head * hd];
+                for h in 0..n_head {
+                    let kv_h = h / group_size;
+                    let qh = &q[h * hd..(h + 1) * hd];
+                    let mut scores = vec![0.0f32; kv_len];
+                    for tt in 0..kv_len {
+                        let cp = (kv_start + tt) % cfg.swa_window_size;
+                        let ko = cp * kv_stride + kv_h * hd;
+                        scores[tt] = qh
+                            .iter()
+                            .zip(&kv.0[ko..ko + hd])
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>()
+                            * scale;
+                    }
+                    cpu::softmax_inplace(&mut scores);
+                    let out = &mut attn_out[h * hd..(h + 1) * hd];
+                    for tt in 0..kv_len {
+                        let cp = (kv_start + tt) % cfg.swa_window_size;
+                        let vo = cp * kv_stride + kv_h * hd;
+                        let s = scores[tt];
+                        for d in 0..hd {
+                            out[d] += s * kv.1[vo + d];
+                        }
+                    }
+                }
+                let mut proj = vec![0.0; n_embd];
+                lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+                let residual = &hidden[t * n_embd..(t + 1) * n_embd];
+                let mut cur: Vec<f32> = residual.iter().zip(&proj).map(|(r, p)| r + p).collect();
+                let ffn_res = cur.clone();
+                cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
+                let mut gate = vec![0.0; cfg.ffn_dim];
+                let mut up = vec![0.0; cfg.ffn_dim];
+                lw.ffn_w1.gemv(&cur, &mut gate);
+                lw.ffn_w3.gemv(&cur, &mut up);
+                cpu::silu_mul_inplace(&mut gate, &up);
+                let mut down = vec![0.0; n_embd];
+                lw.ffn_w2.gemv(&gate, &mut down);
+                cur = ffn_res.iter().zip(&down).map(|(r, d)| r + d).collect();
+                new_hidden.extend_from_slice(&cur);
+            }
         }
-
-        // Output norm.
-        cpu::rmsnorm(&mut cur, &weights.output_norm, cfg.rms_norm_eps);
-        outputs.extend_from_slice(&cur);
+        hidden = new_hidden;
     }
 
     state.n_past += n_tokens;
 
+    // Output norm per token.
+    let mut outputs = Vec::with_capacity(n_tokens * n_embd);
+    for t in 0..n_tokens {
+        let mut cur = hidden[t * n_embd..(t + 1) * n_embd].to_vec();
+        cpu::rmsnorm(&mut cur, &weights.output_norm, cfg.rms_norm_eps);
+        outputs.extend_from_slice(&cur);
+    }
     // 4. Linear projection → spectrogram.
     let lin_out_dim = weights.lin_w.rows; // n_fft_bins * 2 = 1282
     let mut spectrum = Vec::with_capacity(n_tokens * lin_out_dim);

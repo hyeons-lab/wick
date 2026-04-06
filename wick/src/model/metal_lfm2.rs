@@ -1132,6 +1132,37 @@ impl Model for MetalLfm2Model {
         self.ctx.read_f32(&self.hidden_buf, hs)
     }
 
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        assert_eq!(embedding.len(), hs);
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        unsafe {
+            let dst = self.hidden_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // Run layers only (no logit projection). Returns hidden state.
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.hidden_buf, hs)
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],

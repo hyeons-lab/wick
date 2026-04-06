@@ -69,6 +69,9 @@ pub fn generate_audio(
     let mut sampler = Sampler::new(config.sampler.clone());
     let mut df_state = DepthformerState::new(&decoder_weights.depthformer_config);
     let mut detok_state = DetokenizerState::new(&detok_weights.config);
+    // Accumulate all spectrum data for a single ISTFT pass at the end.
+    // This avoids discontinuities from per-frame ISTFT with fresh overlap buffers.
+    let mut all_spectrum = Vec::new();
 
     let start = Instant::now();
 
@@ -138,60 +141,77 @@ pub fn generate_audio(
             next_token = sampler.sample(&mut logits);
             pos += 1;
         } else {
-            // Audio mode: extract embedding, sample frame, detokenize.
-            let embedding = model.forward_embedding(&[next_token], pos, &mut state);
+            // Audio mode: embedding → sample codes → detokenize → feed back.
+            // Uses forward_hidden_from_embedding for embedding→embedding loop.
+            let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
             pos += 1;
             generated += 1;
 
-            let codes = sample_audio_frame(
-                decoder_weights,
-                &mut df_state,
-                &embedding,
-                config.audio_temperature,
-                config.audio_top_k,
-            );
+            loop {
+                let codes = sample_audio_frame(
+                    decoder_weights,
+                    &mut df_state,
+                    &emb,
+                    config.audio_temperature,
+                    config.audio_top_k,
+                );
 
-            // Check for audio end.
-            if codes[0] == AUDIO_END_CODE {
-                modality = Modality::Text;
-                modality_budget = match config.mode {
-                    AudioMode::Interleaved => 6,
-                    AudioMode::Sequential => usize::MAX,
-                };
-                // Feed a dummy token back to continue text generation.
-                logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
-                next_token = sampler.sample(&mut logits);
+                if codes[0] == AUDIO_END_CODE {
+                    modality = Modality::Text;
+                    modality_budget = match config.mode {
+                        AudioMode::Interleaved => 6,
+                        AudioMode::Sequential => usize::MAX,
+                    };
+                    logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                    next_token = sampler.sample(&mut logits);
+                    pos += 1;
+                    break;
+                }
+
+                let spectrum = detokenize_to_spectrum(
+                    detok_weights,
+                    decoder_weights,
+                    &mut detok_state,
+                    &codes,
+                );
+                all_spectrum.extend_from_slice(&spectrum);
+                audio_frames += 1;
+                modality_budget = modality_budget.saturating_sub(1);
+
+                // Feed codes back as embedding → next hidden state.
+                let audio_emb = embed_audio_token(decoder_weights, &codes);
+                emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                 pos += 1;
-                continue;
+                generated += 1;
+
+                if generated >= config.max_tokens || pos >= model_config.max_seq_len {
+                    break;
+                }
+                if matches!(config.mode, AudioMode::Interleaved)
+                    && modality_budget == 0
+                    && !text_done
+                {
+                    modality = Modality::Text;
+                    modality_budget = 6;
+                    logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                    next_token = sampler.sample(&mut logits);
+                    pos += 1;
+                    break;
+                }
             }
+        }
+    }
 
-            // Detokenize to PCM.
-            let spectrum =
-                detokenize_to_spectrum(detok_weights, decoder_weights, &mut detok_state, &codes);
-            let pcm = istft_to_pcm(
-                &spectrum,
-                detok_weights.config.n_fft,
-                detok_weights.config.hop_length,
-            );
-            if !pcm.is_empty() {
-                audio_callback(&pcm, detok_weights.config.sample_rate as u32);
-                audio_samples += pcm.len();
-            }
-            audio_frames += 1;
-
-            modality_budget = modality_budget.saturating_sub(1);
-
-            // Feed audio embedding back to LLM.
-            let audio_emb = embed_audio_token(decoder_weights, &codes);
-            logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
-            next_token = sampler.sample(&mut logits);
-            pos += 1;
-
-            // Check if we should switch back to text.
-            if matches!(config.mode, AudioMode::Interleaved) && modality_budget == 0 && !text_done {
-                modality = Modality::Text;
-                modality_budget = 6;
-            }
+    // Batch ISTFT: all accumulated spectrum → PCM in one pass with proper overlap.
+    if !all_spectrum.is_empty() {
+        let pcm = istft_to_pcm(
+            &all_spectrum,
+            detok_weights.config.n_fft,
+            detok_weights.config.hop_length,
+        );
+        if !pcm.is_empty() {
+            audio_callback(&pcm, detok_weights.config.sample_rate as u32);
+            audio_samples = pcm.len();
         }
     }
 
