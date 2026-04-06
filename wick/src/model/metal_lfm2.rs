@@ -1096,6 +1096,76 @@ impl Model for MetalLfm2Model {
         unsafe { *(self.argmax_token_buf.contents() as *const u32) }
     }
 
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1);
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        // 1. Dequant embedding → hidden_buf.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // 2. Run layers only (no logit projection).
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+
+        // 3. Read hidden state (before logit projection).
+        self.ctx.read_f32(&self.hidden_buf, hs)
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        assert_eq!(embedding.len(), hs);
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        // 1. Write embedding directly into hidden_buf (skip token lookup).
+        unsafe {
+            let dst = self.hidden_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // 2. Run layers + logit projection.
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

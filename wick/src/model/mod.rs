@@ -65,6 +65,31 @@ pub trait Model: Send {
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
 
+    /// Run a forward pass and return the hidden state BEFORE logit projection.
+    /// Used by the audio decoder to extract the LLM embedding for audio frame sampling.
+    /// Default: panics (must be overridden by backends that support audio).
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _ = tokens;
+        unimplemented!("forward_embedding not supported by this backend")
+    }
+
+    /// Forward pass with a float embedding as input (instead of a token ID).
+    /// Used to feed audio codec embeddings back into the LLM after an audio frame.
+    /// Default: panics (must be overridden by backends that support audio).
+    fn forward_from_embedding(
+        &self,
+        _embedding: &[f32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        unimplemented!("forward_from_embedding not supported by this backend")
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///
