@@ -13,6 +13,9 @@ use crate::tokenizer::BpeTokenizer;
 pub struct GenerateConfig {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
+    /// If true, suppress per-token stdout writes. Used by bench to avoid
+    /// stdout I/O inside the timed decode loop.
+    pub silent: bool,
 }
 
 impl Default for GenerateConfig {
@@ -20,6 +23,7 @@ impl Default for GenerateConfig {
         Self {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
+            silent: false,
         }
     }
 }
@@ -59,17 +63,17 @@ pub fn generate(
         0.0
     };
 
-    // Decode loop
+    // Decode loop. In greedy mode we skip the full logits readback +
+    // CPU argmax and let the model return a token id directly. Matches
+    // sampler's greedy trigger: temperature<=0 OR top_k=1.
+    let greedy = config.sampler.temperature <= 0.0 || config.sampler.top_k == 1;
     let decode_start = Instant::now();
     let mut generated = 0usize;
     let mut pos = prompt_tokens.len();
 
+    // Seed the loop with the first token from prefill logits.
+    let mut next_token = sampler.sample(&mut logits);
     loop {
-        if generated >= config.max_tokens {
-            break;
-        }
-
-        let next_token = sampler.sample(&mut logits);
         all_tokens.push(next_token);
         generated += 1;
 
@@ -78,13 +82,25 @@ pub fn generate(
             break;
         }
 
-        // Print token incrementally
-        let piece = tokenizer.decode(&[next_token]);
-        print!("{piece}");
-        std::io::stdout().flush()?;
+        // Print token incrementally (skipped in silent/bench mode).
+        if !config.silent {
+            let piece = tokenizer.decode(&[next_token]);
+            print!("{piece}");
+            std::io::stdout().flush()?;
+        }
 
-        // Forward pass for next token
-        logits = model.forward(&[next_token], pos, &mut state);
+        if generated >= config.max_tokens {
+            break;
+        }
+
+        // Forward pass for next token. Greedy: token-id only (4-byte read);
+        // otherwise full logits + sampler.
+        next_token = if greedy {
+            model.forward_greedy(&[next_token], pos, &mut state)
+        } else {
+            logits = model.forward(&[next_token], pos, &mut state);
+            sampler.sample(&mut logits)
+        };
         pos += 1;
     }
 

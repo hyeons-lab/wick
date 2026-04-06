@@ -68,19 +68,36 @@ enum Command {
         text: String,
     },
 
-    /// Run benchmarks on a model.
+    /// Benchmark decode throughput with stable in-process measurements.
+    ///
+    /// Loads the model once, runs a short warmup, then measures decode tok/s
+    /// over N runs and reports p10/p50/p90/mean/stddev. Production mode only
+    /// (WICK_PROFILE must be unset) — profile-mode timings are diagnostic and
+    /// don't predict real decode throughput.
     Bench {
         /// Path to the GGUF model file.
         #[arg(short, long)]
         model: String,
 
-        /// Number of prompt tokens to benchmark.
-        #[arg(long, default_value_t = 128)]
-        prompt_tokens: usize,
+        /// The prompt to benchmark on.
+        #[arg(short, long, default_value = "The capital of France is")]
+        prompt: String,
 
-        /// Number of tokens to generate.
+        /// Number of measured runs.
+        #[arg(long, default_value_t = 20)]
+        runs: usize,
+
+        /// Warmup runs (discarded). Primes Metal shader cache and GPU clock.
+        #[arg(long, default_value_t = 2)]
+        warmup: usize,
+
+        /// Max tokens to decode per run.
         #[arg(long, default_value_t = 128)]
-        gen_tokens: usize,
+        max_tokens: usize,
+
+        /// Device to use: cpu, gpu, metal, or auto.
+        #[arg(long, default_value = "auto")]
+        device: String,
     },
 }
 
@@ -89,25 +106,53 @@ fn load_model_for_device(
     device: &str,
 ) -> Result<Box<dyn wick::model::Model>> {
     match device {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        "metal" => {
+            eprintln!("Using native Metal backend");
+            wick::model::load_model_metal(gguf)
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        "metal" => {
+            anyhow::bail!("Metal backend not available (compile with --features metal on macOS)")
+        }
         #[cfg(feature = "gpu")]
-        "gpu" => {
-            eprintln!("Using GPU backend");
+        "gpu" | "wgpu" => {
+            eprintln!("Using wgpu GPU backend");
             wick::model::load_model_gpu(gguf)
         }
         #[cfg(not(feature = "gpu"))]
-        "gpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
+        "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
         "cpu" => wick::model::load_model(gguf),
         _ => {
-            // "auto" or unknown: try GPU if available, fall back to CPU
-            #[cfg(feature = "gpu")]
+            // "auto" or unknown: metal > wgpu > cpu
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
-                eprintln!("Using GPU backend (auto)");
-                return wick::model::load_model_gpu(gguf);
+                eprintln!("Using native Metal backend (auto)");
+                wick::model::load_model_metal(gguf)
             }
-            #[cfg(not(feature = "gpu"))]
+            #[cfg(all(feature = "gpu", not(all(feature = "metal", target_os = "macos"))))]
+            {
+                eprintln!("Using wgpu GPU backend (auto)");
+                wick::model::load_model_gpu(gguf)
+            }
+            #[cfg(all(not(feature = "gpu"), not(all(feature = "metal", target_os = "macos"))))]
             wick::model::load_model(gguf)
         }
     }
+}
+
+/// (p10, p50, p90, mean, stddev)
+fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
+    assert!(!xs.is_empty());
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = xs.len();
+    let p = |q: f64| {
+        let idx = ((n as f64 - 1.0) * q).round() as usize;
+        xs[idx]
+    };
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+    (p(0.1), p(0.5), p(0.9), mean, var.sqrt())
 }
 
 fn main() -> Result<()> {
@@ -164,6 +209,7 @@ fn main() -> Result<()> {
                     temperature,
                     ..Default::default()
                 },
+                silent: false,
             };
 
             let result =
@@ -190,9 +236,93 @@ fn main() -> Result<()> {
             println!("wick chat: model={model}");
             println!("Not yet implemented — coming in Phase 6.");
         }
-        Command::Bench { model, .. } => {
-            println!("wick bench: model={model}");
-            println!("Not yet implemented — coming in Phase 6.");
+        Command::Bench {
+            model,
+            prompt,
+            runs,
+            warmup,
+            max_tokens,
+            device,
+        } => {
+            anyhow::ensure!(runs >= 1, "--runs must be >= 1");
+            if std::env::var("WICK_PROFILE").is_ok() {
+                eprintln!(
+                    "warning: WICK_PROFILE is set — bench numbers will be inflated by profile overhead"
+                );
+            }
+
+            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
+            let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+            let add_bos = gguf
+                .get_bool("tokenizer.ggml.add_bos_token")
+                .unwrap_or(false);
+            let loaded_model = load_model_for_device(gguf, &device)?;
+
+            let mut tokens = Vec::new();
+            if add_bos {
+                if let Some(bos) = tokenizer.bos_token() {
+                    tokens.push(bos);
+                }
+            }
+            tokens.extend_from_slice(&tokenizer.encode(&prompt));
+
+            eprintln!(
+                "Model: {} | {} layers | hidden={}",
+                loaded_model.config().architecture,
+                loaded_model.config().n_layers,
+                loaded_model.config().hidden_size
+            );
+            eprintln!(
+                "Prompt tokens: {} | max_tokens: {} | warmup: {} | runs: {}",
+                tokens.len(),
+                max_tokens,
+                warmup,
+                runs
+            );
+
+            // Greedy (temp=0): deterministic, bench-friendly.
+            let config = wick::engine::GenerateConfig {
+                max_tokens,
+                sampler: wick::sampler::SamplerConfig {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+                silent: true,
+            };
+
+            let run_once = || -> Result<(f64, f64)> {
+                let r =
+                    wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
+                Ok((r.prefill_tok_per_sec, r.decode_tok_per_sec))
+            };
+
+            for i in 0..warmup {
+                eprintln!("warmup {}/{}", i + 1, warmup);
+                let _ = run_once()?;
+            }
+
+            let mut decode_tps = Vec::with_capacity(runs);
+            let mut prefill_tps = Vec::with_capacity(runs);
+            for i in 0..runs {
+                let (pf, dc) = run_once()?;
+                eprintln!(
+                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s",
+                    i + 1,
+                    runs
+                );
+                decode_tps.push(dc);
+                prefill_tps.push(pf);
+            }
+            eprintln!();
+
+            let (p10, p50, p90, mean, stddev) = summarize(decode_tps);
+            eprintln!(
+                "decode tok/s: p50={p50:.1} p10={p10:.1} p90={p90:.1} mean={mean:.1} stddev={stddev:.1} (n={runs})"
+            );
+            let (p10, p50, p90, mean, stddev) = summarize(prefill_tps);
+            eprintln!(
+                "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
+            );
         }
     }
 

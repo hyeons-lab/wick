@@ -240,11 +240,7 @@ impl GpuContext {
     }
 
     /// Resolve timestamps and print per-span timings.
-    /// Only prints if WICK_GPU_PROFILE=1 env var is set.
     pub fn finish_profiler(&self) {
-        if std::env::var("WICK_GPU_PROFILE").as_deref() != Ok("1") {
-            return;
-        }
         let profiler = match &self.profiler {
             Some(p) => p,
             None => return,
@@ -314,6 +310,8 @@ impl GpuContext {
 pub mod shaders {
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.wgsl");
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
+    pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");
+    pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");

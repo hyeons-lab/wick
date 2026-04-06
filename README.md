@@ -28,23 +28,42 @@ Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF
 
 Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
 
-### GPU backend (experimental, wgpu/Metal)
+### GPU backends
 
-Cross-platform GPU inference via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows, WebGPU in browsers). Feature-gated behind `gpu`.
+Two GPU backends with runtime selection via `--device`:
 
-| Backend | Prefill | Decode |
-|---------|--------:|-------:|
-| llama.cpp (native Metal, reference) | 655 tok/s | 158 tok/s |
-| wick CPU (NEON Q4_0) | 197 tok/s | 98 tok/s |
-| **wick GPU (wgpu Metal)** | **38 tok/s** | **51 tok/s** |
+**Native Metal** (`--device metal`, macOS/iOS) — hand-written MSL shaders, single-encoder dispatch, GPU argmax. Beats llama.cpp across all tested models and context lengths.
 
-The wgpu GPU backend is **3x slower than llama.cpp's native Metal** and **2x slower than our own NEON CPU path** on Apple Silicon. The gap comes from:
-- wgpu's per-dispatch validation/state-tracking overhead (Rust-side)
-- WGSL → MSL translation produces less optimal code than hand-written MSL
-- No simdgroup matrix ops in WGSL (llama.cpp uses them for GEMV)
-- Shared memory bus on Apple Silicon means GPU gets no bandwidth advantage
+**wgpu** (`--device gpu`, cross-platform) — WGSL shaders targeting Metal/Vulkan/DX12/WebGPU. Portable but slower due to API translation overhead.
 
-The wgpu backend's value is **portability** — it runs on Linux/Windows discrete GPUs and WebGPU browsers where NEON isn't available. On M-series Macs, use the CPU backend for best performance.
+#### Decode throughput vs llama.cpp (greedy, M1 Max)
+
+| Model | Context | llama.cpp | wick Metal | wick wgpu | wick CPU |
+|-------|---------|----------:|-----------:|----------:|---------:|
+| LFM2-450M | tg128 | 301 | **379** (+26%) | 75 | 120 |
+| LFM2-450M | tg512 | 325 | **345** (+6%) | 70 | — |
+| LFM2.5-VL-1.6B | tg128 | 262 | **278** (+6%) | — | — |
+| LFM2.5-VL-1.6B | tg512 | 200 | **242** (+21%) | — | — |
+| LFM2.5-Audio-1.5B | tg128 | 267 | **278** (+4%) | — | — |
+| LFM2.5-Audio-1.5B | tg512 | 201 | **253** (+26%) | — | — |
+
+Measured with `wick bench --runs 20 --warmup 3` (sustained in-process, p50 reported). llama.cpp numbers from `llama-bench -r 10` on the Liquid4All fork (9438fcb27).
+
+#### Key Metal optimizations
+
+- **GPU argmax** — greedy sampling on GPU, avoids 256KB logits readback (+57%)
+- **Q6_K native embedding GEMV** — reads 52 MB Q6_K bytes directly, no f32 dequant
+- **llama.cpp-derived fast Q4_0 GEMV** — pre-scaled y, uint16 nibble loads, sumy bias hoisting
+- **Fused gate+up GEMV** — single dispatch for both FFN projections
+- **Fused QK norm + RoPE** — 3 dispatches → 1 per attention layer
+- **Vectorized attention V loads** — float2 loads in weighted-sum phase
+- **Residual accumulate in GEMV** — `y += W×x` instead of separate add
+
+#### Key wgpu optimizations
+
+- **Compute pass batching** — 300 passes → ~80 per token (+30%)
+- **Fast Q4_0 GEMV** — ported Metal algorithm to WGSL with subgroupAdd
+- **Multi-row f32 GEMV** — 8 rows per workgroup, 8× less input bandwidth
 
 ### Key optimizations
 
@@ -59,10 +78,11 @@ The wgpu backend's value is **portability** — it runs on Linux/Windows discret
 ## Features
 
 - **GGUF model loading** with memory-mapped tensors
-- **CPU inference** with SIMD-optimized kernels (NEON dotprod on aarch64)
+- **Three compute backends** — CPU (NEON SIMD), native Metal (MSL), wgpu (WGSL/Vulkan/Metal/DX12)
 - **Hybrid architectures** — LFM2/LFM2.5 (gated conv + grouped query attention)
 - **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M
 - **Built-in BPE tokenizer** — no Python, no runtime dependencies
+- **Bench harness** — `wick bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering
 - **Single static binary**
 
@@ -102,7 +122,7 @@ Two-crate workspace:
 - **`wick`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
 - **`wick-cli`** — CLI binary (clap, dispatches to `wick`)
 
-Compute backends: scalar CPU -> NEON SIMD (aarch64) -> wgpu GPU (planned).
+Compute backends: scalar CPU → NEON SIMD (aarch64) → native Metal (macOS/iOS) → wgpu (cross-platform GPU).
 
 ## License
 

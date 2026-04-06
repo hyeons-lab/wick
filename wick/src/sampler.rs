@@ -4,6 +4,20 @@ use rand::rngs::StdRng;
 
 use crate::backend::cpu;
 
+/// NaN-safe CPU argmax. NaN values compare as -inf (never selected).
+pub fn cpu_argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
+            let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
+            a.total_cmp(&b)
+        })
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
 /// Configuration for token sampling.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -43,18 +57,10 @@ impl Sampler {
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         assert!(!logits.is_empty(), "cannot sample from empty logits");
 
-        // Greedy: argmax (NaN-safe using total_cmp)
-        if self.config.temperature <= 0.0 {
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
-                    let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
-                    a.total_cmp(&b)
-                })
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+        // Greedy: argmax (NaN-safe). Triggered by temperature<=0 OR top_k=1
+        // (single candidate makes temp/top_p irrelevant).
+        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+            return cpu_argmax(logits);
         }
 
         // Temperature scaling

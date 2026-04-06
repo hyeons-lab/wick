@@ -23,6 +23,10 @@ struct GpuWeight {
     k: u32, // input cols (stored in params_buf for shader access)
     /// Pre-allocated params buffer with [m, k] — eliminates per-dispatch allocation.
     params_buf: wgpu::Buffer,
+    /// Pre-created bind group for this weight's primary GEMV dispatch.
+    /// Created after all scratch buffers are allocated, to avoid per-token
+    /// create_bind_group overhead (~16 µs each, 300×/token = 4.8 ms).
+    cached_bg: Option<wgpu::BindGroup>,
 }
 
 /// GPU buffer handles for one layer's weights.
@@ -51,6 +55,8 @@ struct GpuLayerWeights {
 struct GpuPipelines {
     gemv_f32: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
+    gemv_q4_0_fast: wgpu::ComputePipeline,
+    gemv_q6_k: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
@@ -80,7 +86,8 @@ pub struct GpuLfm2Model {
     config: ModelConfig,
     pipelines: GpuPipelines,
     // GPU weight buffers
-    embedding: wgpu::Buffer, // [vocab_size × hidden_size] f32
+    embedding: wgpu::Buffer,        // raw Q6_K bytes for output projection
+    embedding_params: wgpu::Buffer, // [vocab_size, hidden_size]
     output_norm: wgpu::Buffer,
     layers: Vec<GpuLayerWeights>,
     // GPU scratch buffers (reused across layers)
@@ -128,6 +135,12 @@ impl GpuLfm2Model {
         let pipelines = GpuPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
+            gemv_q4_0_fast: ctx.create_pipeline(
+                shaders::GEMV_Q4_0_FAST,
+                "gemv_q4_0_fast",
+                "gemv_q4_0_fast",
+            ),
+            gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
             silu_mul_inplace: ctx.create_pipeline(
@@ -151,6 +164,10 @@ impl GpuLfm2Model {
         let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
         let embedding_f32 = emb_tensor.to_f32_vec();
         let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
+        let embedding_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[config.vocab_size as u32, config.hidden_size as u32]),
+            "emb_params",
+        );
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
 
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
@@ -171,6 +188,7 @@ impl GpuLfm2Model {
                 m: wref.m as u32,
                 k: wref.k as u32,
                 params_buf,
+                cached_bg: None,
             }
         };
 
@@ -288,11 +306,12 @@ impl GpuLfm2Model {
             embedding_f32,
         };
 
-        Ok(Self {
+        let mut model = Self {
             ctx,
             config,
             pipelines,
             embedding,
+            embedding_params,
             output_norm,
             layers,
             hidden_buf,
@@ -312,7 +331,95 @@ impl GpuLfm2Model {
             conv_out_buf,
             conv_gate_buf,
             gpu_state,
-        })
+        };
+        model.cache_bind_groups();
+        Ok(model)
+    }
+
+    /// Create a GEMV bind group for a given (weight, input, output) triple.
+    fn make_gemv_bg(
+        &self,
+        w: &GpuWeight,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let pipeline = match w.dtype {
+            DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
+            _ => &self.pipelines.gemv_f32,
+        };
+        self.ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w.buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: w.params_buf.as_entire_binding(),
+                    },
+                ],
+            })
+    }
+
+    /// Pre-create bind groups for all per-layer GEMV dispatches.
+    /// Eliminates ~150 create_bind_group calls per token (~2.4 ms CPU).
+    fn cache_bind_groups(&mut self) {
+        let cfg = &self.config;
+        for i in 0..cfg.n_layers {
+            // FFN
+            let gate_bg = self.make_gemv_bg(
+                &self.layers[i].ffn_gate,
+                &self.ffn_input_buf,
+                &self.gate_buf,
+            );
+            self.layers[i].ffn_gate.cached_bg = Some(gate_bg);
+            let up_bg =
+                self.make_gemv_bg(&self.layers[i].ffn_up, &self.ffn_input_buf, &self.up_buf);
+            self.layers[i].ffn_up.cached_bg = Some(up_bg);
+            let down_bg =
+                self.make_gemv_bg(&self.layers[i].ffn_down, &self.gate_buf, &self.out_buf);
+            self.layers[i].ffn_down.cached_bg = Some(down_bg);
+
+            if cfg.block_types[i] == BlockType::GatedConv {
+                if let Some(ref w) = self.layers[i].conv_in_proj {
+                    let bg = self.make_gemv_bg(w, &self.normed_buf, &self.conv_proj_buf);
+                    self.layers[i].conv_in_proj.as_mut().unwrap().cached_bg = Some(bg);
+                }
+                if let Some(ref w) = self.layers[i].conv_out_proj {
+                    let bg = self.make_gemv_bg(w, &self.conv_gate_buf, &self.out_buf);
+                    self.layers[i].conv_out_proj.as_mut().unwrap().cached_bg = Some(bg);
+                }
+            } else {
+                if let Some(ref w) = self.layers[i].attn_q {
+                    let bg = self.make_gemv_bg(w, &self.normed_buf, &self.q_buf);
+                    self.layers[i].attn_q.as_mut().unwrap().cached_bg = Some(bg);
+                }
+                if let Some(ref w) = self.layers[i].attn_k {
+                    let bg = self.make_gemv_bg(w, &self.normed_buf, &self.k_buf);
+                    self.layers[i].attn_k.as_mut().unwrap().cached_bg = Some(bg);
+                }
+                if let Some(ref w) = self.layers[i].attn_v {
+                    let bg = self.make_gemv_bg(w, &self.normed_buf, &self.v_buf);
+                    self.layers[i].attn_v.as_mut().unwrap().cached_bg = Some(bg);
+                }
+                if let Some(ref w) = self.layers[i].attn_output {
+                    let bg = self.make_gemv_bg(w, &self.attn_out_buf, &self.out_buf);
+                    self.layers[i].attn_output.as_mut().unwrap().cached_bg = Some(bg);
+                }
+            }
+        }
     }
 
     // ── GPU dispatch helpers ────────────────────────────────────────────
@@ -338,6 +445,19 @@ impl GpuLfm2Model {
         }
     }
 
+    /// Dispatch into an existing compute pass (no pass creation overhead).
+    fn dispatch_into(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: (u32, u32, u32),
+    ) {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+    }
+
     /// Submit encoder and wait for GPU to finish.
     fn submit_and_wait(&self, enc: wgpu::CommandEncoder) {
         self.ctx.queue.submit(Some(enc.finish()));
@@ -350,7 +470,7 @@ impl GpuLfm2Model {
 
     // ── Encode helpers (add passes to an existing encoder) ────────────
 
-    /// Encode GEMV dispatch — selects Q4_0 or f32 pipeline based on weight dtype.
+    /// Encode GEMV dispatch — uses cached bind group if available, else creates one.
     fn encode_gemv_weight(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -359,47 +479,29 @@ impl GpuLfm2Model {
         output: &wgpu::Buffer,
     ) {
         let pipeline = match w.dtype {
-            DType::Q4_0 => &self.pipelines.gemv_q4_0,
+            DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
             _ => &self.pipelines.gemv_f32,
         };
         let label = match w.dtype {
             DType::Q4_0 => "gemv_q4",
             _ => "gemv_f32",
         };
-        let bg = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: w.buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: input.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: output.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: w.params_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        // Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
-        let workgroups_x = match w.dtype {
-            DType::Q4_0 => w.m.div_ceil(8).min(65535),
-            _ => w.m.min(65535),
+        // Use cached BG if available (pre-created at init for known
+        // weight/input/output triples — saves ~16µs per dispatch).
+        let fresh_bg;
+        let bg = if let Some(ref cached) = w.cached_bg {
+            cached
+        } else {
+            fresh_bg = self.make_gemv_bg(w, input, output);
+            &fresh_bg
         };
-        let workgroups_y = match w.dtype {
-            DType::Q4_0 => w.m.div_ceil(8).div_ceil(65535),
-            _ => w.m.div_ceil(65535),
+        // Fast Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
+        let rows_per_wg: u32 = match w.dtype {
+            DType::Q4_0 => 4,
+            _ => 1,
         };
+        let workgroups_x = (w.m.div_ceil(rows_per_wg)).min(65535);
+        let workgroups_y = (w.m.div_ceil(rows_per_wg)).div_ceil(65535);
         self.encode(enc, pipeline, &bg, (workgroups_x, workgroups_y, 1), label);
     }
 
@@ -439,11 +541,12 @@ impl GpuLfm2Model {
                     },
                 ],
             });
+        let groups = m.div_ceil(8);
         self.encode(
             enc,
             &self.pipelines.gemv_f32,
             &bg,
-            (m.min(65535), m.div_ceil(65535), 1),
+            (groups.min(65535), groups.div_ceil(65535), 1),
             "gemv_f32",
         );
     }
@@ -767,18 +870,55 @@ impl Model for GpuLfm2Model {
             bytemuck::cast_slice(&self.gpu_state.embedding_f32[emb_offset..emb_offset + hs]),
         );
 
-        // 2. Per-layer loop — batch GPU dispatches, break only for CPU work
+        // 2. Per-layer loop — one encoder per layer (block + FFN merged).
+        // Each layer submits independently to maintain CPU-GPU pipeline overlap.
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
+            let mut enc = self.new_encoder();
 
             if cfg.block_types[i] == BlockType::GatedConv {
                 let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
                 let d_conv = kernel_size - 1;
                 let conv_buf = self.gpu_state.conv_buffers[i].as_ref().unwrap();
 
-                // Encoder 1: pre-norm + in_proj + b*x gate + conv1d + c*conv_out gate + out_proj + residual
-                // All GPU — no CPU readback needed!
-                let mut enc = self.new_encoder();
+                // Pre-create BGs for conv block.
+                let norm_p = self.ctx.upload_storage(
+                    bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
+                    "p",
+                );
+                let norm_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.normed_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: lw.attn_norm.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: norm_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let in_w = lw.conv_in_proj.as_ref().unwrap();
+                let in_bg_tmp;
+                let in_bg = match in_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        in_bg_tmp = self.make_gemv_bg(in_w, &self.normed_buf, &self.conv_proj_buf);
+                        &in_bg_tmp
+                    }
+                };
+                let in_rows = in_w.m.div_ceil(4);
+
+                // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
                 self.encode_copy(
                     &mut enc,
                     &self.hidden_buf,
@@ -787,20 +927,21 @@ impl Model for GpuLfm2Model {
                     0,
                     hs as u64,
                 );
-                self.encode_rmsnorm(
-                    &mut enc,
-                    &self.normed_buf,
-                    &lw.attn_norm,
-                    hs32,
-                    cfg.rms_norm_eps,
-                );
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.conv_in_proj.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.conv_proj_buf,
-                );
-                // bx = b * x: copy b → conv_bx, copy x → conv_out (temp), mul_inplace
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("conv_pre"),
+                        timestamp_writes: None,
+                    });
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        in_bg,
+                        (in_rows.min(65535), in_rows.div_ceil(65535), 1),
+                    );
+                }
+
+                // Copies: conv_proj slices → conv_bx, conv_out.
                 self.encode_copy(
                     &mut enc,
                     &self.conv_proj_buf,
@@ -817,26 +958,142 @@ impl Model for GpuLfm2Model {
                     0,
                     hs as u64,
                 );
-                self.encode_elementwise(
-                    &mut enc,
-                    &self.pipelines.mul_inplace,
-                    &self.conv_bx_buf,
-                    &self.conv_out_buf,
-                    hs32,
-                    "mul",
+
+                // Pre-create BGs for passes 2 and 3.
+                let mul_p = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let mul1_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.mul_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.conv_bx_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.conv_out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: mul_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let conv_p = self.ctx.upload_storage(
+                    bytemuck::cast_slice(&[hs32, kernel_size, d_conv, 0u32]),
+                    "p",
                 );
-                // conv1d
-                self.encode_conv1d(
-                    &mut enc,
-                    &self.conv_bx_buf,
-                    conv_buf,
-                    lw.conv_weight.as_ref().unwrap(),
-                    &self.conv_out_buf,
-                    hs32,
-                    kernel_size,
-                    d_conv,
-                );
-                // c * conv_out: copy c → conv_gate, mul_inplace
+                let conv_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.conv1d.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.conv_bx_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: conv_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: lw.conv_weight.as_ref().unwrap().as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.conv_out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: conv_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let mul2_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.mul_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.conv_gate_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.conv_out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: mul_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let out_w = lw.conv_out_proj.as_ref().unwrap();
+                let out_bg_tmp;
+                let out_bg = match out_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        out_bg_tmp = self.make_gemv_bg(out_w, &self.conv_gate_buf, &self.out_buf);
+                        &out_bg_tmp
+                    }
+                };
+                let out_rows = out_w.m.div_ceil(4);
+                let add_p = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let add_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.hidden_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: add_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                // Pass 2: mul(bx) + conv1d (after copies 4-5, before copy 8).
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("conv_mid"),
+                        timestamp_writes: None,
+                    });
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.mul_inplace,
+                        &mul1_bg,
+                        (hs32.div_ceil(256), 1, 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.conv1d,
+                        &conv_bg,
+                        (hs32.div_ceil(256), 1, 1),
+                    );
+                }
+
+                // Copy c → conv_gate.
                 self.encode_copy(
                     &mut enc,
                     &self.conv_proj_buf,
@@ -845,39 +1102,176 @@ impl Model for GpuLfm2Model {
                     0,
                     hs as u64,
                 );
-                self.encode_elementwise(
-                    &mut enc,
-                    &self.pipelines.mul_inplace,
-                    &self.conv_gate_buf,
-                    &self.conv_out_buf,
-                    hs32,
-                    "mul",
-                );
-                // out_proj + residual
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.conv_out_proj.as_ref().unwrap(),
-                    &self.conv_gate_buf,
-                    &self.out_buf,
-                );
-                self.encode_elementwise(
-                    &mut enc,
-                    &self.pipelines.add_inplace,
-                    &self.hidden_buf,
-                    &self.out_buf,
-                    hs32,
-                    "add",
-                );
-                self.ctx.queue.submit(Some(enc.finish()));
+
+                // Pass 3: mul(gate) + out_proj + add.
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("conv_post"),
+                        timestamp_writes: None,
+                    });
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.mul_inplace,
+                        &mul2_bg,
+                        (hs32.div_ceil(256), 1, 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        out_bg,
+                        (out_rows.min(65535), out_rows.div_ceil(65535), 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.add_inplace,
+                        &add_bg,
+                        (hs32.div_ceil(256), 1, 1),
+                    );
+                }
             } else {
-                // Attention block
+                // Attention block — batched into 2 compute passes (separated by KV cache copies).
                 let head_dim = (hs / cfg.n_heads) as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
 
-                // Encoder 1: pre-norm + Q/K/V projections (4 dispatches)
-                let mut enc = self.new_encoder();
+                // Pre-create all BGs before opening passes.
+                let norm_p = self.ctx.upload_storage(
+                    bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
+                    "p",
+                );
+                let norm_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.normed_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: lw.attn_norm.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: norm_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let q_w = lw.attn_q.as_ref().unwrap();
+                let q_bg_tmp;
+                let q_bg = match q_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        q_bg_tmp = self.make_gemv_bg(q_w, &self.normed_buf, &self.q_buf);
+                        &q_bg_tmp
+                    }
+                };
+                let k_w = lw.attn_k.as_ref().unwrap();
+                let k_bg_tmp;
+                let k_bg = match k_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        k_bg_tmp = self.make_gemv_bg(k_w, &self.normed_buf, &self.k_buf);
+                        &k_bg_tmp
+                    }
+                };
+                let v_w = lw.attn_v.as_ref().unwrap();
+                let v_bg_tmp;
+                let v_bg = match v_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        v_bg_tmp = self.make_gemv_bg(v_w, &self.normed_buf, &self.v_buf);
+                        &v_bg_tmp
+                    }
+                };
+                let qn_p = self.ctx.upload_storage(
+                    bytemuck::cast_slice(&[head_dim, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
+                    "p",
+                );
+                let qn_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.q_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: lw.attn_q_norm.as_ref().unwrap().as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: qn_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let kn_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.k_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: lw.attn_k_norm.as_ref().unwrap().as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: qn_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let rope_params: [u32; 5] = [
+                    pos as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rope_theta.to_bits(),
+                ];
+                let rope_p = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&rope_params), "p");
+                let rope_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rope.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.q_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.k_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: rope_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                let q_rows = q_w.m.div_ceil(4);
+                let k_rows = k_w.m.div_ceil(4);
+                let v_rows = v_w.m.div_ceil(4);
+                let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
+
+                // Copy hidden → normed, then pass 1: norm + QKV + per-head norm + rope.
                 self.encode_copy(
                     &mut enc,
                     &self.hidden_buf,
@@ -886,68 +1280,60 @@ impl Model for GpuLfm2Model {
                     0,
                     hs as u64,
                 );
-                self.encode_rmsnorm(
-                    &mut enc,
-                    &self.normed_buf,
-                    &lw.attn_norm,
-                    hs32,
-                    cfg.rms_norm_eps,
-                );
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.attn_q.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.q_buf,
-                );
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.attn_k.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.k_buf,
-                );
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.attn_v.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.v_buf,
-                );
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("attn_pre"),
+                        timestamp_writes: None,
+                    });
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        q_bg,
+                        (q_rows.min(65535), q_rows.div_ceil(65535), 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        k_bg,
+                        (k_rows.min(65535), k_rows.div_ceil(65535), 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        v_bg,
+                        (v_rows.min(65535), v_rows.div_ceil(65535), 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.per_head_rmsnorm,
+                        &qn_bg,
+                        (n_heads, 1, 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.per_head_rmsnorm,
+                        &kn_bg,
+                        (n_kv_heads, 1, 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.rope,
+                        &rope_bg,
+                        (max_pairs.div_ceil(256), 1, 1),
+                    );
+                }
 
-                // GPU: per-head QK norm + RoPE (no CPU roundtrip)
-                self.encode_per_head_rmsnorm(
-                    &mut enc,
-                    &self.q_buf,
-                    lw.attn_q_norm.as_ref().unwrap(),
-                    head_dim,
-                    n_heads,
-                    cfg.rms_norm_eps,
-                );
-                self.encode_per_head_rmsnorm(
-                    &mut enc,
-                    &self.k_buf,
-                    lw.attn_k_norm.as_ref().unwrap(),
-                    head_dim,
-                    n_kv_heads,
-                    cfg.rms_norm_eps,
-                );
-                self.encode_rope(
-                    &mut enc,
-                    &self.q_buf,
-                    &self.k_buf,
-                    pos as u32,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    cfg.rope_theta,
-                );
-
-                // KV cache copy (K+V on GPU) + attention + out_proj + residual
+                // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
                 let seq_len = self.gpu_state.seq_len.get();
                 let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
                 self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
                 self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
+
                 let attn_seq_len = (seq_len + 1) as u32;
                 let scale = 1.0 / (head_dim as f32).sqrt();
+                // Attention BG (changes per token due to seq_len).
                 self.encode_attention(
                     &mut enc,
                     &self.q_buf,
@@ -961,25 +1347,62 @@ impl Model for GpuLfm2Model {
                     attn_seq_len,
                     scale,
                 );
-                self.encode_gemv_weight(
-                    &mut enc,
-                    lw.attn_output.as_ref().unwrap(),
-                    &self.attn_out_buf,
-                    &self.out_buf,
-                );
-                self.encode_elementwise(
-                    &mut enc,
-                    &self.pipelines.add_inplace,
-                    &self.hidden_buf,
-                    &self.out_buf,
-                    hs32,
-                    "add",
-                );
-                self.ctx.queue.submit(Some(enc.finish()));
+                // out_proj + add — batch into one pass.
+                let out_w = lw.attn_output.as_ref().unwrap();
+                let out_bg_tmp;
+                let out_bg = match out_w.cached_bg.as_ref() {
+                    Some(b) => b,
+                    None => {
+                        out_bg_tmp = self.make_gemv_bg(out_w, &self.attn_out_buf, &self.out_buf);
+                        &out_bg_tmp
+                    }
+                };
+                let add_p = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let add_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.hidden_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: add_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let out_rows = out_w.m.div_ceil(4);
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("attn_post"),
+                        timestamp_writes: None,
+                    });
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.gemv_q4_0_fast,
+                        out_bg,
+                        (out_rows.min(65535), out_rows.div_ceil(65535), 1),
+                    );
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.add_inplace,
+                        &add_bg,
+                        (hs32.div_ceil(256), 1, 1),
+                    );
+                }
             }
 
-            // Encoder 3: FFN — entirely GPU, no CPU readback (7 dispatches)
-            let mut enc = self.new_encoder();
+            // FFN — same encoder as block above.
             self.encode_copy(
                 &mut enc,
                 &self.hidden_buf,
@@ -988,36 +1411,156 @@ impl Model for GpuLfm2Model {
                 0,
                 hs as u64,
             );
-            self.encode_rmsnorm(
-                &mut enc,
-                &self.ffn_input_buf,
-                &lw.ffn_norm,
-                hs32,
-                cfg.rms_norm_eps,
+            // FFN: batch 6 dispatches into ONE compute pass.
+            // Pre-create bind groups before opening the pass.
+            let norm_params = self.ctx.upload_storage(
+                bytemuck::cast_slice(&[hs32, cfg.rms_norm_eps.to_bits(), 0u32, 0u32]),
+                "p",
             );
-            self.encode_gemv_weight(&mut enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
-            self.encode_gemv_weight(&mut enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
-            self.encode_elementwise(
-                &mut enc,
-                &self.pipelines.silu_mul_inplace,
-                &self.gate_buf,
-                &self.up_buf,
-                lw.ffn_gate.m,
-                "silu_mul",
-            );
-            self.encode_gemv_weight(&mut enc, &lw.ffn_down, &self.gate_buf, &self.out_buf);
-            self.encode_elementwise(
-                &mut enc,
-                &self.pipelines.add_inplace,
-                &self.hidden_buf,
-                &self.out_buf,
-                hs32,
-                "add",
-            );
+            let norm_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.ffn_input_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: lw.ffn_norm.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: norm_params.as_entire_binding(),
+                        },
+                    ],
+                });
+            let gate_bg_tmp;
+            let gate_bg = match lw.ffn_gate.cached_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    gate_bg_tmp =
+                        self.make_gemv_bg(&lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
+                    &gate_bg_tmp
+                }
+            };
+            let up_bg_tmp;
+            let up_bg = match lw.ffn_up.cached_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    up_bg_tmp = self.make_gemv_bg(&lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+                    &up_bg_tmp
+                }
+            };
+            let silu_params = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&[lw.ffn_gate.m, 0u32]), "p");
+            let silu_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.gate_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.up_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: silu_params.as_entire_binding(),
+                        },
+                    ],
+                });
+            let down_bg_tmp;
+            let down_bg = match lw.ffn_down.cached_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    down_bg_tmp = self.make_gemv_bg(&lw.ffn_down, &self.gate_buf, &self.out_buf);
+                    &down_bg_tmp
+                }
+            };
+            let add_params = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+            let add_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.hidden_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.out_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: add_params.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let gate_rows = lw.ffn_gate.m.div_ceil(4);
+            let up_rows = lw.ffn_up.m.div_ceil(4);
+            let down_rows = lw.ffn_down.m.div_ceil(4);
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("ffn"),
+                    timestamp_writes: None,
+                });
+                // rmsnorm
+                self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                // gate + up GEMVs
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.gemv_q4_0_fast,
+                    gate_bg,
+                    (gate_rows.min(65535), gate_rows.div_ceil(65535), 1),
+                );
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.gemv_q4_0_fast,
+                    up_bg,
+                    (up_rows.min(65535), up_rows.div_ceil(65535), 1),
+                );
+                // silu_mul
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.silu_mul_inplace,
+                    &silu_bg,
+                    (lw.ffn_gate.m.div_ceil(256), 1, 1),
+                );
+                // down GEMV
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.gemv_q4_0_fast,
+                    down_bg,
+                    (down_rows.min(65535), down_rows.div_ceil(65535), 1),
+                );
+                // residual add
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.add_inplace,
+                    &add_bg,
+                    (hs32.div_ceil(256), 1, 1),
+                );
+            }
             self.ctx.queue.submit(Some(enc.finish()));
         }
 
-        // 3. Output norm + projection (2 dispatches in one encoder)
+        // 3. Output norm + projection.
         let mut enc = self.new_encoder();
         self.encode_rmsnorm(
             &mut enc,
@@ -1041,6 +1584,22 @@ impl Model for GpuLfm2Model {
         state.seq_len += 1;
         self.ctx.finish_profiler();
         self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
+    }
+
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        // Reset internal seq_len so repeated generate() calls (bench) work.
+        self.gpu_state.seq_len.set(start_pos);
+        // Default: sequential single-token forward.
+        let mut logits = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            logits = self.forward(&[token], start_pos + i, state);
+        }
+        logits
     }
 
     fn config(&self) -> &ModelConfig {
