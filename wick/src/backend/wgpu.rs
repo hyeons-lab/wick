@@ -65,11 +65,7 @@ impl GpuContext {
             &wgpu::DeviceDescriptor {
                 label: Some("wick-gpu"),
                 required_features: features,
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-                    max_buffer_size: adapter_limits.max_buffer_size,
-                    ..wgpu::Limits::default()
-                },
+                required_limits: adapter_limits.clone(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,

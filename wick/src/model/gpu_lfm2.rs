@@ -128,19 +128,18 @@ pub struct GpuLfm2Model {
 }
 
 impl GpuLfm2Model {
-    pub fn from_gguf(gguf: GgufFile) -> Result<Self> {
+    pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
         let ctx = GpuContext::new()?;
 
         // Parse config (same as CPU Lfm2Model)
         let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf)?;
-        let config = cpu_model.config().clone();
+        let mut config = cpu_model.config().clone();
+        let max_seq_len = context_size.min(config.max_seq_len);
+        config.max_seq_len = max_seq_len;
         let hs = config.hidden_size;
         let is = config.intermediate_size;
         let max_kv_dim =
             config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / config.n_heads);
-        // WGSL attention uses device-memory scores (no TG limit).
-        // Clamp to model's context_length.
-        let max_seq_len = config.max_seq_len;
 
         tracing::info!(
             "GPU model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -561,7 +560,8 @@ impl GpuLfm2Model {
         m: u32,
         k: u32,
     ) {
-        let params_buf = self.ctx.upload_storage(bytemuck::cast_slice(&[m, k]), "p");
+        // Use pre-allocated params (m=vocab_size, k=hs are constant).
+        let params_buf = &self.embedding_params;
         let bg = self
             .ctx
             .device

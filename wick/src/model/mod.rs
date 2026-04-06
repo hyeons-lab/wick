@@ -90,13 +90,16 @@ pub fn load_model(gguf: GgufFile) -> Result<Box<dyn Model>> {
 
 /// Load a model with GPU acceleration.
 #[cfg(feature = "gpu")]
-pub fn load_model_gpu(gguf: GgufFile) -> Result<Box<dyn Model>> {
+pub fn load_model_gpu(gguf: GgufFile, context_size: usize) -> Result<Box<dyn Model>> {
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf(gguf)?)),
+        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf(
+            gguf,
+            context_size,
+        )?)),
         other => bail!("unsupported architecture for GPU: {other}"),
     }
 }

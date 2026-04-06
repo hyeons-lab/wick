@@ -130,7 +130,7 @@ fn load_model_for_device(
         #[cfg(feature = "gpu")]
         "gpu" | "wgpu" => {
             eprintln!("Using wgpu GPU backend");
-            wick::model::load_model_gpu(open()?)
+            wick::model::load_model_gpu(open()?, context_size)
         }
         #[cfg(not(feature = "gpu"))]
         "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
@@ -160,7 +160,7 @@ fn load_model_auto(path: &Path, context_size: usize) -> Result<Box<dyn wick::mod
 
     // Try wgpu (any platform with Vulkan/Metal/DX12).
     #[cfg(feature = "gpu")]
-    match open().and_then(wick::model::load_model_gpu) {
+    match open().and_then(|g| wick::model::load_model_gpu(g, context_size)) {
         Ok(m) => {
             eprintln!("Using wgpu GPU backend (auto)");
             return Ok(m);
