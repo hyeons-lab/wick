@@ -118,6 +118,7 @@ pub struct GpuLfm2Model {
     conv1d_params: wgpu::Buffer,         // [hs, kernel_size, d_conv, 0]
     per_head_norm_params: wgpu::Buffer,  // [head_dim, eps_bits, 0, 0]
     rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
+    attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_bx_buf: wgpu::Buffer,   // [hidden_size]
@@ -344,6 +345,7 @@ impl GpuLfm2Model {
         );
         // rope_params is updated per token via queue.write_buffer — needs COPY_DST.
         let rope_params = ctx.create_storage_rw(5 * 4, "rope_params");
+        let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
 
         let mut model = Self {
             ctx,
@@ -371,6 +373,7 @@ impl GpuLfm2Model {
             conv1d_params,
             per_head_norm_params,
             rope_params,
+            attn_params,
             conv_proj_buf,
             conv_bx_buf,
             conv_out_buf,
@@ -655,7 +658,10 @@ impl GpuLfm2Model {
             0,
             0,
         ];
-        let params_buf = self.ctx.upload_storage(bytemuck::cast_slice(&params), "p");
+        self.ctx
+            .queue
+            .write_buffer(&self.attn_params, 0, bytemuck::cast_slice(&params));
+        let params_buf = &self.attn_params;
         let bg = self
             .ctx
             .device
@@ -1333,9 +1339,7 @@ impl Model for GpuLfm2Model {
                     &down_bg_tmp
                 }
             };
-            let add_params = self
-                .ctx
-                .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+            let add_params = &self.elementwise_hs_params;
             let add_bg = self
                 .ctx
                 .device
