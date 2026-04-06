@@ -81,13 +81,21 @@ struct GpuState {
     embedding_f32: Vec<f32>,
 }
 
+/// GPU-accelerated LFM2 model.
+///
+/// NOTE: This model is stateful — KV caches and conv rolling buffers live on
+/// the GPU and persist across forward() calls. This is inherent to GPU backends
+/// (GPU-resident state can't live in the CPU-side InferenceState). Consequence:
+/// one GpuLfm2Model instance = one session. For concurrent sessions, create
+/// multiple model instances.
 pub struct GpuLfm2Model {
     ctx: GpuContext,
     config: ModelConfig,
     pipelines: GpuPipelines,
     // GPU weight buffers
-    embedding: wgpu::Buffer,        // raw Q6_K bytes for output projection
-    embedding_params: wgpu::Buffer, // [vocab_size, hidden_size]
+    embedding: wgpu::Buffer,
+    #[allow(dead_code)]
+    embedding_params: wgpu::Buffer,
     output_norm: wgpu::Buffer,
     layers: Vec<GpuLayerWeights>,
     // GPU scratch buffers (reused across layers)
@@ -103,6 +111,10 @@ pub struct GpuLfm2Model {
     attn_out_buf: wgpu::Buffer,  // [hidden_size]
     logits_buf: wgpu::Buffer,    // [vocab_size]
     scores_buf: wgpu::Buffer,    // [n_heads × max_seq_len]
+    // Pre-allocated shader params (avoids upload_storage per dispatch).
+    rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
+    elementwise_hs_params: wgpu::Buffer, // [hs, 0]
+    elementwise_is_params: wgpu::Buffer, // [intermediate_size, 0]
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_bx_buf: wgpu::Buffer,   // [hidden_size]
@@ -123,7 +135,7 @@ impl GpuLfm2Model {
         let is = config.intermediate_size;
         let max_kv_dim =
             config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / config.n_heads);
-        let max_seq_len = 1024usize; // initial allocation, grows as needed
+        let max_seq_len = config.max_seq_len;
 
         tracing::info!(
             "GPU model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -306,6 +318,16 @@ impl GpuLfm2Model {
             embedding_f32,
         };
 
+        // Pre-allocate shader params buffers (avoids upload_storage per dispatch).
+        let rmsnorm_hs_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[hs as u32, config.rms_norm_eps.to_bits(), 0u32, 0u32]),
+            "rmsnorm_hs_params",
+        );
+        let elementwise_hs_params =
+            ctx.upload_storage(bytemuck::cast_slice(&[hs as u32, 0u32]), "ew_hs_params");
+        let elementwise_is_params =
+            ctx.upload_storage(bytemuck::cast_slice(&[is as u32, 0u32]), "ew_is_params");
+
         let mut model = Self {
             ctx,
             config,
@@ -326,6 +348,9 @@ impl GpuLfm2Model {
             attn_out_buf,
             logits_buf,
             scores_buf,
+            rmsnorm_hs_params,
+            elementwise_hs_params,
+            elementwise_is_params,
             conv_proj_buf,
             conv_bx_buf,
             conv_out_buf,
@@ -557,11 +582,10 @@ impl GpuLfm2Model {
         x: &wgpu::Buffer,
         weight: &wgpu::Buffer,
         n: u32,
-        eps: f32,
+        _eps: f32,
     ) {
-        let params_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&[n, eps.to_bits(), 0u32, 0u32]), "p");
+        // Use pre-allocated params buffer (n and eps are always hs and config.rms_norm_eps).
+        let params_buf = &self.rmsnorm_hs_params;
         let bg = self
             .ctx
             .device
@@ -960,9 +984,7 @@ impl Model for GpuLfm2Model {
                 );
 
                 // Pre-create BGs for passes 2 and 3.
-                let mul_p = self
-                    .ctx
-                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let mul_p = &self.elementwise_hs_params;
                 let mul1_bg = self
                     .ctx
                     .device
@@ -1048,9 +1070,7 @@ impl Model for GpuLfm2Model {
                     }
                 };
                 let out_rows = out_w.m.div_ceil(4);
-                let add_p = self
-                    .ctx
-                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let add_p = &self.elementwise_hs_params;
                 let add_bg = self
                     .ctx
                     .device
@@ -1357,9 +1377,7 @@ impl Model for GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
-                let add_p = self
-                    .ctx
-                    .upload_storage(bytemuck::cast_slice(&[hs32, 0u32]), "p");
+                let add_p = &self.elementwise_hs_params;
                 let add_bg = self
                     .ctx
                     .device
@@ -1455,9 +1473,7 @@ impl Model for GpuLfm2Model {
                     &up_bg_tmp
                 }
             };
-            let silu_params = self
-                .ctx
-                .upload_storage(bytemuck::cast_slice(&[lw.ffn_gate.m, 0u32]), "p");
+            let silu_params = &self.elementwise_is_params;
             let silu_bg = self
                 .ctx
                 .device
