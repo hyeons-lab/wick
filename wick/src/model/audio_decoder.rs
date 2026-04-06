@@ -818,12 +818,15 @@ fn detok_conv_block(
     let mut conv_out = vec![0.0; chunk_size];
     // The rolling buffer has d_conv previous bx vectors.
     // Kernel applies: sum over k of weight[k] * input[pos - d_conv + k]
+    // GGUF stores conv.weight as [kernel_size, n_embd] with dim0 (kernel) fastest.
+    // Element (k, ch) is at index ch * kernel_size + k.
+    let kernel_size = d_conv + 1;
     for ch in 0..chunk_size {
         let mut sum = 0.0;
         for k in 0..d_conv {
-            sum += conv_buf[k * n_embd + ch] * conv_w[k * n_embd + ch];
+            sum += conv_buf[k * n_embd + ch] * conv_w[ch * kernel_size + k];
         }
-        sum += bx[ch] * conv_w[d_conv * n_embd + ch];
+        sum += bx[ch] * conv_w[ch * kernel_size + d_conv];
         conv_out[ch] = sum;
     }
 
