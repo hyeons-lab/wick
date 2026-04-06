@@ -15,6 +15,9 @@ pub struct GpuContext {
     pub backend: String,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<GpuProfiler>,
+    /// Pre-allocated staging buffer for download_f32. Resized on demand.
+    staging: std::cell::RefCell<Option<wgpu::Buffer>>,
+    staging_size: std::cell::Cell<u64>,
 }
 
 /// GPU timestamp profiler — records per-dispatch timing.
@@ -124,6 +127,8 @@ impl GpuContext {
             adapter_name,
             backend,
             profiler,
+            staging: std::cell::RefCell::new(None),
+            staging_size: std::cell::Cell::new(0),
         })
     }
 
@@ -154,15 +159,22 @@ impl GpuContext {
         })
     }
 
-    /// Read f32 data back from a GPU buffer (blocking).
+    /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
+    /// staging buffer to avoid per-token allocation.
     pub fn download_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         let size = (count * std::mem::size_of::<f32>()) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging-download"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Grow staging buffer if needed (typically allocated once for vocab_size).
+        if size > self.staging_size.get() {
+            *self.staging.borrow_mut() = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("staging-download"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.staging_size.set(size);
+        }
+        let staging_ref = self.staging.borrow();
+        let staging = staging_ref.as_ref().unwrap();
 
         let mut encoder = self
             .device

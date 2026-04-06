@@ -101,6 +101,11 @@ pub fn generate(
             std::io::stdout().flush()?;
         }
 
+        // Skip the final forward if we've hit the limit (avoids 1 wasted forward).
+        if generated >= config.max_tokens || pos >= model_config.max_seq_len {
+            break;
+        }
+
         // Forward pass for next token. Greedy: token-id only (4-byte read);
         // otherwise full logits + sampler.
         next_token = if greedy {
