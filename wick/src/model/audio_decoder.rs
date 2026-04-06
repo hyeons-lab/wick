@@ -496,3 +496,209 @@ pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec
 
     result
 }
+
+// ── Detokenizer: codes → PCM ────────────────────────────────────────────
+
+/// Config for the detokenizer's LFM2 backbone.
+#[derive(Debug, Clone)]
+pub struct DetokenizerConfig {
+    pub n_layer: usize,
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub n_embd_head: usize,
+    pub ffn_dim: usize,
+    pub d_conv: usize, // conv kernel - 1
+    pub rms_norm_eps: f32,
+    pub rope_freq_base: f32,
+    pub swa_window_size: usize,
+    pub n_codes: usize,
+    pub n_fft: usize,
+    pub hop_length: usize,
+    pub sample_rate: usize,
+    /// Per-layer type: true = conv (recurrent), false = attention.
+    pub layer_is_conv: Vec<bool>,
+}
+
+/// Weights for one detokenizer LFM2 layer.
+pub struct DetokLayerWeights {
+    pub operator_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    pub ffn_w1: F32Weight, // gate
+    pub ffn_w2: F32Weight, // down
+    pub ffn_w3: F32Weight, // up
+    // Conv layers
+    pub conv_in_proj: Option<F32Weight>,
+    pub conv_out_proj: Option<F32Weight>,
+    pub conv_weight: Option<Vec<f32>>, // [kernel_size, n_embd]
+    // Attention layers
+    pub wq: Option<F32Weight>,
+    pub wk: Option<F32Weight>,
+    pub wv: Option<F32Weight>,
+    pub wo: Option<F32Weight>,
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
+}
+
+/// All detokenizer weights (loaded from vocoder GGUF).
+pub struct DetokenizerWeights {
+    pub config: DetokenizerConfig,
+    pub output_norm: Vec<f32>,
+    pub emb_weight: F32Weight, // code embedding [n_codes * n_vocab, emb_dim]
+    pub lin_w: F32Weight,      // linear head
+    pub lin_b: Vec<f32>,
+    pub layers: Vec<DetokLayerWeights>,
+}
+
+impl DetokenizerWeights {
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+        // Layer types (hardcoded from decoder.cpp).
+        let layer_is_conv = vec![true, true, false, true, false, true, false, true];
+        let n_layer = layer_is_conv.len();
+
+        // Derive config from weight shapes.
+        let conv_in = F32Weight::from_tensor(gguf, "lfm.layers.0.conv.in_proj.weight")?;
+        let n_embd = conv_in.cols;
+        let q_norm_w = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
+        let n_embd_head = q_norm_w.shape()[0];
+        let q_w = F32Weight::from_tensor(gguf, "lfm.layers.2.self_attn.q_proj.weight")?;
+        let n_head = q_w.rows / n_embd_head;
+        let k_w = F32Weight::from_tensor(gguf, "lfm.layers.2.self_attn.k_proj.weight")?;
+        let n_head_kv = k_w.rows / n_embd_head;
+        let ffn_w1_0 = F32Weight::from_tensor(gguf, "lfm.layers.0.feed_forward.w1.weight")?;
+        let ffn_dim = ffn_w1_0.rows;
+
+        let config = DetokenizerConfig {
+            n_layer,
+            n_embd,
+            n_head,
+            n_head_kv,
+            n_embd_head,
+            ffn_dim,
+            d_conv: 2, // kernel_size=3, d_conv=2
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            swa_window_size: 30,
+            n_codes: 8,
+            n_fft: 1280,
+            hop_length: 320,
+            sample_rate: 24000,
+            layer_is_conv,
+        };
+
+        let output_norm = gguf.get_tensor("lfm.embedding_norm.weight")?.to_f32_vec();
+
+        let emb_weight = F32Weight::from_tensor(gguf, "emb.emb.weight")?;
+        let lin_w = F32Weight::from_tensor(gguf, "lin.weight")?;
+        let lin_b = gguf.get_tensor("lin.bias")?.to_f32_vec();
+
+        let mut layers = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            let prefix = format!("lfm.layers.{i}");
+            let is_conv = config.layer_is_conv[i];
+
+            layers.push(DetokLayerWeights {
+                operator_norm: gguf
+                    .get_tensor(&format!("{prefix}.operator_norm.weight"))?
+                    .to_f32_vec(),
+                ffn_norm: gguf
+                    .get_tensor(&format!("{prefix}.ffn_norm.weight"))?
+                    .to_f32_vec(),
+                ffn_w1: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
+                ffn_w2: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
+                ffn_w3: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
+                conv_in_proj: if is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.conv.in_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                conv_out_proj: if is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.conv.out_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                conv_weight: if is_conv {
+                    Some(
+                        gguf.get_tensor(&format!("{prefix}.conv.conv.weight"))?
+                            .to_f32_vec(),
+                    )
+                } else {
+                    None
+                },
+                wq: if !is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                wk: if !is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.self_attn.k_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                wv: if !is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.self_attn.v_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                wo: if !is_conv {
+                    Some(F32Weight::from_tensor(
+                        gguf,
+                        &format!("{prefix}.self_attn.out_proj.weight"),
+                    )?)
+                } else {
+                    None
+                },
+                q_norm: if !is_conv {
+                    Some(
+                        gguf.get_tensor(&format!("{prefix}.self_attn.q_layernorm.weight"))?
+                            .to_f32_vec(),
+                    )
+                } else {
+                    None
+                },
+                k_norm: if !is_conv {
+                    Some(
+                        gguf.get_tensor(&format!("{prefix}.self_attn.k_layernorm.weight"))?
+                            .to_f32_vec(),
+                    )
+                } else {
+                    None
+                },
+            });
+        }
+
+        eprintln!(
+            "Detokenizer loaded: {}L, embd={}, head={}/{}, ffn={}, conv_layers={}",
+            n_layer,
+            n_embd,
+            n_head,
+            n_head_kv,
+            ffn_dim,
+            config.layer_is_conv.iter().filter(|&&c| c).count()
+        );
+
+        Ok(Self {
+            config,
+            output_norm,
+            emb_weight,
+            lin_w,
+            lin_b,
+            layers,
+        })
+    }
+}
