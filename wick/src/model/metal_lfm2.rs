@@ -1240,35 +1240,74 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Stage all N embedding rows (dequantized from Q6_K) into one GPU buffer.
-        let mut stage = vec![0.0f32; hs * n];
-        for (i, &t) in tokens.iter().enumerate() {
-            self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
-        }
-        let emb_staging = self.ctx.upload_f32(&stage);
+        // Allocate batch hidden state buffer: [hs × n] holding all tokens.
+        // On unified memory, this is ~4-16 MB for typical prompt sizes.
+        let batch_buf = self.ctx.create_buffer((hs * n * 4) as u64);
 
-        // Single command buffer for ALL prompt tokens — no CPU sync between them.
+        // Stage all N embedding rows into batch_buf.
+        {
+            let mut stage = vec![0.0f32; hs * n];
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
+            }
+            unsafe {
+                let dst = batch_buf.contents() as *mut f32;
+                std::ptr::copy_nonoverlapping(stage.as_ptr(), dst, stage.len());
+            }
+        }
+
+        // Layer-first ordering: for each layer, process ALL N tokens through
+        // that layer before moving to the next. This keeps weight matrices in
+        // GPU SLC across N dispatches (read once from DRAM, not N times).
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
 
-        for i in 0..n {
-            let pos = start_pos + i;
-            // Copy this token's embedding into hidden_buf.
+        for layer in 0..cfg.n_layers {
+            for i in 0..n {
+                let pos = start_pos + i;
+                let tok_off = (i * hs * 4) as u64;
+
+                // Copy this token's hidden state from batch_buf to hidden_buf.
+                self.copy_compute(
+                    enc,
+                    &batch_buf,
+                    tok_off,
+                    &self.hidden_buf,
+                    0,
+                    &self.params.elementwise_hs,
+                    hs as u64,
+                );
+
+                // Process this single layer (not all layers — just `layer`).
+                self.encode_single_layer(enc, layer, pos);
+
+                // Copy result back to batch_buf.
+                self.copy_compute(
+                    enc,
+                    &self.hidden_buf,
+                    0,
+                    &batch_buf,
+                    tok_off,
+                    &self.params.elementwise_hs,
+                    hs as u64,
+                );
+            }
+        }
+
+        // Final: output norm + logits for last token only.
+        {
+            let last_off = ((n - 1) * hs * 4) as u64;
             self.copy_compute(
                 enc,
-                &emb_staging,
-                (i * hs * 4) as u64,
+                &batch_buf,
+                last_off,
                 &self.hidden_buf,
                 0,
                 &self.params.elementwise_hs,
                 hs as u64,
             );
-            self.encode_layers(enc, pos);
-            // Only produce logits for the LAST token.
-            if i == n - 1 {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            }
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
         }
 
         enc.end_encoding();
@@ -1509,12 +1548,163 @@ impl MetalLfm2Model {
 
     /// Encode one full token's layer stack (all attn/conv + FFN blocks). `pos` is the
     /// sequence position for RoPE and the KV cache write offset.
-    fn encode_layers(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+    /// Encode a SINGLE layer for the current hidden_buf state at position pos.
+    fn encode_single_layer(&self, enc: &metal::ComputeCommandEncoderRef, i: usize, pos: usize) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
         let phs = &self.params.elementwise_hs;
+        {
+            let lw = &self.layers[i];
 
+            if cfg.block_types[i] == BlockType::GatedConv {
+                let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
+                self.encode_gemv_weight(
+                    enc,
+                    lw.conv_in_proj.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.conv_proj_buf,
+                );
+                self.encode_mul_out(
+                    enc,
+                    &self.conv_proj_buf,
+                    0,
+                    &self.conv_proj_buf,
+                    (2 * hs * 4) as u64,
+                    &self.conv_bx_buf,
+                    phs,
+                    hs32,
+                );
+                self.encode_conv1d(
+                    enc,
+                    &self.conv_bx_buf,
+                    conv_buf,
+                    lw.conv_weight.as_ref().unwrap(),
+                    &self.conv_out_buf,
+                    hs32,
+                );
+                self.encode_mul_out(
+                    enc,
+                    &self.conv_proj_buf,
+                    (hs * 4) as u64,
+                    &self.conv_out_buf,
+                    0,
+                    &self.conv_gate_buf,
+                    phs,
+                    hs32,
+                );
+                self.encode_gemv_weight_accumulate(
+                    enc,
+                    lw.conv_out_proj.as_ref().unwrap(),
+                    &self.conv_gate_buf,
+                    &self.hidden_buf,
+                );
+            } else {
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
+                let kv_dim = n_kv_heads * head_dim;
+                let n_heads = cfg.n_heads as u32;
+
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
+                let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                let kv_offset = (pos * kv_dim as usize * 2) as u64;
+
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_q.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.q_buf,
+                );
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_k.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.k_buf,
+                );
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_v.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.v_buf,
+                );
+
+                self.encode_qk_norm_rope(
+                    enc,
+                    &self.q_buf,
+                    &self.k_buf,
+                    0,
+                    lw.attn_q_norm.as_ref().unwrap(),
+                    lw.attn_k_norm.as_ref().unwrap(),
+                    pos as u32,
+                    head_dim,
+                    n_heads,
+                    n_kv_heads,
+                );
+
+                self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, kv_offset, kv_dim);
+                self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, kv_offset, kv_dim);
+
+                self.encode_attention(
+                    enc,
+                    &self.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.attn_out_buf,
+                    (pos + 1) as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                );
+                self.encode_gemv_weight_accumulate(
+                    enc,
+                    lw.attn_output.as_ref().unwrap(),
+                    &self.attn_out_buf,
+                    &self.hidden_buf,
+                );
+            }
+
+            // FFN
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
+            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+                self.encode_gemv_gate_up(
+                    enc,
+                    &lw.ffn_gate,
+                    &lw.ffn_up,
+                    &self.ffn_input_buf,
+                    &self.gate_buf,
+                    &self.up_buf,
+                );
+            } else {
+                self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
+                self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+            }
+            self.encode_elementwise(
+                enc,
+                &self.pipelines.silu_mul_inplace,
+                &self.gate_buf,
+                &self.up_buf,
+                &self.params.elementwise_is,
+                lw.ffn_gate.m,
+            );
+            self.encode_gemv_weight_accumulate(enc, &lw.ffn_down, &self.gate_buf, &self.hidden_buf);
+        }
+    }
+
+    fn encode_layers(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+        for i in 0..self.config.n_layers {
+            self.encode_single_layer(enc, i, pos);
+        }
+    }
+
+    // Keep the old implementation as `encode_layers_old` for reference — delete after verifying.
+    #[allow(dead_code)]
+    fn encode_layers_old(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let hs32 = hs as u32;
+        let phs = &self.params.elementwise_hs;
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
 
