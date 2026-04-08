@@ -336,6 +336,28 @@ fn main() -> Result<()> {
                 let detok_weights =
                     wick::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf)?;
 
+                // Construct Metal detokenizer if using Metal device.
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let gpu_detok = if device == "metal" || device == "auto" {
+                    match wick::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(
+                        &voc_gguf,
+                        Path::new(vocoder_path),
+                    ) {
+                        Ok(d) => {
+                            eprintln!("Metal detokenizer loaded");
+                            Some(d)
+                        }
+                        Err(e) => {
+                            eprintln!("Metal detokenizer failed: {e}, using CPU");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                let gpu_detok: Option<()> = None;
+
                 let mut all_pcm = Vec::new();
                 let sys = system.as_deref().unwrap(); // validated above
                 let mode = if sys == "Respond with interleaved text and audio." {
@@ -355,6 +377,12 @@ fn main() -> Result<()> {
                     mode,
                 };
 
+                // GPU detokenizer dispatch disabled until Metal shader issues are debugged.
+                // MetalAudioDecoder loads and compiles shaders successfully.
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let _ = &gpu_detok;
+                let gpu_detok_ref: Option<&dyn Fn(&[i32]) -> Vec<f32>> = None;
+
                 let result = wick::audio_engine::generate_audio(
                     loaded_model.as_ref(),
                     &decoder_weights,
@@ -362,7 +390,7 @@ fn main() -> Result<()> {
                     &tokenizer,
                     &tokens,
                     &audio_config,
-                    None, // GPU detokenizer (TODO: construct MetalAudioDecoder when --device metal)
+                    gpu_detok_ref,
                     |text| {
                         print!("{text}");
                         std::io::stdout().flush().ok();

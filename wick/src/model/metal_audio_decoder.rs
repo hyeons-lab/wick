@@ -67,6 +67,7 @@ struct Pipelines {
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
     memcpy_f32: ComputePipelineState,
     mul_out: ComputePipelineState,
+    add_inplace: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     qk_norm_rope: ComputePipelineState,
@@ -171,6 +172,7 @@ impl MetalAudioDecoder {
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
             memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
+            add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
@@ -787,7 +789,15 @@ impl MetalAudioDecoder {
                 sz1d(32),
             );
             self.barrier(enc);
-            // TODO: add lin_b bias
+            // Add bias: spectrum_buf[spec_off..] += lin_b
+            let bias_n = spectrum_per_frame as u32;
+            let bias_params: [u32; 2] = [bias_n, 0];
+            enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+            enc.set_buffer(0, Some(&self.spectrum_buf), spec_off);
+            enc.set_buffer(1, Some(&self.lin_b), 0);
+            enc.set_bytes(2, 8, bias_params.as_ptr() as *const _);
+            enc.dispatch_thread_groups(sz1d((bias_n as u64).div_ceil(256)), sz1d(256));
+            self.barrier(enc);
         }
 
         enc.end_encoding();
