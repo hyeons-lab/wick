@@ -345,6 +345,15 @@ fn main() -> Result<()> {
                     ) {
                         Ok(d) => {
                             eprintln!("Metal detokenizer loaded");
+                            eprintln!("  smoke test: rmsnorm...");
+                            d.smoke_test();
+                            eprintln!("  smoke test: gemv...");
+                            d.smoke_test_gemv();
+                            eprintln!("  smoke test: conv layer...");
+                            d.smoke_test_conv_layer();
+                            eprintln!("  smoke test: full 8-layer...");
+                            d.smoke_test_full();
+                            eprintln!("  smoke tests passed");
                             Some(d)
                         }
                         Err(e) => {
@@ -377,10 +386,19 @@ fn main() -> Result<()> {
                     mode,
                 };
 
-                // GPU detokenizer dispatch disabled until Metal shader issues are debugged.
-                // MetalAudioDecoder loads and compiles shaders successfully.
+                // GPU detokenizer closure
                 #[cfg(all(feature = "metal", target_os = "macos"))]
-                let _ = &gpu_detok;
+                let gpu_closure;
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let gpu_detok_ref: Option<&dyn Fn(&[i32]) -> Vec<f32>> = if let Some(d) = &gpu_detok
+                {
+                    let dw = &detok_weights;
+                    gpu_closure = move |codes: &[i32]| d.detokenize_to_spectrum(dw, codes);
+                    Some(&gpu_closure)
+                } else {
+                    None
+                };
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
                 let gpu_detok_ref: Option<&dyn Fn(&[i32]) -> Vec<f32>> = None;
 
                 let result = wick::audio_engine::generate_audio(

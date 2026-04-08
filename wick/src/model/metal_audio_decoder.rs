@@ -382,6 +382,156 @@ impl MetalAudioDecoder {
         &self.cfg
     }
 
+    /// Minimal GPU smoke test: write known data to a buffer, run one rmsnorm,
+    /// read back. Returns the first 4 output values.
+    pub fn smoke_test(&self) -> Vec<f32> {
+        let hs = self.cfg.n_embd;
+
+        // Write ones into hidden_buf
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            for v in dst.iter_mut() {
+                *v = 1.0;
+            }
+        }
+
+        // Run rmsnorm → normed_buf
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Read back
+        let out =
+            unsafe { std::slice::from_raw_parts(self.normed_buf.contents() as *const f32, hs) };
+        eprintln!(
+            "[smoke] rmsnorm output first4: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            out[0], out[1], out[2], out[3]
+        );
+        out[..4].to_vec()
+    }
+
+    /// Test full 8-layer dispatch for 6 tokens, one layer per command buffer.
+    pub fn smoke_test_full(&self) {
+        let hs = self.cfg.n_embd;
+        let n_frames = 6;
+
+        // Write test data
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(
+                self.tokens_buf.contents() as *mut f32,
+                n_frames * hs,
+            );
+            for (i, v) in dst.iter_mut().enumerate() {
+                *v = (i as f32 * 0.001).sin() * 0.1;
+            }
+        }
+        for buf in &self.conv_bufs {
+            if let Some(b) = buf {
+                unsafe {
+                    std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
+                }
+            }
+        }
+        self.n_past.set(0);
+        let n_past = 0;
+
+        for (il, lw) in self.layers.iter().enumerate() {
+            let t0 = std::time::Instant::now();
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            if self.cfg.layer_is_conv[il] {
+                self.encode_conv_layer(enc, lw, il, n_frames);
+            } else {
+                self.encode_attn_layer(enc, lw, il, n_frames, n_past);
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let dt = t0.elapsed();
+            let kind = if self.cfg.layer_is_conv[il] {
+                "conv"
+            } else {
+                "attn"
+            };
+            eprintln!(
+                "  [smoke_full] layer {il} ({kind}): {:.1}ms",
+                dt.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// Test one full conv layer dispatch for 1 token.
+    pub fn smoke_test_conv_layer(&self) -> Vec<f32> {
+        let hs = self.cfg.n_embd;
+
+        // Write test data into tokens_buf[0..hs]
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.tokens_buf.contents() as *mut f32, hs);
+            for (i, v) in dst.iter_mut().enumerate() {
+                *v = (i as f32 * 0.001).sin();
+            }
+        }
+        // Zero conv buffer
+        if let Some(b) = &self.conv_bufs[0] {
+            unsafe {
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
+            }
+        }
+
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        eprintln!("  [smoke_conv] dispatching layer 0, 1 token...");
+        self.encode_conv_layer(enc, &self.layers[0], 0, 1);
+        enc.end_encoding();
+        eprintln!("  [smoke_conv] committing...");
+        cb.commit();
+        cb.wait_until_completed();
+        eprintln!("  [smoke_conv] done");
+
+        let out =
+            unsafe { std::slice::from_raw_parts(self.tokens_buf.contents() as *const f32, hs) };
+        eprintln!(
+            "[smoke] conv layer 0 output first4: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            out[0], out[1], out[2], out[3]
+        );
+        out[..4].to_vec()
+    }
+
+    /// Test one GEMV dispatch and return first 4 values.
+    pub fn smoke_test_gemv(&self) -> Vec<f32> {
+        let hs = self.cfg.n_embd;
+
+        // Write ones into normed_buf
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.normed_buf.contents() as *mut f32, hs);
+            for v in dst.iter_mut() {
+                *v = 0.01;
+            }
+        }
+
+        // Run conv_in_proj GEMV (layer 0, which is conv)
+        let lw = &self.layers[0];
+        let w = lw.conv_in_proj.as_ref().unwrap();
+
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_gemv(enc, w, &self.normed_buf, &self.proj_buf, false);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let out =
+            unsafe { std::slice::from_raw_parts(self.proj_buf.contents() as *const f32, 3 * hs) };
+        eprintln!(
+            "[smoke] gemv output first4: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            out[0], out[1], out[2], out[3]
+        );
+        out[..4].to_vec()
+    }
+
     // ── GEMV dispatch ───────────────────────────────────────────────────
 
     fn encode_gemv(
@@ -742,11 +892,12 @@ impl MetalAudioDecoder {
         let n_fft_bins = self.cfg.n_fft / 2 + 1; // 641
         let spectrum_per_frame = n_fft_bins * 2; // 1282
 
+        eprintln!("[gpu_detok] entering frame, n_past={}", self.n_past.get());
         // 1. Embed + upsample on CPU
         let tokens = {
             use crate::model::audio_decoder::{detok_embed_codes, upsample};
             let emb = detok_embed_codes(cpu_weights, codes);
-            upsample(&emb, n_frames, hs)
+            upsample(&emb, hs, n_frames)
         };
 
         // 2. Upload to GPU
@@ -755,58 +906,83 @@ impl MetalAudioDecoder {
             std::ptr::copy_nonoverlapping(tokens.as_ptr(), dst, tokens.len());
         }
 
-        // 3. Encode all layers
-        let cb = self.ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
+        eprintln!("[gpu_detok] tokens uploaded, starting layers");
+        // 3. Encode layers
         let n_past = self.n_past.get();
+        static DETOK_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = DETOK_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         for (il, lw) in self.layers.iter().enumerate() {
+            let t0 = std::time::Instant::now();
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
             if self.cfg.layer_is_conv[il] {
                 self.encode_conv_layer(enc, lw, il, n_frames);
             } else {
                 self.encode_attn_layer(enc, lw, il, n_frames, n_past);
             }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            if call == 0 {
+                eprintln!(
+                    "[gpu_detok] layer {il}: {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
 
         // 4. Output norm + linear head per frame
-        for t in 0..n_frames {
-            let tok_off = (t * hs * 4) as u64;
-            let spec_off = (t * spectrum_per_frame * 4) as u64;
+        {
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for t in 0..n_frames {
+                let tok_off = (t * hs * 4) as u64;
+                let spec_off = (t * spectrum_per_frame * 4) as u64;
 
-            self.encode_memcpy(enc, &self.tokens_buf, tok_off, &self.hidden_buf, 0, hs);
-            self.barrier(enc);
-            self.encode_rmsnorm(enc, &self.hidden_buf, &self.output_norm);
-            self.barrier(enc);
-            // lin_w GEMV → spectrum_buf at offset for this frame
-            enc.set_compute_pipeline_state(&self.pipes.gemv_q4_0_fast_slim);
-            enc.set_buffer(0, Some(&self.mmap_buf), self.lin_w.mmap_offset);
-            enc.set_buffer(1, Some(&self.hidden_buf), 0);
-            enc.set_buffer(2, Some(&self.spectrum_buf), spec_off);
-            enc.set_buffer(3, Some(&self.lin_w.params_buf), 0);
-            let groups = self.lin_w.m.div_ceil(2);
-            enc.dispatch_thread_groups(
-                sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
-                sz1d(32),
-            );
-            self.barrier(enc);
-            // Add bias: spectrum_buf[spec_off..] += lin_b
-            let bias_n = spectrum_per_frame as u32;
-            let bias_params: [u32; 2] = [bias_n, 0];
-            enc.set_compute_pipeline_state(&self.pipes.add_inplace);
-            enc.set_buffer(0, Some(&self.spectrum_buf), spec_off);
-            enc.set_buffer(1, Some(&self.lin_b), 0);
-            enc.set_bytes(2, 8, bias_params.as_ptr() as *const _);
-            enc.dispatch_thread_groups(sz1d((bias_n as u64).div_ceil(256)), sz1d(256));
-            self.barrier(enc);
+                self.encode_memcpy(enc, &self.tokens_buf, tok_off, &self.hidden_buf, 0, hs);
+                self.barrier(enc);
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.output_norm);
+                self.barrier(enc);
+                // lin_w GEMV
+                enc.set_compute_pipeline_state(&self.pipes.gemv_q4_0_fast_slim);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.lin_w.mmap_offset);
+                enc.set_buffer(1, Some(&self.hidden_buf), 0);
+                enc.set_buffer(2, Some(&self.spectrum_buf), spec_off);
+                enc.set_buffer(3, Some(&self.lin_w.params_buf), 0);
+                let groups = self.lin_w.m.div_ceil(2);
+                enc.dispatch_thread_groups(
+                    sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
+                    sz1d(32),
+                );
+                self.barrier(enc);
+                // Add bias
+                let bias_n = spectrum_per_frame as u32;
+                let bias_params: [u32; 2] = [bias_n, 0];
+                enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+                enc.set_buffer(0, Some(&self.spectrum_buf), spec_off);
+                enc.set_buffer(1, Some(&self.lin_b), 0);
+                enc.set_bytes(2, 8, bias_params.as_ptr() as *const _);
+                enc.dispatch_thread_groups(sz1d((bias_n as u64).div_ceil(256)), sz1d(256));
+                self.barrier(enc);
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
         }
-
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
 
         self.n_past.set(n_past + n_frames);
 
         // 5. Read spectrum from GPU
+        if call == 0 {
+            let p = unsafe {
+                std::slice::from_raw_parts(self.spectrum_buf.contents() as *const f32, 8)
+            };
+            eprintln!("[gpu_detok] first call spectrum[0..8]: {:?}", p);
+            let any_nan = p.iter().any(|v| v.is_nan());
+            let any_inf = p.iter().any(|v| v.is_infinite());
+            eprintln!("[gpu_detok] nan={any_nan} inf={any_inf}");
+        }
         let total = n_frames * spectrum_per_frame;
         let mut spectrum = vec![0.0f32; total];
         unsafe {
