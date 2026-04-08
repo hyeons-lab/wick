@@ -167,13 +167,17 @@ pub fn generate_audio(
                 // Run audio loop with this embedding.
                 loop {
                     let t0 = Instant::now();
-                    let codes = sample_audio_frame(
-                        decoder_weights,
-                        &mut df_state,
-                        &emb,
-                        config.audio_temperature,
-                        config.audio_top_k,
-                    );
+                    let codes = if let Some(g) = gpu {
+                        g.sample_audio_frame(&emb, config.audio_temperature, config.audio_top_k)
+                    } else {
+                        sample_audio_frame(
+                            decoder_weights,
+                            &mut df_state,
+                            &emb,
+                            config.audio_temperature,
+                            config.audio_top_k,
+                        )
+                    };
                     time_depthformer += t0.elapsed();
                     if codes[0] == AUDIO_END_CODE {
                         text_done = true;
@@ -236,13 +240,17 @@ pub fn generate_audio(
 
             loop {
                 let t0 = Instant::now();
-                let codes = sample_audio_frame(
-                    decoder_weights,
-                    &mut df_state,
-                    &emb,
-                    config.audio_temperature,
-                    config.audio_top_k,
-                );
+                let codes = if let Some(g) = gpu {
+                    g.sample_audio_frame(&emb, config.audio_temperature, config.audio_top_k)
+                } else {
+                    sample_audio_frame(
+                        decoder_weights,
+                        &mut df_state,
+                        &emb,
+                        config.audio_temperature,
+                        config.audio_top_k,
+                    )
+                };
                 time_depthformer += t0.elapsed();
 
                 if codes[0] == AUDIO_END_CODE {

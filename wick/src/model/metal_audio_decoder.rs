@@ -93,6 +93,8 @@ pub struct MetalAudioDecoder {
     pipes: Pipelines,
     params: Params,
 
+    depthformer: Option<MetalDepthformer>,
+
     layers: Vec<DetokLayerGpu>,
     output_norm: Buffer,
     lin_w: MetalWeight,
@@ -124,6 +126,8 @@ pub struct MetalAudioDecoder {
 
 impl MetalAudioDecoder {
     pub fn from_gguf(gguf: &GgufFile, vocoder_path: &Path) -> Result<Self> {
+        // Also load the CPU decoder weights for depthformer config
+        let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
         let ctx = MetalContext::new()?;
 
         // Parse config from tensor shapes (same logic as DetokenizerWeights::from_gguf).
@@ -330,11 +334,29 @@ impl MetalAudioDecoder {
         let spectrum_buf = ab(spectrum_size);
         let tokens_buf = ab(6 * n_embd);
 
+        // Build Metal depthformer
+        let depthformer = match MetalDepthformer::from_gguf(
+            gguf,
+            vocoder_path,
+            &cpu_dec.depthformer_config,
+            &cpu_dec.decoder_config,
+        ) {
+            Ok(df) => {
+                eprintln!("Metal depthformer loaded");
+                Some(df)
+            }
+            Err(e) => {
+                eprintln!("Metal depthformer failed: {e}, using CPU");
+                None
+            }
+        };
+
         Ok(Self {
             ctx,
             cfg,
             pipes,
             params,
+            depthformer,
             layers,
             output_norm,
             lin_w,
@@ -1096,13 +1118,7 @@ impl MetalDepthformer {
     }
 
     /// Sample one audio frame (8 codes) on GPU.
-    pub fn sample_frame(
-        &self,
-        cpu_weights: &crate::model::audio_decoder::AudioDecoderWeights,
-        embedding: &[f32],
-        temperature: f32,
-        top_k: usize,
-    ) -> [i32; 8] {
+    pub fn sample_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         let cfg = &self.df_cfg;
         let dec = &self.dec_cfg;
         let n_embd = cfg.n_embd;
@@ -1372,9 +1388,12 @@ impl MetalDepthformer {
 // ── AudioGpu trait implementation ───────────────────────────────────────────
 
 impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
-    fn sample_audio_frame(&self, _embedding: &[f32], _temperature: f32, _top_k: usize) -> [i32; 8] {
-        // Metal depthformer not yet wired — CPU fallback used in audio_engine
-        panic!("Use CPU depthformer fallback");
+    fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
+        if let Some(df) = &self.depthformer {
+            df.sample_frame(embedding, temperature, top_k)
+        } else {
+            panic!("No Metal depthformer — use CPU fallback")
+        }
     }
 
     fn detokenize_to_spectrum(
