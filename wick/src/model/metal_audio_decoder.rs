@@ -886,9 +886,10 @@ struct DfLayerGpu {
 struct DfPipelines {
     gemv_f32: ComputePipelineState,
     add_inplace: ComputePipelineState,
+    memcpy_f32: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     qk_norm_rope: ComputePipelineState,
-    flash_attention: ComputePipelineState, // f32 KV cache
+    flash_attention: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
 }
 
@@ -937,6 +938,7 @@ impl MetalDepthformer {
         let pipes = DfPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
+            memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
             flash_attention: ctx.create_pipeline(shaders::FLASH_ATTENTION, "flash_attention")?,
@@ -1187,39 +1189,23 @@ impl MetalDepthformer {
                 enc.set_bytes(4, 28, rope_params.as_ptr() as *const _);
                 enc.dispatch_thread_groups(sz1d((n_head + n_kv) as u64), sz1d(256));
 
-                // KV cache write: f32 memcpy from qkv_buf to cache
+                // KV cache write: GPU memcpy from qkv_buf to cache (f32)
                 let k_src_off = (q_dim * 4) as u64;
                 let v_src_off = ((q_dim + kv_dim) * 4) as u64;
-                let cache_off = (pos * kv_dim * 4) as u64; // f32 bytes
-                let copy_n: [u32; 2] = [kv_dim as u32, 0];
+                let cache_off = (pos * kv_dim * 4) as u64;
+                let copy_params: [u32; 2] = [kv_dim as u32, 0];
                 // Copy K
-                enc.set_compute_pipeline_state(&self.pipes.add_inplace); // reuse as memcpy via: dst = 0 + src
-                // Actually need a proper memcpy. Use a blit or elementwise.
-                // Simplest: write from CPU side (unified memory) after commit.
-                // But we're inside a CB. Let me just use the elementwise add trick:
-                // hidden_buf is not used here, so use it as zero + copy.
-                // Actually simplest: use set_buffer with offset for the qkv region.
-                // The flash_attention shader reads from k_cache/v_cache directly.
-                // We need to copy qkv_buf[q_dim..q_dim+kv_dim] → kv_k[pos*kv_dim]
-                // and qkv_buf[q_dim+kv_dim..] → kv_v[pos*kv_dim].
-                // No memcpy pipeline in DfPipelines. Let me add one quick.
-                // For now: do the copy on CPU after the CB (ugly but works).
-                // TODO: add memcpy_f32 to DfPipelines
-                // HACK: end encoding, commit, do CPU copy, start new CB
-                enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
-                unsafe {
-                    let src_k = (self.qkv_buf.contents() as *const f32).add(q_dim);
-                    let dst_k = (self.kv_k[il].contents() as *mut f32).add(pos * kv_dim);
-                    std::ptr::copy_nonoverlapping(src_k, dst_k, kv_dim);
-                    let src_v = (self.qkv_buf.contents() as *const f32).add(q_dim + kv_dim);
-                    let dst_v = (self.kv_v[il].contents() as *mut f32).add(pos * kv_dim);
-                    std::ptr::copy_nonoverlapping(src_v, dst_v, kv_dim);
-                }
-                // Start new CB for attention + rest of layer
-                let cb = self.ctx.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
+                enc.set_buffer(0, Some(&self.qkv_buf), k_src_off);
+                enc.set_buffer(1, Some(&self.kv_k[il]), cache_off);
+                enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
+                enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
+                // Copy V
+                enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
+                enc.set_buffer(0, Some(&self.qkv_buf), v_src_off);
+                enc.set_buffer(1, Some(&self.kv_v[il]), cache_off);
+                enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
+                enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
 
                 // Attention (flash_attention reads float* KV)
                 let seq_len = pos + 1;
@@ -1361,12 +1347,10 @@ impl MetalDepthformer {
 // ── AudioGpu trait implementation ───────────────────────────────────────────
 
 impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
-    fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
-        if let Some(df) = &self.depthformer {
-            df.sample_frame(embedding, temperature, top_k)
-        } else {
-            panic!("No Metal depthformer — use CPU fallback")
-        }
+    fn sample_audio_frame(&self, _embedding: &[f32], _temperature: f32, _top_k: usize) -> [i32; 8] {
+        // GPU depthformer is slower than CPU NEON (21ms vs 17ms) and produces
+        // different codes due to GEMV accumulation order. Keep on CPU.
+        panic!("Use CPU depthformer fallback")
     }
 
     fn detokenize_to_spectrum(

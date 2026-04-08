@@ -167,8 +167,16 @@ pub fn generate_audio(
                 // Run audio loop with this embedding.
                 loop {
                     let t0 = Instant::now();
-                    let codes = if let Some(g) = gpu {
-                        g.sample_audio_frame(&emb, config.audio_temperature, config.audio_top_k)
+                    // GPU depthformer disabled by default: GEMV accumulation
+                    // order differences produce wrong codes. Set WICK_GPU_DF=1 to test.
+                    let use_gpu_df =
+                        gpu.is_some() && std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                    let codes = if use_gpu_df {
+                        gpu.unwrap().sample_audio_frame(
+                            &emb,
+                            config.audio_temperature,
+                            config.audio_top_k,
+                        )
                     } else {
                         sample_audio_frame(
                             decoder_weights,
@@ -240,8 +248,14 @@ pub fn generate_audio(
 
             loop {
                 let t0 = Instant::now();
-                let codes = if let Some(g) = gpu {
-                    g.sample_audio_frame(&emb, config.audio_temperature, config.audio_top_k)
+                let use_gpu_df =
+                    gpu.is_some() && std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                let codes = if use_gpu_df {
+                    gpu.unwrap().sample_audio_frame(
+                        &emb,
+                        config.audio_temperature,
+                        config.audio_top_k,
+                    )
                 } else {
                     sample_audio_frame(
                         decoder_weights,
