@@ -538,6 +538,34 @@ impl MetalAudioDecoder {
     }
 
     // ── GEMV dispatch ───────────────────────────────────────────────────
+    //
+    // Buffer slot constants matching Metal shader signatures:
+    //
+    // gemv_q4_0_fast_slim{,_accum}:
+    //   0: a (weight, Q4_0 bytes)
+    //   1: x (input, f32)
+    //   2: y (output, f32)
+    //   3: params {m, k}
+    //
+    // gemv_q4_0_fast_slim_gate_up:
+    //   0: a_gate (weight, Q4_0 bytes)
+    //   1: a_up   (weight, Q4_0 bytes)
+    //   2: x      (input, f32)
+    //   3: y_gate (output, f32)
+    //   4: y_up   (output, f32)
+    //   5: params  {m, k}
+
+    const GEMV_BUF_WEIGHT: u64 = 0;
+    const GEMV_BUF_INPUT: u64 = 1;
+    const GEMV_BUF_OUTPUT: u64 = 2;
+    const GEMV_BUF_PARAMS: u64 = 3;
+
+    const GATE_UP_BUF_A_GATE: u64 = 0;
+    const GATE_UP_BUF_A_UP: u64 = 1;
+    const GATE_UP_BUF_X: u64 = 2;
+    const GATE_UP_BUF_Y_GATE: u64 = 3;
+    const GATE_UP_BUF_Y_UP: u64 = 4;
+    const GATE_UP_BUF_PARAMS: u64 = 5;
 
     fn encode_gemv(
         &self,
@@ -554,10 +582,10 @@ impl MetalAudioDecoder {
         };
         let groups = w.m.div_ceil(2);
         enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
-        enc.set_buffer(1, Some(input), 0);
-        enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&w.params_buf), 0);
+        enc.set_buffer(Self::GEMV_BUF_WEIGHT, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(Self::GEMV_BUF_INPUT, Some(input), 0);
+        enc.set_buffer(Self::GEMV_BUF_OUTPUT, Some(output), 0);
+        enc.set_buffer(Self::GEMV_BUF_PARAMS, Some(&w.params_buf), 0);
         enc.dispatch_thread_groups(
             sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
             sz1d(32),
@@ -575,12 +603,16 @@ impl MetalAudioDecoder {
     ) {
         let groups = w1.m.div_ceil(2);
         enc.set_compute_pipeline_state(&self.pipes.gemv_q4_0_fast_slim_gate_up);
-        enc.set_buffer(0, Some(&self.mmap_buf), w1.mmap_offset);
-        enc.set_buffer(1, Some(input), 0);
-        enc.set_buffer(2, Some(gate), 0);
-        enc.set_buffer(3, Some(&w1.params_buf), 0);
-        enc.set_buffer(4, Some(&self.mmap_buf), w3.mmap_offset);
-        enc.set_buffer(5, Some(up), 0);
+        enc.set_buffer(
+            Self::GATE_UP_BUF_A_GATE,
+            Some(&self.mmap_buf),
+            w1.mmap_offset,
+        );
+        enc.set_buffer(Self::GATE_UP_BUF_A_UP, Some(&self.mmap_buf), w3.mmap_offset);
+        enc.set_buffer(Self::GATE_UP_BUF_X, Some(input), 0);
+        enc.set_buffer(Self::GATE_UP_BUF_Y_GATE, Some(gate), 0);
+        enc.set_buffer(Self::GATE_UP_BUF_Y_UP, Some(up), 0);
+        enc.set_buffer(Self::GATE_UP_BUF_PARAMS, Some(&w1.params_buf), 0);
         enc.dispatch_thread_groups(
             sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
             sz1d(32),
@@ -791,6 +823,9 @@ impl MetalAudioDecoder {
         n_tokens: usize,
         n_past: usize,
     ) {
+        // Bidirectional attention: all tokens see each other within a frame.
+        // Phase 1: write ALL tokens' K/V to cache (with norm + RoPE).
+        // Phase 2: each token attends to ALL cached positions, then out_proj + FFN.
         let hs = self.cfg.n_embd;
         let hd = self.cfg.n_embd_head;
         let n_heads = self.cfg.n_head as u32;
@@ -804,52 +839,71 @@ impl MetalAudioDecoder {
         let wo = lw.wo.as_ref().unwrap();
         let qn = lw.q_norm.as_ref().unwrap();
         let kn = lw.k_norm.as_ref().unwrap();
+        let freq_bits = self.cfg.rope_freq_base.to_bits();
+        let eps_bits = self.cfg.rms_norm_eps.to_bits();
+
+        // Phase 1: project K/V for all tokens, write to cache.
+        for t in 0..n_tokens {
+            let tok_off = (t * hs * 4) as u64;
+            let pos = n_past + t;
+
+            self.encode_memcpy(enc, &self.tokens_buf, tok_off, &self.hidden_buf, 0, hs);
+            self.barrier(enc);
+            self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &lw.operator_norm);
+            self.barrier(enc);
+
+            // K/V projection + norm + RoPE
+            self.encode_gemv(enc, wk, &self.normed_buf, &self.k_buf, false);
+            self.encode_gemv(enc, wv, &self.normed_buf, &self.v_buf, false);
+            self.barrier(enc);
+
+            // K norm + RoPE (dispatch only n_kv threadgroups for K heads)
+            let k_rope: [u32; 6] = [pos as u32, 0, n_kv, hd as u32, eps_bits, freq_bits];
+            enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
+            enc.set_buffer(0, Some(&self.k_buf), 0);
+            enc.set_buffer(1, Some(&self.k_buf), 0);
+            enc.set_buffer(2, Some(kn), 0);
+            enc.set_buffer(3, Some(kn), 0);
+            enc.set_bytes(4, 24, k_rope.as_ptr() as *const _);
+            enc.dispatch_thread_groups(sz1d(n_kv as u64), sz1d(256));
+            self.barrier(enc);
+
+            // Cast K/V to f16 and write to cache
+            let cache_pos = pos % self.cfg.swa_window_size;
+            let cache_off = (cache_pos * kv_dim * 2) as u64;
+            self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, cache_off, kv_dim);
+            self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, cache_off, kv_dim);
+            self.barrier(enc);
+        }
+
+        // Phase 2: each token computes Q, attends to ALL cached K/V, then FFN.
+        let seq_len = (n_past + n_tokens).min(self.cfg.swa_window_size);
+        let scale = 1.0f32 / (hd as f32).sqrt();
 
         for t in 0..n_tokens {
             let tok_off = (t * hs * 4) as u64;
             let pos = n_past + t;
 
-            // Load token
+            // Reload hidden and recompute Q (avoids extra storage for 6 Q vectors)
             self.encode_memcpy(enc, &self.tokens_buf, tok_off, &self.hidden_buf, 0, hs);
             self.barrier(enc);
-
-            // RMSnorm
             self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &lw.operator_norm);
             self.barrier(enc);
-
-            // Q/K/V projections
             self.encode_gemv(enc, wq, &self.normed_buf, &self.q_buf, false);
-            self.encode_gemv(enc, wk, &self.normed_buf, &self.k_buf, false);
-            self.encode_gemv(enc, wv, &self.normed_buf, &self.v_buf, false);
             self.barrier(enc);
 
-            // QK norm + RoPE (NeoX style for detokenizer)
-            let freq_bits = self.cfg.rope_freq_base.to_bits();
-            let eps_bits = self.cfg.rms_norm_eps.to_bits();
-            let rope_params: [u32; 6] = [pos as u32, n_heads, n_kv, hd as u32, eps_bits, freq_bits];
+            // Q norm + RoPE (dispatch only n_heads threadgroups for Q heads)
+            let q_rope: [u32; 6] = [pos as u32, n_heads, 0, hd as u32, eps_bits, freq_bits];
             enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
             enc.set_buffer(0, Some(&self.q_buf), 0);
-            enc.set_buffer(1, Some(&self.k_buf), 0);
+            enc.set_buffer(1, Some(&self.q_buf), 0);
             enc.set_buffer(2, Some(qn), 0);
-            enc.set_buffer(3, Some(kn), 0);
-            enc.set_bytes(
-                4,
-                std::mem::size_of_val(&rope_params) as u64,
-                rope_params.as_ptr() as *const _,
-            );
-            enc.dispatch_thread_groups(sz1d((n_heads + n_kv) as u64), sz1d(256));
+            enc.set_buffer(3, Some(qn), 0);
+            enc.set_bytes(4, 24, q_rope.as_ptr() as *const _);
+            enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 
-            // Write K, V to cache as f16 (ring buffer: pos % swa_window_size)
-            let cache_pos = pos % self.cfg.swa_window_size;
-            let cache_off_f16 = (cache_pos * kv_dim * 2) as u64; // f16 = 2 bytes
-            self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, cache_off_f16, kv_dim);
-            self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, cache_off_f16, kv_dim);
-            self.barrier(enc);
-
-            // Attention
-            let seq_len = (pos + 1).min(self.cfg.swa_window_size);
-            let scale = 1.0f32 / (hd as f32).sqrt();
+            // Attention: attend to ALL cached positions
             let attn_params: [u32; 8] = [
                 n_heads,
                 n_kv,
@@ -865,11 +919,7 @@ impl MetalAudioDecoder {
             enc.set_buffer(1, Some(k_cache), 0);
             enc.set_buffer(2, Some(v_cache), 0);
             enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-            enc.set_bytes(
-                4,
-                std::mem::size_of_val(&attn_params) as u64,
-                attn_params.as_ptr() as *const _,
-            );
+            enc.set_bytes(4, 32, attn_params.as_ptr() as *const _);
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 
@@ -891,11 +941,9 @@ impl MetalAudioDecoder {
             self.barrier(enc);
             self.encode_silu_mul(enc);
             self.barrier(enc);
-            // down projection accumulates into hidden_buf (residual add)
             self.encode_gemv(enc, &lw.ffn_w2, &self.gate_buf, &self.hidden_buf, true);
             self.barrier(enc);
 
-            // Write back
             self.encode_memcpy(enc, &self.hidden_buf, 0, &self.tokens_buf, tok_off, hs);
             self.barrier(enc);
         }
@@ -956,6 +1004,24 @@ impl MetalAudioDecoder {
                     "[gpu_detok] L{il}: {dt:.1}ms rms={rms:.6} nan={has_nan} first2=[{:.6},{:.6}]",
                     tok0[0], tok0[1]
                 );
+                // Check gate/up/attn buffers for magnitude clues
+                if !self.cfg.layer_is_conv[il] {
+                    let attn = unsafe {
+                        std::slice::from_raw_parts(self.attn_out_buf.contents() as *const f32, hs)
+                    };
+                    let gate = unsafe {
+                        std::slice::from_raw_parts(
+                            self.gate_buf.contents() as *const f32,
+                            self.cfg.ffn_dim,
+                        )
+                    };
+                    let a_rms = (attn.iter().map(|v| v * v).sum::<f32>() / hs as f32).sqrt();
+                    let g_rms =
+                        (gate.iter().map(|v| v * v).sum::<f32>() / self.cfg.ffn_dim as f32).sqrt();
+                    eprintln!(
+                        "[gpu_detok]   attn_out rms={a_rms:.6} gate(post-silu) rms={g_rms:.6}"
+                    );
+                }
             }
         }
 
