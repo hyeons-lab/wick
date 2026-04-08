@@ -28,11 +28,12 @@ fn sz2d(x: u64, y: u64) -> metal::MTLSize {
     metal::MTLSize::new(x, y, 1)
 }
 
-// ── GPU weight reference ────────────────────────────────────────────────────
+// ── GPU weight ──────────────────────────────────────────────────────────────
 
+/// F32 weight matrix on GPU. Dequantized from Q4_0 at load time to match
+/// the CPU detokenizer's precision path exactly.
 struct MetalWeight {
-    mmap_offset: u64,
-    dtype: DType,
+    buf: Buffer, // uploaded F32 data [m * k]
     m: u32,
     k: u32,
     params_buf: Buffer,
@@ -62,17 +63,14 @@ struct DetokLayerGpu {
 // ── Pipelines ───────────────────────────────────────────────────────────────
 
 struct Pipelines {
-    gemv_q4_0_fast_slim: ComputePipelineState,
-    gemv_q4_0_fast_slim_accum: ComputePipelineState,
-    gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
+    gemv_f32: ComputePipelineState,
     memcpy_f32: ComputePipelineState,
-    cast_f32_to_f16: ComputePipelineState,
     mul_out: ComputePipelineState,
     add_inplace: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     qk_norm_rope: ComputePipelineState,
-    attention: ComputePipelineState,
+    flash_attention: ComputePipelineState,
     conv1d: ComputePipelineState,
 }
 
@@ -103,9 +101,10 @@ pub struct MetalAudioDecoder {
     // Scratch
     hidden_buf: Buffer,
     normed_buf: Buffer,
-    proj_buf: Buffer,     // [3 * n_embd] for conv in_proj output
-    bx_buf: Buffer,       // [n_embd] for b*x
-    conv_out_buf: Buffer, // [n_embd]
+    accum_scratch: Buffer, // [max(n_embd, ffn_dim)] scratch for GEMV + add_inplace residual
+    proj_buf: Buffer,      // [3 * n_embd] for conv in_proj output
+    bx_buf: Buffer,        // [n_embd] for b*x
+    conv_out_buf: Buffer,  // [n_embd]
     gate_buf: Buffer,
     up_buf: Buffer,
     q_buf: Buffer, // [n_head * head_dim]
@@ -120,9 +119,7 @@ pub struct MetalAudioDecoder {
     kv_k: Vec<Option<Buffer>>,
     kv_v: Vec<Option<Buffer>>,
     n_past: Cell<usize>,
-
-    mmap_buf: Buffer,
-    _mmap: memmap2::Mmap,
+    // mmap removed — all weights uploaded as dequantized F32 for CPU-matching precision
 }
 
 impl MetalAudioDecoder {
@@ -163,36 +160,20 @@ impl MetalAudioDecoder {
             layer_is_conv,
         };
 
-        // Pipelines
         let pipes = Pipelines {
-            gemv_q4_0_fast_slim: ctx
-                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim")?,
-            gemv_q4_0_fast_slim_accum: ctx
-                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_accum")?,
-            gemv_q4_0_fast_slim_gate_up: ctx
-                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
+            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
             memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
-            cast_f32_to_f16: ctx.create_pipeline(shaders::ELEMENTWISE, "cast_f32_to_f16")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
-            attention: ctx.create_pipeline(shaders::ATTENTION, "attention")?,
+            flash_attention: ctx.create_pipeline(shaders::FLASH_ATTENTION, "flash_attention")?,
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise")?,
         };
 
-        // Mmap for zero-copy weight access
-        let mmap_file = std::fs::File::open(vocoder_path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&mmap_file)? };
-        let page_size = 16384u64;
-        let aligned_len = (mmap.len() as u64 + page_size - 1) & !(page_size - 1);
-        let mmap_buf = ctx.device.new_buffer_with_bytes_no_copy(
-            mmap.as_ptr() as *const _,
-            aligned_len,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
+        // Weights are dequantized from Q4_0 to F32 and uploaded.
+        // ~140 MB GPU memory — matches CPU precision path exactly.
 
         let eps_bits = cfg.rms_norm_eps.to_bits();
 
@@ -216,13 +197,21 @@ impl MetalAudioDecoder {
             conv1d: ctx.upload_bytes(bytemuck::cast_slice(&[n_embd as u32, 3u32, 2u32, 0u32])),
         };
 
-        // Weight upload helper
+        // Dequantize Q4_0 weight to F32 and upload to GPU.
+        // This matches the CPU detokenizer's precision path exactly.
         let make_weight = |name: &str| -> Result<MetalWeight> {
-            let (off, rows, cols, dtype) = gguf.tensor_meta(name)?;
+            let t = gguf.get_tensor(name)?;
+            let f32_data = t.to_f32_vec();
+            let shape = t.shape();
+            let (rows, cols) = match shape.len() {
+                1 => (1, shape[0]),
+                2 => (shape[1], shape[0]),
+                _ => anyhow::bail!("unexpected rank for {name}"),
+            };
+            let buf = ctx.upload_f32(&f32_data);
             let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&[rows as u32, cols as u32]));
             Ok(MetalWeight {
-                mmap_offset: off as u64,
-                dtype,
+                buf,
                 m: rows as u32,
                 k: cols as u32,
                 params_buf,
@@ -319,9 +308,8 @@ impl MetalAudioDecoder {
             if cfg.layer_is_conv[i] {
                 conv_bufs[i] = Some(ab(cfg.d_conv * n_embd));
             } else {
-                // KV caches are f16 to match the attention shader's expectation.
-                // Size: swa_window_size * kv_dim * 2 bytes (f16).
-                let kv_bytes = (cfg.swa_window_size * kv_dim * 2) as u64;
+                // KV caches are f32. flash_attention reads float*, not half*.
+                let kv_bytes = (cfg.swa_window_size * kv_dim * 4) as u64;
                 kv_k[i] = Some(ctx.create_buffer(kv_bytes));
                 kv_v[i] = Some(ctx.create_buffer(kv_bytes));
             }
@@ -329,6 +317,7 @@ impl MetalAudioDecoder {
 
         let hidden_buf = ab(n_embd);
         let normed_buf = ab(n_embd);
+        let accum_scratch = ab(n_embd.max(ffn_dim));
         let proj_buf = ab(3 * n_embd);
         let bx_buf = ab(n_embd);
         let conv_out_buf = ab(n_embd);
@@ -352,6 +341,7 @@ impl MetalAudioDecoder {
             lin_b,
             hidden_buf,
             normed_buf,
+            accum_scratch,
             proj_buf,
             bx_buf,
             conv_out_buf,
@@ -367,8 +357,6 @@ impl MetalAudioDecoder {
             kv_k,
             kv_v,
             n_past: Cell::new(0),
-            mmap_buf,
-            _mmap: mmap,
         })
     }
 
@@ -405,68 +393,42 @@ impl MetalAudioDecoder {
     //   4: y_up   (output, f32)
     //   5: params  {m, k}
 
-    const GEMV_BUF_WEIGHT: u64 = 0;
-    const GEMV_BUF_INPUT: u64 = 1;
-    const GEMV_BUF_OUTPUT: u64 = 2;
-    const GEMV_BUF_PARAMS: u64 = 3;
-
-    const GATE_UP_BUF_A_GATE: u64 = 0;
-    const GATE_UP_BUF_A_UP: u64 = 1;
-    const GATE_UP_BUF_X: u64 = 2;
-    const GATE_UP_BUF_Y_GATE: u64 = 3;
-    const GATE_UP_BUF_Y_UP: u64 = 4;
-    const GATE_UP_BUF_PARAMS: u64 = 5;
-
+    // gemv_f32 shader: a(0) [m*k f32], x(1) [k f32], y(2) [m f32], params(3) {m, k}
     fn encode_gemv(
         &self,
         enc: &ComputeCommandEncoderRef,
         w: &MetalWeight,
         input: &Buffer,
         output: &Buffer,
-        accum: bool,
     ) {
-        let pipe = if accum {
-            &self.pipes.gemv_q4_0_fast_slim_accum
-        } else {
-            &self.pipes.gemv_q4_0_fast_slim
-        };
-        let groups = w.m.div_ceil(2);
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(Self::GEMV_BUF_WEIGHT, Some(&self.mmap_buf), w.mmap_offset);
-        enc.set_buffer(Self::GEMV_BUF_INPUT, Some(input), 0);
-        enc.set_buffer(Self::GEMV_BUF_OUTPUT, Some(output), 0);
-        enc.set_buffer(Self::GEMV_BUF_PARAMS, Some(&w.params_buf), 0);
-        enc.dispatch_thread_groups(
-            sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
-            sz1d(32),
-        );
+        let groups = w.m as u64;
+        enc.set_compute_pipeline_state(&self.pipes.gemv_f32);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(input), 0);
+        enc.set_buffer(2, Some(output), 0);
+        enc.set_buffer(3, Some(&w.params_buf), 0);
+        enc.dispatch_thread_groups(sz1d(groups), sz1d(32));
     }
 
-    fn encode_gemv_gate_up(
+    /// GEMV with residual accumulate: output = output + W @ input.
+    /// Uses gemv_f32 into a scratch buffer, then add_inplace.
+    fn encode_gemv_accum(
         &self,
         enc: &ComputeCommandEncoderRef,
-        w1: &MetalWeight,
-        w3: &MetalWeight,
+        w: &MetalWeight,
         input: &Buffer,
-        gate: &Buffer,
-        up: &Buffer,
+        output: &Buffer,
+        scratch: &Buffer,
     ) {
-        let groups = w1.m.div_ceil(2);
-        enc.set_compute_pipeline_state(&self.pipes.gemv_q4_0_fast_slim_gate_up);
-        enc.set_buffer(
-            Self::GATE_UP_BUF_A_GATE,
-            Some(&self.mmap_buf),
-            w1.mmap_offset,
-        );
-        enc.set_buffer(Self::GATE_UP_BUF_A_UP, Some(&self.mmap_buf), w3.mmap_offset);
-        enc.set_buffer(Self::GATE_UP_BUF_X, Some(input), 0);
-        enc.set_buffer(Self::GATE_UP_BUF_Y_GATE, Some(gate), 0);
-        enc.set_buffer(Self::GATE_UP_BUF_Y_UP, Some(up), 0);
-        enc.set_buffer(Self::GATE_UP_BUF_PARAMS, Some(&w1.params_buf), 0);
-        enc.dispatch_thread_groups(
-            sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
-            sz1d(32),
-        );
+        self.encode_gemv(enc, w, input, scratch);
+        self.barrier(enc);
+        let n = w.m;
+        let params: [u32; 2] = [n, 0];
+        enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+        enc.set_buffer(0, Some(output), 0);
+        enc.set_buffer(1, Some(scratch), 0);
+        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
     // ── Elementwise dispatch ────────────────────────────────────────────
@@ -559,23 +521,6 @@ impl MetalAudioDecoder {
 
     // Apple Silicon serializes compute dispatches within a single encoder in practice.
     // Explicit barriers are not available in the metal crate v0.31 without resources list.
-    // If correctness issues arise, add per-buffer barriers via memory_barrier_with_resources.
-    fn encode_cast_f32_to_f16(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        src: &Buffer,
-        dst: &Buffer,
-        dst_off_bytes: u64,
-        n: usize,
-    ) {
-        let params: [u32; 2] = [n as u32, 0];
-        enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
-        enc.set_buffer(0, Some(src), 0);
-        enc.set_buffer(1, Some(dst), dst_off_bytes);
-        enc.set_bytes(2, 8, params.as_ptr() as *const _);
-        enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
-    }
-
     #[inline(always)]
     fn barrier(&self, _enc: &ComputeCommandEncoderRef) {}
 
@@ -606,7 +551,7 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // in_proj: normed → proj_buf [3*hs]
-            self.encode_gemv(enc, cin, &self.normed_buf, &self.proj_buf, false);
+            self.encode_gemv(enc, cin, &self.normed_buf, &self.proj_buf);
             self.barrier(enc);
 
             // bx = b * x (b at offset 0, x at offset 2*hs)
@@ -638,25 +583,30 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // out_proj: gated → accumulate into hidden_buf (residual add)
-            self.encode_gemv(enc, cop, &self.bx_buf, &self.hidden_buf, true);
+            self.encode_gemv_accum(
+                enc,
+                cop,
+                &self.bx_buf,
+                &self.hidden_buf,
+                &self.accum_scratch,
+            );
             self.barrier(enc);
 
             // FFN: rmsnorm → gate+up → silu_mul → down → residual
             self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &lw.ffn_norm);
             self.barrier(enc);
-            self.encode_gemv_gate_up(
-                enc,
-                &lw.ffn_w1,
-                &lw.ffn_w3,
-                &self.normed_buf,
-                &self.gate_buf,
-                &self.up_buf,
-            );
+            self.encode_gemv(enc, &lw.ffn_w1, &self.normed_buf, &self.gate_buf);
+            self.encode_gemv(enc, &lw.ffn_w3, &self.normed_buf, &self.up_buf);
             self.barrier(enc);
             self.encode_silu_mul(enc);
             self.barrier(enc);
-            // down: accumulate into hidden_buf (FFN residual add)
-            self.encode_gemv(enc, &lw.ffn_w2, &self.gate_buf, &self.hidden_buf, true);
+            self.encode_gemv_accum(
+                enc,
+                &lw.ffn_w2,
+                &self.gate_buf,
+                &self.hidden_buf,
+                &self.accum_scratch,
+            );
             self.barrier(enc);
 
             // Write back to tokens_buf
@@ -703,8 +653,8 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // K/V projection + norm + RoPE
-            self.encode_gemv(enc, wk, &self.normed_buf, &self.k_buf, false);
-            self.encode_gemv(enc, wv, &self.normed_buf, &self.v_buf, false);
+            self.encode_gemv(enc, wk, &self.normed_buf, &self.k_buf);
+            self.encode_gemv(enc, wv, &self.normed_buf, &self.v_buf);
             self.barrier(enc);
 
             // K norm + RoPE (dispatch only n_kv threadgroups for K heads)
@@ -718,11 +668,11 @@ impl MetalAudioDecoder {
             enc.dispatch_thread_groups(sz1d(n_kv as u64), sz1d(256));
             self.barrier(enc);
 
-            // Cast K/V to f16 and write to cache
+            // Write K/V to cache as f32 (no f16 cast — preserves precision)
             let cache_pos = pos % self.cfg.swa_window_size;
-            let cache_off = (cache_pos * kv_dim * 2) as u64;
-            self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, cache_off, kv_dim);
-            self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, cache_off, kv_dim);
+            let cache_off = (cache_pos * kv_dim * 4) as u64;
+            self.encode_memcpy(enc, &self.k_buf, 0, k_cache, cache_off, kv_dim);
+            self.encode_memcpy(enc, &self.v_buf, 0, v_cache, cache_off, kv_dim);
             self.barrier(enc);
         }
 
@@ -739,7 +689,7 @@ impl MetalAudioDecoder {
             self.barrier(enc);
             self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &lw.operator_norm);
             self.barrier(enc);
-            self.encode_gemv(enc, wq, &self.normed_buf, &self.q_buf, false);
+            self.encode_gemv(enc, wq, &self.normed_buf, &self.q_buf);
             self.barrier(enc);
 
             // Q norm + RoPE (dispatch only n_heads threadgroups for Q heads)
@@ -764,7 +714,7 @@ impl MetalAudioDecoder {
                 0,
                 0,
             ];
-            enc.set_compute_pipeline_state(&self.pipes.attention);
+            enc.set_compute_pipeline_state(&self.pipes.flash_attention);
             enc.set_buffer(0, Some(&self.q_buf), 0);
             enc.set_buffer(1, Some(k_cache), 0);
             enc.set_buffer(2, Some(v_cache), 0);
@@ -774,24 +724,30 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // Output projection (accumulate into hidden_buf as residual)
-            self.encode_gemv(enc, wo, &self.attn_out_buf, &self.hidden_buf, true);
+            self.encode_gemv_accum(
+                enc,
+                wo,
+                &self.attn_out_buf,
+                &self.hidden_buf,
+                &self.accum_scratch,
+            );
             self.barrier(enc);
 
             // FFN
             self.encode_rmsnorm_out(enc, &self.hidden_buf, &self.normed_buf, &lw.ffn_norm);
             self.barrier(enc);
-            self.encode_gemv_gate_up(
-                enc,
-                &lw.ffn_w1,
-                &lw.ffn_w3,
-                &self.normed_buf,
-                &self.gate_buf,
-                &self.up_buf,
-            );
+            self.encode_gemv(enc, &lw.ffn_w1, &self.normed_buf, &self.gate_buf);
+            self.encode_gemv(enc, &lw.ffn_w3, &self.normed_buf, &self.up_buf);
             self.barrier(enc);
             self.encode_silu_mul(enc);
             self.barrier(enc);
-            self.encode_gemv(enc, &lw.ffn_w2, &self.gate_buf, &self.hidden_buf, true);
+            self.encode_gemv_accum(
+                enc,
+                &lw.ffn_w2,
+                &self.gate_buf,
+                &self.hidden_buf,
+                &self.accum_scratch,
+            );
             self.barrier(enc);
 
             self.encode_memcpy(enc, &self.hidden_buf, 0, &self.tokens_buf, tok_off, hs);
@@ -852,17 +808,13 @@ impl MetalAudioDecoder {
                 self.barrier(enc);
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.output_norm);
                 self.barrier(enc);
-                // lin_w GEMV
-                enc.set_compute_pipeline_state(&self.pipes.gemv_q4_0_fast_slim);
-                enc.set_buffer(0, Some(&self.mmap_buf), self.lin_w.mmap_offset);
+                // lin_w GEMV (F32)
+                enc.set_compute_pipeline_state(&self.pipes.gemv_f32);
+                enc.set_buffer(0, Some(&self.lin_w.buf), 0);
                 enc.set_buffer(1, Some(&self.hidden_buf), 0);
                 enc.set_buffer(2, Some(&self.spectrum_buf), spec_off);
                 enc.set_buffer(3, Some(&self.lin_w.params_buf), 0);
-                let groups = self.lin_w.m.div_ceil(2);
-                enc.dispatch_thread_groups(
-                    sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64),
-                    sz1d(32),
-                );
+                enc.dispatch_thread_groups(sz1d(self.lin_w.m as u64), sz1d(32));
                 self.barrier(enc);
                 // Add bias
                 let bias_n = spectrum_per_frame as u32;
