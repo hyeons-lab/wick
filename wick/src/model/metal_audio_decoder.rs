@@ -66,6 +66,7 @@ struct Pipelines {
     gemv_q4_0_fast_slim_accum: ComputePipelineState,
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
     memcpy_f32: ComputePipelineState,
+    cast_f32_to_f16: ComputePipelineState,
     mul_out: ComputePipelineState,
     add_inplace: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
@@ -171,6 +172,7 @@ impl MetalAudioDecoder {
             gemv_q4_0_fast_slim_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
             memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
+            cast_f32_to_f16: ctx.create_pipeline(shaders::ELEMENTWISE, "cast_f32_to_f16")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
@@ -317,8 +319,11 @@ impl MetalAudioDecoder {
             if cfg.layer_is_conv[i] {
                 conv_bufs[i] = Some(ab(cfg.d_conv * n_embd));
             } else {
-                kv_k[i] = Some(ab(cfg.swa_window_size * kv_dim));
-                kv_v[i] = Some(ab(cfg.swa_window_size * kv_dim));
+                // KV caches are f16 to match the attention shader's expectation.
+                // Size: swa_window_size * kv_dim * 2 bytes (f16).
+                let kv_bytes = (cfg.swa_window_size * kv_dim * 2) as u64;
+                kv_k[i] = Some(ctx.create_buffer(kv_bytes));
+                kv_v[i] = Some(ctx.create_buffer(kv_bytes));
             }
         }
 
@@ -673,6 +678,22 @@ impl MetalAudioDecoder {
     // Apple Silicon serializes compute dispatches within a single encoder in practice.
     // Explicit barriers are not available in the metal crate v0.31 without resources list.
     // If correctness issues arise, add per-buffer barriers via memory_barrier_with_resources.
+    fn encode_cast_f32_to_f16(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        n: usize,
+    ) {
+        let params: [u32; 2] = [n as u32, 0];
+        enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), dst_off_bytes);
+        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
+    }
+
     #[inline(always)]
     fn barrier(&self, _enc: &ComputeCommandEncoderRef) {}
 
@@ -819,11 +840,11 @@ impl MetalAudioDecoder {
             enc.dispatch_thread_groups(sz1d((n_heads + n_kv) as u64), sz1d(256));
             self.barrier(enc);
 
-            // Write K, V to cache (ring buffer: pos % swa_window_size)
+            // Write K, V to cache as f16 (ring buffer: pos % swa_window_size)
             let cache_pos = pos % self.cfg.swa_window_size;
-            let cache_off = (cache_pos * kv_dim * 4) as u64;
-            self.encode_memcpy(enc, &self.k_buf, 0, k_cache, cache_off, kv_dim);
-            self.encode_memcpy(enc, &self.v_buf, 0, v_cache, cache_off, kv_dim);
+            let cache_off_f16 = (cache_pos * kv_dim * 2) as u64; // f16 = 2 bytes
+            self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, cache_off_f16, kv_dim);
+            self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, cache_off_f16, kv_dim);
             self.barrier(enc);
 
             // Attention
@@ -925,9 +946,15 @@ impl MetalAudioDecoder {
             cb.commit();
             cb.wait_until_completed();
             if call == 0 {
+                let dt = t0.elapsed().as_secs_f64() * 1000.0;
+                let tok0 = unsafe {
+                    std::slice::from_raw_parts(self.tokens_buf.contents() as *const f32, hs)
+                };
+                let has_nan = tok0.iter().any(|v| v.is_nan());
+                let rms = (tok0.iter().map(|v| v * v).sum::<f32>() / hs as f32).sqrt();
                 eprintln!(
-                    "[gpu_detok] layer {il}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
+                    "[gpu_detok] L{il}: {dt:.1}ms rms={rms:.6} nan={has_nan} first2=[{:.6},{:.6}]",
+                    tok0[0], tok0[1]
                 );
             }
         }
