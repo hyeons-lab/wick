@@ -658,13 +658,13 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // K norm + RoPE (dispatch only n_kv threadgroups for K heads)
-            let k_rope: [u32; 6] = [pos as u32, 0, n_kv, hd as u32, eps_bits, freq_bits];
+            let k_rope: [u32; 7] = [pos as u32, 0, n_kv, hd as u32, eps_bits, freq_bits, 0]; // NeoX
             enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
             enc.set_buffer(0, Some(&self.k_buf), 0);
             enc.set_buffer(1, Some(&self.k_buf), 0);
             enc.set_buffer(2, Some(kn), 0);
             enc.set_buffer(3, Some(kn), 0);
-            enc.set_bytes(4, 24, k_rope.as_ptr() as *const _);
+            enc.set_bytes(4, 28, k_rope.as_ptr() as *const _);
             enc.dispatch_thread_groups(sz1d(n_kv as u64), sz1d(256));
             self.barrier(enc);
 
@@ -693,13 +693,13 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // Q norm + RoPE (dispatch only n_heads threadgroups for Q heads)
-            let q_rope: [u32; 6] = [pos as u32, n_heads, 0, hd as u32, eps_bits, freq_bits];
+            let q_rope: [u32; 7] = [pos as u32, n_heads, 0, hd as u32, eps_bits, freq_bits, 0]; // NeoX
             enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
             enc.set_buffer(0, Some(&self.q_buf), 0);
             enc.set_buffer(1, Some(&self.q_buf), 0);
             enc.set_buffer(2, Some(qn), 0);
             enc.set_buffer(3, Some(qn), 0);
-            enc.set_bytes(4, 24, q_rope.as_ptr() as *const _);
+            enc.set_bytes(4, 28, q_rope.as_ptr() as *const _);
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 

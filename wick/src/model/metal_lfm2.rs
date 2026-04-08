@@ -759,7 +759,15 @@ impl MetalLfm2Model {
     ) {
         let eps_bits = self.config.rms_norm_eps.to_bits();
         let freq_base_bits = self.config.rope_theta.to_bits();
-        let params: [u32; 6] = [pos, n_heads, n_kv_heads, head_dim, eps_bits, freq_base_bits];
+        let params: [u32; 7] = [
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            eps_bits,
+            freq_base_bits,
+            0,
+        ]; // rope_type=0 (NeoX)
         enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k), k_off_bytes);
