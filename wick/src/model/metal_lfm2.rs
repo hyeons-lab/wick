@@ -144,6 +144,9 @@ pub struct MetalLfm2Model {
     conv_bx_buf: Buffer,
     conv_out_buf: Buffer,
     conv_gate_buf: Buffer,
+    /// Pre-allocated batch buffer for prefill. Sized for max_seq_len tokens.
+    /// Reused across prefill calls to avoid per-call allocation.
+    prefill_batch_buf: Buffer,
     state: MetalState,
     /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
     /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
@@ -395,6 +398,7 @@ impl MetalLfm2Model {
             conv_bx_buf: make_buf(hs),
             conv_out_buf: make_buf(hs),
             conv_gate_buf: make_buf(hs),
+            prefill_batch_buf: make_buf(hs * max_seq_len),
             ctx,
             config,
             pipelines,
@@ -1240,9 +1244,8 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Allocate batch hidden state buffer: [hs × n] holding all tokens.
-        // On unified memory, this is ~4-16 MB for typical prompt sizes.
-        let batch_buf = self.ctx.create_buffer((hs * n * 4) as u64);
+        // Reuse pre-allocated batch buffer (sized for max_seq_len).
+        let batch_buf = &self.prefill_batch_buf;
 
         // Stage all N embedding rows into batch_buf.
         {
@@ -1698,9 +1701,10 @@ impl MetalLfm2Model {
         }
     }
 
-    // Keep the old implementation as `encode_layers_old` for reference — delete after verifying.
+    // The gpu_timed and profiled variants below still use the inline
+    // pattern for per-category instrumentation.
     #[allow(dead_code)]
-    fn encode_layers_old(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+    fn _encode_layers_old_removed(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
