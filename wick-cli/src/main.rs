@@ -345,15 +345,6 @@ fn main() -> Result<()> {
                     ) {
                         Ok(d) => {
                             eprintln!("Metal detokenizer loaded");
-                            eprintln!("  smoke test: rmsnorm...");
-                            d.smoke_test();
-                            eprintln!("  smoke test: gemv...");
-                            d.smoke_test_gemv();
-                            eprintln!("  smoke test: conv layer...");
-                            d.smoke_test_conv_layer();
-                            eprintln!("  smoke test: full 8-layer...");
-                            d.smoke_test_full();
-                            eprintln!("  smoke tests passed");
                             Some(d)
                         }
                         Err(e) => {
