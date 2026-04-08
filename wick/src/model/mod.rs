@@ -7,6 +7,9 @@ pub mod gpu_lfm2;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_lfm2;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_audio_decoder;
+
 use anyhow::{Result, bail};
 
 use crate::gguf::GgufFile;

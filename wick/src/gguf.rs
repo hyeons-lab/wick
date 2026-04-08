@@ -557,6 +557,21 @@ impl GgufFile {
         Ok(&self.mmap[range])
     }
 
+    /// Get tensor metadata: (byte_offset_in_mmap, rows, cols, dtype).
+    /// For GGUF [ne0, ne1] tensors: rows = ne1 (output dim), cols = ne0 (input dim).
+    pub fn tensor_meta(&self, name: &str) -> Result<(usize, usize, usize, DType)> {
+        let (info, range) = self.tensor_range(name)?;
+        let (rows, cols) = match info.shape.len() {
+            1 => (1, info.shape[0]),
+            2 => (info.shape[1], info.shape[0]),
+            _ => anyhow::bail!(
+                "tensor_meta: unexpected rank for {name}: {}",
+                info.shape.len()
+            ),
+        };
+        Ok((range.start, rows, cols, info.dtype))
+    }
+
     /// Print a summary of the GGUF file for inspection.
     pub fn print_inspect(&self) {
         println!("=== GGUF File ===");

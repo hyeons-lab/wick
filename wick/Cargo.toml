@@ -29,5 +29,5 @@ rustfft = { workspace = true, optional = true }
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
-metal = ["dep:metal", "dep:objc"]
+metal = ["dep:metal", "dep:objc", "audio"]
 audio = ["dep:rustfft"]

@@ -65,24 +65,75 @@ impl F32Weight {
     }
 }
 
+/// A weight tensor stored in its native quantized format (Q4_0).
+/// Uses the quantized GEMV path (NEON Q4_0×Q8_0) matching ggml's computation.
+pub struct QuantWeight {
+    pub data: Vec<u8>,
+    pub dtype: DType,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl QuantWeight {
+    fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
+        let tensor = gguf.get_tensor(name)?;
+        let shape = tensor.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[1], shape[0]),
+            _ => anyhow::bail!("unexpected tensor rank for {name}: {}", shape.len()),
+        };
+        let data = tensor.data().to_vec();
+        let dtype = tensor.dtype();
+        Ok(Self {
+            data,
+            rows,
+            cols,
+            dtype,
+        })
+    }
+
+    /// Matrix-vector multiply using the quantized GEMV path.
+    pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        assert_eq!(x.len(), self.cols);
+        assert_eq!(y.len(), self.rows);
+        crate::backend::cpu::gemv_dispatch(
+            self.dtype, &self.data, x, y, self.rows, self.cols, None,
+        );
+    }
+
+    /// Matrix-vector multiply for a row subrange [row_start..row_start+n_rows].
+    /// Used for per-codebook slicing of depth_linear.
+    pub fn gemv_rows(&self, x: &[f32], y: &mut [f32], row_start: usize, n_rows: usize) {
+        assert_eq!(x.len(), self.cols);
+        assert_eq!(y.len(), n_rows);
+        assert!(row_start + n_rows <= self.rows);
+        let row_bytes = (self.cols / self.dtype.block_size()) * self.dtype.block_bytes();
+        let offset = row_start * row_bytes;
+        let slice = &self.data[offset..offset + n_rows * row_bytes];
+        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, None);
+    }
+}
+
 /// Per-layer weights for one depthformer layer.
+/// Uses QuantWeight for GEMV to match ggml's Q4_0 computation path.
 pub struct DepthformerLayerWeights {
     pub operator_norm: Vec<f32>,
-    pub wqkv: F32Weight,
+    pub wqkv: QuantWeight,
     pub q_norm: Vec<f32>,
     pub k_norm: Vec<f32>,
-    pub wo: F32Weight,
+    pub wo: QuantWeight,
     pub ffn_norm: Vec<f32>,
-    pub w1: F32Weight, // gate
-    pub w2: F32Weight, // down
-    pub w3: F32Weight, // up
+    pub w1: QuantWeight, // gate
+    pub w2: QuantWeight, // down
+    pub w3: QuantWeight, // up
 }
 
 /// Per-codebook embedding layer weights.
 pub struct CodebookWeights {
     pub embedding: F32Weight,
     pub norm: Vec<f32>,
-    pub to_logits: F32Weight,
+    pub to_logits: QuantWeight,
 }
 
 /// All weights for the audio decoder (loaded from vocoder GGUF).
@@ -90,7 +141,7 @@ pub struct AudioDecoderWeights {
     pub depthformer_config: DepthformerConfig,
     pub decoder_config: DecoderConfig,
     pub depthformer_layers: Vec<DepthformerLayerWeights>,
-    pub depth_linear_w: F32Weight,
+    pub depth_linear_w: QuantWeight,
     pub depth_linear_b: Vec<f32>,
     pub depth_embeddings: Vec<CodebookWeights>,
     pub audio_embedding: CodebookWeights,
@@ -149,25 +200,28 @@ impl AudioDecoderWeights {
                 operator_norm: gguf
                     .get_tensor(&format!("{prefix}.operator_norm.weight"))?
                     .to_f32_vec(),
-                wqkv: F32Weight::from_tensor(gguf, &format!("{prefix}.operator.qkv_proj.weight"))?,
+                wqkv: QuantWeight::from_tensor(
+                    gguf,
+                    &format!("{prefix}.operator.qkv_proj.weight"),
+                )?,
                 q_norm: gguf
                     .get_tensor(&format!("{prefix}.operator.attention.q_layernorm.weight"))?
                     .to_f32_vec(),
                 k_norm: gguf
                     .get_tensor(&format!("{prefix}.operator.attention.k_layernorm.weight"))?
                     .to_f32_vec(),
-                wo: F32Weight::from_tensor(gguf, &format!("{prefix}.operator.out_proj.weight"))?,
+                wo: QuantWeight::from_tensor(gguf, &format!("{prefix}.operator.out_proj.weight"))?,
                 ffn_norm: gguf
                     .get_tensor(&format!("{prefix}.ffn_norm.weight"))?
                     .to_f32_vec(),
-                w1: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
-                w2: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
-                w3: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
+                w1: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
+                w2: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
+                w3: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
             });
         }
 
         // Decoder model weights.
-        let depth_linear_w = F32Weight::from_tensor(gguf, "depth_linear.weight")?;
+        let depth_linear_w = QuantWeight::from_tensor(gguf, "depth_linear.weight")?;
         let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.to_f32_vec();
 
         let n_codebook = 8;
@@ -179,7 +233,7 @@ impl AudioDecoderWeights {
                 norm: gguf
                     .get_tensor(&format!("{prefix}.embedding_norm.weight"))?
                     .to_f32_vec(),
-                to_logits: F32Weight::from_tensor(gguf, &format!("{prefix}.to_logits.weight"))?,
+                to_logits: QuantWeight::from_tensor(gguf, &format!("{prefix}.to_logits.weight"))?,
             });
         }
 
@@ -188,7 +242,7 @@ impl AudioDecoderWeights {
             norm: gguf
                 .get_tensor("audio_embedding.embedding_norm.weight")?
                 .to_f32_vec(),
-            to_logits: F32Weight::from_tensor(gguf, "audio_embedding.to_logits.weight")?,
+            to_logits: QuantWeight::from_tensor(gguf, "audio_embedding.to_logits.weight")?,
         };
 
         // Derive decoder config from weight shapes.
@@ -255,17 +309,33 @@ impl DepthformerState {
     }
 }
 
-/// Apply RoPE (neox style) to a single head's Q or K vector in-place.
-fn apply_rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
-    let half = head_dim / 2;
-    for i in 0..half {
-        let freq = 1.0 / freq_base.powf(i as f32 / half as f32);
-        let theta = pos as f32 * freq;
+/// Apply RoPE (interleaved / LLAMA_ROPE_TYPE_NORM) to a single head.
+/// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
+fn apply_rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = pos as f32;
+    for i in 0..head_dim / 2 {
+        let (sin_t, cos_t) = theta.sin_cos();
+        let x0 = x[2 * i];
+        let x1 = x[2 * i + 1];
+        x[2 * i] = x0 * cos_t - x1 * sin_t;
+        x[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
+    }
+}
+
+/// Apply RoPE (NeoX style / LLAMA_ROPE_TYPE_NEOX) to a single head.
+/// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
+fn apply_rope_neox(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = pos as f32;
+    for i in 0..head_dim / 2 {
         let (sin_t, cos_t) = theta.sin_cos();
         let x0 = x[i];
-        let x1 = x[i + half];
+        let x1 = x[i + head_dim / 2];
         x[i] = x0 * cos_t - x1 * sin_t;
-        x[i + half] = x0 * sin_t + x1 * cos_t;
+        x[i + head_dim / 2] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
     }
 }
 
@@ -281,102 +351,165 @@ pub fn depthformer_forward(
     let n_kv = cfg.n_head_kv;
     let hd = cfg.n_embd_head;
     let pos = state.n_past;
+    let kv_dim = n_kv * hd;
+    let q_dim = n_head * hd;
+    let k_dim = n_kv * hd;
+    let qkv_dim = q_dim + k_dim + k_dim; // Q + K + V
+    let group_size = n_head / n_kv;
+    let scale = 1.0 / (hd as f32).sqrt();
 
     let mut cur = input.to_vec();
     assert_eq!(cur.len(), n_embd);
 
+    // Pre-allocate buffers outside the layer loop to avoid per-layer allocation.
+    let mut residual = vec![0.0f32; n_embd];
+    let mut qkv = vec![0.0f32; qkv_dim];
+    let mut attn_out = vec![0.0f32; n_head * hd];
+    let mut proj = vec![0.0f32; n_embd];
+    let mut gate = vec![0.0f32; cfg.ffn_dim];
+    let mut up = vec![0.0f32; cfg.ffn_dim];
+    let mut scores = vec![0.0f32; cfg.max_seq_len];
+    // Q8_0 scratch for pre-quantized GEMV (avoids re-quantizing for each weight matrix).
+    let mut q8_scales = Vec::new();
+    let mut q8_quants = Vec::new();
+
     for (il, lw) in weights.depthformer_layers.iter().enumerate() {
-        let residual = cur.clone();
+        residual.copy_from_slice(&cur);
 
         // 1. RMSnorm.
         cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
 
         // 2. Fused QKV projection → split.
-        let qkv_dim = (n_head + 2 * n_kv) * hd;
-        let mut qkv = vec![0.0; qkv_dim];
-        lw.wqkv.gemv(&cur, &mut qkv);
+        // Pre-quantize cur to Q8_0 once, reuse for QKV and later wo.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let nb = n_embd / 32;
+            q8_scales.resize(nb, 0.0);
+            q8_quants.resize(n_embd, 0);
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &cur,
+                    &mut q8_scales,
+                    &mut q8_quants,
+                );
+            }
+        }
+        qkv.iter_mut().for_each(|v| *v = 0.0);
+        crate::backend::cpu::gemv_dispatch(
+            lw.wqkv.dtype,
+            &lw.wqkv.data,
+            &cur,
+            &mut qkv,
+            lw.wqkv.rows,
+            lw.wqkv.cols,
+            Some((&mut q8_scales, &mut q8_quants)),
+        );
 
-        let q_dim = n_head * hd;
-        let k_dim = n_kv * hd;
-        let mut q = qkv[..q_dim].to_vec();
-        let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
-        let v = qkv[q_dim + k_dim..].to_vec();
+        // Split in-place via index ranges (no copy for V).
+        // Q: qkv[0..q_dim], K: qkv[q_dim..q_dim+k_dim], V: qkv[q_dim+k_dim..]
 
-        // 3. Per-head RMSnorm on Q and K.
+        // 3. Per-head RMSnorm on Q and K (in-place within qkv).
         for h in 0..n_head {
-            let s = &mut q[h * hd..(h + 1) * hd];
+            let s = &mut qkv[h * hd..(h + 1) * hd];
             cpu::rmsnorm(s, &lw.q_norm, cfg.rms_norm_eps);
         }
         for h in 0..n_kv {
-            let s = &mut k[h * hd..(h + 1) * hd];
+            let s = &mut qkv[q_dim + h * hd..q_dim + (h + 1) * hd];
             cpu::rmsnorm(s, &lw.k_norm, cfg.rms_norm_eps);
         }
 
-        // 4. RoPE on Q and K.
+        // 4. RoPE on Q and K (depthformer uses interleaved/NORM style).
         for h in 0..n_head {
-            apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+            apply_rope_interleaved(&mut qkv[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
         }
         for h in 0..n_kv {
-            apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+            apply_rope_interleaved(
+                &mut qkv[q_dim + h * hd..q_dim + (h + 1) * hd],
+                pos,
+                hd,
+                cfg.rope_freq_base,
+            );
         }
 
         // 5. Write K, V to cache at position n_past.
         let kv = &mut state.kv[il];
         for h in 0..n_kv {
-            let cache_off = pos * n_kv * hd + h * hd;
-            kv.k[cache_off..cache_off + hd].copy_from_slice(&k[h * hd..(h + 1) * hd]);
-            kv.v[cache_off..cache_off + hd].copy_from_slice(&v[h * hd..(h + 1) * hd]);
+            let cache_off = pos * kv_dim + h * hd;
+            kv.k[cache_off..cache_off + hd]
+                .copy_from_slice(&qkv[q_dim + h * hd..q_dim + (h + 1) * hd]);
+            kv.v[cache_off..cache_off + hd]
+                .copy_from_slice(&qkv[q_dim + k_dim + h * hd..q_dim + k_dim + (h + 1) * hd]);
         }
 
-        // 6. Attention: Q×K → softmax → ×V (GQA with group_size = n_head/n_kv).
+        // 6. Attention: Q×K → softmax → ×V (GQA).
         let seq_len = pos + 1;
-        let group_size = n_head / n_kv;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let mut attn_out = vec![0.0; n_head * hd];
+        attn_out.iter_mut().for_each(|v| *v = 0.0);
 
         for h in 0..n_head {
             let kv_h = h / group_size;
-            let q_head = &q[h * hd..(h + 1) * hd];
+            let q_head = &qkv[h * hd..(h + 1) * hd];
+            let kv_h_offset = kv_h * hd;
 
-            // Q×K scores.
-            let mut scores = vec![0.0f32; seq_len];
-            for t in 0..seq_len {
-                let k_off = t * n_kv * hd + kv_h * hd;
-                let k_t = &kv.k[k_off..k_off + hd];
-                scores[t] = q_head.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale;
-            }
-            cpu::softmax_inplace(&mut scores);
+            let sc = &mut scores[..seq_len];
+            cpu::attn_scores(q_head, &kv.k, sc, kv_dim, kv_h_offset, hd, scale, seq_len);
+            cpu::softmax_inplace(sc);
 
-            // Weighted V sum.
             let out = &mut attn_out[h * hd..(h + 1) * hd];
-            for t in 0..seq_len {
-                let v_off = t * n_kv * hd + kv_h * hd;
-                let v_t = &kv.v[v_off..v_off + hd];
-                let s = scores[t];
-                for d in 0..hd {
-                    out[d] += s * v_t[d];
-                }
-            }
+            cpu::attn_values(sc, &kv.v, out, kv_dim, kv_h_offset, hd, seq_len);
         }
 
-        // 7. Out projection + residual.
-        let mut proj = vec![0.0; n_embd];
+        // 7. Out projection + residual (in-place).
+        proj.iter_mut().for_each(|v| *v = 0.0);
         lw.wo.gemv(&attn_out, &mut proj);
-        cur = residual.iter().zip(&proj).map(|(r, p)| r + p).collect();
+        for (c, (r, p)) in cur.iter_mut().zip(residual.iter().zip(&proj)) {
+            *c = r + p;
+        }
 
         // 8. FFN: RMSnorm → SwiGLU(w1, w3) → w2 → residual.
-        let ffn_residual = cur.clone();
+        residual.copy_from_slice(&cur);
         cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
 
-        let mut gate = vec![0.0; cfg.ffn_dim];
-        let mut up = vec![0.0; cfg.ffn_dim];
-        lw.w1.gemv(&cur, &mut gate);
-        lw.w3.gemv(&cur, &mut up);
+        // Pre-quantize cur for FFN gate + up (same input).
+        #[cfg(target_arch = "aarch64")]
+        {
+            let nb = n_embd / 32;
+            q8_scales.resize(nb, 0.0);
+            q8_quants.resize(n_embd, 0);
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &cur,
+                    &mut q8_scales,
+                    &mut q8_quants,
+                );
+            }
+        }
+        gate.iter_mut().for_each(|v| *v = 0.0);
+        up.iter_mut().for_each(|v| *v = 0.0);
+        crate::backend::cpu::gemv_dispatch(
+            lw.w1.dtype,
+            &lw.w1.data,
+            &cur,
+            &mut gate,
+            lw.w1.rows,
+            lw.w1.cols,
+            Some((&mut q8_scales, &mut q8_quants)),
+        );
+        crate::backend::cpu::gemv_dispatch(
+            lw.w3.dtype,
+            &lw.w3.data,
+            &cur,
+            &mut up,
+            lw.w3.rows,
+            lw.w3.cols,
+            Some((&mut q8_scales, &mut q8_quants)),
+        );
         cpu::silu_mul_inplace(&mut gate, &up);
 
-        let mut down = vec![0.0; n_embd];
-        lw.w2.gemv(&gate, &mut down);
-        cur = ffn_residual.iter().zip(&down).map(|(r, d)| r + d).collect();
+        proj.iter_mut().for_each(|v| *v = 0.0);
+        lw.w2.gemv(&gate, &mut proj);
+        for (c, (r, d)) in cur.iter_mut().zip(residual.iter().zip(&proj)) {
+            *c = r + d;
+        }
     }
 
     state.n_past += 1;
@@ -413,12 +546,13 @@ pub fn sample_audio_frame(
         //    depth_linear.weight is [n_embd_llm, n_codebook * n_embd_d],
         //    slice rows [j*n_embd_d .. (j+1)*n_embd_d].
         let mut depthformer_in = vec![0.0; n_embd_d];
-        let w = &weights.depth_linear_w;
         let row_start = j * n_embd_d;
+        weights
+            .depth_linear_w
+            .gemv_rows(embedding, &mut depthformer_in, row_start, n_embd_d);
+        // Add bias.
         for (r, out) in depthformer_in.iter_mut().enumerate() {
-            let row = &w.data[(row_start + r) * w.cols..(row_start + r + 1) * w.cols];
-            *out = row.iter().zip(embedding).map(|(a, b)| a * b).sum::<f32>()
-                + weights.depth_linear_b[row_start + r];
+            *out += weights.depth_linear_b[row_start + r];
         }
 
         // 2. Add previous codebook's token embedding (if j > 0).
@@ -472,6 +606,7 @@ pub fn sample_audio_frame(
         prev_token = sampled;
     }
 
+    eprintln!("  codes: {token:?}");
     token
 }
 
@@ -751,7 +886,7 @@ impl DetokenizerState {
 
 /// Embed 8 audio codes into a single vector for the detokenizer.
 /// Looks up each code with per-codebook offset, averages across codebooks.
-fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32> {
+pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32> {
     let n_codes = weights.config.n_codes;
     let emb = &weights.emb_weight;
     let emb_dim = emb.cols;
@@ -774,7 +909,7 @@ fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32> {
 }
 
 /// Linear interpolation upsample: 1 token → n_up tokens.
-fn upsample(input: &[f32], n_embd: usize, n_up: usize) -> Vec<f32> {
+pub fn upsample(input: &[f32], n_embd: usize, n_up: usize) -> Vec<f32> {
     let n_in = input.len() / n_embd;
     let n_out = n_in * n_up;
     let mut output = vec![0.0; n_out * n_embd];
@@ -875,11 +1010,11 @@ fn detok_attn_block(
     let k_norm = lw.k_norm.as_ref().unwrap();
     for h in 0..n_head {
         cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
-        apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
     }
     for h in 0..n_kv {
         cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
-        apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
     }
 
     // Write to KV cache (ring buffer for SWA).
@@ -1001,7 +1136,7 @@ pub fn detokenize_to_spectrum(
                         lw.q_norm.as_ref().unwrap(),
                         cfg.rms_norm_eps,
                     );
-                    apply_rope(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+                    apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 for h in 0..n_kv {
                     cpu::rmsnorm(
@@ -1009,7 +1144,7 @@ pub fn detokenize_to_spectrum(
                         lw.k_norm.as_ref().unwrap(),
                         cfg.rms_norm_eps,
                     );
-                    apply_rope(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+                    apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 let wp = pos % cfg.swa_window_size;
                 kv.0[wp * kv_stride..(wp + 1) * kv_stride].copy_from_slice(&k);
@@ -1159,6 +1294,12 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
         window_sum[n_fft - hop_length..].fill(0.0);
     }
 
+    // Strip startup padding: the first (n_fft - hop_length) / 2 samples are
+    // overlap-add artifacts. Matches llama.cpp's `padding_to_remove`.
+    let padding = (n_fft - hop_length) / 2;
+    if output.len() > padding {
+        output.drain(..padding);
+    }
     output
 }
 

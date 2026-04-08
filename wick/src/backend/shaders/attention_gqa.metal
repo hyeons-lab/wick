@@ -104,7 +104,7 @@ kernel void attention_gqa(
         // exp + sum.
         float partial_sum = 0.0f;
         for (uint t = tid; t < seq_len; t += 256u) {
-            float e = fast::exp(scores[s_off + t] - max_val);
+            float e = exp(scores[s_off + t] - max_val);
             scores[s_off + t] = e;
             partial_sum += e;
         }

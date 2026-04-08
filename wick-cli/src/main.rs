@@ -55,6 +55,14 @@ enum Command {
         /// E.g. "Perform TTS." or "Respond with interleaved text and audio."
         #[arg(long)]
         system: Option<String>,
+
+        /// Audio sampling temperature (0.0 = greedy, >0 = stochastic).
+        #[arg(long, default_value_t = 0.8)]
+        audio_temperature: f32,
+
+        /// Audio top-k for stochastic sampling.
+        #[arg(long, default_value_t = 4)]
+        audio_top_k: usize,
     },
 
     /// Inspect a GGUF model file.
@@ -255,6 +263,8 @@ fn main() -> Result<()> {
             vocoder,
             audio_out,
             system,
+            audio_temperature,
+            audio_top_k,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -340,8 +350,8 @@ fn main() -> Result<()> {
                         temperature,
                         ..Default::default()
                     },
-                    audio_temperature: 0.8,
-                    audio_top_k: 4,
+                    audio_temperature,
+                    audio_top_k,
                     mode,
                 };
 
@@ -352,6 +362,7 @@ fn main() -> Result<()> {
                     &tokenizer,
                     &tokens,
                     &audio_config,
+                    None, // GPU detokenizer (TODO: construct MetalAudioDecoder when --device metal)
                     |text| {
                         print!("{text}");
                         std::io::stdout().flush().ok();
@@ -371,6 +382,25 @@ fn main() -> Result<()> {
                     result.audio_samples as f64 / 24000.0
                 );
                 eprintln!("Elapsed: {:.1}s", result.elapsed_secs);
+                if result.audio_frames > 0 {
+                    let df_ms = result.depthformer_secs * 1000.0;
+                    let dt_ms = result.detokenizer_secs * 1000.0;
+                    let other_ms =
+                        (result.elapsed_secs - result.depthformer_secs - result.detokenizer_secs)
+                            * 1000.0;
+                    let df_per = df_ms / result.audio_frames as f64;
+                    let dt_per = dt_ms / result.audio_frames as f64;
+                    eprintln!(
+                        "Breakdown: depthformer {df_ms:.0}ms ({df_per:.1}ms/frame), detokenizer {dt_ms:.0}ms ({dt_per:.1}ms/frame), other {other_ms:.0}ms",
+                    );
+                }
+                let total_steps = result.text_tokens + result.audio_frames;
+                if result.elapsed_secs > 0.0 {
+                    eprintln!(
+                        "Throughput: {:.1} tok/s (text+audio)",
+                        total_steps as f64 / result.elapsed_secs,
+                    );
+                }
 
                 // Write WAV if requested.
                 if let Some(wav_path) = &audio_out {

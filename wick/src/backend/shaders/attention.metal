@@ -99,7 +99,7 @@ kernel void attention(
     // exp + sum.
     float partial_sum = 0.0f;
     for (uint t = tid; t < seq_len; t += 256u) {
-        float e = fast::exp(scores[t] - max_val);
+        float e = exp(scores[t] - max_val);
         scores[t] = e;
         partial_sum += e;
     }

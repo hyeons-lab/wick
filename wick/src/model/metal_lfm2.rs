@@ -1117,7 +1117,11 @@ impl Model for MetalLfm2Model {
 
         let pos = self.state.seq_len.get();
 
-        // 2. Run layers only (no logit projection).
+        // 2. Run layers only (no output norm, no logit projection).
+        // The reference's llama_get_embeddings returns the raw hidden state
+        // without the output norm weight multiplication (RMS ~0.14), not the
+        // normed+weighted state (RMS ~1.5). This was confirmed by feeding the
+        // reference's embedding to wick's depthformer → 8/8 matching codes.
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         self.encode_layers(enc, pos);
@@ -1128,8 +1132,15 @@ impl Model for MetalLfm2Model {
         self.state.seq_len.set(self.state.seq_len.get() + 1);
         state.seq_len += 1;
 
-        // 3. Read hidden state (before logit projection).
-        self.ctx.read_f32(&self.hidden_buf, hs)
+        // Apply output norm.
+        let cb2 = self.ctx.queue.new_command_buffer();
+        let enc2 = cb2.new_compute_command_encoder();
+        self.encode_rmsnorm(enc2, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        enc2.end_encoding();
+        cb2.commit();
+        cb2.wait_until_completed();
+
+        self.ctx.read_f32(&self.normed_buf, hs)
     }
 
     fn forward_hidden_from_embedding(
@@ -1150,17 +1161,18 @@ impl Model for MetalLfm2Model {
 
         let pos = self.state.seq_len.get();
 
-        // Run layers only (no logit projection). Returns hidden state.
+        // Run layers + output norm.
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         self.encode_layers(enc, pos);
+        self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
 
         self.state.seq_len.set(self.state.seq_len.get() + 1);
         state.seq_len += 1;
-        self.ctx.read_f32(&self.hidden_buf, hs)
+        self.ctx.read_f32(&self.normed_buf, hs)
     }
 
     fn forward_from_embedding(

@@ -68,5 +68,5 @@ kernel void silu_mul_inplace(
 ) {
     if (gid >= params.n) return;
     float g = a[gid];
-    a[gid] = (g / (1.0f + fast::exp(-g))) * b[gid];
+    a[gid] = (g / (1.0f + exp(-g))) * b[gid];
 }

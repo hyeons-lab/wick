@@ -66,10 +66,10 @@ inline void head_rope(
 ) {
     uint half_dim = head_dim / 2u;
     for (uint d = tid; d < half_dim; d += 256u) {
-        float freq = 1.0f / fast::powr(freq_base, float(2u * d) / float(head_dim));
+        float freq = 1.0f / powr(freq_base, float(2u * d) / float(head_dim));
         float angle = float(pos) * freq;
-        float cos_a = fast::cos(angle);
-        float sin_a = fast::sin(angle);
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
         float x0 = buf[d];
         float x1 = buf[d + half_dim];
         buf[d] = x0 * cos_a - x1 * sin_a;

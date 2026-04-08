@@ -1,6 +1,5 @@
 //! Audio-aware generation loop with text ↔ audio modality switching.
 
-use std::io::Write;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -40,6 +39,8 @@ pub struct AudioGenerateResult {
     pub audio_frames: usize,
     pub audio_samples: usize,
     pub elapsed_secs: f64,
+    pub depthformer_secs: f64,
+    pub detokenizer_secs: f64,
 }
 
 /// Special token IDs for modality control.
@@ -54,6 +55,9 @@ enum Modality {
 }
 
 /// Generate text + audio from a model with vocoder.
+///
+/// `gpu_detok_fn`: optional GPU-accelerated detokenizer. If Some, called instead
+/// of the CPU `detokenize_to_spectrum` for each frame.
 pub fn generate_audio(
     model: &dyn Model,
     decoder_weights: &AudioDecoderWeights,
@@ -61,8 +65,9 @@ pub fn generate_audio(
     tokenizer: &BpeTokenizer,
     prompt_tokens: &[u32],
     config: &AudioGenerateConfig,
+    gpu_detok_fn: Option<&dyn Fn(&[i32]) -> Vec<f32>>,
     mut text_callback: impl FnMut(&str),
-    mut audio_callback: impl FnMut(&[f32], u32), // (samples, sample_rate)
+    mut audio_callback: impl FnMut(&[f32], u32),
 ) -> Result<AudioGenerateResult> {
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config);
@@ -74,6 +79,8 @@ pub fn generate_audio(
     let mut all_spectrum = Vec::new();
 
     let start = Instant::now();
+    let mut time_depthformer = std::time::Duration::ZERO;
+    let mut time_detokenizer = std::time::Duration::ZERO;
 
     // Prefill.
     let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
@@ -94,6 +101,12 @@ pub fn generate_audio(
 
     let mut next_token = sampler.sample(&mut logits);
 
+    // Track consecutive audio segments after text_done to detect trailing garbage.
+    // When the model finishes text (text_done) but doesn't emit audio_end cleanly,
+    // we cap the number of trailing audio segments to avoid infinite generation.
+    let mut trailing_audio_segments: usize = 0;
+    const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
+
     loop {
         if generated >= config.max_tokens || pos >= model_config.max_seq_len {
             break;
@@ -105,25 +118,22 @@ pub fn generate_audio(
                 break;
             }
 
-            // Modality switch triggers.
-            if next_token == TOKEN_TEXT_END {
-                text_done = true;
-            }
-            if next_token == TOKEN_AUDIO_START
-                || (matches!(config.mode, AudioMode::Interleaved)
-                    && (modality_budget == 0 || text_done))
-            {
+            // Sequential mode: switch on audio_start token.
+            if next_token == TOKEN_AUDIO_START {
                 modality = Modality::Audio;
                 modality_budget = match config.mode {
                     AudioMode::Interleaved => 12,
                     AudioMode::Sequential => usize::MAX,
                 };
-                // Switch LLM to embedding mode.
                 continue;
             }
 
+            if next_token == TOKEN_TEXT_END {
+                text_done = true;
+            }
+
             // Emit text token.
-            if next_token != TOKEN_TEXT_END && next_token != TOKEN_AUDIO_START {
+            if next_token != TOKEN_TEXT_END {
                 let piece = tokenizer.decode(&[next_token]);
                 text_callback(&piece);
                 text_tokens += 1;
@@ -136,18 +146,97 @@ pub fn generate_audio(
                 break;
             }
 
-            // Next text token.
+            // Interleaved: check budget AFTER consuming the current token.
+            // When budget hits 0, use forward_embedding on this token to
+            // extract the audio embedding. This matches the reference which
+            // extracts from the decode of the LAST text token.
+            if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
+            {
+                if text_done {
+                    trailing_audio_segments += 1;
+                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
+                        break;
+                    }
+                }
+
+                let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+                pos += 1;
+
+                modality = Modality::Audio;
+                modality_budget = 12;
+
+                // Run audio loop with this embedding.
+                loop {
+                    let t0 = Instant::now();
+                    let codes = sample_audio_frame(
+                        decoder_weights,
+                        &mut df_state,
+                        &emb,
+                        config.audio_temperature,
+                        config.audio_top_k,
+                    );
+                    time_depthformer += t0.elapsed();
+                    if codes[0] == AUDIO_END_CODE {
+                        text_done = true;
+                        break;
+                    }
+
+                    let t1 = Instant::now();
+                    let spectrum = if let Some(gpu_fn) = gpu_detok_fn {
+                        gpu_fn(&codes)
+                    } else {
+                        detokenize_to_spectrum(
+                            detok_weights,
+                            decoder_weights,
+                            &mut detok_state,
+                            &codes,
+                        )
+                    };
+                    time_detokenizer += t1.elapsed();
+                    all_spectrum.extend_from_slice(&spectrum);
+                    audio_frames += 1;
+                    modality_budget = modality_budget.saturating_sub(1);
+
+                    let audio_emb = embed_audio_token(decoder_weights, &codes);
+
+                    if generated >= config.max_tokens || pos >= model_config.max_seq_len {
+                        break;
+                    }
+                    if modality_budget == 0 && !text_done {
+                        // Switch back to text. The reference transitions by
+                        // decoding the last audio code embedding and sampling
+                        // text from those logits (not by injecting TEXT_END).
+                        logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                        next_token = sampler.sample(&mut logits);
+                        pos += 1;
+                        break;
+                    }
+
+                    emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                    pos += 1;
+                    generated += 1;
+                }
+
+                // Switch back to text.
+                modality = Modality::Text;
+                modality_budget = 6;
+                continue;
+            }
+
+            // Normal text: forward and sample next token.
             logits = model.forward(&[next_token], pos, &mut state);
             next_token = sampler.sample(&mut logits);
             pos += 1;
         } else {
-            // Audio mode: embedding → sample codes → detokenize → feed back.
-            // Uses forward_hidden_from_embedding for embedding→embedding loop.
+            // Sequential audio mode: embedding from the audio_start token.
             let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+            // The output norm naturally produces the right scale (~0.14 RMS)
+            // when the hidden state has the activation outlier at channel 1455.
             pos += 1;
             generated += 1;
 
             loop {
+                let t0 = Instant::now();
                 let codes = sample_audio_frame(
                     decoder_weights,
                     &mut df_state,
@@ -155,9 +244,11 @@ pub fn generate_audio(
                     config.audio_temperature,
                     config.audio_top_k,
                 );
+                time_depthformer += t0.elapsed();
 
                 if codes[0] == AUDIO_END_CODE {
                     modality = Modality::Text;
+                    text_done = true;
                     modality_budget = match config.mode {
                         AudioMode::Interleaved => 6,
                         AudioMode::Sequential => usize::MAX,
@@ -168,12 +259,13 @@ pub fn generate_audio(
                     break;
                 }
 
-                let spectrum = detokenize_to_spectrum(
-                    detok_weights,
-                    decoder_weights,
-                    &mut detok_state,
-                    &codes,
-                );
+                let t1 = Instant::now();
+                let spectrum = if let Some(gpu_fn) = gpu_detok_fn {
+                    gpu_fn(&codes)
+                } else {
+                    detokenize_to_spectrum(detok_weights, decoder_weights, &mut detok_state, &codes)
+                };
+                time_detokenizer += t1.elapsed();
                 all_spectrum.extend_from_slice(&spectrum);
                 audio_frames += 1;
                 modality_budget = modality_budget.saturating_sub(1);
@@ -220,5 +312,7 @@ pub fn generate_audio(
         audio_frames,
         audio_samples,
         elapsed_secs: start.elapsed().as_secs_f64(),
+        depthformer_secs: time_depthformer.as_secs_f64(),
+        detokenizer_secs: time_detokenizer.as_secs_f64(),
     })
 }

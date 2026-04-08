@@ -5,6 +5,12 @@ use regex::Regex;
 
 use crate::gguf::{GgufFile, GgufValue};
 
+/// A segment of text split at special token boundaries.
+enum Segment<'a> {
+    Text(&'a str),
+    Special(u32),
+}
+
 /// A minimal byte-level BPE tokenizer.
 ///
 /// Loads vocabulary and merges from GGUF metadata. Implements the same
@@ -120,23 +126,67 @@ impl BpeTokenizer {
             return vec![];
         }
 
-        // Pretokenize: split text into chunks using the LLAMA3/LFM2 regex pattern.
-        // This keeps spaces attached to the following word (e.g., " world" as one chunk)
-        // so they match vocab entries like "Ġworld" (where Ġ = space in GPT-2 encoding).
-        let chunks: Vec<&str> = self
-            .pretokenize_re
-            .find_iter(text)
-            .map(|m| m.as_str())
-            .collect();
-
+        // First, split text at special token boundaries.
+        // Special tokens (e.g., <|im_start|>, <|im_end|>) are emitted as single
+        // token IDs; the text segments between them are BPE-encoded normally.
+        let segments = self.split_special_tokens(text);
         let mut result = Vec::new();
-        for chunk in &chunks {
-            // Each chunk's UTF-8 bytes are split into individual characters,
-            // then BPE merges are applied within the chunk.
-            let ids = self.bpe_encode_chunk(chunk);
-            result.extend(ids);
+        for segment in &segments {
+            match segment {
+                Segment::Special(id) => result.push(*id),
+                Segment::Text(s) => {
+                    // Pretokenize: split into chunks using the LLAMA3/LFM2 regex.
+                    let chunks: Vec<&str> = self
+                        .pretokenize_re
+                        .find_iter(s)
+                        .map(|m| m.as_str())
+                        .collect();
+                    for chunk in &chunks {
+                        result.extend(self.bpe_encode_chunk(chunk));
+                    }
+                }
+            }
         }
         result
+    }
+
+    /// Split text at special token boundaries, returning alternating
+    /// text segments and special token IDs.
+    fn split_special_tokens<'a>(&self, text: &'a str) -> Vec<Segment<'a>> {
+        if self.special_tokens.is_empty() {
+            return vec![Segment::Text(text)];
+        }
+
+        let mut segments = Vec::new();
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            // Find the earliest special token in the remaining text.
+            let mut best: Option<(usize, usize, u32)> = None; // (start, end, id)
+            for (tok_str, &tok_id) in &self.special_tokens {
+                if let Some(pos) = remaining.find(tok_str.as_str()) {
+                    if best.is_none() || pos < best.unwrap().0 {
+                        best = Some((pos, pos + tok_str.len(), tok_id));
+                    }
+                }
+            }
+
+            match best {
+                Some((start, end, id)) => {
+                    if start > 0 {
+                        segments.push(Segment::Text(&remaining[..start]));
+                    }
+                    segments.push(Segment::Special(id));
+                    remaining = &remaining[end..];
+                }
+                None => {
+                    segments.push(Segment::Text(remaining));
+                    break;
+                }
+            }
+        }
+
+        segments
     }
 
     /// Apply BPE to a single pretokenized chunk.

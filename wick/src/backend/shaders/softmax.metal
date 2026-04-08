@@ -34,7 +34,7 @@ kernel void softmax(
     // Phase 2: exp + sum.
     float partial_sum = 0.0f;
     for (uint i = tid; i < n; i += 256u) {
-        float e = fast::exp(x[i] - max_val);
+        float e = exp(x[i] - max_val);
         x[i] = e;
         partial_sum += e;
     }
