@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::kv_cache::InferenceState;
 use crate::model::Model;
 use crate::model::audio_decoder::{
-    AudioDecoderWeights, DepthformerState, DetokenizerState, DetokenizerWeights,
+    AudioDecoderWeights, AudioGpu, DepthformerState, DetokenizerState, DetokenizerWeights,
     detokenize_to_spectrum, embed_audio_token, istft_to_pcm, sample_audio_frame,
 };
 use crate::sampler::{Sampler, SamplerConfig};
@@ -56,8 +56,7 @@ enum Modality {
 
 /// Generate text + audio from a model with vocoder.
 ///
-/// `gpu_detok_fn`: optional GPU-accelerated detokenizer. If Some, called instead
-/// of the CPU `detokenize_to_spectrum` for each frame.
+/// `gpu`: optional GPU backend for depthformer + detokenizer acceleration.
 pub fn generate_audio(
     model: &dyn Model,
     decoder_weights: &AudioDecoderWeights,
@@ -65,7 +64,7 @@ pub fn generate_audio(
     tokenizer: &BpeTokenizer,
     prompt_tokens: &[u32],
     config: &AudioGenerateConfig,
-    gpu_detok_fn: Option<&dyn Fn(&[i32]) -> Vec<f32>>,
+    gpu: Option<&dyn AudioGpu>,
     mut text_callback: impl FnMut(&str),
     mut audio_callback: impl FnMut(&[f32], u32),
 ) -> Result<AudioGenerateResult> {
@@ -182,8 +181,8 @@ pub fn generate_audio(
                     }
 
                     let t1 = Instant::now();
-                    let spectrum = if let Some(gpu_fn) = gpu_detok_fn {
-                        gpu_fn(&codes)
+                    let spectrum = if let Some(g) = gpu {
+                        g.detokenize_to_spectrum(detok_weights, &codes)
                     } else {
                         detokenize_to_spectrum(
                             detok_weights,
@@ -260,8 +259,8 @@ pub fn generate_audio(
                 }
 
                 let t1 = Instant::now();
-                let spectrum = if let Some(gpu_fn) = gpu_detok_fn {
-                    gpu_fn(&codes)
+                let spectrum = if let Some(g) = gpu {
+                    g.detokenize_to_spectrum(detok_weights, &codes)
                 } else {
                     detokenize_to_spectrum(detok_weights, decoder_weights, &mut detok_state, &codes)
                 };

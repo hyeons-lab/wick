@@ -843,3 +843,27 @@ impl MetalAudioDecoder {
         spectrum
     }
 }
+
+impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
+    fn sample_audio_frame(&self, _embedding: &[f32], _temperature: f32, _top_k: usize) -> [i32; 8] {
+        // TODO: Metal depthformer dispatch (Phase 3)
+        // For now, fall through to CPU in the audio engine
+        panic!("Metal depthformer not yet implemented — use CPU fallback");
+    }
+
+    fn detokenize_to_spectrum(
+        &self,
+        cpu_weights: &crate::model::audio_decoder::DetokenizerWeights,
+        codes: &[i32],
+    ) -> Vec<f32> {
+        self.detokenize_to_spectrum(cpu_weights, codes)
+    }
+
+    fn reset_depthformer(&self) {
+        // TODO: depthformer KV cache reset (Phase 3)
+    }
+
+    fn reset_detokenizer(&self) {
+        self.reset();
+    }
+}

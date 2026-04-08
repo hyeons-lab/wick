@@ -377,20 +377,13 @@ fn main() -> Result<()> {
                     mode,
                 };
 
-                // GPU detokenizer closure
+                // GPU audio backend (depthformer + detokenizer)
                 #[cfg(all(feature = "metal", target_os = "macos"))]
-                let gpu_closure;
-                #[cfg(all(feature = "metal", target_os = "macos"))]
-                let gpu_detok_ref: Option<&dyn Fn(&[i32]) -> Vec<f32>> = if let Some(d) = &gpu_detok
-                {
-                    let dw = &detok_weights;
-                    gpu_closure = move |codes: &[i32]| d.detokenize_to_spectrum(dw, codes);
-                    Some(&gpu_closure)
-                } else {
-                    None
-                };
+                let gpu_ref: Option<&dyn wick::model::audio_decoder::AudioGpu> = gpu_detok
+                    .as_ref()
+                    .map(|d| d as &dyn wick::model::audio_decoder::AudioGpu);
                 #[cfg(not(all(feature = "metal", target_os = "macos")))]
-                let gpu_detok_ref: Option<&dyn Fn(&[i32]) -> Vec<f32>> = None;
+                let gpu_ref: Option<&dyn wick::model::audio_decoder::AudioGpu> = None;
 
                 let result = wick::audio_engine::generate_audio(
                     loaded_model.as_ref(),
@@ -399,7 +392,7 @@ fn main() -> Result<()> {
                     &tokenizer,
                     &tokens,
                     &audio_config,
-                    gpu_detok_ref,
+                    gpu_ref,
                     |text| {
                         print!("{text}");
                         std::io::stdout().flush().ok();

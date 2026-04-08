@@ -11,6 +11,22 @@ use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::tensor::DType;
 
+/// GPU-accelerated audio backend. Implementations provide Metal or WGPU
+/// dispatch for the depthformer (code sampling) and detokenizer (spectrum).
+pub trait AudioGpu {
+    /// Sample 8 audio codes from an LLM embedding using the depthformer.
+    fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8];
+
+    /// Convert 8 audio codes to spectrum [n_frames × n_fft_bins × 2].
+    fn detokenize_to_spectrum(&self, cpu_weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32>;
+
+    /// Reset depthformer KV caches (called per audio frame).
+    fn reset_depthformer(&self);
+
+    /// Reset detokenizer state (conv buffers + KV caches, called per generation).
+    fn reset_detokenizer(&self);
+}
+
 /// Configuration for the depthformer (small transformer inside the decoder).
 #[derive(Debug, Clone)]
 pub struct DepthformerConfig {
