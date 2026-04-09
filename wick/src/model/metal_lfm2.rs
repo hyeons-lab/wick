@@ -94,6 +94,7 @@ struct MetalPipelines {
     argmax_f32: ComputePipelineState,
     gemv_q4_0_batch: ComputePipelineState,
     rmsnorm_batch: ComputePipelineState,
+    add_rmsnorm_batch: ComputePipelineState,
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
     attention_prefill: ComputePipelineState,
@@ -244,6 +245,7 @@ impl MetalLfm2Model {
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32")?,
             gemv_q4_0_batch: ctx.create_pipeline(shaders::GEMV_Q4_0_BATCH, "gemv_q4_0_batch")?,
             rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "rmsnorm_batch")?,
+            add_rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")?,
             conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
             attention_prefill: ctx
@@ -1019,6 +1021,34 @@ impl MetalLfm2Model {
             std::mem::size_of_val(&params) as u64,
             params.as_ptr() as *const _,
         );
+        enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
+    }
+
+    /// Fused add + rmsnorm: src[i] += residual[i], then rmsnorm(src) → dst.
+    /// Eliminates a separate add_inplace dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_add_rmsnorm_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        n_tokens: u32,
+        stride: u32,
+    ) {
+        let hs = self.config.hidden_size as u32;
+        let params: [u32; 4] = [hs, self.config.rms_norm_eps.to_bits(), stride, stride];
+        enc.set_compute_pipeline_state(&self.pipelines.add_rmsnorm_batch);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        enc.set_buffer(2, Some(weight), 0);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_buffer(4, Some(residual), 0);
         enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
     }
 
@@ -1805,18 +1835,32 @@ impl Model for MetalLfm2Model {
         for layer in 0..cfg.n_layers {
             let lw = &self.layers[layer];
 
-            // Phase 1: batch rmsnorm (1 dispatch for all N tokens)
-            self.encode_rmsnorm_batch(
-                enc,
-                batch_buf,
-                0,
-                &self.prefill_normed_buf,
-                0,
-                &lw.attn_norm,
-                n as u32,
-                hs as u32,
-                hs as u32,
-            );
+            // Phase 1: fused add(FFN_down residual) + rmsnorm, or plain rmsnorm for layer 0.
+            // The previous layer's FFN down GEMM wrote to normed_buf as scratch.
+            if layer > 0 {
+                // Fuse: batch_buf += normed_buf (FFN down residual), then rmsnorm → normed_buf
+                self.encode_add_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.attn_norm,
+                    &self.prefill_normed_buf, // residual from prev layer's FFN down
+                    n as u32,
+                    hs as u32,
+                );
+            } else {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.attn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            }
 
             if cfg.block_types[layer] == BlockType::GatedConv {
                 let conv_buf = self.state.conv_buffers[layer].as_ref().unwrap();
@@ -1876,19 +1920,19 @@ impl Model for MetalLfm2Model {
                     enc.dispatch_thread_groups(grid, sz1d(256));
                 }
 
-                // Phase 6: out_proj GEMM → scratch, then add to batch
+                // Phase 6: out_proj GEMM → gate_buf scratch (no add yet — fused into FFN norm)
                 if w_out.dtype == DType::Q4_0 {
-                    self.encode_gemm_add(
+                    self.encode_gemm(
                         enc,
                         w_out,
                         &self.prefill_normed_buf,
                         0,
-                        batch_buf,
-                        0,
                         &self.prefill_gate_buf,
+                        0,
                         n as u32,
                         hs as u32,
                         hs as u32,
+                        false,
                     );
                 } else {
                     for i in 0..n {
@@ -2060,20 +2104,20 @@ impl Model for MetalLfm2Model {
                     enc.dispatch_thread_groups(sz1d((n as u32 * n_heads) as u64), sz1d(256));
                 }
 
-                // Attn output proj GEMM → scratch, then add to batch.
+                // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
                 let w_o = lw.attn_output.as_ref().unwrap();
                 if w_o.dtype == DType::Q4_0 {
-                    self.encode_gemm_add(
+                    self.encode_gemm(
                         enc,
                         w_o,
                         &self.prefill_normed_buf,
                         0,
-                        batch_buf,
-                        0,
                         &self.prefill_gate_buf,
+                        0,
                         n as u32,
                         hs as u32,
                         hs as u32,
+                        false,
                     );
                 } else {
                     for i in 0..n {
@@ -2090,16 +2134,16 @@ impl Model for MetalLfm2Model {
             }
 
             // Phase 7: batch FFN for ALL N tokens
-            // rmsnorm (1 dispatch for all N)
-            self.encode_rmsnorm_batch(
+            // Fused add(out_proj residual) + rmsnorm in 1 dispatch.
+            // gate_buf holds the out_proj/attn_out GEMM result; add it to batch_buf
+            // and rmsnorm the result in one pass.
+            self.encode_add_rmsnorm_batch(
                 enc,
                 batch_buf,
-                0,
                 &self.prefill_normed_buf,
-                0,
                 &lw.ffn_norm,
+                &self.prefill_gate_buf,
                 n as u32,
-                hs as u32,
                 hs as u32,
             );
             // gate+up GEMV (1 dispatch each for all N tokens)
@@ -2163,19 +2207,19 @@ impl Model for MetalLfm2Model {
                 );
                 enc.dispatch_thread_groups(grid, sz1d(256));
             }
-            // FFN down GEMM → scratch, then add to batch.
+            // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
             if lw.ffn_down.dtype == DType::Q4_0 {
-                self.encode_gemm_add(
+                self.encode_gemm(
                     enc,
                     &lw.ffn_down,
                     &self.prefill_gate_buf,
                     0,
-                    batch_buf,
-                    0,
                     &self.prefill_normed_buf,
+                    0,
                     n as u32,
                     is as u32,
                     hs as u32,
+                    false,
                 );
             } else {
                 for i in 0..n {
@@ -2189,6 +2233,22 @@ impl Model for MetalLfm2Model {
                     );
                 }
             }
+        }
+
+        // Add last layer's FFN down residual (in normed_buf) to batch_buf.
+        {
+            let total = (n * hs) as u32;
+            let grid = sz1d(total.div_ceil(256) as u64);
+            enc.set_compute_pipeline_state(&self.pipelines.add_inplace);
+            enc.set_buffer(0, Some(batch_buf), 0);
+            enc.set_buffer(1, Some(&self.prefill_normed_buf), 0);
+            let params: [u32; 2] = [total, 0];
+            enc.set_bytes(
+                2,
+                std::mem::size_of_val(&params) as u64,
+                params.as_ptr() as *const _,
+            );
+            enc.dispatch_thread_groups(grid, sz1d(256));
         }
 
         // Final: output norm + logits for last token only.
