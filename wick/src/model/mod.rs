@@ -119,6 +119,9 @@ pub trait Model: Send {
         0
     }
 
+    /// Configure the KV prefix cache. No-op for backends without caching.
+    fn configure_cache(&self, _config: crate::kv_cache::KvCacheConfig) {}
+
     /// Snapshot the current KV and conv state for prefix caching.
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
         unimplemented!("snapshot_state not supported by this backend")

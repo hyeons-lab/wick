@@ -1793,6 +1793,10 @@ impl Model for MetalLfm2Model {
         self.ctx.device.current_allocated_size()
     }
 
+    fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        *self.prefix_cache.borrow_mut() = crate::kv_cache::KvPrefixCache::new(config, &self.config);
+    }
+
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
         use crate::kv_cache::{LayerSnapshot, StateSnapshot};
         let seq_len = self.state.seq_len.get();

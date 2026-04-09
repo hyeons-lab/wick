@@ -42,6 +42,22 @@ enum Command {
         /// memory. Context >4096 auto-switches to flash attention (~14% slower).
         #[arg(long, default_value_t = 4096)]
         context_size: usize,
+
+        /// Directory for KV prefix cache files. Enables disk caching for prompt reuse.
+        #[arg(long)]
+        cache_dir: Option<String>,
+
+        /// Max warm (memory) cache size in MB. Default 256.
+        #[arg(long, default_value_t = 256)]
+        cache_warm_mb: u64,
+
+        /// Max disk cache size in GB. Default 10.
+        #[arg(long, default_value_t = 10)]
+        cache_disk_gb: u64,
+
+        /// Disable KV prefix caching entirely.
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Inspect a GGUF model file.
@@ -208,6 +224,10 @@ fn main() -> Result<()> {
             device,
             token_ids,
             context_size,
+            cache_dir,
+            cache_warm_mb,
+            cache_disk_gb,
+            no_cache,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -216,6 +236,28 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
 
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+
+            // Configure KV prefix cache.
+            if no_cache {
+                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                    cache_dir: None,
+                    max_warm_entries: 0,
+                    max_warm_bytes: 0,
+                    max_cold_bytes: 0,
+                });
+            } else {
+                let dir = cache_dir.map(std::path::PathBuf::from).or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| std::path::PathBuf::from(h).join(".cache/wick/kv"))
+                });
+                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                    cache_dir: dir,
+                    max_warm_entries: 32,
+                    max_warm_bytes: cache_warm_mb * 1024 * 1024,
+                    max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
+                });
+            }
 
             let tokens = if let Some(ids) = &token_ids {
                 // Parse comma-separated token IDs
