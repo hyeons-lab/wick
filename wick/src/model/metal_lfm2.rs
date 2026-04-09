@@ -97,6 +97,7 @@ struct MetalPipelines {
     add_rmsnorm_batch: ComputePipelineState,
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
+    gemm_q8_0: ComputePipelineState,
     attention_prefill: ComputePipelineState,
     qk_norm_rope_batch: ComputePipelineState,
     conv1d_fused_batch: ComputePipelineState,
@@ -249,6 +250,7 @@ impl MetalLfm2Model {
             add_rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")?,
             conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+            gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
             attention_prefill: ctx
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill")?,
             qk_norm_rope_batch: ctx
@@ -687,7 +689,11 @@ impl MetalLfm2Model {
         y_stride: u32,
         accumulate: bool,
     ) {
-        debug_assert_eq!(w.dtype, DType::Q4_0, "GEMM only supports Q4_0");
+        debug_assert!(
+            w.dtype == DType::Q4_0 || w.dtype == DType::Q8_0,
+            "GEMM only supports Q4_0 and Q8_0, got {:?}",
+            w.dtype
+        );
         if n < GEMM_MIN_N || w.k % 32 != 0 {
             return self.encode_gemv_batch(
                 enc,
@@ -712,7 +718,11 @@ impl MetalLfm2Model {
         ];
         let tg_rows = (w.m + 63) / 64; // ceil(m/64)
         let tg_cols = (n + 31) / 32; // ceil(n/32)
-        enc.set_compute_pipeline_state(&self.pipelines.gemm_q4_0);
+        let gemm_pipeline = match w.dtype {
+            DType::Q8_0 => &self.pipelines.gemm_q8_0,
+            _ => &self.pipelines.gemm_q4_0,
+        };
+        enc.set_compute_pipeline_state(gemm_pipeline);
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(x), x_off_bytes);
         enc.set_buffer(2, Some(y), y_off_bytes);
@@ -2257,7 +2267,9 @@ impl MetalLfm2Model {
                 hs as u32,
             );
             // gate+up GEMV (1 dispatch each for all N tokens)
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+            if lw.ffn_gate.dtype == DType::Q4_0
+                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
+            {
                 self.encode_gemm(
                     enc,
                     &lw.ffn_gate,
@@ -3103,7 +3115,9 @@ impl MetalLfm2Model {
 
             // FFN
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+            if lw.ffn_gate.dtype == DType::Q4_0
+                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
+            {
                 self.encode_gemv_gate_up(
                     enc,
                     &lw.ffn_gate,
@@ -3270,7 +3284,9 @@ impl MetalLfm2Model {
             // batched mode because ~2048 TGs redundantly reducing across the
             // hidden vector costs more than one dispatch saved.
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+            if lw.ffn_gate.dtype == DType::Q4_0
+                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
+            {
                 self.encode_gemv_gate_up(
                     enc,
                     &lw.ffn_gate,
@@ -3427,7 +3443,9 @@ impl MetalLfm2Model {
 
             self.gpu_sampled_pass(timer, cb, "ffn_norm_gemv", |enc| {
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+                if lw.ffn_gate.dtype == DType::Q4_0
+                    || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
+                {
                     self.encode_gemv_gate_up(
                         enc,
                         &lw.ffn_gate,
@@ -3598,7 +3616,9 @@ impl MetalLfm2Model {
             // FFN: rmsnorm + gate/up GEMVs.
             self.profile_segment(timer, "ffn_norm_gemv", |enc| {
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+                if lw.ffn_gate.dtype == DType::Q4_0
+                    || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
+                {
                     self.encode_gemv_gate_up(
                         enc,
                         &lw.ffn_gate,
