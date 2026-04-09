@@ -773,3 +773,125 @@ fn test_q8_0_prefill_parity() {
     eprintln!("  Metal top-5: {:?}", &idx_m[..5]);
     eprintln!("  CPU   top-5: {:?}", &idx_c[..5]);
 }
+
+/// Standalone Q8_0 GEMM parity: create a tiny matrix, run GPU GEMM, compare with CPU.
+#[test]
+#[ignore]
+fn test_q8_0_gemm_standalone() {
+    use wick::backend::metal::MetalContext;
+
+    let ctx = MetalContext::new().unwrap();
+
+    // Create a small Q8_0 weight: m=64 rows, k=32 cols (1 block per row).
+    // Each row is one Q8_0 block: 2 bytes (f16 scale) + 32 bytes (int8 quants) = 34 bytes.
+    let m = 64u32;
+    let k = 32u32;
+    let n = 4u32; // 4 input vectors
+    let nb = k / 32; // 1 block per row
+
+    // Build Q8_0 weight data: scale=1.0, quants=[1,2,3,...,32] for each row.
+    let mut weight_data = Vec::new();
+    for row in 0..m {
+        let scale: u16 = half::f16::from_f32(1.0 / (row as f32 + 1.0)).to_bits();
+        weight_data.extend_from_slice(&scale.to_le_bytes());
+        for j in 0..32u8 {
+            weight_data.push(((j as i8) - 16) as u8); // quants: -16..15
+        }
+    }
+    assert_eq!(weight_data.len(), m as usize * 34);
+
+    // Build input: n vectors of k=32 floats, all 1.0.
+    let input_data: Vec<f32> = vec![1.0; (n * k) as usize];
+
+    // Expected output: for each row, dot(scale * quants, input) = scale * sum(quants)
+    // quants = [-16, -15, ..., 15], sum = sum(-16..15) = -16+(-15)+...+15 = -16
+    // (16 negative values from -16..-1 sum to -136, 16 values 0..15 sum to 120, total = -16)
+    let quant_sum = -16.0f32;
+    let mut expected = vec![0.0f32; (m * n) as usize];
+    for row in 0..m {
+        let scale = 1.0 / (row as f32 + 1.0);
+        for col in 0..n {
+            expected[(col * m + row) as usize] = scale * quant_sum;
+        }
+    }
+
+    // Upload to GPU.
+    let weight_buf = ctx.device.new_buffer_with_data(
+        weight_data.as_ptr() as *const _,
+        weight_data.len() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let input_buf = ctx.device.new_buffer_with_data(
+        input_data.as_ptr() as *const _,
+        (input_data.len() * 4) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let output_buf = ctx.create_buffer((m * n * 4) as u64);
+
+    // Create pipeline.
+    let pipeline = ctx
+        .create_pipeline(wick::backend::metal::shaders::GEMM_Q8_0, "gemm_q8_0")
+        .unwrap();
+
+    // Dispatch.
+    let params: [u32; 6] = [m, k, n, k, m, 0]; // x_stride=k, y_stride=m
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&weight_buf), 0);
+    enc.set_buffer(1, Some(&input_buf), 0);
+    enc.set_buffer(2, Some(&output_buf), 0);
+    enc.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        params.as_ptr() as *const _,
+    );
+    enc.set_threadgroup_memory_length(0, 8192);
+    let tg_rows = (m + 63) / 64;
+    let tg_cols = (n + 31) / 32;
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: tg_cols as u64,
+            height: tg_rows as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    // Read back.
+    let gpu_output = ctx.read_f32(&output_buf, (m * n) as usize);
+
+    // Compare.
+    let mut max_diff = 0.0f32;
+    let mut nan_count = 0;
+    for i in 0..(m * n) as usize {
+        if gpu_output[i].is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        max_diff = max_diff.max((gpu_output[i] - expected[i]).abs());
+    }
+
+    eprintln!("=== Q8_0 GEMM Standalone Test ===");
+    eprintln!("  m={m}, k={k}, n={n}");
+    eprintln!("  NaN count: {nan_count}/{}", m * n);
+    eprintln!("  max_diff: {max_diff:.6}");
+    eprintln!(
+        "  GPU[0..4]: {:.4} {:.4} {:.4} {:.4}",
+        gpu_output[0], gpu_output[1], gpu_output[2], gpu_output[3]
+    );
+    eprintln!(
+        "  Expected[0..4]: {:.4} {:.4} {:.4} {:.4}",
+        expected[0], expected[1], expected[2], expected[3]
+    );
+
+    assert_eq!(nan_count, 0, "GEMM produced NaN values");
+    assert!(max_diff < 1.0, "GEMM max_diff {max_diff} > 1.0");
+}

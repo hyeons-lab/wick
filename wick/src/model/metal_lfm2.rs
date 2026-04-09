@@ -715,18 +715,48 @@ impl MetalLfm2Model {
             w.dtype
         );
         if n < GEMM_MIN_N || w.k % 32 != 0 {
-            return self.encode_gemv_batch(
-                enc,
-                w,
-                x,
-                x_off_bytes,
-                y,
-                y_off_bytes,
-                n,
-                x_stride,
-                y_stride,
-                accumulate,
-            );
+            // Batch GEMV only supports Q4_0. For Q8_0, fall back to per-token GEMV.
+            if w.dtype == DType::Q4_0 {
+                return self.encode_gemv_batch(
+                    enc,
+                    w,
+                    x,
+                    x_off_bytes,
+                    y,
+                    y_off_bytes,
+                    n,
+                    x_stride,
+                    y_stride,
+                    accumulate,
+                );
+            }
+            // Per-token GEMV fallback for Q8_0 and other dtypes.
+            let b4 = |off: usize| (off * 4) as u64;
+            let m = w.m as usize;
+            for i in 0..n as usize {
+                if accumulate {
+                    self.encode_gemv_impl(
+                        enc,
+                        w,
+                        x,
+                        x_off_bytes + b4(i * x_stride as usize),
+                        y,
+                        y_off_bytes + b4(i * y_stride as usize),
+                        true,
+                    );
+                } else {
+                    self.encode_gemv_impl(
+                        enc,
+                        w,
+                        x,
+                        x_off_bytes + b4(i * x_stride as usize),
+                        y,
+                        y_off_bytes + b4(i * y_stride as usize),
+                        false,
+                    );
+                }
+            }
+            return;
         }
         let params: [u32; 6] = [
             w.m,
@@ -2043,8 +2073,8 @@ impl MetalLfm2Model {
                 let w_in = lw.conv_in_proj.as_ref().unwrap();
                 let w_out = lw.conv_out_proj.as_ref().unwrap();
 
-                // Phase 2: batch in_proj (GEMM for Q4_0, per-token GEMV for Q8_0/others)
-                if w_in.dtype == DType::Q4_0 {
+                // Phase 2: batch in_proj (GEMM for Q4_0/Q8_0, per-token GEMV for others)
+                if w_in.dtype == DType::Q4_0 || w_in.dtype == DType::Q8_0 {
                     self.encode_gemm(
                         enc,
                         w_in,
@@ -2097,7 +2127,7 @@ impl MetalLfm2Model {
                 }
 
                 // Phase 6: out_proj GEMM → gate_buf scratch (no add yet — fused into FFN norm)
-                if w_out.dtype == DType::Q4_0 {
+                if w_out.dtype == DType::Q4_0 || w_out.dtype == DType::Q8_0 {
                     self.encode_gemm(
                         enc,
                         w_out,
@@ -2136,7 +2166,7 @@ impl MetalLfm2Model {
                 let w_q = lw.attn_q.as_ref().unwrap();
                 let w_k = lw.attn_k.as_ref().unwrap();
                 let w_v = lw.attn_v.as_ref().unwrap();
-                if w_q.dtype == DType::Q4_0 {
+                if w_q.dtype == DType::Q4_0 || w_q.dtype == DType::Q8_0 {
                     // Q → prefill_proj_buf, stride = hs
                     self.encode_gemm(
                         enc,
@@ -2284,7 +2314,7 @@ impl MetalLfm2Model {
 
                 // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
                 let w_o = lw.attn_output.as_ref().unwrap();
-                if w_o.dtype == DType::Q4_0 {
+                if w_o.dtype == DType::Q4_0 || w_o.dtype == DType::Q8_0 {
                     self.encode_gemm(
                         enc,
                         w_o,
@@ -2326,7 +2356,9 @@ impl MetalLfm2Model {
                 hs as u32,
             );
             // gate+up GEMM (1 dispatch each for all N tokens)
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+            if (lw.ffn_gate.dtype == DType::Q4_0 || lw.ffn_gate.dtype == DType::Q8_0)
+                && (lw.ffn_up.dtype == DType::Q4_0 || lw.ffn_up.dtype == DType::Q8_0)
+            {
                 self.encode_gemm(
                     enc,
                     &lw.ffn_gate,
@@ -2387,7 +2419,7 @@ impl MetalLfm2Model {
                 enc.dispatch_thread_groups(grid, sz1d(256));
             }
             // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
-            if lw.ffn_down.dtype == DType::Q4_0 {
+            if lw.ffn_down.dtype == DType::Q4_0 || lw.ffn_down.dtype == DType::Q8_0 {
                 self.encode_gemm(
                     enc,
                     &lw.ffn_down,
