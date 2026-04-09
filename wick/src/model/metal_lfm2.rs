@@ -2043,7 +2043,7 @@ impl MetalLfm2Model {
                 let w_in = lw.conv_in_proj.as_ref().unwrap();
                 let w_out = lw.conv_out_proj.as_ref().unwrap();
 
-                // Phase 2: batch in_proj GEMV (1 dispatch for all N tokens)
+                // Phase 2: batch in_proj (GEMM for Q4_0, per-token GEMV for others)
                 if w_in.dtype == DType::Q4_0 {
                     self.encode_gemm(
                         enc,
@@ -2111,13 +2111,15 @@ impl MetalLfm2Model {
                         false,
                     );
                 } else {
+                    // Write to gate_buf as scratch (same as Q4_0 GEMM path).
+                    // The fused add_rmsnorm_batch will add gate_buf to batch_buf.
                     for i in 0..n {
-                        self.encode_gemv_weight_accumulate_offsets(
+                        self.encode_gemv_weight_offset(
                             enc,
                             w_out,
                             &self.prefill_normed_buf,
                             b4(i * hs),
-                            batch_buf,
+                            &self.prefill_gate_buf,
                             b4(i * hs),
                         );
                     }
@@ -2296,13 +2298,14 @@ impl MetalLfm2Model {
                         false,
                     );
                 } else {
+                    // Write to gate_buf scratch (fused add+norm follows).
                     for i in 0..n {
-                        self.encode_gemv_weight_accumulate_offsets(
+                        self.encode_gemv_weight_offset(
                             enc,
                             w_o,
                             &self.prefill_normed_buf,
                             b4(i * hs),
-                            batch_buf,
+                            &self.prefill_gate_buf,
                             b4(i * hs),
                         );
                     }
@@ -2322,7 +2325,7 @@ impl MetalLfm2Model {
                 n as u32,
                 hs as u32,
             );
-            // gate+up GEMV (1 dispatch each for all N tokens)
+            // gate+up GEMM (1 dispatch each for all N tokens)
             if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                 self.encode_gemm(
                     enc,
@@ -2398,13 +2401,14 @@ impl MetalLfm2Model {
                     false,
                 );
             } else {
+                // Write to normed_buf scratch (fused add into next layer's norm).
                 for i in 0..n {
-                    self.encode_gemv_weight_accumulate_offsets(
+                    self.encode_gemv_weight_offset(
                         enc,
                         &lw.ffn_down,
                         &self.prefill_gate_buf,
                         b4(i * is),
-                        batch_buf,
+                        &self.prefill_normed_buf,
                         b4(i * hs),
                     );
                 }

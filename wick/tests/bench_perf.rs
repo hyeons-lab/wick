@@ -661,3 +661,115 @@ fn test_prefix_cache_cold_roundtrip() {
     // Cleanup.
     let _ = std::fs::remove_dir_all(&cache_dir);
 }
+
+/// Debug Q8_0 GEMV: compare a single weight matrix × vector on GPU vs CPU.
+#[test]
+#[ignore]
+fn test_q8_0_gemv_parity() {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q8_0") else {
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let cfg = model.config();
+
+    // Run a single forward pass.
+    let mut state_metal = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits_metal = model.forward(&[1], 0, &mut state_metal);
+
+    // Also run on CPU for reference.
+    let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
+    let cpu_model = wick::model::load_model(gguf2).unwrap();
+    let mut state_cpu = wick::kv_cache::InferenceState::from_config(cpu_model.config());
+    let logits_cpu = cpu_model.forward(&[1], 0, &mut state_cpu);
+
+    // Compare.
+    let mut max_diff = 0.0f32;
+    let mut sum_diff = 0.0f64;
+    for i in 0..logits_metal.len().min(logits_cpu.len()) {
+        let d = (logits_metal[i] - logits_cpu[i]).abs();
+        max_diff = max_diff.max(d);
+        sum_diff += d as f64;
+    }
+    let avg_diff = sum_diff / logits_metal.len() as f64;
+
+    // Top-5 comparison.
+    let mut idx_metal: Vec<usize> = (0..logits_metal.len()).collect();
+    idx_metal.sort_by(|&a, &b| logits_metal[b].partial_cmp(&logits_metal[a]).unwrap());
+    let mut idx_cpu: Vec<usize> = (0..logits_cpu.len()).collect();
+    idx_cpu.sort_by(|&a, &b| logits_cpu[b].partial_cmp(&logits_cpu[a]).unwrap());
+
+    eprintln!("=== Q8_0 GEMV Parity (single token forward) ===");
+    eprintln!(
+        "  Metal logits[0..3]: {:.4} {:.4} {:.4}",
+        logits_metal[0], logits_metal[1], logits_metal[2]
+    );
+    eprintln!(
+        "  CPU   logits[0..3]: {:.4} {:.4} {:.4}",
+        logits_cpu[0], logits_cpu[1], logits_cpu[2]
+    );
+    eprintln!("  max_diff: {max_diff:.4}, avg_diff: {avg_diff:.6}");
+    eprintln!("  Metal top-5: {:?}", &idx_metal[..5]);
+    eprintln!("  CPU   top-5: {:?}", &idx_cpu[..5]);
+    eprintln!("  Metal top-1 logit: {:.4}", logits_metal[idx_metal[0]]);
+    eprintln!("  CPU   top-1 logit: {:.4}", logits_cpu[idx_cpu[0]]);
+}
+
+/// Q8_0 prefill parity: compare 6-token prefill logits Metal vs CPU.
+#[test]
+#[ignore]
+fn test_q8_0_prefill_parity() {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q8_0") else {
+        return;
+    };
+
+    let tokens: Vec<u32> = vec![1, 422, 3871, 315, 5765, 338]; // "The capital of France is"
+
+    // Metal prefill
+    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    model.configure_cache(wick::kv_cache::KvCacheConfig {
+        cache_dir: None,
+        max_warm_entries: 0,
+        max_warm_bytes: 0,
+        max_cold_bytes: 0,
+    });
+    let cfg = model.config();
+    let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits_metal = model.forward_prefill(&tokens, 0, &mut state);
+
+    // CPU reference
+    let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
+    let cpu_model = wick::model::load_model(gguf2).unwrap();
+    let mut state_cpu = wick::kv_cache::InferenceState::from_config(cpu_model.config());
+    let logits_cpu = cpu_model.forward_prefill(&tokens, 0, &mut state_cpu);
+
+    let mut max_diff = 0.0f32;
+    for i in 0..logits_metal.len().min(logits_cpu.len()) {
+        max_diff = max_diff.max((logits_metal[i] - logits_cpu[i]).abs());
+    }
+
+    let mut idx_m: Vec<usize> = (0..logits_metal.len()).collect();
+    idx_m.sort_by(|&a, &b| logits_metal[b].partial_cmp(&logits_metal[a]).unwrap());
+    let mut idx_c: Vec<usize> = (0..logits_cpu.len()).collect();
+    idx_c.sort_by(|&a, &b| logits_cpu[b].partial_cmp(&logits_cpu[a]).unwrap());
+
+    eprintln!("=== Q8_0 Prefill Parity (6 tokens) ===");
+    eprintln!(
+        "  Metal logits[0..3]: {:.4} {:.4} {:.4}",
+        logits_metal[0], logits_metal[1], logits_metal[2]
+    );
+    eprintln!(
+        "  CPU   logits[0..3]: {:.4} {:.4} {:.4}",
+        logits_cpu[0], logits_cpu[1], logits_cpu[2]
+    );
+    eprintln!("  max_diff: {max_diff:.4}");
+    eprintln!("  Metal top-5: {:?}", &idx_m[..5]);
+    eprintln!("  CPU   top-5: {:?}", &idx_c[..5]);
+}
