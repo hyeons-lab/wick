@@ -57,6 +57,7 @@ enum Modality {
 /// Generate text + audio from a model with vocoder.
 ///
 /// `gpu`: optional GPU backend for depthformer + detokenizer acceleration.
+#[allow(unused_assignments, clippy::too_many_arguments)]
 pub fn generate_audio(
     model: &dyn Model,
     decoder_weights: &AudioDecoderWeights,

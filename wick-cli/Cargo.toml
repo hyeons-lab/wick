@@ -20,5 +20,4 @@ tracing-subscriber.workspace = true
 [features]
 default = []
 gpu = ["wick/gpu"]
-metal = ["wick/metal", "wick/audio"]
-audio = ["wick/audio"]
+metal = ["wick/metal"]

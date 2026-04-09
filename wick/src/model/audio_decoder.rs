@@ -548,7 +548,7 @@ pub fn sample_audio_frame(
     top_k: usize,
 ) -> [i32; 8] {
     let cfg = &weights.decoder_config;
-    let df_cfg = &weights.depthformer_config;
+    let _df_cfg = &weights.depthformer_config;
     let mut token = [0i32; 8];
     let mut prev_token: i32 = -1;
 
@@ -890,11 +890,9 @@ impl DetokenizerState {
         for buf in &mut self.conv_bufs {
             buf.fill(0.0);
         }
-        for kv in &mut self.attn_kv {
-            if let Some((k, v)) = kv {
-                k.fill(0.0);
-                v.fill(0.0);
-            }
+        for (k, v) in self.attn_kv.iter_mut().flatten() {
+            k.fill(0.0);
+            v.fill(0.0);
         }
         self.n_past = 0;
     }
@@ -961,7 +959,7 @@ fn detok_conv_block(
     let x = &bcx[2 * chunk_size..];
 
     // bx = b * x
-    let mut bx: Vec<f32> = b.iter().zip(x).map(|(bi, xi)| bi * xi).collect();
+    let bx: Vec<f32> = b.iter().zip(x).map(|(bi, xi)| bi * xi).collect();
 
     // conv1d with rolling buffer: concat [conv_buf, bx], convolve, update buf.
     let kernel_size = d_conv + 1;
@@ -1001,6 +999,7 @@ fn detok_conv_block(
     out
 }
 
+#[allow(dead_code)]
 /// Process one token through an attention block.
 fn detok_attn_block(
     lw: &DetokLayerWeights,
@@ -1041,11 +1040,7 @@ fn detok_attn_block(
     v_cache[write_pos * kv_stride..(write_pos + 1) * kv_stride].copy_from_slice(&v);
 
     // Attention with sliding window.
-    let kv_start = if pos + 1 > cfg.swa_window_size {
-        pos + 1 - cfg.swa_window_size
-    } else {
-        0
-    };
+    let kv_start = (pos + 1).saturating_sub(cfg.swa_window_size);
     let kv_len = pos + 1 - kv_start;
     let group_size = n_head / n_kv;
     let scale = 1.0 / (hd as f32).sqrt();
@@ -1085,7 +1080,7 @@ fn detok_attn_block(
 /// Returns raw spectrogram data as [n_frames × n_fft_bins × 2] (log_abs, angle).
 pub fn detokenize_to_spectrum(
     weights: &DetokenizerWeights,
-    detok_weights: &AudioDecoderWeights,
+    _detok_weights: &AudioDecoderWeights,
     state: &mut DetokenizerState,
     codes: &[i32],
 ) -> Vec<f32> {
@@ -1319,35 +1314,16 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
     output
 }
 
-/// Inverse FFT of one frame. Uses rustfft when the `audio` feature is enabled,
-/// otherwise falls back to naive O(n²) DFT.
+/// Inverse FFT of one frame using rustfft.
 fn ifft_frame(complex: &[(f32, f32)], n_fft: usize) -> Vec<f32> {
-    #[cfg(feature = "audio")]
-    {
-        use rustfft::{FftPlanner, num_complex::Complex32};
-        let mut planner = FftPlanner::new();
-        let ifft = planner.plan_fft_inverse(n_fft);
-        let mut buf: Vec<Complex32> = complex
-            .iter()
-            .map(|&(re, im)| Complex32::new(re, im))
-            .collect();
-        ifft.process(&mut buf);
-        let inv_n = 1.0 / n_fft as f32;
-        buf.iter().map(|c| c.re * inv_n).collect()
-    }
-    #[cfg(not(feature = "audio"))]
-    {
-        // Naive O(n²) DFT fallback.
-        let inv_n = 1.0 / n_fft as f32;
-        (0..n_fft)
-            .map(|n| {
-                let mut sum = 0.0f32;
-                for k in 0..n_fft {
-                    let angle = 2.0 * std::f32::consts::PI * k as f32 * n as f32 * inv_n;
-                    sum += complex[k].0 * angle.cos() - complex[k].1 * angle.sin();
-                }
-                sum * inv_n
-            })
-            .collect()
-    }
+    use rustfft::{FftPlanner, num_complex::Complex32};
+    let mut planner = FftPlanner::new();
+    let ifft = planner.plan_fft_inverse(n_fft);
+    let mut buf: Vec<Complex32> = complex
+        .iter()
+        .map(|&(re, im)| Complex32::new(re, im))
+        .collect();
+    ifft.process(&mut buf);
+    let inv_n = 1.0 / n_fft as f32;
+    buf.iter().map(|c| c.re * inv_n).collect()
 }

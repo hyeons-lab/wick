@@ -24,11 +24,10 @@ wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
-rustfft = { workspace = true, optional = true }
+rustfft.workspace = true
 flatbuffers.workspace = true
 
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
-metal = ["dep:metal", "dep:objc", "audio"]
-audio = ["dep:rustfft"]
+metal = ["dep:metal", "dep:objc"]

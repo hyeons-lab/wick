@@ -178,4 +178,10 @@ pub fn load_model_metal(
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::manual_saturating_arithmetic,
+    unused_variables
+)]
 pub mod audio_decoder;
