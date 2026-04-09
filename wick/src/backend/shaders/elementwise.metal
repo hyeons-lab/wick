@@ -9,7 +9,7 @@ struct Params { uint n; uint _pad; };
 kernel void memcpy_f32(
     const device float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
@@ -19,7 +19,7 @@ kernel void memcpy_f32(
 kernel void add_inplace(
     device float* a [[buffer(0)]],
     const device float* b [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
@@ -29,7 +29,7 @@ kernel void add_inplace(
 kernel void mul_inplace(
     device float* a [[buffer(0)]],
     const device float* b [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
@@ -42,7 +42,7 @@ kernel void mul_out(
     const device float* a [[buffer(0)]],
     const device float* b [[buffer(1)]],
     device float* dst [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
@@ -53,7 +53,7 @@ kernel void mul_out(
 kernel void cast_f32_to_f16(
     const device float* src [[buffer(0)]],
     device half* dst [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
@@ -63,7 +63,7 @@ kernel void cast_f32_to_f16(
 kernel void silu_mul_inplace(
     device float* a [[buffer(0)]],
     const device float* b [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;

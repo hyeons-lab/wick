@@ -11,7 +11,7 @@ kernel void gemv_f32(
     const device float* a [[buffer(0)]],
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint3 tid_v [[thread_position_in_threadgroup]],
     uint3 tg_id [[threadgroup_position_in_grid]]
 ) {

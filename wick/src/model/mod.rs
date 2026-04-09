@@ -113,6 +113,11 @@ pub trait Model: Send {
         let logits = self.forward(tokens, pos, state);
         crate::sampler::cpu_argmax(&logits)
     }
+
+    /// GPU memory allocated by this model (bytes). 0 for CPU-only backends.
+    fn gpu_memory_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Load a model from a GGUF file, dispatching on the architecture.

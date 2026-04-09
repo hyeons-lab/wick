@@ -15,7 +15,7 @@ struct Params {
 kernel void rope(
     device float* q [[buffer(0)]],
     device float* k [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint pos = params.pos;

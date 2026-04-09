@@ -9,7 +9,7 @@ struct Params { uint head_dim; uint eps_bits; uint _pad0; uint _pad1; };
 kernel void per_head_rmsnorm(
     device float* x [[buffer(0)]],
     const device float* w [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {

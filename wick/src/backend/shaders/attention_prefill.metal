@@ -1,51 +1,53 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Fused attention per head: Q·K → softmax → weighted V sum.
-// One threadgroup per head, 256 threads. Scores are kept in threadgroup
-// memory — no round-trips through a device-memory scores buffer.
-//
-// MAX_SEQ_LEN caps the per-head attention window. If you exceed this,
-// raise it (tradeoff: 4 bytes per slot per active threadgroup of shared
-// memory, which is plentiful on Apple GPUs).
+// Batched causal attention for prefill: all queries in one dispatch.
+// Each threadgroup handles one (query_idx, head) pair.
+// Dispatch: (n_queries * n_heads) threadgroups × 256 threads.
 
-// Caps per-TG threadgroup memory. 4096 scores = 16 KB; total TG memory
-// ≈ 20.6 KB (within Apple Silicon's 32 KB limit). For seq_len > 4096,
-// the Rust side auto-switches to flash attention.
 constant constexpr uint MAX_SEQ_LEN = 4096;
 constant constexpr uint MAX_HEAD_DIM = 128;
 
-struct Params {
+struct PrefillAttnParams {
     uint n_heads;
     uint n_kv_heads;
     uint head_dim;
     uint kv_dim;
-    uint seq_len;
+    uint start_pos;
+    uint n_queries;
     uint scale_bits;
-    uint _pad0;
-    uint _pad1;
+    uint q_stride;
+    uint out_stride;
 };
 
-kernel void attention(
-    const device float* q [[buffer(0)]],
+kernel void attention_prefill(
+    const device float* q_batch [[buffer(0)]],
     const device half* k_cache [[buffer(1)]],
     const device half* v_cache [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant Params& params [[buffer(4)]],
+    device float* out_batch [[buffer(3)]],
+    constant PrefillAttnParams& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
+    uint tg_idx [[threadgroup_position_in_grid]]
 ) {
     uint n_heads = params.n_heads;
     uint n_kv_heads = params.n_kv_heads;
     uint head_dim = params.head_dim;
     uint kv_dim = params.kv_dim;
-    uint seq_len = params.seq_len;
+    uint start_pos = params.start_pos;
     float scale = as_type<float>(params.scale_bits);
+
+    uint query_idx = tg_idx / n_heads;
+    uint head = tg_idx % n_heads;
+    uint seq_len = start_pos + query_idx + 1;
+
+    if (seq_len > MAX_SEQ_LEN) return;
 
     uint group_size = n_heads / n_kv_heads;
     uint kv_head = head / group_size;
     uint kv_h_offset = kv_head * head_dim;
-    uint q_offset = head * head_dim;
+
+    uint q_offset = query_idx * params.q_stride + head * head_dim;
+    uint out_offset = query_idx * params.out_stride + head * head_dim;
 
     threadgroup float scores[MAX_SEQ_LEN];
     threadgroup float q_shared[MAX_HEAD_DIM];
@@ -53,34 +55,28 @@ kernel void attention(
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5u;
 
-    // Load Q once into threadgroup memory — all 256 threads reuse it in phase 1.
     if (tid < head_dim) {
-        q_shared[tid] = q[q_offset + tid];
+        q_shared[tid] = q_batch[q_offset + tid];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 1: Q·K scores (kept in threadgroup memory).
-    // Vectorized float4 loads for K when head_dim % 4 == 0 — one instruction
-    // reads 16 bytes vs four scalar loads. q_shared is packed into float4s lazily.
+    // Phase 1: Q·K scores with vectorized loads.
     uint hd4 = head_dim / 4u;
     for (uint t = tid; t < seq_len; t += 256u) {
         float acc = 0.0f;
         uint k_base = t * kv_dim + kv_h_offset;
-        const device half4* k4 = (device const half4*) (k_cache + k_base);
-        #pragma clang loop unroll(full)
+        const device half4* k4 = (device const half4*)(k_cache + k_base);
         for (uint d = 0u; d < hd4; d++) {
             float4 kk = float4(k4[d]);
-            float4 qq = float4(q_shared[d * 4u + 0u],
-                               q_shared[d * 4u + 1u],
-                               q_shared[d * 4u + 2u],
-                               q_shared[d * 4u + 3u]);
+            float4 qq = float4(q_shared[d * 4u], q_shared[d * 4u + 1u],
+                               q_shared[d * 4u + 2u], q_shared[d * 4u + 3u]);
             acc += dot(qq, kk);
         }
         scores[t] = acc * scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 2: softmax — find max.
+    // Phase 2: softmax.
     float local_max = -INFINITY;
     for (uint t = tid; t < seq_len; t += 256u) {
         local_max = max(local_max, scores[t]);
@@ -96,7 +92,6 @@ kernel void attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float max_val = sg_val[0];
 
-    // exp + sum.
     float partial_sum = 0.0f;
     for (uint t = tid; t < seq_len; t += 256u) {
         float e = exp(scores[t] - max_val);
@@ -119,39 +114,29 @@ kernel void attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: weighted V sum. Coalesced across simdgroup lanes.
-    // 8 simdgroups each process seq_len/8 timesteps. Within each simdgroup:
-    // 32 lanes cooperate to load v_cache[tt, 0..head_dim] coalesced. Each lane
-    // holds DIMS_PER_LANE partial_out values for its slice of head_dim.
-    // After the loop, reduce partials across simdgroups via threadgroup memory.
-    //
-    // Works for head_dim ≤ 256 (DIMS_PER_LANE = head_dim/32, capped at 8).
+    // Phase 3: weighted V sum.
     uint dims_per_lane = head_dim / 32u;
     if (dims_per_lane < 1u) dims_per_lane = 1u;
     if (dims_per_lane > 8u) dims_per_lane = 8u;
 
-    // Each simdgroup owns a timestep range.
     uint chunk = (seq_len + 7u) / 8u;
     uint t_start = simd_id * chunk;
     uint t_end = min(t_start + chunk, seq_len);
 
-    // Per-lane partial accumulators (up to 8 dims).
     float po[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (dims_per_lane == 2u) {
-        // head_dim=64: each lane owns 2 contiguous dims → one half2 load per tt.
         for (uint tt = t_start; tt < t_end; tt++) {
             float s = scores[tt];
             uint v_base = tt * kv_dim + kv_h_offset + simd_lane * 2u;
-            float2 v2 = float2(*((device const half2*) (v_cache + v_base)));
+            float2 v2 = float2(*((device const half2*)(v_cache + v_base)));
             po[0] += s * v2.x;
             po[1] += s * v2.y;
         }
     } else if (dims_per_lane == 4u) {
-        // head_dim=128: half4 load per tt.
         for (uint tt = t_start; tt < t_end; tt++) {
             float s = scores[tt];
             uint v_base = tt * kv_dim + kv_h_offset + simd_lane * 4u;
-            float4 v4 = float4(*((device const half4*) (v_cache + v_base)));
+            float4 v4 = float4(*((device const half4*)(v_cache + v_base)));
             po[0] += s * v4.x;
             po[1] += s * v4.y;
             po[2] += s * v4.z;
@@ -160,41 +145,29 @@ kernel void attention(
     } else {
         for (uint tt = t_start; tt < t_end; tt++) {
             float s = scores[tt];
-            uint v_base = tt * kv_dim + kv_h_offset;
-            #pragma clang loop unroll(full)
-            for (uint i = 0u; i < 8u; i++) {
-                if (i < dims_per_lane) {
-                    uint d = simd_lane * dims_per_lane + i;
-                    if (d < head_dim) {
-                        po[i] += s * v_cache[v_base + d];
-                    }
-                }
+            for (uint d = 0; d < dims_per_lane; d++) {
+                uint v_idx = tt * kv_dim + kv_h_offset + simd_lane * dims_per_lane + d;
+                po[d] += s * float(v_cache[v_idx]);
             }
         }
     }
 
-    // Reduce partials across simdgroups via threadgroup memory.
-    // Layout: partials_tg[sg_id × head_dim + d]
-    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
-    for (uint i = 0u; i < dims_per_lane; i++) {
-        uint d = simd_lane * dims_per_lane + i;
-        if (d < head_dim) {
-            partials_tg[simd_id * head_dim + d] = po[i];
-        }
+    // Reduce across simdgroups.
+    threadgroup float reduce_buf[256 * 8];
+    for (uint d = 0; d < dims_per_lane; d++) {
+        reduce_buf[simd_id * 32 * dims_per_lane + simd_lane * dims_per_lane + d] = po[d];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First simdgroup sums the 8 partials per output dim.
-    if (simd_id == 0u) {
-        for (uint i = 0u; i < dims_per_lane; i++) {
-            uint d = simd_lane * dims_per_lane + i;
-            if (d < head_dim) {
-                float sum = 0.0f;
-                #pragma clang loop unroll(full)
-                for (uint sg = 0u; sg < 8u; sg++) {
-                    sum += partials_tg[sg * head_dim + d];
-                }
-                out[q_offset + d] = sum;
+    if (simd_id == 0) {
+        for (uint d = 0; d < dims_per_lane; d++) {
+            float sum = 0.0f;
+            for (uint sg = 0; sg < 8u; sg++) {
+                sum += reduce_buf[sg * 32 * dims_per_lane + simd_lane * dims_per_lane + d];
+            }
+            uint out_dim = simd_lane * dims_per_lane + d;
+            if (out_dim < head_dim) {
+                out_batch[out_offset + out_dim] = sum;
             }
         }
     }

@@ -27,7 +27,7 @@ kernel void flash_attention(
     const device float* k_cache [[buffer(1)]],
     const device float* v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
-    const device Params& params [[buffer(4)]],
+    constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {

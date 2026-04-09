@@ -7,7 +7,7 @@ struct Params { uint n; uint _pad; };
 
 kernel void softmax(
     device float* x [[buffer(0)]],
-    const device Params& params [[buffer(1)]],
+    constant Params& params [[buffer(1)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint n = params.n;

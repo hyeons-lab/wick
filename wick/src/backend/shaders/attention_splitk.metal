@@ -31,7 +31,7 @@ kernel void attention_split_compute(
     device float* partials_out [[buffer(3)]],    // [n_heads × n_splits × head_dim]
     device float* partials_max [[buffer(4)]],    // [n_heads × n_splits]
     device float* partials_sum [[buffer(5)]],    // [n_heads × n_splits]
-    const device SplitParams& params [[buffer(6)]],
+    constant SplitParams& params [[buffer(6)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
 ) {
@@ -161,7 +161,7 @@ kernel void attention_split_merge(
     const device float* partials_max [[buffer(1)]],  // [n_heads × n_splits]
     const device float* partials_sum [[buffer(2)]],  // [n_heads × n_splits]
     device float* out [[buffer(3)]],                 // [n_heads × head_dim]
-    const device SplitParams& params [[buffer(4)]],
+    constant SplitParams& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {

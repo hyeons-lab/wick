@@ -1,41 +1,36 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Fused: per-head RMSnorm + RoPE for Q and K (in a GQA attention layer).
-// Replaces 3 dispatches (per_head_rmsnorm Q, per_head_rmsnorm K, rope) with 1.
-//
-// Dispatch: max(n_heads, n_kv_heads) threadgroups × 256 threads.
-//   TGs 0..n_kv_heads-1 process BOTH a Q head AND the corresponding K head.
-//   TGs n_kv_heads..n_heads-1 process only their Q head.
-//
-// K is accessed via a byte offset into k_cache (typically pos * kv_dim * 4).
+// Batched qk_norm_rope: processes N tokens in one dispatch.
+// Dispatch: (n_tokens * (n_heads + n_kv_heads)) TGs × 256 threads.
 
-struct Params {
-    uint pos;
+struct BatchParams {
+    uint start_pos;
+    uint n_tokens;
     uint n_heads;
     uint n_kv_heads;
     uint head_dim;
     uint eps_bits;
     uint freq_base_bits;
-    uint rope_type; // 0 = NeoX (pairs at [i, i+half]), 1 = interleaved (pairs at [2i, 2i+1])
+    uint rope_type;
+    uint q_stride;  // floats between Q vectors (typically hs)
+    uint k_stride;  // floats between K vectors (typically kv_dim)
 };
 
 inline void head_rmsnorm(
-    device float* buf,          // buf[0..head_dim]
-    const device float* w,      // w[0..head_dim]
-    threadgroup float* scratch, // at least [head_dim + 8] floats
+    device float* buf,
+    const device float* w,
+    threadgroup float* scratch,
     uint tid,
     uint head_dim,
     float eps
 ) {
-    // Sum of squares.
     float partial = 0.0f;
     for (uint i = tid; i < head_dim; i += 256u) {
         float v = buf[i];
-        scratch[i] = v;  // cache x into threadgroup mem for phase 2
+        scratch[i] = v;
         partial += v * v;
     }
-    // Two-stage simd reduction.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5u;
@@ -50,16 +45,12 @@ inline void head_rmsnorm(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv_rms = 1.0f / sqrt(sg_val[0] / float(head_dim) + eps);
-    // Apply normalization back to buf.
     for (uint i = tid; i < head_dim; i += 256u) {
         buf[i] = scratch[i] * inv_rms * w[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Apply RoPE to buf[0..head_dim] in place.
-// rope_type 0 = NeoX: pairs at [d, d + half_dim]
-// rope_type 1 = interleaved (LLAMA_ROPE_TYPE_NORM): pairs at [2d, 2d+1]
 inline void head_rope(
     device float* buf,
     uint tid,
@@ -69,7 +60,6 @@ inline void head_rope(
     uint rope_type
 ) {
     uint half_dim = head_dim / 2u;
-    // Use iterative theta multiplication matching ggml's ggml_rope_cache_init.
     float theta_scale = powr(freq_base, -2.0f / float(head_dim));
     for (uint d = tid; d < half_dim; d += 256u) {
         float theta = float(pos);
@@ -77,13 +67,11 @@ inline void head_rope(
         float cos_a = cos(theta);
         float sin_a = sin(theta);
         if (rope_type == 0u) {
-            // NeoX: pairs at [d, d + half_dim]
             float x0 = buf[d];
             float x1 = buf[d + half_dim];
             buf[d] = x0 * cos_a - x1 * sin_a;
             buf[d + half_dim] = x0 * sin_a + x1 * cos_a;
         } else {
-            // Interleaved: pairs at [2d, 2d+1]
             float x0 = buf[2u * d];
             float x1 = buf[2u * d + 1u];
             buf[2u * d] = x0 * cos_a - x1 * sin_a;
@@ -92,39 +80,37 @@ inline void head_rope(
     }
 }
 
-kernel void qk_norm_rope(
-    device float* q [[buffer(0)]],        // [n_heads × head_dim]
-    device float* k_cache [[buffer(1)]],  // [seq_len × kv_dim], offset to current row
+kernel void qk_norm_rope_batch(
+    device float* q_batch [[buffer(0)]],
+    device float* k_batch [[buffer(1)]],
     const device float* q_norm_w [[buffer(2)]],
     const device float* k_norm_w [[buffer(3)]],
-    constant Params& params [[buffer(4)]],
+    constant BatchParams& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
+    uint tg_idx [[threadgroup_position_in_grid]]
 ) {
     uint n_heads = params.n_heads;
     uint n_kv_heads = params.n_kv_heads;
     uint head_dim = params.head_dim;
     float eps = as_type<float>(params.eps_bits);
     float freq_base = as_type<float>(params.freq_base_bits);
-    uint pos = params.pos;
-
-    // Threadgroup scratch: head_dim floats for x-cache + 8 for simd reduction.
-    // head_dim ≤ 256 for LFM2/Llama-family models.
-    threadgroup float scratch[264];
-
-    // Dispatch: (n_heads + n_kv_heads) TGs. First n_heads handle Q heads;
-    // remaining n_kv_heads handle K heads. Gives every TG equal work (no
-    // load imbalance from doing 2× work in the first few TGs).
     uint rope_type = params.rope_type;
 
+    uint heads_per_token = n_heads + n_kv_heads;
+    uint token_idx = tg_idx / heads_per_token;
+    uint head = tg_idx % heads_per_token;
+    uint pos = params.start_pos + token_idx;
+
+    threadgroup float scratch[264];
+
     if (head < n_heads) {
-        device float* q_head = q + head * head_dim;
+        device float* q_head = q_batch + token_idx * params.q_stride + head * head_dim;
         head_rmsnorm(q_head, q_norm_w, scratch, tid, head_dim, eps);
         head_rope(q_head, tid, head_dim, pos, freq_base, rope_type);
     } else {
         uint kh = head - n_heads;
         if (kh < n_kv_heads) {
-            device float* k_head = k_cache + kh * head_dim;
+            device float* k_head = k_batch + token_idx * params.k_stride + kh * head_dim;
             head_rmsnorm(k_head, k_norm_w, scratch, tid, head_dim, eps);
             head_rope(k_head, tid, head_dim, pos, freq_base, rope_type);
         }

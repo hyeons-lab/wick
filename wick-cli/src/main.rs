@@ -561,6 +561,56 @@ fn main() -> Result<()> {
             eprintln!(
                 "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
             );
+
+            // GPU memory.
+            let gpu_mb = loaded_model.gpu_memory_bytes() as f64 / 1_048_576.0;
+            if gpu_mb > 0.0 {
+                eprintln!("gpu memory: {gpu_mb:.0} MB");
+            }
+
+            // Report memory usage (macOS).
+            #[cfg(target_os = "macos")]
+            {
+                use std::mem::MaybeUninit;
+                unsafe extern "C" {
+                    fn mach_task_self() -> u32;
+                    fn task_info(
+                        target_task: u32,
+                        flavor: u32,
+                        task_info_out: *mut u8,
+                        task_info_outCnt: *mut u32,
+                    ) -> i32;
+                }
+                // MACH_TASK_BASIC_INFO = 20
+                #[repr(C)]
+                struct MachTaskBasicInfo {
+                    virtual_size: u64,
+                    resident_size: u64,
+                    resident_size_max: u64,
+                    user_time: [u32; 2],
+                    system_time: [u32; 2],
+                    policy: i32,
+                    suspend_count: i32,
+                }
+                let mut info = MaybeUninit::<MachTaskBasicInfo>::zeroed();
+                let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
+                let ret = unsafe {
+                    task_info(
+                        mach_task_self(),
+                        20,
+                        info.as_mut_ptr() as *mut u8,
+                        &mut count,
+                    )
+                };
+                if ret == 0 {
+                    let info = unsafe { info.assume_init() };
+                    eprintln!(
+                        "memory: resident={:.0} MB, peak={:.0} MB",
+                        info.resident_size as f64 / 1_048_576.0,
+                        info.resident_size_max as f64 / 1_048_576.0,
+                    );
+                }
+            }
         }
     }
 
