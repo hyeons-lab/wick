@@ -895,3 +895,63 @@ fn test_q8_0_gemm_standalone() {
     assert_eq!(nan_count, 0, "GEMM produced NaN values");
     assert!(max_diff < 1.0, "GEMM max_diff {max_diff} > 1.0");
 }
+
+/// Profile 450M prefill phase breakdown.
+#[test]
+#[ignore]
+fn test_450m_prefill_phase_profile() {
+    use std::collections::HashMap;
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-450M-Q4_0") else {
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    model.configure_cache(wick::kv_cache::KvCacheConfig {
+        cache_dir: None,
+        max_warm_entries: 0,
+        max_warm_bytes: 0,
+        max_cold_bytes: 0,
+    });
+    let cfg = model.config();
+    let n = 128;
+    let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
+
+    let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+    let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+    let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    let mut by_cat: HashMap<String, (f64, usize)> = HashMap::new();
+    for (name, us) in &timings {
+        let cat = name.split('_').skip(1).collect::<Vec<_>>().join("_");
+        let entry = by_cat.entry(cat).or_insert((0.0, 0));
+        entry.0 += us;
+        entry.1 += 1;
+    }
+    let total_us: f64 = timings.iter().map(|(_, us)| us).sum();
+    eprintln!("=== 450M Prefill Phase Profile (n={n}) ===");
+    eprintln!(
+        "  Total: {:.1} ms ({:.0} tok/s)",
+        total_us / 1000.0,
+        n as f64 / (total_us / 1e6)
+    );
+    let mut cats: Vec<_> = by_cat.into_iter().collect();
+    cats.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+    eprintln!(
+        "  {:30} {:>8} {:>6} {:>6}",
+        "Phase", "Total µs", "Count", "%"
+    );
+    for (cat, (total, count)) in &cats {
+        eprintln!(
+            "  {:30} {:>8.0} {:>6} {:>5.1}%",
+            cat,
+            total,
+            count,
+            total / total_us * 100.0
+        );
+    }
+}
