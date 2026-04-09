@@ -2309,7 +2309,13 @@ impl MetalLfm2Model {
                         std::mem::size_of_val(&params) as u64,
                         params.as_ptr() as *const _,
                     );
-                    enc.dispatch_thread_groups(sz1d((n as u32 * n_heads) as u64), sz1d(256));
+                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    let hd_val = head_dim as usize;
+                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+                    let q_per_tg = 8u32;
+                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
                 }
 
                 // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
@@ -2737,7 +2743,13 @@ impl MetalLfm2Model {
                         std::mem::size_of_val(&params) as u64,
                         params.as_ptr() as *const _,
                     );
-                    enc.dispatch_thread_groups(sz1d((n as u32 * n_heads) as u64), sz1d(256));
+                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    let hd_val = head_dim as usize;
+                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+                    let q_per_tg = 8u32;
+                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
                 });
 
                 // Output proj GEMM + add
