@@ -59,6 +59,8 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_f16: ComputePipelineState,
     gemv_q6_k: ComputePipelineState,
+    gemv_q8_0: ComputePipelineState,
+    gemv_q8_0_accum: ComputePipelineState,
     gemv_q4_0_fast_accum: ComputePipelineState,
     gemv_q4_0_fast_slim: ComputePipelineState,
     gemv_q4_0_fast_slim_accum: ComputePipelineState,
@@ -138,7 +140,8 @@ pub struct MetalLfm2Model {
     /// token_embd.weight as Q6_K natively in the GGUF (52 MB) — we upload
     /// those bytes directly and GEMV-decode on GPU. Avoids dequantization
     /// at load AND preserves original model precision.
-    embedding_q6k_offset: u64,
+    embedding_offset: u64,
+    embedding_dtype: DType,
     output_norm: Buffer,
 
     layers: Vec<MetalLayerWeights>,
@@ -210,6 +213,8 @@ impl MetalLfm2Model {
             gemv_q4_0_fast: ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast")?,
             gemv_f16: ctx.create_pipeline(shaders::GEMV_F16, "gemv_f16")?,
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
+            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0")?,
+            gemv_q8_0_accum: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0_accum")?,
             gemv_q4_0_fast_accum: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_accum")?,
             gemv_q4_0_fast_slim: ctx
@@ -280,10 +285,11 @@ impl MetalLfm2Model {
             None,
         );
 
-        // Embedding Q6K: reference mmap directly via offset (no copy).
+        // Embedding: reference mmap directly via offset (no copy).
         let emb_data = cpu_model.gguf().tensor_data("token_embd.weight")?;
         let mmap_base = cpu_model.gguf().mmap_data().as_ptr() as usize;
-        let embedding_q6k_offset = (emb_data.as_ptr() as usize - mmap_base) as u64;
+        let embedding_offset = (emb_data.as_ptr() as usize - mmap_base) as u64;
+        let embedding_dtype = cpu_model.embd_ref().dtype;
 
         // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
         // tensor data region in a usable format (f32 vs mmap'd bytes).
@@ -449,7 +455,8 @@ impl MetalLfm2Model {
             config,
             pipelines,
             params,
-            embedding_q6k_offset,
+            embedding_offset,
+            embedding_dtype,
             output_norm,
             layers,
             _mmap: mmap,
@@ -490,15 +497,28 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
 }
 
 impl MetalLfm2Model {
-    /// Dequantize one embedding row from Q6_K bytes into `dst`.
-    /// Dequantize one embedding row from Q6_K mmap data.
+    /// Dequantize one embedding row into `dst`. Handles Q6_K and Q8_0.
     fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
         let hs = self.state.embedding_hidden_size;
         debug_assert_eq!(dst.len(), hs);
-        let row_bytes = hs / 256 * 210; // Q6_K: 210 bytes per 256 elements
-        let mmap_start = self.embedding_q6k_offset as usize + token_id * row_bytes;
+        let row_bytes = match self.embedding_dtype {
+            DType::Q6K => hs / 256 * 210,
+            DType::Q8_0 => hs / 32 * 34,
+            DType::Q4_0 => hs / 32 * 18,
+            _ => hs * 4, // f32
+        };
+        let mmap_start = self.embedding_offset as usize + token_id * row_bytes;
         let row_data = &self._mmap[mmap_start..mmap_start + row_bytes];
-        crate::quant::dequantize_q6_k_row(row_data, dst);
+        match self.embedding_dtype {
+            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, dst),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, dst),
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, dst),
+            _ => {
+                // f32: direct copy
+                let src = bytemuck::cast_slice::<u8, f32>(row_data);
+                dst.copy_from_slice(src);
+            }
+        }
     }
 
     fn dispatch(
@@ -959,6 +979,15 @@ impl MetalLfm2Model {
                     ),
                 }
             }
+            DType::Q8_0 => (
+                if accumulate {
+                    &self.pipelines.gemv_q8_0_accum
+                } else {
+                    &self.pipelines.gemv_q8_0
+                },
+                w.m.div_ceil(2),
+                32u64,
+            ),
             _ => (&self.pipelines.gemv_f32, w.m, 32u64),
         };
         let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
@@ -976,18 +1005,41 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
-        // Q6_K vocab-head projection — reads the original 52 MB Q6_K bytes
-        // directly from GGUF (vs 268 MB f32 or 134 MB f16). 4 rows per TG,
-        // 64 threads/TG (2 simdgroups × 2 rows each).
         let m = self.config.vocab_size as u32;
-        let groups = m.div_ceil(4);
-        let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-        enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
-        enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_q6k_offset);
-        enc.set_buffer(1, Some(input), 0);
-        enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-        enc.dispatch_thread_groups(grid, sz1d(64));
+        match self.embedding_dtype {
+            DType::Q6K => {
+                // Q6_K: 4 rows/TG, 64 threads (2 simdgroups × 2 rows).
+                let groups = m.div_ceil(4);
+                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(64));
+            }
+            DType::Q8_0 => {
+                // Q8_0: 2 rows/TG, 32 threads.
+                let groups = m.div_ceil(2);
+                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(32));
+            }
+            _ => {
+                // Fallback: use f32 GEMV.
+                let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(32));
+            }
+        }
     }
 
     fn encode_rmsnorm(
@@ -2271,9 +2323,7 @@ impl MetalLfm2Model {
                 hs as u32,
             );
             // gate+up GEMV (1 dispatch each for all N tokens)
-            if lw.ffn_gate.dtype == DType::Q4_0
-                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
-            {
+            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                 self.encode_gemm(
                     enc,
                     &lw.ffn_gate,
@@ -3119,9 +3169,7 @@ impl MetalLfm2Model {
 
             // FFN
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0
-                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
-            {
+            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                 self.encode_gemv_gate_up(
                     enc,
                     &lw.ffn_gate,
@@ -3288,9 +3336,7 @@ impl MetalLfm2Model {
             // batched mode because ~2048 TGs redundantly reducing across the
             // hidden vector costs more than one dispatch saved.
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0
-                || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
-            {
+            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                 self.encode_gemv_gate_up(
                     enc,
                     &lw.ffn_gate,
@@ -3447,9 +3493,7 @@ impl MetalLfm2Model {
 
             self.gpu_sampled_pass(timer, cb, "ffn_norm_gemv", |enc| {
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0
-                    || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
-                {
+                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                     self.encode_gemv_gate_up(
                         enc,
                         &lw.ffn_gate,
@@ -3620,9 +3664,7 @@ impl MetalLfm2Model {
             // FFN: rmsnorm + gate/up GEMVs.
             self.profile_segment(timer, "ffn_norm_gemv", |enc| {
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0
-                    || lw.ffn_gate.dtype == DType::Q8_0 && lw.ffn_up.dtype == DType::Q4_0
-                {
+                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
                     self.encode_gemv_gate_up(
                         enc,
                         &lw.ffn_gate,

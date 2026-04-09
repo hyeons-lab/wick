@@ -2,7 +2,9 @@
 using namespace metal;
 
 // GEMM for Q8_0 weights using simdgroup matrix multiply-accumulate.
-// Same structure as gemm_q4_0 but with Q8_0 dequantization (34-byte blocks).
+//
+// Each threadgroup computes a 64×32 output tile via cooperative loads
+// to threadgroup memory and 8×8 simdgroup matrix operations.
 //
 // Dispatch: (ceil(n/32), ceil(m/64)) TGs × 128 threads (4 simdgroups).
 // Threadgroup memory: 8 KB (4 KB weights as half + 4 KB input as float).
@@ -27,11 +29,11 @@ struct GemmParams {
 
 struct block_q8_0 {
     half d;
-    char qs[32];
+    int8_t qs[32];
 };
 
 void dequantize_q8_0(device const block_q8_0 * xb, short il, thread half4x4 & reg) {
-    device const char * qs = xb->qs;
+    device const int8_t * qs = xb->qs;
     const float d = xb->d;
 
     float4x4 reg_f;
