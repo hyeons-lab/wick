@@ -61,6 +61,7 @@ struct MetalPipelines {
     gemv_q6_k: ComputePipelineState,
     gemv_q8_0: ComputePipelineState,
     gemv_q8_0_accum: ComputePipelineState,
+    gemv_q8_0_batch: ComputePipelineState,
     gemv_q4_0_fast_accum: ComputePipelineState,
     gemv_q4_0_fast_slim: ComputePipelineState,
     gemv_q4_0_fast_slim_accum: ComputePipelineState,
@@ -215,6 +216,7 @@ impl MetalLfm2Model {
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0")?,
             gemv_q8_0_accum: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0_accum")?,
+            gemv_q8_0_batch: ctx.create_pipeline(shaders::GEMV_Q8_0_BATCH, "gemv_q8_0_batch")?,
             gemv_q4_0_fast_accum: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_accum")?,
             gemv_q4_0_fast_slim: ctx
@@ -694,6 +696,57 @@ impl MetalLfm2Model {
         );
     }
 
+    /// Q8_0 batch GEMV — same structure as Q4_0 but with Q8_0 dequant.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_q8_0_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        x: &Buffer,
+        x_off_bytes: u64,
+        y: &Buffer,
+        y_off_bytes: u64,
+        n: u32,
+        x_stride: u32,
+        y_stride: u32,
+        accumulate: bool,
+    ) {
+        debug_assert_eq!(w.dtype, DType::Q8_0);
+        let params: [u32; 6] = [
+            w.m,
+            w.k,
+            n,
+            x_stride,
+            y_stride,
+            if accumulate { 1 } else { 0 },
+        ];
+        let rows_per_tg = 8u32;
+        let cols_per_tg = 4u32;
+        let row_groups = w.m.div_ceil(rows_per_tg);
+        let col_groups = n.div_ceil(cols_per_tg);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0_batch);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(x), x_off_bytes);
+        enc.set_buffer(2, Some(y), y_off_bytes);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: row_groups as u64,
+                height: col_groups as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
     /// True GEMM with simdgroup matrix ops. Falls back to batch GEMV for small n.
     #[allow(clippy::too_many_arguments)]
     fn encode_gemm(
@@ -715,7 +768,6 @@ impl MetalLfm2Model {
             w.dtype
         );
         if n < GEMM_MIN_N || w.k % 32 != 0 {
-            // Batch GEMV only supports Q4_0. For Q8_0, fall back to per-token GEMV.
             if w.dtype == DType::Q4_0 {
                 return self.encode_gemv_batch(
                     enc,
@@ -730,7 +782,21 @@ impl MetalLfm2Model {
                     accumulate,
                 );
             }
-            // Per-token GEMV fallback for Q8_0 and other dtypes.
+            if w.dtype == DType::Q8_0 {
+                return self.encode_gemv_q8_0_batch(
+                    enc,
+                    w,
+                    x,
+                    x_off_bytes,
+                    y,
+                    y_off_bytes,
+                    n,
+                    x_stride,
+                    y_stride,
+                    accumulate,
+                );
+            }
+            // Per-token GEMV fallback for other dtypes.
             let b4 = |off: usize| (off * 4) as u64;
             let m = w.m as usize;
             for i in 0..n as usize {
