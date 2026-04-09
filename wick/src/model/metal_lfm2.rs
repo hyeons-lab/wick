@@ -2043,7 +2043,7 @@ impl MetalLfm2Model {
                 let w_in = lw.conv_in_proj.as_ref().unwrap();
                 let w_out = lw.conv_out_proj.as_ref().unwrap();
 
-                // Phase 2: batch in_proj (GEMM for Q4_0, per-token GEMV for others)
+                // Phase 2: batch in_proj (GEMM for Q4_0, per-token GEMV for Q8_0/others)
                 if w_in.dtype == DType::Q4_0 {
                     self.encode_gemm(
                         enc,

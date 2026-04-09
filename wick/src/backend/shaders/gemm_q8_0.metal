@@ -27,14 +27,14 @@ struct GemmParams {
     uint _pad;
 };
 
-struct block_q8_0 {
-    half d;
-    int8_t qs[32];
-};
+constant constexpr uint Q8_BLOCK_BYTES = 34; // 2 (f16 scale) + 32 (int8 quants)
 
-void dequantize_q8_0(device const block_q8_0 * xb, short il, thread half4x4 & reg) {
-    device const int8_t * qs = xb->qs;
-    const float d = xb->d;
+// Dequantize 16 elements from a Q8_0 block using raw byte access.
+// blk points to the start of the block (f16 scale at offset 0, quants at offset 2).
+// il selects which half: 0 = elements 0-15, 1 = elements 16-31.
+void dequantize_q8_0(const device uchar * blk, short il, thread half4x4 & reg) {
+    const float d = float(*(const device half*)blk);
+    const device int8_t * qs = (const device int8_t*)(blk + 2);
 
     float4x4 reg_f;
     for (int i = 0; i < 16; i++) {
@@ -85,8 +85,11 @@ kernel void gemm_q8_0(
 
     short il = (tiitg % THREAD_PER_ROW);
 
-    device const block_q8_0 * x = (device const block_q8_0 *)(src0
-        + row_bytes * (r0 * BLOCK_SIZE_M + thread_row)) + il / nl;
+    // Raw byte pointer instead of struct pointer to avoid padding issues.
+    // Each block is exactly Q8_BLOCK_BYTES (34) bytes.
+    const device uchar * x_bytes = src0
+        + row_bytes * (r0 * BLOCK_SIZE_M + thread_row)
+        + (il / nl) * Q8_BLOCK_BYTES;
 
     device const float * y = src1
         + x_stride * (r1 * BLOCK_SIZE_N + thread_col)
@@ -94,7 +97,7 @@ kernel void gemm_q8_0(
 
     for (uint loop_k = 0; loop_k < k; loop_k += BLOCK_SIZE_K) {
         half4x4 temp_a;
-        dequantize_q8_0(x, il, temp_a);
+        dequantize_q8_0(x_bytes, il, temp_a);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -108,7 +111,7 @@ kernel void gemm_q8_0(
         *(threadgroup float2x4 *)(sb + 32 * 8 * (tiitg % THREAD_PER_COL) + 8 * (tiitg / THREAD_PER_COL)) = *((device float2x4 *) y);
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1) / nl : x;
+        x_bytes = (il < 2) ? x_bytes + ((2 + nl - 1) / nl) * Q8_BLOCK_BYTES : x_bytes;
         y += BLOCK_SIZE_K;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
