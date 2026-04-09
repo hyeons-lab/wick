@@ -281,6 +281,10 @@ impl KvPrefixCache {
 
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
     pub fn insert(&mut self, tokens: &[u32], snapshot: StateSnapshot) {
+        // Skip if cache is disabled (max_warm_entries == 0 and no disk).
+        if self.config.max_warm_entries == 0 && self.config.cache_dir.is_none() {
+            return;
+        }
         let hash = hash_tokens(tokens);
         let snap_bytes = snapshot.byte_size() as u64;
 

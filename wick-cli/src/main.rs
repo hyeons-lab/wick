@@ -123,6 +123,10 @@ enum Command {
         /// Max context window size (KV cache). Default 4096.
         #[arg(long, default_value_t = 4096)]
         context_size: usize,
+
+        /// Disable KV prefix caching entirely.
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -324,6 +328,7 @@ fn main() -> Result<()> {
             max_tokens,
             device,
             context_size,
+            no_cache,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("WICK_PROFILE").is_ok() {
@@ -338,6 +343,15 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+
+            if no_cache {
+                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                    cache_dir: None,
+                    max_warm_entries: 0,
+                    max_warm_bytes: 0,
+                    max_cold_bytes: 0,
+                });
+            }
 
             let mut tokens = Vec::new();
             if add_bos {
