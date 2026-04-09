@@ -16,7 +16,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 
 /// Per-layer block type (for hybrid architectures like LFM2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockType {
     Attention,
     GatedConv,
@@ -117,6 +117,16 @@ pub trait Model: Send {
     /// GPU memory allocated by this model (bytes). 0 for CPU-only backends.
     fn gpu_memory_bytes(&self) -> u64 {
         0
+    }
+
+    /// Snapshot the current KV and conv state for prefix caching.
+    fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
+        unimplemented!("snapshot_state not supported by this backend")
+    }
+
+    /// Restore a previously snapshotted state. Sets internal seq_len.
+    fn restore_state(&self, _snapshot: &crate::kv_cache::StateSnapshot) {
+        unimplemented!("restore_state not supported by this backend")
     }
 }
 

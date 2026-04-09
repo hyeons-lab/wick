@@ -25,6 +25,7 @@ pollster = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft = { workspace = true, optional = true }
+flatbuffers.workspace = true
 
 [features]
 default = []

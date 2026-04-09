@@ -1,3 +1,8 @@
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
 use crate::model::{BlockType, ModelConfig};
 
 /// Per-layer inference state.
@@ -155,4 +160,358 @@ impl InferenceState {
             panic!("kv_cache called on non-attention layer {layer}");
         }
     }
+}
+
+// ── KV Prefix Cache ─────────────────────────────────────────────────────
+
+/// Snapshot of model KV + conv state after prefilling a token sequence.
+/// Backend-agnostic: stores raw bytes that the backend knows how to restore.
+#[derive(Clone)]
+pub struct StateSnapshot {
+    pub layers: Vec<LayerSnapshot>,
+    pub seq_len: usize,
+}
+
+#[derive(Clone)]
+pub enum LayerSnapshot {
+    Attention { k_data: Vec<u8>, v_data: Vec<u8> },
+    Conv { buffer: Vec<u8> },
+}
+
+impl StateSnapshot {
+    pub fn byte_size(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                LayerSnapshot::Attention { k_data, v_data } => k_data.len() + v_data.len(),
+                LayerSnapshot::Conv { buffer } => buffer.len(),
+            })
+            .sum()
+    }
+}
+
+/// Configuration for the KV prefix cache.
+pub struct KvCacheConfig {
+    /// Directory for cold-tier (disk) cache files. None = disk caching disabled.
+    pub cache_dir: Option<PathBuf>,
+    /// Max warm-tier (memory) entries.
+    pub max_warm_entries: usize,
+    /// Max warm-tier total bytes.
+    pub max_warm_bytes: u64,
+    /// Max cold-tier (disk) total size in bytes.
+    pub max_cold_bytes: u64,
+}
+
+impl Default for KvCacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_dir: None,
+            max_warm_entries: 32,
+            max_warm_bytes: 256 * 1024 * 1024,
+            max_cold_bytes: 10 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+struct CacheEntry {
+    tokens: Vec<u32>,
+    snapshot: StateSnapshot,
+    last_used: Cell<Instant>,
+}
+
+/// Two-tier KV prefix cache: warm (memory) + cold (disk via FlatBuffers).
+pub struct KvPrefixCache {
+    warm: HashMap<u64, CacheEntry>,
+    config: KvCacheConfig,
+    model_fingerprint: u64,
+    warm_bytes: u64,
+}
+
+impl KvPrefixCache {
+    pub fn new(config: KvCacheConfig, model_config: &ModelConfig) -> Self {
+        Self {
+            warm: HashMap::new(),
+            model_fingerprint: model_fingerprint(model_config),
+            config,
+            warm_bytes: 0,
+        }
+    }
+
+    /// Find the longest cached prefix matching the start of `tokens`.
+    pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
+        // Warm tier: flat scan. Clone the snapshot to avoid borrow issues.
+        let warm_hit = self
+            .warm
+            .values()
+            .filter(|e| tokens.starts_with(&e.tokens))
+            .max_by_key(|e| e.tokens.len())
+            .map(|e| {
+                e.last_used.set(Instant::now());
+                (e.snapshot.clone(), e.tokens.len())
+            });
+
+        if warm_hit.is_some() {
+            return warm_hit;
+        }
+
+        // Cold tier: scan cache dir for matching files.
+        if let Some(dir) = self.config.cache_dir.clone() {
+            if let Some(snapshot) = self.find_cold_prefix(&dir, tokens) {
+                let len = snapshot.seq_len;
+                // Promote to warm.
+                let hash = hash_tokens(&tokens[..len]);
+                let snap_bytes = snapshot.byte_size() as u64;
+                self.evict_warm_if_needed(snap_bytes);
+                self.warm_bytes += snap_bytes;
+                let snapshot_clone = snapshot.clone();
+                self.warm.insert(
+                    hash,
+                    CacheEntry {
+                        tokens: tokens[..len].to_vec(),
+                        snapshot,
+                        last_used: Cell::new(Instant::now()),
+                    },
+                );
+                return Some((snapshot_clone, len));
+            }
+        }
+
+        None
+    }
+
+    /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
+    pub fn insert(&mut self, tokens: &[u32], snapshot: StateSnapshot) {
+        let hash = hash_tokens(tokens);
+        let snap_bytes = snapshot.byte_size() as u64;
+
+        // Evict from warm if needed.
+        self.evict_warm_if_needed(snap_bytes);
+
+        // Save to cold tier.
+        if let Some(dir) = &self.config.cache_dir {
+            self.save_cold(dir, tokens, &snapshot);
+        }
+
+        self.warm_bytes += snap_bytes;
+        self.warm.insert(
+            hash,
+            CacheEntry {
+                tokens: tokens.to_vec(),
+                snapshot,
+                last_used: Cell::new(Instant::now()),
+            },
+        );
+    }
+
+    /// Total bytes in warm tier.
+    pub fn warm_bytes(&self) -> u64 {
+        self.warm_bytes
+    }
+
+    /// Number of warm entries.
+    pub fn warm_count(&self) -> usize {
+        self.warm.len()
+    }
+
+    fn evict_warm_if_needed(&mut self, new_bytes: u64) {
+        while (self.warm.len() >= self.config.max_warm_entries
+            || self.warm_bytes + new_bytes > self.config.max_warm_bytes)
+            && !self.warm.is_empty()
+        {
+            let oldest = self
+                .warm
+                .iter()
+                .min_by_key(|(_, e)| e.last_used.get())
+                .map(|(k, _)| *k);
+            if let Some(key) = oldest {
+                if let Some(removed) = self.warm.remove(&key) {
+                    self.warm_bytes -= removed.snapshot.byte_size() as u64;
+                }
+            }
+        }
+    }
+
+    // ── Cold tier (FlatBuffers) ─────────────────────────────────────
+
+    fn cold_filename(&self, token_hash: u64) -> String {
+        format!(
+            "{:016x}_{:016x}.kvcache",
+            self.model_fingerprint, token_hash
+        )
+    }
+
+    fn save_cold(&self, dir: &Path, tokens: &[u32], snapshot: &StateSnapshot) {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+
+        let mut builder =
+            flatbuffers::FlatBufferBuilder::with_capacity(snapshot.byte_size() + 1024);
+
+        // Build layers.
+        let mut layer_offsets = Vec::with_capacity(snapshot.layers.len());
+        for layer in &snapshot.layers {
+            let (tag, k_off, v_off) = match layer {
+                LayerSnapshot::Attention { k_data, v_data } => {
+                    let k = builder.create_vector(k_data);
+                    let v = builder.create_vector(v_data);
+                    (0u8, Some(k), Some(v))
+                }
+                LayerSnapshot::Conv { buffer } => {
+                    let k = builder.create_vector(buffer);
+                    (1u8, Some(k), None)
+                }
+            };
+            let ld = crate::generated::wick::cache::LayerData::create(
+                &mut builder,
+                &crate::generated::wick::cache::LayerDataArgs {
+                    type_tag: tag,
+                    k_data: k_off,
+                    v_data: v_off,
+                },
+            );
+            layer_offsets.push(ld);
+        }
+
+        let layers_vec = builder.create_vector(&layer_offsets);
+        let tokens_vec = builder.create_vector(tokens);
+
+        let entry = crate::generated::wick::cache::KvCacheEntry::create(
+            &mut builder,
+            &crate::generated::wick::cache::KvCacheEntryArgs {
+                model_fingerprint: self.model_fingerprint,
+                seq_len: snapshot.seq_len as u32,
+                tokens: Some(tokens_vec),
+                layers: Some(layers_vec),
+            },
+        );
+        builder.finish(entry, None);
+
+        let data = builder.finished_data();
+        let hash = hash_tokens(tokens);
+        let path = dir.join(self.cold_filename(hash));
+        let _ = std::fs::write(&path, data);
+
+        self.evict_cold_if_needed(dir);
+    }
+
+    fn find_cold_prefix(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        let fp_prefix = format!("{:016x}_", self.model_fingerprint);
+
+        let mut best: Option<(StateSnapshot, usize)> = None;
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(&fp_prefix) || !name_str.ends_with(".kvcache") {
+                continue;
+            }
+
+            if let Some(snapshot) = self.load_cold_file(&entry.path(), tokens) {
+                let len = snapshot.seq_len;
+                if best.as_ref().is_none_or(|(_, bl)| len > *bl) {
+                    best = Some((snapshot, len));
+                }
+            }
+        }
+
+        best.map(|(s, _)| s)
+    }
+
+    fn load_cold_file(&self, path: &Path, expected_prefix: &[u32]) -> Option<StateSnapshot> {
+        let data = std::fs::read(path).ok()?;
+        let entry = flatbuffers::root::<crate::generated::wick::cache::KvCacheEntry>(&data).ok()?;
+
+        // Validate model fingerprint.
+        if entry.model_fingerprint() != self.model_fingerprint {
+            return None;
+        }
+
+        let cached_tokens = entry.tokens()?;
+        let seq_len = entry.seq_len() as usize;
+
+        // Check that cached tokens are a prefix of expected tokens.
+        if cached_tokens.len() > expected_prefix.len() {
+            return None;
+        }
+        for (i, ct) in cached_tokens.iter().enumerate() {
+            if ct != expected_prefix[i] {
+                return None;
+            }
+        }
+
+        // Reconstruct snapshot.
+        let layers_fb = entry.layers()?;
+        let mut layers = Vec::with_capacity(layers_fb.len());
+        for l in layers_fb {
+            match l.type_tag() {
+                0 => {
+                    layers.push(LayerSnapshot::Attention {
+                        k_data: l.k_data()?.iter().collect(),
+                        v_data: l.v_data()?.iter().collect(),
+                    });
+                }
+                1 => {
+                    layers.push(LayerSnapshot::Conv {
+                        buffer: l.k_data()?.iter().collect(),
+                    });
+                }
+                _ => return None,
+            }
+        }
+
+        Some(StateSnapshot { layers, seq_len })
+    }
+
+    fn evict_cold_if_needed(&self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "kvcache"))
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                Some((e.path(), meta.len(), meta.modified().ok()?))
+            })
+            .collect();
+
+        let total: u64 = files.iter().map(|(_, sz, _)| sz).sum();
+        if total <= self.config.max_cold_bytes {
+            return;
+        }
+
+        // Sort by mtime ascending (oldest first).
+        files.sort_by_key(|(_, _, t)| *t);
+        let mut remaining = total;
+        for (path, sz, _) in &files {
+            if remaining <= self.config.max_cold_bytes {
+                break;
+            }
+            let _ = std::fs::remove_file(path);
+            remaining -= sz;
+        }
+    }
+}
+
+fn hash_tokens(tokens: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tokens.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compute a fingerprint for a model configuration.
+/// Two models with different fingerprints have incompatible KV cache layouts.
+pub fn model_fingerprint(config: &ModelConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.architecture.hash(&mut hasher);
+    config.n_layers.hash(&mut hasher);
+    config.hidden_size.hash(&mut hasher);
+    config.n_heads.hash(&mut hasher);
+    config.block_types.hash(&mut hasher);
+    config.kv_heads_per_layer.hash(&mut hasher);
+    hasher.finish()
 }

@@ -180,6 +180,7 @@ pub struct MetalLfm2Model {
     mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
+    prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
 }
 
 impl MetalLfm2Model {
@@ -396,6 +397,11 @@ impl MetalLfm2Model {
                 .upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32, hs as u32])),
         };
 
+        let prefix_cache = std::cell::RefCell::new(crate::kv_cache::KvPrefixCache::new(
+            crate::kv_cache::KvCacheConfig::default(),
+            &config,
+        ));
+
         // GPU timestamp profiler. Must be built before `ctx` is moved into the struct.
         let gpu_timer = if std::env::var("WICK_PROFILE").as_deref() == Ok("gpu") {
             build_gpu_timer(&ctx, 512)
@@ -460,6 +466,7 @@ impl MetalLfm2Model {
                 None
             },
             gpu_timer,
+            prefix_cache,
         })
     }
 }
@@ -1776,7 +1783,110 @@ impl Model for MetalLfm2Model {
         self.ctx.device.current_allocated_size()
     }
 
+    fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
+        use crate::kv_cache::{LayerSnapshot, StateSnapshot};
+        let seq_len = self.state.seq_len.get();
+        let cfg = &self.config;
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::Attention {
+                let head_dim = cfg.hidden_size / cfg.n_heads;
+                let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                let byte_len = seq_len * kv_dim * 2; // f16 = 2 bytes
+                let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                let k_data = unsafe {
+                    std::slice::from_raw_parts(k_cache.contents() as *const u8, byte_len).to_vec()
+                };
+                let v_data = unsafe {
+                    std::slice::from_raw_parts(v_cache.contents() as *const u8, byte_len).to_vec()
+                };
+                layers.push(LayerSnapshot::Attention { k_data, v_data });
+            } else {
+                let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+                let byte_len = conv_buf.length() as usize;
+                let buffer = unsafe {
+                    std::slice::from_raw_parts(conv_buf.contents() as *const u8, byte_len).to_vec()
+                };
+                layers.push(LayerSnapshot::Conv { buffer });
+            }
+        }
+
+        StateSnapshot { layers, seq_len }
+    }
+
+    fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
+        use crate::kv_cache::LayerSnapshot;
+        let cfg = &self.config;
+        for (i, layer_snap) in snapshot.layers.iter().enumerate() {
+            match layer_snap {
+                LayerSnapshot::Attention { k_data, v_data } => {
+                    let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            k_data.as_ptr(),
+                            k_cache.contents() as *mut u8,
+                            k_data.len(),
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            v_data.as_ptr(),
+                            v_cache.contents() as *mut u8,
+                            v_data.len(),
+                        );
+                    }
+                }
+                LayerSnapshot::Conv { buffer } => {
+                    let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buffer.as_ptr(),
+                            conv_buf.contents() as *mut u8,
+                            buffer.len(),
+                        );
+                    }
+                }
+            }
+        }
+        self.state.seq_len.set(snapshot.seq_len);
+    }
+
     fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        // Cache lookup: only for fresh prefills (start_pos == 0).
+        if start_pos == 0 {
+            let hit = self.prefix_cache.borrow_mut().find_longest_prefix(tokens);
+            if let Some((snapshot, prefix_len)) = hit {
+                // Always keep at least 1 token for forward_prefill_inner to produce logits.
+                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                if use_len > 0 {
+                    self.restore_state(&snapshot);
+                    state.seq_len = use_len;
+
+                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                    self.prefix_cache
+                        .borrow_mut()
+                        .insert(tokens, self.snapshot_state());
+                    return logits;
+                }
+            }
+        }
+
+        let logits = self.forward_prefill_inner(tokens, start_pos, state);
+        if start_pos == 0 {
+            self.prefix_cache
+                .borrow_mut()
+                .insert(tokens, self.snapshot_state());
+        }
+        logits
+    }
+}
+
+impl MetalLfm2Model {
+    fn forward_prefill_inner(
         &self,
         tokens: &[u32],
         start_pos: usize,

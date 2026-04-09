@@ -71,14 +71,18 @@ fn bench_prefill(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
     let model = MetalLfm2Model::from_gguf(gguf, model_path, 8192).unwrap();
     let cfg = model.config();
 
-    let tokens: Vec<u32> = (0..n_tokens as u32).map(|i| i % 1000 + 1).collect();
-
-    // Warmup
+    // Warmup with unique tokens (offset 9999 to avoid cache collisions with runs).
+    let warmup_tokens: Vec<u32> = (0..n_tokens as u32).map(|i| i % 1000 + 9999).collect();
     let mut state = wick::kv_cache::InferenceState::from_config(cfg);
-    let _ = model.forward_prefill(&tokens, 0, &mut state);
+    let _ = model.forward_prefill(&warmup_tokens, 0, &mut state);
 
     let mut tok_per_sec = Vec::new();
-    for _ in 0..runs {
+    for run in 0..runs {
+        // Unique tokens per run to avoid KV prefix cache hits.
+        // Use run index in a way that changes the first token (cache key).
+        let tokens: Vec<u32> = (0..n_tokens as u32)
+            .map(|i| (i.wrapping_mul(7) + run as u32 * 3571 + 1) % 50000 + 1)
+            .collect();
         let mut state = wick::kv_cache::InferenceState::from_config(cfg);
         let t0 = Instant::now();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
@@ -530,4 +534,58 @@ fn test_prefill_phase_profile() {
         let pct = total / total_us * 100.0;
         eprintln!("  {:30} {:>8.0} {:>6} {:>5.1}%", cat, total, count, pct);
     }
+}
+
+/// Verify that KV prefix cache produces identical results on cache hit.
+#[test]
+#[ignore]
+fn test_prefix_cache_correctness() {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") else {
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let cfg = model.config();
+
+    let tokens: Vec<u32> = (0..64u32).map(|i| i % 1000 + 1).collect();
+
+    // First call: cache miss → full prefill.
+    let mut state1 = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits1 = model.forward_prefill(&tokens, 0, &mut state1);
+
+    // Second call: cache hit → should restore and produce identical logits.
+    let mut state2 = wick::kv_cache::InferenceState::from_config(cfg);
+    let t0 = Instant::now();
+    let logits2 = model.forward_prefill(&tokens, 0, &mut state2);
+    let hit_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    assert_eq!(logits1.len(), logits2.len());
+    let mut max_diff = 0.0f32;
+    for i in 0..logits1.len() {
+        max_diff = max_diff.max((logits1[i] - logits2[i]).abs());
+    }
+
+    eprintln!("=== Prefix Cache Correctness ===");
+    eprintln!("  First call (miss): full prefill");
+    eprintln!("  Second call (hit): {hit_ms:.2} ms");
+    eprintln!("  Max logit diff: {max_diff:.6}");
+    assert!(
+        max_diff < 0.05,
+        "Cache hit logits differ: max_diff={max_diff}"
+    );
+
+    // Third call: prefix match with extra tokens.
+    let mut extended = tokens.clone();
+    extended.extend_from_slice(&[42, 43, 44, 45]);
+    let mut state3 = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits3 = model.forward_prefill(&extended, 0, &mut state3);
+    eprintln!(
+        "  Extended prefill (64+4 tokens): logits[0]={:.4}",
+        logits3[0]
+    );
+    // Just check it doesn't crash and produces valid logits.
+    assert!(logits3[0].is_finite());
 }
