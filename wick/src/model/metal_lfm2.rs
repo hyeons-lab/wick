@@ -181,7 +181,7 @@ pub struct MetalLfm2Model {
     mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
-    prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
+    pub prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
 }
 
 impl MetalLfm2Model {

@@ -222,7 +222,7 @@ struct CacheEntry {
 /// Two-tier KV prefix cache: warm (memory) + cold (disk via FlatBuffers).
 pub struct KvPrefixCache {
     warm: HashMap<u64, CacheEntry>,
-    config: KvCacheConfig,
+    pub config: KvCacheConfig,
     model_fingerprint: u64,
     warm_bytes: u64,
 }

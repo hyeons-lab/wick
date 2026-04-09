@@ -589,3 +589,75 @@ fn test_prefix_cache_correctness() {
     // Just check it doesn't crash and produces valid logits.
     assert!(logits3[0].is_finite());
 }
+
+/// Verify cold-tier (disk) cache roundtrip: save → load → verify logits match.
+#[test]
+#[ignore]
+fn test_prefix_cache_cold_roundtrip() {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") else {
+        return;
+    };
+
+    let cache_dir = std::env::temp_dir().join("wick_test_cold_cache");
+    let _ = std::fs::remove_dir_all(&cache_dir);
+
+    // First model: prefill and cache to disk.
+    let gguf1 = wick::gguf::GgufFile::open(&path).unwrap();
+    let model1 = MetalLfm2Model::from_gguf(gguf1, &path, 8192).unwrap();
+    let cfg = model1.config();
+
+    let tokens: Vec<u32> = (0..64u32).map(|i| i % 1000 + 1).collect();
+
+    // Configure cache with disk.
+    {
+        let mut cache = model1.prefix_cache.borrow_mut();
+        cache.config.cache_dir = Some(cache_dir.clone());
+    }
+
+    // Prefill — triggers auto-cache (warm + cold).
+    let mut state1 = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits1 = model1.forward_prefill(&tokens, 0, &mut state1);
+
+    // Verify cold file exists.
+    let cold_files: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "kvcache"))
+        .collect();
+    eprintln!("Cold cache files: {}", cold_files.len());
+    assert!(!cold_files.is_empty(), "No cold cache files created");
+
+    // Second model: fresh instance, load from cold cache.
+    let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
+    let model2 = MetalLfm2Model::from_gguf(gguf2, &path, 8192).unwrap();
+    {
+        let mut cache = model2.prefix_cache.borrow_mut();
+        cache.config.cache_dir = Some(cache_dir.clone());
+    }
+
+    // Prefill with same tokens — should hit cold cache.
+    let mut state2 = wick::kv_cache::InferenceState::from_config(cfg);
+    let t0 = Instant::now();
+    let logits2 = model2.forward_prefill(&tokens, 0, &mut state2);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Compare logits.
+    let mut max_diff = 0.0f32;
+    for i in 0..logits1.len() {
+        max_diff = max_diff.max((logits1[i] - logits2[i]).abs());
+    }
+
+    eprintln!("=== Cold Cache Roundtrip ===");
+    eprintln!("  Cold restore + prefill: {ms:.1} ms");
+    eprintln!("  Max logit diff: {max_diff:.6}");
+    assert!(
+        max_diff < 0.05,
+        "Cold cache logits differ: max_diff={max_diff}"
+    );
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
