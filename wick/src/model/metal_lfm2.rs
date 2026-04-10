@@ -2604,15 +2604,11 @@ impl MetalLfm2Model {
         let b4 = |off: usize| (off * 4) as u64;
         let batch_buf = &self.prefill_batch_buf;
 
-        // Stage embeddings.
-        {
-            let mut stage = vec![0.0f32; hs * n];
+        // Stage all N embedding rows directly into batch_buf's mapped memory.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
             for (i, &t) in tokens.iter().enumerate() {
-                self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
-            }
-            unsafe {
-                let dst = batch_buf.contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(stage.as_ptr(), dst, stage.len());
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
             }
         }
 

@@ -60,10 +60,11 @@ inline void head_rope(
     uint rope_type
 ) {
     uint half_dim = head_dim / 2u;
+    // theta[d] = pos * freq_base^(-2d/head_dim). Compute with powr for O(1)
+    // per thread instead of an O(d) iterative multiplication loop.
     float theta_scale = powr(freq_base, -2.0f / float(head_dim));
     for (uint d = tid; d < half_dim; d += 256u) {
-        float theta = float(pos);
-        for (uint i = 0; i < d; i++) { theta *= theta_scale; }
+        float theta = float(pos) * powr(theta_scale, float(d));
         float cos_a = cos(theta);
         float sin_a = sin(theta);
         if (rope_type == 0u) {

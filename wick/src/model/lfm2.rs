@@ -769,8 +769,14 @@ impl Lfm2Model {
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let mut normed = vec![0.0f32; hs];
-        let mut ffn_input = vec![0.0f32; hs];
+        // Reuse pre-allocated scratch from InferenceState instead of allocating
+        // fresh Vecs on every call. Take them out of `state.scratch` to avoid
+        // borrow-checker conflicts with the mutable `state` passed to
+        // forward_attn_block / forward_conv_block below; put them back at the end.
+        let mut normed = std::mem::take(&mut state.scratch.normed);
+        let mut ffn_input = std::mem::take(&mut state.scratch.ffn_input);
+        normed.resize(hs, 0.0);
+        ffn_input.resize(hs, 0.0);
 
         for i in 0..cfg.n_layers {
             normed.copy_from_slice(hidden);
@@ -860,6 +866,10 @@ impl Lfm2Model {
 
         cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
         state.seq_len += 1;
+
+        // Return the scratch buffers for the next call.
+        state.scratch.normed = normed;
+        state.scratch.ffn_input = ffn_input;
     }
 }
 
