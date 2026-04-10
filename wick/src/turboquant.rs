@@ -898,7 +898,11 @@ pub fn attn_scores_turboquant_gqa(
                     pos_sum += q_jl[base + 7] * ((byte >> 7) & 1) as f32;
                 }
                 let signed_sum = 2.0 * pos_sum - total_sum;
-                let correction = residual_norm * qjl_scale * signed_sum;
+                // residual_norm is stored in unit-normalized key space, so the
+                // correction must be rescaled by the original key norm to match
+                // polar_dot (which has already been multiplied by norm above).
+                // Math: q·k = norm · (polar_dot_unscaled + residual_norm · q_rot·residual_unit)
+                let correction = norm * residual_norm * qjl_scale * signed_sum;
 
                 scores_flat[g * seq_len + t] = (polar_dot + correction) * scale;
             }

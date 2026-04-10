@@ -901,7 +901,10 @@ pub unsafe fn attn_scores_turboquant_neon(
                 }
                 let pos_sum = vaddvq_f32(vaddq_f32(pos_acc0, pos_acc1));
                 let signed_sum = 2.0 * pos_sum - total_sum;
-                let correction = residual_norm * qjl_scale * signed_sum;
+                // residual_norm is stored in unit-normalized key space, so
+                // the correction must be rescaled by the original key norm
+                // to match polar_dot (which was multiplied by norm above).
+                let correction = norm * residual_norm * qjl_scale * signed_sum;
 
                 scores_flat[g * seq_len + t] = (polar_dot + correction) * scale;
             }
