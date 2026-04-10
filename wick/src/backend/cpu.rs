@@ -3,9 +3,10 @@
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
 use crate::quant::{
-    BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32,
-    vec_dot_q6_k_f32, vec_dot_q8_0_f32,
+    BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32,
 };
+#[cfg(not(target_arch = "aarch64"))]
+use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
 use crate::tensor::DType;
 use std::mem::size_of;
 
@@ -116,8 +117,36 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
-/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k]. No inner allocation.
-pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// Parallel for_each with chunking to prevent over-splitting.
+/// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
+pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
+    let chunk_size = (y.len() / rayon::current_num_threads()).max(min_rows);
+    y.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let base = ci * chunk_size;
+            for (j, yi) in chunk.iter_mut().enumerate() {
+                f((base + j, yi));
+            }
+        });
+}
+
+#[allow(clippy::ptr_arg)]
+/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
+///
+/// On aarch64, uses integer dot product with caller-provided Q8_0 scratch buffers
+/// to avoid per-call heap allocation. The scratch buffers are resized as needed.
+pub fn gemv_q4_0_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
@@ -125,20 +154,107 @@ pub fn gemv_q4_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ4_0>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
-            sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q4_0_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
-        *yi = sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (q8_scales, q8_quants);
+        for (i, yi) in y.iter_mut().enumerate() {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ4_0>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_0) };
+                sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+            }
+            *yi = sum;
+        }
     }
 }
 
-/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k]. No inner allocation.
-pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// Minimum output dimension to use parallel GEMV (avoid rayon overhead for small ops).
+pub const GEMV_PAR_THRESHOLD: usize = 256;
+
+/// Quantize f32 vector to Q8_0 format for use with `gemv_q4_0_with_q8`.
+/// Returns (scales, quants). On aarch64, uses NEON-vectorized quantization.
+#[cfg(target_arch = "aarch64")]
+pub fn quantize_f32_to_q8_0(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
+    assert_eq!(
+        x.len() % 32,
+        0,
+        "quantize_f32_to_q8_0: x.len() must be divisible by 32"
+    );
+    let n_blocks = x.len() / 32;
+    let mut scales = vec![0.0f32; n_blocks];
+    let mut quants = vec![0i8; x.len()];
+    unsafe {
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(x, &mut scales, &mut quants);
+    }
+    (scales, quants)
+}
+
+/// GEMV with pre-quantized Q8_0 input. Dispatches to Q4_0 or Q8_0 integer path.
+/// For other dtypes, falls back to the regular f32 path.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_with_preq(
+    dtype: DType,
+    a_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    x_f32: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    match dtype {
+        DType::Q4_0 => gemv_q4_0_with_q8(a_quant, x_scales, x_quants, y, m, k),
+        DType::Q8_0 => unsafe {
+            crate::backend::simd::neon::gemv_q8_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
+        DType::Q6K => unsafe {
+            crate::backend::simd::neon::gemv_q6k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
+        _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
+    }
+}
+
+/// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
+/// the same input is used for multiple weight matrices (e.g., ffn_gate + ffn_up).
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q4_0_with_q8(
+    a_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k);
+    }
+}
+
+#[allow(clippy::ptr_arg)]
+/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k].
+/// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
+/// with vdotq_s32 — ~4x fewer instructions than f32 widening path).
+pub fn gemv_q8_0_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
@@ -146,40 +262,89 @@ pub fn gemv_q8_0_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ8_0>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
-            sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q8_0_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
-        *yi = sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (q8_scales, q8_quants);
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ8_0>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ8_0) };
+                sum += vec_dot_q8_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
+            }
+            *yi = sum;
+        };
+
+        if m >= GEMV_PAR_THRESHOLD {
+            par_rows(y, 512, compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 
-/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. No inner allocation.
-pub fn gemv_q6k_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
+/// On aarch64, quantizes x to Q8_0 then uses integer Q6_K × Q8_0 dot product with vdotq_s32.
+#[allow(clippy::ptr_arg)]
+#[allow(unused_variables)]
+pub fn gemv_q6k_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
-    let blocks_per_row = k / 256;
-    let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
-    debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
-        let row_start = i * row_bytes;
-        let mut sum = 0.0f32;
-        for bi in 0..blocks_per_row {
-            let offset = row_start + bi * size_of::<BlockQ6K>();
-            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
-            sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            crate::backend::simd::neon::gemv_q6k_f32_neon(
+                a_quant, x, y, m, k, q8_scales, q8_quants,
+            );
         }
-        *yi = sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let offset = row_start + bi * size_of::<BlockQ6K>();
+                let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ6K) };
+                sum += vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+            }
+            *yi = sum;
+        };
+
+        if m >= GEMV_PAR_THRESHOLD {
+            par_rows(y, 512, compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 
-/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. No inner allocation.
+/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. Parallelized across rows.
 pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -188,7 +353,7 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
 
-    for (i, yi) in y.iter_mut().enumerate() {
+    let compute_row = |(i, yi): (usize, &mut f32)| {
         let row_start = i * row_bytes;
         let mut sum = 0.0f32;
         for bi in 0..blocks_per_row {
@@ -197,6 +362,12 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
             sum += vec_dot_q4_k_m_f32(block, &x[bi * 256..(bi + 1) * 256]);
         }
         *yi = sum;
+    };
+
+    if m >= GEMV_PAR_THRESHOLD {
+        par_rows(y, 512, compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
     }
 }
 
@@ -218,12 +389,56 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
 }
 
 /// Dispatch GEMV based on dtype: y[m] = W[m,k] @ x[k].
-pub fn gemv_dispatch(dtype: DType, data: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// For Q4_0, pass scratch buffers to avoid per-call allocation.
+pub fn gemv_dispatch(
+    dtype: DType,
+    data: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+) {
     match dtype {
+        DType::Q4_0 => {
+            if let Some((scales, quants)) = q8_scratch {
+                gemv_q4_0_f32(data, x, y, m, k, scales, quants);
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q4_0_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
+        DType::Q8_0 => {
+            if let Some((scales, quants)) = q8_scratch {
+                gemv_q8_0_f32(data, x, y, m, k, scales, quants);
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
         DType::F32 => gemv_f32(data, x, y, m, k),
-        DType::Q4_0 => gemv_q4_0_f32(data, x, y, m, k),
-        DType::Q8_0 => gemv_q8_0_f32(data, x, y, m, k),
-        DType::Q6K => gemv_q6k_f32(data, x, y, m, k),
+        DType::Q6K => {
+            #[cfg(target_arch = "aarch64")]
+            if let Some((scales, quants)) = q8_scratch {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, scales, quants);
+                }
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                unsafe {
+                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, &mut s, &mut q);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
     }
@@ -255,6 +470,15 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
 pub fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+/// Fused SiLU activation + element-wise multiply: gate = silu(gate) * up.
+/// Single pass instead of separate silu_inplace + mul_inplace.
+pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        *g = *g / (1.0 + (-*g).exp()) * u;
     }
 }
 
@@ -464,6 +688,26 @@ mod tests {
         assert!((x[1] - 0.7311).abs() < 1e-3);
         assert!((x[2] - (-0.2689)).abs() < 1e-3);
         assert!((x[3] - 4.9665).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_silu_mul_inplace() {
+        let mut gate = vec![0.0, 1.0, -1.0, 5.0];
+        let up = vec![2.0, 3.0, 0.5, 1.0];
+
+        // Reference: silu(gate) * up
+        let mut gate_ref = gate.clone();
+        silu_inplace(&mut gate_ref);
+        mul_inplace(&mut gate_ref, &up);
+
+        silu_mul_inplace(&mut gate, &up);
+
+        for (i, (&got, &expected)) in gate.iter().zip(gate_ref.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "silu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
     }
 
     #[test]

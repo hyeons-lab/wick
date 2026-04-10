@@ -3,15 +3,42 @@
 // Platform-specific implementations behind cfg gates.
 // The dispatch functions select the best available implementation at compile time.
 
+#[cfg(target_arch = "aarch64")]
+use crate::quant::BlockQ6K;
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
 
+/// Send+Sync pointer wrapper for parallel GEMV closures.
+/// Stores pointers as usize to satisfy Send+Sync (raw pointers don't implement them).
+/// Safety: callers ensure non-overlapping row access and immutable source data.
 #[cfg(target_arch = "aarch64")]
-mod neon {
+#[derive(Clone, Copy)]
+struct GemvPtrs {
+    a: usize,
+    xq: usize,
+    xs: usize,
+}
+#[cfg(target_arch = "aarch64")]
+impl GemvPtrs {
+    fn a(&self) -> *const u8 {
+        self.a as *const u8
+    }
+    fn xq(&self) -> *const i8 {
+        self.xq as *const i8
+    }
+    fn xs(&self) -> *const f32 {
+        self.xs as *const f32
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop, unused_unsafe)]
+pub(crate) mod neon {
     use super::*;
     use std::arch::aarch64::*;
+    use std::mem::size_of;
 
     /// NEON-optimized Q8_0 dot product with f32 vector.
     #[target_feature(enable = "neon")]
@@ -173,6 +200,442 @@ mod neon {
             }
 
             sumf
+        }
+    }
+
+    /// Quantize f32 vector to Q8_0 format (NEON-vectorized, f16 scale roundtrip).
+    /// Stores scales and quants into caller-provided buffers.
+    /// Returns the number of blocks written.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn quantize_f32_to_q8_0_neon(
+        x: &[f32],
+        scales: &mut [f32],
+        quants: &mut [i8],
+    ) -> usize {
+        unsafe {
+            let k = x.len();
+            debug_assert_eq!(
+                k % 32,
+                0,
+                "quantize_f32_to_q8_0: x.len() must be divisible by 32"
+            );
+            debug_assert!(scales.len() >= k / 32);
+            debug_assert!(quants.len() >= k);
+            let n_blocks = k / 32;
+
+            for bi in 0..n_blocks {
+                let base = bi * 32;
+                let x_ptr = x.as_ptr().add(base);
+
+                let s0 = vld1q_f32(x_ptr);
+                let s1 = vld1q_f32(x_ptr.add(4));
+                let s2 = vld1q_f32(x_ptr.add(8));
+                let s3 = vld1q_f32(x_ptr.add(12));
+                let s4 = vld1q_f32(x_ptr.add(16));
+                let s5 = vld1q_f32(x_ptr.add(20));
+                let s6 = vld1q_f32(x_ptr.add(24));
+                let s7 = vld1q_f32(x_ptr.add(28));
+
+                let a0 = vmaxq_f32(vabsq_f32(s0), vabsq_f32(s1));
+                let a1 = vmaxq_f32(vabsq_f32(s2), vabsq_f32(s3));
+                let a2 = vmaxq_f32(vabsq_f32(s4), vabsq_f32(s5));
+                let a3 = vmaxq_f32(vabsq_f32(s6), vabsq_f32(s7));
+                let a4 = vmaxq_f32(a0, a1);
+                let a5 = vmaxq_f32(a2, a3);
+                let a6 = vmaxq_f32(a4, a5);
+                let amax = vmaxvq_f32(a6);
+
+                let d = amax / 127.0;
+                let d = f16::from_f32(d).to_f32(); // f16 roundtrip
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                scales[bi] = d;
+
+                // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
+                // f32→i32 (vcvtnq), then i32→i16→i8 via vqmovn (saturating narrow).
+                // Process 8 values at a time → 4 iterations for 32 values.
+                let qp = quants.as_mut_ptr().add(base);
+                let vi0 = vcvtnq_s32_f32(vmulq_n_f32(s0, id));
+                let vi1 = vcvtnq_s32_f32(vmulq_n_f32(s1, id));
+                let vi2 = vcvtnq_s32_f32(vmulq_n_f32(s2, id));
+                let vi3 = vcvtnq_s32_f32(vmulq_n_f32(s3, id));
+                let vi4 = vcvtnq_s32_f32(vmulq_n_f32(s4, id));
+                let vi5 = vcvtnq_s32_f32(vmulq_n_f32(s5, id));
+                let vi6 = vcvtnq_s32_f32(vmulq_n_f32(s6, id));
+                let vi7 = vcvtnq_s32_f32(vmulq_n_f32(s7, id));
+
+                // i32x4 pairs → i16x8 → i8x8, then store 8 bytes at a time
+                let n16_01 = vcombine_s16(vqmovn_s32(vi0), vqmovn_s32(vi1));
+                let n16_23 = vcombine_s16(vqmovn_s32(vi2), vqmovn_s32(vi3));
+                let n16_45 = vcombine_s16(vqmovn_s32(vi4), vqmovn_s32(vi5));
+                let n16_67 = vcombine_s16(vqmovn_s32(vi6), vqmovn_s32(vi7));
+
+                vst1_s8(qp, vqmovn_s16(n16_01));
+                vst1_s8(qp.add(8), vqmovn_s16(n16_23));
+                vst1_s8(qp.add(16), vqmovn_s16(n16_45));
+                vst1_s8(qp.add(24), vqmovn_s16(n16_67));
+            }
+            n_blocks
+        }
+    }
+
+    /// NEON integer GEMV using pre-quantized Q8_0 input.
+    /// Call `quantize_f32_to_q8_0_neon` first, then call this for each weight matrix.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_0_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let blocks_per_row = k / 32;
+            let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+
+            let ptrs = GemvPtrs {
+                a: a_quant.as_ptr() as usize,
+                xq: x_quants.as_ptr() as usize,
+                xs: x_scales.as_ptr() as usize,
+            };
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let mask_lo = vdupq_n_u8(0x0F);
+                let offset_8 = vdupq_n_s8(0x8);
+                let row_start = i * row_bytes;
+                let mut sumv0 = vdupq_n_f32(0.0);
+                let mut sumv1 = vdupq_n_f32(0.0);
+
+                let mut bi = 0usize;
+                while bi + 1 < blocks_per_row {
+                    let b0 = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ4_0>())
+                        as *const BlockQ4_0);
+                    let b1 = &*(ptrs.a().add(row_start + (bi + 1) * size_of::<BlockQ4_0>())
+                        as *const BlockQ4_0);
+
+                    let v0 = vld1q_u8(b0.qs.as_ptr());
+                    let v1 = vld1q_u8(b1.qs.as_ptr());
+                    let v0_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_lo)), offset_8);
+                    let v0_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), offset_8);
+                    let v1_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_lo)), offset_8);
+                    let v1_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), offset_8);
+
+                    let y0_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let y0_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let y1_lo = vld1q_s8(ptrs.xq().add((bi + 1) * 32));
+                    let y1_hi = vld1q_s8(ptrs.xq().add((bi + 1) * 32 + 16));
+
+                    let z = vdupq_n_s32(0);
+                    let p_0 = vdotq_s32(vdotq_s32(z, v0_lo, y0_lo), v0_hi, y0_hi);
+                    let p_1 = vdotq_s32(vdotq_s32(z, v1_lo, y1_lo), v1_hi, y1_hi);
+
+                    let d0 = f16::from_bits(b0.d).to_f32() * *ptrs.xs().add(bi);
+                    let d1 = f16::from_bits(b1.d).to_f32() * *ptrs.xs().add(bi + 1);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                    sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+                    bi += 2;
+                }
+
+                if bi < blocks_per_row {
+                    let b = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ4_0>())
+                        as *const BlockQ4_0);
+                    let v = vld1q_u8(b.qs.as_ptr());
+                    let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                    let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+                    let y_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let y_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let z = vdupq_n_s32(0);
+                    let p = vdotq_s32(vdotq_s32(z, v_lo, y_lo), v_hi, y_hi);
+                    let d = f16::from_bits(b.d).to_f32() * *ptrs.xs().add(bi);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                }
+
+                *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+            };
+
+            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                crate::backend::cpu::par_rows(y, 512, compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
+    /// Uses caller-provided scratch buffers to avoid per-call heap allocation.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q4_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+            gemv_q4_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+        }
+    }
+
+    /// NEON Q8_0 × Q8_0 GEMV with pre-quantized input (no quantization step).
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q8_0_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            let row_bytes = n_blocks * size_of::<BlockQ8_0>();
+
+            let ptrs = GemvPtrs {
+                a: a_quant.as_ptr() as usize,
+                xq: x_quants.as_ptr() as usize,
+                xs: x_scales.as_ptr() as usize,
+            };
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let row_start = i * row_bytes;
+                let mut sumv0 = vdupq_n_f32(0.0);
+                let mut sumv1 = vdupq_n_f32(0.0);
+
+                let mut bi = 0usize;
+                while bi + 1 < n_blocks {
+                    // Weight block 0
+                    let wb0 = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+                    let wb1 = &*(ptrs.a().add(row_start + (bi + 1) * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+
+                    // Load weight quants (32 i8 per block = 2 × int8x16_t)
+                    let w0_lo = vld1q_s8(wb0.quants.as_ptr());
+                    let w0_hi = vld1q_s8(wb0.quants.as_ptr().add(16));
+                    let w1_lo = vld1q_s8(wb1.quants.as_ptr());
+                    let w1_hi = vld1q_s8(wb1.quants.as_ptr().add(16));
+
+                    // Load input quants
+                    let x0_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let x0_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let x1_lo = vld1q_s8(ptrs.xq().add((bi + 1) * 32));
+                    let x1_hi = vld1q_s8(ptrs.xq().add((bi + 1) * 32 + 16));
+
+                    // Integer dot product: 2 × vdotq_s32 per block
+                    let z = vdupq_n_s32(0);
+                    let p_0 = vdotq_s32(vdotq_s32(z, w0_lo, x0_lo), w0_hi, x0_hi);
+                    let p_1 = vdotq_s32(vdotq_s32(z, w1_lo, x1_lo), w1_hi, x1_hi);
+
+                    // Scale: d_weight × d_input
+                    let d0 = f16::from_bits(wb0.delta).to_f32() * *ptrs.xs().add(bi);
+                    let d1 = f16::from_bits(wb1.delta).to_f32() * *ptrs.xs().add(bi + 1);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                    sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+                    bi += 2;
+                }
+
+                if bi < n_blocks {
+                    let wb = &*(ptrs.a().add(row_start + bi * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+                    let w_lo = vld1q_s8(wb.quants.as_ptr());
+                    let w_hi = vld1q_s8(wb.quants.as_ptr().add(16));
+                    let x_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                    let x_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+                    let z = vdupq_n_s32(0);
+                    let p = vdotq_s32(vdotq_s32(z, w_lo, x_lo), w_hi, x_hi);
+                    let d = f16::from_bits(wb.delta).to_f32() * *ptrs.xs().add(bi);
+                    sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
+                }
+
+                *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+            };
+
+            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                crate::backend::cpu::par_rows(y, 512, compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// NEON integer GEMV: y[m] = A_q8_0[m,k] @ x_f32[k].
+    /// Convenience wrapper: quantizes x then calls gemv_q8_0_q8_0_neon.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q8_0_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+            gemv_q8_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+        }
+    }
+
+    /// NEON Q6_K × Q8_0 integer GEMV with pre-quantized input.
+    ///
+    /// Extracts 6-bit quants as i8, dots with Q8_0 input using vdotq_s32.
+    /// 16 sub-blocks of 16 values per Q6_K block, each with its own scale.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q6k_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let blocks_per_row = k / 256;
+            let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+            let a_base = a_quant.as_ptr() as usize;
+            let xq_base = x_quants.as_ptr() as usize;
+            let xs_base = x_scales.as_ptr() as usize;
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let row_start = i * row_bytes;
+                let mut sumf = 0.0f32;
+                let mask_0f = vdupq_n_u8(0x0F);
+                let mask_03 = vdupq_n_u8(0x03);
+                let offset_32 = vdupq_n_s8(32);
+                let z = vdupq_n_s32(0);
+
+                for bi in 0..blocks_per_row {
+                    let blk =
+                        &*((a_base + row_start + bi * size_of::<BlockQ6K>()) as *const BlockQ6K);
+                    let d = f16::from_bits(blk.d).to_f32();
+                    let ql = blk.ql.as_ptr();
+                    let qh = blk.qh.as_ptr();
+                    let sc = blk.scales.as_ptr();
+                    let xq_off = bi * 256;
+
+                    // Fused extraction + dot product: extract 16 6-bit quants, immediately
+                    // dot with Q8_0 input. No intermediate buffer — stays in registers.
+                    // Scale index tracks which of the 16 sub-block scales to use.
+                    let mut sc_idx = 0usize;
+                    let mut ql_p = 0usize;
+                    let mut qh_p = 0usize;
+                    let mut y_p = 0usize;
+
+                    for _pass in 0..2 {
+                        for half in 0..2 {
+                            let l_off = half * 16;
+                            let ql_lo_v = vld1q_u8(ql.add(ql_p + l_off));
+                            let ql_hi_v = vld1q_u8(ql.add(ql_p + l_off + 32));
+                            let qh_v = vld1q_u8(qh.add(qh_p + l_off));
+
+                            // q1: values at y_p + l_off (16 values, sc_idx)
+                            let q1 = vsubq_s8(
+                                vreinterpretq_s8_u8(vorrq_u8(
+                                    vandq_u8(ql_lo_v, mask_0f),
+                                    vshlq_n_u8::<4>(vandq_u8(qh_v, mask_03)),
+                                )),
+                                offset_32,
+                            );
+                            let xv1 = vld1q_s8((xq_base as *const i8).add(xq_off + y_p + l_off));
+                            let q8_bi1 = (xq_off + y_p + l_off) / 32;
+                            let d1 =
+                                d * (*sc.add(sc_idx) as f32) * *(xs_base as *const f32).add(q8_bi1);
+                            sumf += d1 * vaddvq_s32(vdotq_s32(z, q1, xv1)) as f32;
+
+                            // q2: values at y_p + l_off + 32 (16 values, sc_idx + 2)
+                            let q2 = vsubq_s8(
+                                vreinterpretq_s8_u8(vorrq_u8(
+                                    vandq_u8(ql_hi_v, mask_0f),
+                                    vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh_v), mask_03)),
+                                )),
+                                offset_32,
+                            );
+                            let xv2 =
+                                vld1q_s8((xq_base as *const i8).add(xq_off + y_p + l_off + 32));
+                            let q8_bi2 = (xq_off + y_p + l_off + 32) / 32;
+                            let d2 = d
+                                * (*sc.add(sc_idx + 2) as f32)
+                                * *(xs_base as *const f32).add(q8_bi2);
+                            sumf += d2 * vaddvq_s32(vdotq_s32(z, q2, xv2)) as f32;
+
+                            // q3: values at y_p + l_off + 64 (16 values, sc_idx + 4)
+                            let q3 = vsubq_s8(
+                                vreinterpretq_s8_u8(vorrq_u8(
+                                    vshrq_n_u8::<4>(ql_lo_v),
+                                    vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh_v), mask_03)),
+                                )),
+                                offset_32,
+                            );
+                            let xv3 =
+                                vld1q_s8((xq_base as *const i8).add(xq_off + y_p + l_off + 64));
+                            let q8_bi3 = (xq_off + y_p + l_off + 64) / 32;
+                            let d3 = d
+                                * (*sc.add(sc_idx + 4) as f32)
+                                * *(xs_base as *const f32).add(q8_bi3);
+                            sumf += d3 * vaddvq_s32(vdotq_s32(z, q3, xv3)) as f32;
+
+                            // q4: values at y_p + l_off + 96 (16 values, sc_idx + 6)
+                            let q4 = vsubq_s8(
+                                vreinterpretq_s8_u8(vorrq_u8(
+                                    vshrq_n_u8::<4>(ql_hi_v),
+                                    vshlq_n_u8::<4>(vshrq_n_u8::<6>(qh_v)),
+                                )),
+                                offset_32,
+                            );
+                            let xv4 =
+                                vld1q_s8((xq_base as *const i8).add(xq_off + y_p + l_off + 96));
+                            let q8_bi4 = (xq_off + y_p + l_off + 96) / 32;
+                            let d4 = d
+                                * (*sc.add(sc_idx + 6) as f32)
+                                * *(xs_base as *const f32).add(q8_bi4);
+                            sumf += d4 * vaddvq_s32(vdotq_s32(z, q4, xv4)) as f32;
+
+                            sc_idx += 1; // advance by 1 per half (is = l/16 = half)
+                        }
+                        y_p += 128;
+                        ql_p += 64;
+                        qh_p += 32;
+                        sc_idx = 8; // second pass uses scales 8..15
+                    }
+                }
+
+                *yi = sumf;
+            };
+
+            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+                crate::backend::cpu::par_rows(y, 512, compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// NEON Q6_K GEMV: quantizes x to Q8_0 using scratch, then calls integer path.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemv_q6k_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            let n_blocks = k / 32;
+            q8_scales.resize(n_blocks, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+            gemv_q6k_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
         }
     }
 }
