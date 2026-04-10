@@ -288,10 +288,39 @@ impl Lfm2Model {
         &self.gguf.mmap_data()[wref.start..wref.start + wref.size]
     }
 
-    /// GEMV dispatch: y[m] = W[m,k] @ x[k], where W is quantized.
+    /// GEMV dispatch without scratch buffers.
     fn gemv(&self, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
         let data = self.weight_data(wref);
-        cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k);
+        cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
+    }
+
+    /// GEMV with pre-quantized Q8_0 input (skips quantization step).
+    /// For Q4_0/Q8_0 weights, uses the integer dot product path directly.
+    /// For other dtypes, falls back to the f32 path.
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_preq(&self, wref: &WeightRef, x_f32: &[f32], q8s: &[f32], q8q: &[i8], y: &mut [f32]) {
+        let data = self.weight_data(wref);
+        cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
+    }
+
+    /// Quantize x to Q8_0 into scratch buffers.
+    #[cfg(target_arch = "aarch64")]
+    fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
+        assert_eq!(
+            x.len() % 32,
+            0,
+            "quantize_to_scratch: x.len() must be divisible by 32"
+        );
+        let nb = x.len() / 32;
+        state.scratch.q8_scales.resize(nb, 0.0);
+        state.scratch.q8_quants.resize(x.len(), 0);
+        unsafe {
+            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                x,
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+            );
+        }
     }
 
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
@@ -331,8 +360,36 @@ impl Lfm2Model {
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights[layer].as_ref().unwrap();
 
-        // in_proj: hidden → 3*hidden
+        // in_proj: hidden → 3*hidden (uses pre-quantized Q8_0 data when available)
         let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
+        #[cfg(target_arch = "aarch64")]
+        if in_proj.dtype == DType::Q4_0 || in_proj.dtype == DType::Q8_0 {
+            let data = self.weight_data(in_proj);
+            if in_proj.dtype == DType::Q4_0 {
+                cpu::gemv_q4_0_with_q8(
+                    data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    proj,
+                    in_proj.m,
+                    in_proj.k,
+                );
+            } else {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q8_0_q8_0_neon(
+                        data,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        proj,
+                        in_proj.m,
+                        in_proj.k,
+                    );
+                }
+            }
+        } else {
+            self.gemv(in_proj, hidden, proj);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.gemv(in_proj, hidden, proj);
 
         // Split: b, c, x
@@ -394,13 +451,42 @@ impl Lfm2Model {
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
-        // Q, K, V projections into scratch buffers
+        // Q, K, V projections using pre-quantized hidden state
         let q = &mut state.scratch.q[..cfg.hidden_size];
         let k = &mut state.scratch.k[..kv_dim];
         let v = &mut state.scratch.v[..kv_dim];
-        self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
-        self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
-        self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
+
+        // hidden was pre-quantized at layer level — use integer path
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.gemv_preq(
+                refs.attn_q.as_ref().unwrap(),
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                q,
+            );
+            self.gemv_preq(
+                refs.attn_k.as_ref().unwrap(),
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                k,
+            );
+            self.gemv_preq(
+                refs.attn_v.as_ref().unwrap(),
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                v,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
+            self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
+            self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
+        }
 
         // Per-head QK norm (RMSnorm each head slice with shared weights)
         let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
@@ -511,6 +597,10 @@ impl Model for Lfm2Model {
             normed.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
 
+            // Pre-quantize normed input for operator GEMVs (shared across all projections)
+            #[cfg(target_arch = "aarch64")]
+            Self::quantize_to_scratch(&normed, state);
+
             // Operator: conv or attention (writes result to state.scratch.out)
             if cfg.block_types[i] == BlockType::GatedConv {
                 self.forward_conv_block(i, &normed, state);
@@ -525,27 +615,74 @@ impl Model for Lfm2Model {
             ffn_input.copy_from_slice(&hidden);
             cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
 
-            // SwiGLU FFN using scratch buffers
+            // SwiGLU FFN — quantize each unique input once
             let refs = &self.layer_refs[i];
-            self.gemv(
-                &refs.ffn_gate,
-                &ffn_input,
-                &mut state.scratch.gate[..cfg.intermediate_size],
-            );
-            self.gemv(
-                &refs.ffn_up,
-                &ffn_input,
-                &mut state.scratch.up[..cfg.intermediate_size],
-            );
-            cpu::silu_inplace(&mut state.scratch.gate[..cfg.intermediate_size]);
-            cpu::mul_inplace(
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Quantize ffn_input once for gate + up
+                Self::quantize_to_scratch(&ffn_input, state);
+                self.gemv_preq(
+                    &refs.ffn_gate,
+                    &ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..cfg.intermediate_size],
+                );
+                self.gemv_preq(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.up[..cfg.intermediate_size],
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                self.gemv(
+                    &refs.ffn_gate,
+                    &ffn_input,
+                    &mut state.scratch.gate[..cfg.intermediate_size],
+                );
+                self.gemv(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &mut state.scratch.up[..cfg.intermediate_size],
+                );
+            }
+
+            cpu::silu_mul_inplace(
                 &mut state.scratch.gate[..cfg.intermediate_size],
                 &state.scratch.up[..cfg.intermediate_size],
             );
+
+            // Quantize gate (after silu_mul) for down projection
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Quantize directly using disjoint field access to avoid borrow conflict
+                let nb = cfg.intermediate_size / 32;
+                state.scratch.q8_scales.resize(nb, 0.0);
+                state.scratch.q8_quants.resize(cfg.intermediate_size, 0);
+                unsafe {
+                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                        &state.scratch.gate[..cfg.intermediate_size],
+                        &mut state.scratch.q8_scales,
+                        &mut state.scratch.q8_quants,
+                    );
+                }
+                self.gemv_preq(
+                    &refs.ffn_down,
+                    &state.scratch.gate[..cfg.intermediate_size],
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.out[..hs],
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             self.gemv(
                 &refs.ffn_down,
                 &state.scratch.gate[..cfg.intermediate_size],
-                &mut state.scratch.out[..cfg.hidden_size],
+                &mut state.scratch.out[..hs],
             );
 
             // Second residual: hidden += ffn_out
@@ -557,6 +694,18 @@ impl Model for Lfm2Model {
 
         // 4. Output projection (tied embeddings)
         let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.gemv(&self.embd_ref, &hidden, &mut logits);
 
         // Update sequence length
