@@ -301,6 +301,65 @@ impl Lfm2Model {
         cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
     }
 
+    /// Batched GEMM with pre-quantized Q8_0 input columns.
+    /// Dispatches to Q4_0 or Q8_0 GEMM kernel based on weight dtype.
+    /// Returns true if GEMM was performed, false if dtype is unsupported.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_preq(
+        &self,
+        wref: &WeightRef,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        let data = self.weight_data(wref);
+        match wref.dtype {
+            DType::Q4_0 => unsafe {
+                crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            DType::Q8_0 => unsafe {
+                crate::backend::simd::neon::gemm_q8_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            _ => false,
+        }
+    }
+
+    /// Quantize all N columns of a column-major matrix [dim × n] to Q8_0.
+    /// `col` is a scratch buffer of size `dim`.
+    #[cfg(target_arch = "aarch64")]
+    fn quantize_columns(
+        mat: &[f32],
+        dim: usize,
+        n: usize,
+        col: &mut [f32],
+        scales: &mut [f32],
+        quants: &mut [i8],
+    ) {
+        let nb = dim / 32;
+        for j in 0..n {
+            for i in 0..dim {
+                col[i] = mat[i * n + j];
+            }
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &col[..dim],
+                    &mut scales[j * nb..(j + 1) * nb],
+                    &mut quants[j * dim..(j + 1) * dim],
+                );
+            }
+        }
+    }
+
     /// Quantize x to Q8_0 into scratch buffers.
     #[cfg(target_arch = "aarch64")]
     fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
@@ -323,6 +382,12 @@ impl Lfm2Model {
 
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
     fn dequantize_row(&self, wref: &WeightRef, row_idx: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; wref.k];
+        self.dequantize_row_into(wref, row_idx, &mut out);
+        out
+    }
+
+    fn dequantize_row_into(&self, wref: &WeightRef, row_idx: usize, out: &mut [f32]) {
         assert!(
             row_idx < wref.m,
             "dequantize_row: row_idx {row_idx} out of range (m={})",
@@ -333,19 +398,17 @@ impl Lfm2Model {
         let row_start = row_idx * row_bytes;
         let row_data = &data[row_start..row_start + row_bytes];
 
-        let mut out = vec![0.0f32; wref.k];
         match wref.dtype {
-            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, &mut out),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, &mut out),
-            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, &mut out),
-            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, &mut out),
+            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
+            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
             DType::F32 => {
                 let floats: &[f32] = bytemuck::cast_slice(row_data);
                 out.copy_from_slice(floats);
             }
             _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
         }
-        out
     }
 
     /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
@@ -708,6 +771,540 @@ impl Model for Lfm2Model {
 
         // Update sequence length
         state.seq_len += 1;
+
+        logits
+    }
+
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill requires at least one token"
+        );
+
+        // 1. Embed all tokens → hidden[hs × n] with stride n (token j at indices [j, n+j, 2n+j, ...])
+        let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
+        for (j, &token_id) in tokens.iter().enumerate() {
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
+            for i in 0..hs {
+                hidden[i * n + j] = emb_buf[i];
+            }
+        }
+
+        // 2. Per-layer loop — pre-allocate all large buffers outside the loop
+        let mut normed = vec![0.0f32; hs * n];
+        let mut block_out = vec![0.0f32; hs * n];
+        let mut ffn_input = vec![0.0f32; hs * n];
+        let mut ffn_out = vec![0.0f32; hs * n];
+        let mut norm_col = vec![0.0f32; hs];
+        let mut ffn_col = vec![0.0f32; hs];
+        let mut col = vec![0.0f32; hs];
+        let mut gate_col = vec![0.0f32; cfg.intermediate_size];
+        let mut up_col = vec![0.0f32; cfg.intermediate_size];
+        let mut out_col = vec![0.0f32; hs];
+        // Batched projection buffers for conv/attn input projections (aarch64 only)
+        #[cfg(target_arch = "aarch64")]
+        let max_kv_dim =
+            cfg.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / cfg.n_heads);
+        #[cfg(target_arch = "aarch64")]
+        let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
+        #[cfg(target_arch = "aarch64")]
+        let mut proj_mat = vec![0.0f32; proj_rows * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut out_proj_input = vec![0.0f32; hs * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut q_mat = vec![0.0f32; hs * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut k_mat = vec![0.0f32; max_kv_dim * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut v_mat = vec![0.0f32; max_kv_dim * n];
+        // Pre-allocated GEMM buffers (reused across layers)
+        #[cfg(target_arch = "aarch64")]
+        let is = cfg.intermediate_size;
+        #[cfg(target_arch = "aarch64")]
+        let nb_hs = hs / 32;
+        #[cfg(target_arch = "aarch64")]
+        let nb_is = is / 32;
+        #[cfg(target_arch = "aarch64")]
+        let mut bq_scales = vec![0.0f32; n * nb_hs];
+        #[cfg(target_arch = "aarch64")]
+        let mut bq_quants = vec![0i8; n * hs];
+        #[cfg(target_arch = "aarch64")]
+        let mut gate_mat = vec![0.0f32; is * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut up_mat = vec![0.0f32; is * n];
+        #[cfg(target_arch = "aarch64")]
+        let mut dq_scales = vec![0.0f32; n * nb_is];
+        #[cfg(target_arch = "aarch64")]
+        let mut dq_quants = vec![0i8; n * is];
+        #[cfg(target_arch = "aarch64")]
+        let mut inter_col = vec![0.0f32; is];
+
+        for layer in 0..cfg.n_layers {
+            // RMSnorm each column independently
+            for j in 0..n {
+                for i in 0..hs {
+                    norm_col[i] = hidden[i * n + j];
+                }
+                cpu::rmsnorm(
+                    &mut norm_col,
+                    &self.attn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                for i in 0..hs {
+                    normed[i * n + j] = norm_col[i];
+                }
+            }
+
+            // Operator: conv or attention — batch projections via GEMM, sequential core
+            let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
+
+            #[cfg(target_arch = "aarch64")]
+            let used_block_gemm = {
+                let refs = &self.layer_refs[layer];
+                if is_conv {
+                    // --- Conv: batch in_proj + out_proj via GEMM ---
+                    let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
+                    let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
+                    if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
+                        // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
+                        Self::quantize_columns(
+                            &normed,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(
+                            in_proj,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut proj_mat,
+                            3 * hs,
+                            n,
+                            hs,
+                        );
+
+                        // Phase 2: Per-token sequential conv using pre-computed projections
+                        let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
+                        let d_conv = kernel_size - 1;
+                        let conv_weight = self.conv_weights[layer].as_ref().unwrap();
+                        for j in 0..n {
+                            let proj = &mut state.scratch.conv_proj[..3 * hs];
+                            for i in 0..hs {
+                                proj[i] = proj_mat[i * n + j];
+                                proj[hs + i] = proj_mat[(hs + i) * n + j];
+                                proj[2 * hs + i] = proj_mat[(2 * hs + i) * n + j];
+                            }
+                            let (b, rest) = proj.split_at(hs);
+                            let (c_slice, x_slice) = rest.split_at(hs);
+
+                            let conv_scratch = &mut state.scratch.conv_scratch[..hs];
+                            for i in 0..hs {
+                                conv_scratch[i] = b[i] * x_slice[i];
+                            }
+
+                            let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+                                panic!("expected Conv state for layer {layer}");
+                            };
+                            let out_buf = &mut state.scratch.out[..hs];
+                            for ch in 0..hs {
+                                let mut sum = 0.0f32;
+                                for k in 0..d_conv {
+                                    sum += buffer[k * hs + ch] * conv_weight[ch * kernel_size + k];
+                                }
+                                sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
+                                out_buf[ch] = sum;
+                            }
+                            if d_conv > 0 {
+                                if d_conv > 1 {
+                                    buffer.copy_within(hs.., 0);
+                                }
+                                let last_slot = (d_conv - 1) * hs;
+                                buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                            }
+
+                            for i in 0..hs {
+                                out_proj_input[i * n + j] = c_slice[i] * out_buf[i];
+                            }
+                        }
+
+                        // Phase 3: Batch out_proj GEMM
+                        Self::quantize_columns(
+                            &out_proj_input,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    // --- Attention: batch Q/K/V + output projections via GEMM ---
+                    let attn_q_ref = refs.attn_q.as_ref().unwrap();
+                    if matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0) {
+                        let head_dim = hs / cfg.n_heads;
+                        let n_kv_heads = cfg.kv_heads_per_layer[layer];
+                        let kv_dim = n_kv_heads * head_dim;
+
+                        // Phase 1: Batch Q/K/V GEMM
+                        Self::quantize_columns(
+                            &normed,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs);
+                        self.gemm_preq(
+                            refs.attn_k.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut k_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
+                        self.gemm_preq(
+                            refs.attn_v.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut v_mat[..kv_dim * n],
+                            kv_dim,
+                            n,
+                            hs,
+                        );
+
+                        // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
+                        // Pre-reserve KV cache to avoid repeated reallocations
+                        if let LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                        } = &mut state.layers[layer]
+                        {
+                            key_cache.reserve(n * kv_dim);
+                            value_cache.reserve(n * kv_dim);
+                        }
+                        let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
+                        let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
+                        let group_size = cfg.n_heads / n_kv_heads;
+                        let scale = 1.0 / (head_dim as f32).sqrt();
+
+                        for j in 0..n {
+                            let pos = start_pos + j;
+                            // Extract Q, K, V for this token
+                            let q = &mut state.scratch.q[..hs];
+                            let k = &mut state.scratch.k[..kv_dim];
+                            let v = &mut state.scratch.v[..kv_dim];
+                            for i in 0..hs {
+                                q[i] = q_mat[i * n + j];
+                            }
+                            for i in 0..kv_dim {
+                                k[i] = k_mat[i * n + j];
+                                v[i] = v_mat[i * n + j];
+                            }
+
+                            // QK norm
+                            for h in 0..cfg.n_heads {
+                                cpu::rmsnorm(
+                                    &mut q[h * head_dim..(h + 1) * head_dim],
+                                    q_norm,
+                                    cfg.rms_norm_eps,
+                                );
+                            }
+                            for h in 0..n_kv_heads {
+                                cpu::rmsnorm(
+                                    &mut k[h * head_dim..(h + 1) * head_dim],
+                                    k_norm,
+                                    cfg.rms_norm_eps,
+                                );
+                            }
+
+                            // RoPE
+                            cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+
+                            // Append K, V to cache
+                            if let LayerState::Attention {
+                                key_cache,
+                                value_cache,
+                            } = &mut state.layers[layer]
+                            {
+                                key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                                value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                            }
+
+                            // Attention scores + weighted values
+                            let (k_cache, v_cache) = match &state.layers[layer] {
+                                LayerState::Attention {
+                                    key_cache,
+                                    value_cache,
+                                } => (key_cache.as_slice(), value_cache.as_slice()),
+                                _ => panic!("expected Attention state for layer {layer}"),
+                            };
+                            let seq_len = k_cache.len() / kv_dim;
+                            let attn_out = &mut state.scratch.attn_out[..hs];
+                            attn_out.fill(0.0);
+                            let q = &state.scratch.q[..hs];
+                            let scores = &mut state.scratch.scores;
+
+                            for h in 0..cfg.n_heads {
+                                let kv_h = h / group_size;
+                                let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                                scores.resize(seq_len, 0.0);
+                                for (t, score) in scores.iter_mut().enumerate() {
+                                    let mut dot = 0.0f32;
+                                    for d in 0..head_dim {
+                                        dot +=
+                                            q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
+                                    }
+                                    *score = dot * scale;
+                                }
+                                cpu::softmax_inplace(scores);
+                                for d in 0..head_dim {
+                                    let mut val = 0.0f32;
+                                    for (t, &s) in scores.iter().enumerate() {
+                                        val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
+                                    }
+                                    attn_out[h * head_dim + d] = val;
+                                }
+                            }
+
+                            // Store attn output for batched output projection
+                            for i in 0..hs {
+                                out_proj_input[i * n + j] = attn_out[i];
+                            }
+                        }
+
+                        // Phase 3: Batch output projection GEMM
+                        Self::quantize_columns(
+                            &out_proj_input,
+                            hs,
+                            n,
+                            &mut col,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        self.gemm_preq(
+                            refs.attn_output.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            // Fallback: per-token sequential path (non-aarch64 or non-Q4_0)
+            #[cfg(target_arch = "aarch64")]
+            let need_block_fallback = !used_block_gemm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let need_block_fallback = true;
+            if need_block_fallback {
+                block_out.fill(0.0);
+                for j in 0..n {
+                    for i in 0..hs {
+                        col[i] = normed[i * n + j];
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    Self::quantize_to_scratch(&col, state);
+
+                    if is_conv {
+                        self.forward_conv_block(layer, &col, state);
+                    } else {
+                        self.forward_attn_block(layer, &col, start_pos + j, state);
+                    }
+
+                    for i in 0..hs {
+                        block_out[i * n + j] = state.scratch.out[i];
+                    }
+                }
+            }
+
+            // Residual: hidden += block_out
+            for i in 0..hs * n {
+                hidden[i] += block_out[i];
+            }
+
+            // FFN pre-norm each column
+            for j in 0..n {
+                for i in 0..hs {
+                    ffn_col[i] = hidden[i * n + j];
+                }
+                cpu::rmsnorm(
+                    &mut ffn_col,
+                    &self.ffn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                for i in 0..hs {
+                    ffn_input[i * n + j] = ffn_col[i];
+                }
+            }
+
+            // FFN: batched GEMM on aarch64 Q4_0/Q8_0 (reads weights once for all n tokens)
+            let refs = &self.layer_refs[layer];
+            #[cfg(target_arch = "aarch64")]
+            let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0) {
+                // Pre-quantize all n columns to Q8_0
+                Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
+
+                // Gate + Up via batched GEMM
+                self.gemm_preq(
+                    &refs.ffn_gate,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut gate_mat,
+                    is,
+                    n,
+                    hs,
+                );
+                self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
+
+                // Fused SiLU+mul (row-major is×n)
+                cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
+
+                // Re-quantize gate_mat columns for down projection
+                Self::quantize_columns(
+                    &gate_mat,
+                    is,
+                    n,
+                    &mut inter_col,
+                    &mut dq_scales,
+                    &mut dq_quants,
+                );
+
+                // Down via batched GEMM
+                self.gemm_preq(
+                    &refs.ffn_down,
+                    &dq_scales,
+                    &dq_quants,
+                    &mut ffn_out,
+                    hs,
+                    n,
+                    is,
+                );
+                true
+            } else {
+                false
+            };
+
+            // Fallback: per-token GEMV (non-aarch64, or non-Q4_0 weights)
+            #[cfg(target_arch = "aarch64")]
+            let need_fallback = !used_gemm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let need_fallback = true;
+            if need_fallback {
+                ffn_out.fill(0.0);
+                for j in 0..n {
+                    for i in 0..hs {
+                        col[i] = ffn_input[i * n + j];
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        Self::quantize_to_scratch(&col, state);
+                        self.gemv_preq(
+                            &refs.ffn_gate,
+                            &col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut gate_col,
+                        );
+                        self.gemv_preq(
+                            &refs.ffn_up,
+                            &col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut up_col,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        self.gemv(&refs.ffn_gate, &col, &mut gate_col);
+                        self.gemv(&refs.ffn_up, &col, &mut up_col);
+                    }
+
+                    cpu::silu_mul_inplace(&mut gate_col, &up_col);
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        Self::quantize_to_scratch(&gate_col, state);
+                        self.gemv_preq(
+                            &refs.ffn_down,
+                            &gate_col,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut out_col,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
+
+                    for i in 0..hs {
+                        ffn_out[i * n + j] = out_col[i];
+                    }
+                }
+            }
+
+            // Second residual
+            for i in 0..hs * n {
+                hidden[i] += ffn_out[i];
+            }
+        }
+
+        // seq_len tracks total tokens processed. The conv/attn blocks handle
+        // per-token KV cache growth internally. We need seq_len = start_pos + n
+        // at the end for the decode phase to continue from the right position.
+        // Note: seq_len was NOT incremented inside the block functions — only
+        // the single-token forward() does that. So set it here:
+        state.seq_len = start_pos + n;
+
+        // 3. Extract last token, apply output norm + projection
+        let mut last_hidden = vec![0.0f32; hs];
+        for i in 0..hs {
+            last_hidden[i] = hidden[i * n + (n - 1)];
+        }
+        cpu::rmsnorm(&mut last_hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&last_hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &last_hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        self.gemv(&self.embd_ref, &last_hidden, &mut logits);
 
         logits
     }
