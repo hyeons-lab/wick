@@ -2018,8 +2018,14 @@ impl Model for MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        // Cache lookup: only for fresh prefills (start_pos == 0).
+        // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
+        // doesn't carry KV history from a previous generation. The CPU-side
+        // InferenceState is already fresh when callers invoke generate() again,
+        // but the Metal model holds its own seq_len counter and GPU KV buffers.
         if start_pos == 0 {
+            self.state.seq_len.set(0);
+
+            // Cache lookup: only for fresh prefills.
             let hit = self.prefix_cache.borrow_mut().find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
                 // Always keep at least 1 token for forward_prefill_inner to produce logits.
@@ -2067,12 +2073,20 @@ impl MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Fall back to sequential forward() for prompts that exceed batch buffer size.
-        let max_prefill = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
-        if n > max_prefill {
+        // Chunked prefill: process in MAX_PREFILL_TOKENS-sized chunks, each using
+        // the GEMM path. This keeps memory constant while avoiding the 14× slower
+        // sequential fallback for prompts > MAX_PREFILL_TOKENS.
+        let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        if n > max_chunk {
             let mut logits = Vec::new();
-            for (i, &tok) in tokens.iter().enumerate() {
-                logits = self.forward(&[tok], start_pos + i, state);
+            let mut pos = start_pos;
+            let mut remaining = tokens;
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(max_chunk);
+                let chunk = &remaining[..chunk_len];
+                logits = self.forward_prefill_inner(chunk, pos, state);
+                pos += chunk_len;
+                remaining = &remaining[chunk_len..];
             }
             return logits;
         }
@@ -2080,15 +2094,11 @@ impl MetalLfm2Model {
         // Reuse pre-allocated batch buffer (sized for max_seq_len).
         let batch_buf = &self.prefill_batch_buf;
 
-        // Stage all N embedding rows into batch_buf.
-        {
-            let mut stage = vec![0.0f32; hs * n];
+        // Stage all N embedding rows directly into batch_buf's mapped memory.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
             for (i, &t) in tokens.iter().enumerate() {
-                self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
-            }
-            unsafe {
-                let dst = batch_buf.contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(stage.as_ptr(), dst, stage.len());
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
             }
         }
 
