@@ -530,6 +530,202 @@ pub fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+// ── Attention score/value computation ───────────────────────────────────────
+
+/// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
+/// `k_cache` has stride `kv_dim` between timesteps; each key starts at offset `kv_h_offset`.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attn_scores(
+    q_head: &[f32],
+    k_cache: &[f32],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    debug_assert!(q_head.len() >= head_dim);
+    debug_assert!(scores.len() >= seq_len);
+    if seq_len > 0 {
+        debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_scores_neon(
+            q_head,
+            k_cache,
+            scores,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for t in 0..seq_len {
+        let mut dot = 0.0f32;
+        let k_off = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            dot += q_head[d] * k_cache[k_off + d];
+        }
+        scores[t] = dot * scale;
+    }
+}
+
+/// Compute weighted sum of V cache for one head: attn_out[d] = sum_t(scores[t] * v[t,d]).
+/// `v_cache` has stride `kv_dim` between timesteps; each value starts at offset `kv_h_offset`.
+#[allow(clippy::needless_range_loop)]
+pub fn attn_values(
+    scores: &[f32],
+    v_cache: &[f32],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    debug_assert!(scores.len() >= seq_len);
+    debug_assert!(attn_out.len() >= head_dim);
+    if seq_len > 0 {
+        debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_values_neon(
+            scores,
+            v_cache,
+            attn_out,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        attn_out[..head_dim].fill(0.0);
+        for t in 0..seq_len {
+            let s = scores[t];
+            let v_base = t * kv_dim + kv_h_offset;
+            for d in 0..head_dim {
+                attn_out[d] += s * v_cache[v_base + d];
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_scores_neon(
+    q_head: &[f32],
+    k_cache: &[f32],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
+    unsafe {
+        let q_ptr = q_head.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+
+        // Pre-load Q vectors once (constant across all timesteps).
+        // Max 32 float32x4 = head_dim up to 128. Stack array avoids heap alloc.
+        const MAX_Q_VECS: usize = 32;
+        let n_q_vecs = head_dim / 4;
+        debug_assert!(n_q_vecs <= MAX_Q_VECS, "head_dim > 128 not supported");
+        let mut q_vecs = [vdupq_n_f32(0.0); MAX_Q_VECS];
+        for i in 0..n_q_vecs {
+            q_vecs[i] = vld1q_f32(q_ptr.add(i * 4));
+        }
+
+        for t in 0..seq_len {
+            let k_off = t * kv_dim + kv_h_offset;
+            let mut sum0 = vdupq_n_f32(0.0);
+            let mut sum1 = vdupq_n_f32(0.0);
+
+            let mut d = 0usize;
+            let mut qi = 0usize;
+            while d + 8 <= head_dim {
+                let k0 = vld1q_f32(k_ptr.add(k_off + d));
+                let k1 = vld1q_f32(k_ptr.add(k_off + d + 4));
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
+                sum1 = vfmaq_f32(sum1, q_vecs[qi + 1], k1);
+                d += 8;
+                qi += 2;
+            }
+            if d + 4 <= head_dim {
+                let k0 = vld1q_f32(k_ptr.add(k_off + d));
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
+                d += 4;
+            }
+            let mut total = vaddvq_f32(vaddq_f32(sum0, sum1));
+            while d < head_dim {
+                total += *q_ptr.add(d) * *k_ptr.add(k_off + d);
+                d += 1;
+            }
+            scores[t] = total * scale;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_values_neon(
+    scores: &[f32],
+    v_cache: &[f32],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
+    unsafe {
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = attn_out.as_mut_ptr();
+
+        // Accumulate in registers (not memory) across all timesteps, store once at end.
+        // Max 32 float32x4 = head_dim up to 128.
+        const MAX_ACC_VECS: usize = 32;
+        let n_vec = head_dim / 4;
+        let n_tail = head_dim % 4;
+        debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 128 not supported");
+        let mut acc = [vdupq_n_f32(0.0); MAX_ACC_VECS];
+
+        for t in 0..seq_len {
+            let s = vdupq_n_f32(scores[t]);
+            let v_base = t * kv_dim + kv_h_offset;
+            for i in 0..n_vec {
+                let v = vld1q_f32(v_ptr.add(v_base + i * 4));
+                acc[i] = vfmaq_f32(acc[i], s, v);
+            }
+        }
+
+        // Store accumulators to output
+        for i in 0..n_vec {
+            vst1q_f32(out_ptr.add(i * 4), acc[i]);
+        }
+        // Scalar tail
+        let tail_start = n_vec * 4;
+        for dd in 0..n_tail {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val += scores[t] * *v_ptr.add(t * kv_dim + kv_h_offset + tail_start + dd);
+            }
+            *out_ptr.add(tail_start + dd) = val;
+        }
+    }
+}
+
 // ── Positional encoding ─────────────────────────────────────────────────────
 
 /// Apply Rotary Position Embedding (RoPE) to Q and K vectors.
@@ -852,5 +1048,146 @@ mod tests {
         par_rows_n(&mut out, 3, 1, |(_i, _row)| {
             panic!("should not be called");
         });
+    }
+
+    /// Reference scalar attention scores for testing.
+    fn attn_scores_scalar(
+        q: &[f32],
+        k_cache: &[f32],
+        scores: &mut [f32],
+        kv_dim: usize,
+        kv_h_off: usize,
+        head_dim: usize,
+        scale: f32,
+        seq_len: usize,
+    ) {
+        for t in 0..seq_len {
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q[d] * k_cache[t * kv_dim + kv_h_off + d];
+            }
+            scores[t] = dot * scale;
+        }
+    }
+
+    /// Reference scalar attention values for testing.
+    fn attn_values_scalar(
+        scores: &[f32],
+        v_cache: &[f32],
+        out: &mut [f32],
+        kv_dim: usize,
+        kv_h_off: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) {
+        for d in 0..head_dim {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val += scores[t] * v_cache[t * kv_dim + kv_h_off + d];
+            }
+            out[d] = val;
+        }
+    }
+
+    #[test]
+    fn test_attn_scores_matches_scalar() {
+        let head_dim = 64;
+        let kv_dim = 128; // 2 KV heads × 64
+        let kv_h_off = 64; // second KV head
+        let seq_len = 10;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 32.0) * 0.05).collect();
+        let k_cache: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 7 + 3) % 31) as f32 * 0.04 - 0.6)
+            .collect();
+
+        let mut expected = vec![0.0f32; seq_len];
+        attn_scores_scalar(
+            &q,
+            &k_cache,
+            &mut expected,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+
+        let mut actual = vec![0.0f32; seq_len];
+        attn_scores(
+            &q,
+            &k_cache,
+            &mut actual,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+
+        for t in 0..seq_len {
+            let diff = (expected[t] - actual[t]).abs();
+            assert!(
+                diff < 1e-5,
+                "attn_scores mismatch at t={t}: expected={}, actual={}, diff={diff}",
+                expected[t],
+                actual[t]
+            );
+        }
+    }
+
+    #[test]
+    fn test_attn_values_matches_scalar() {
+        let head_dim = 64;
+        let kv_dim = 128;
+        let kv_h_off = 0;
+        let seq_len = 10;
+
+        let scores: Vec<f32> = (0..seq_len)
+            .map(|i| (i as f32 + 1.0) / seq_len as f32)
+            .collect();
+        let v_cache: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 11 + 5) % 29) as f32 * 0.03 - 0.4)
+            .collect();
+
+        let mut expected = vec![0.0f32; head_dim];
+        attn_values_scalar(
+            &scores,
+            &v_cache,
+            &mut expected,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            seq_len,
+        );
+
+        let mut actual = vec![0.0f32; head_dim];
+        attn_values(
+            &scores,
+            &v_cache,
+            &mut actual,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            seq_len,
+        );
+
+        for d in 0..head_dim {
+            let diff = (expected[d] - actual[d]).abs();
+            assert!(
+                diff < 1e-4,
+                "attn_values mismatch at d={d}: expected={}, actual={}, diff={diff}",
+                expected[d],
+                actual[d]
+            );
+        }
+    }
+
+    #[test]
+    fn test_attn_scores_seq_len_zero() {
+        let mut scores = vec![];
+        attn_scores(&[0.0; 64], &[], &mut scores, 64, 0, 64, 0.125, 0);
+        assert!(scores.is_empty());
     }
 }

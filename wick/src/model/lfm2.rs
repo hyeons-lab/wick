@@ -594,33 +594,35 @@ impl Lfm2Model {
             };
             let seq_len = k_cache.len() / kv_dim;
             let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
-            attn_out.fill(0.0);
             let q = &state.scratch.q[..cfg.hidden_size];
             let scores = &mut state.scratch.scores;
 
+            scores.resize(seq_len, 0.0);
             for h in 0..cfg.n_heads {
                 let kv_h = h / group_size;
                 let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                let kv_h_offset = kv_h * head_dim;
 
-                // Resize scores to current seq_len (reuses allocation across heads/tokens)
-                scores.resize(seq_len, 0.0);
-                for (t, score) in scores.iter_mut().enumerate() {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
-                    }
-                    *score = dot * scale;
-                }
-
+                cpu::attn_scores(
+                    q_head,
+                    k_cache,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
                 cpu::softmax_inplace(scores);
-
-                for d in 0..head_dim {
-                    let mut val = 0.0f32;
-                    for (t, &s) in scores.iter().enumerate() {
-                        val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
-                    }
-                    attn_out[h * head_dim + d] = val;
-                }
+                cpu::attn_values(
+                    scores,
+                    v_cache,
+                    &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
             }
         }
 
@@ -1063,30 +1065,34 @@ impl Model for Lfm2Model {
                             };
                             let seq_len = k_cache.len() / kv_dim;
                             let attn_out = &mut state.scratch.attn_out[..hs];
-                            attn_out.fill(0.0);
                             let q = &state.scratch.q[..hs];
                             let scores = &mut state.scratch.scores;
 
+                            scores.resize(seq_len, 0.0);
                             for h in 0..cfg.n_heads {
                                 let kv_h = h / group_size;
                                 let q_head = &q[h * head_dim..(h + 1) * head_dim];
-                                scores.resize(seq_len, 0.0);
-                                for (t, score) in scores.iter_mut().enumerate() {
-                                    let mut dot = 0.0f32;
-                                    for d in 0..head_dim {
-                                        dot +=
-                                            q_head[d] * k_cache[t * kv_dim + kv_h * head_dim + d];
-                                    }
-                                    *score = dot * scale;
-                                }
+                                let kv_h_offset = kv_h * head_dim;
+                                cpu::attn_scores(
+                                    q_head,
+                                    k_cache,
+                                    scores,
+                                    kv_dim,
+                                    kv_h_offset,
+                                    head_dim,
+                                    scale,
+                                    seq_len,
+                                );
                                 cpu::softmax_inplace(scores);
-                                for d in 0..head_dim {
-                                    let mut val = 0.0f32;
-                                    for (t, &s) in scores.iter().enumerate() {
-                                        val += s * v_cache[t * kv_dim + kv_h * head_dim + d];
-                                    }
-                                    attn_out[h * head_dim + d] = val;
-                                }
+                                cpu::attn_values(
+                                    scores,
+                                    v_cache,
+                                    &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                                    kv_dim,
+                                    kv_h_offset,
+                                    head_dim,
+                                    seq_len,
+                                );
                             }
 
                             // Store attn output for batched output projection
