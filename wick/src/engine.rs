@@ -49,12 +49,9 @@ pub fn generate(
 
     let mut all_tokens = prompt_tokens.to_vec();
 
-    // Prefill: process all prompt tokens, capture logits from the last one
+    // Prefill: process all prompt tokens at once (batched GEMM)
     let prefill_start = Instant::now();
-    let mut logits = Vec::new();
-    for (i, &token) in prompt_tokens.iter().enumerate() {
-        logits = model.forward(&[token], i, &mut state);
-    }
+    let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
     let prefill_elapsed = prefill_start.elapsed();
     let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
         prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64()
