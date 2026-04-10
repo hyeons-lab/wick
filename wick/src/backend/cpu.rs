@@ -909,6 +909,76 @@ pub unsafe fn attn_scores_turboquant_neon(
     }
 }
 
+/// NEON weighted sum of compressed values for a GQA group.
+///
+/// For each query head in `[group_start, group_start + group_size)`:
+///   `out[h*head_dim + d] = Σ_t (scores[g*seq_len + t] * norms_f32[t]) * centroid[indices[t, d]]`
+///
+/// Writes the **rotated-space** accumulator to `attn_out`; the caller is
+/// responsible for applying `rht_inverse` to each head after this function
+/// returns. Caller must also ensure `head_dim <= 128` (stack accumulator
+/// limit) and that all buffer lengths are consistent.
+///
+/// # Safety
+/// All slices must be large enough: `polar_data.len() >= seq_len * head_dim/4`,
+/// `norms_f32.len() >= seq_len`, `scores.len() >= group_size * seq_len`,
+/// `attn_out.len() >= (group_start + group_size) * head_dim`.
+/// Requires aarch64 NEON.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub unsafe fn attn_values_turboquant_neon(
+    polar_data: &[u8],    // packed 2-bit data for this KV head
+    norms_f32: &[f32],    // pre-converted f32 norms for this KV head
+    scores: &[f32],       // [group_size * seq_len], row-major by head
+    attn_out: &mut [f32], // [n_heads * head_dim] — writes group_size heads
+    group_start: usize,
+    group_size: usize,
+    head_dim: usize,
+    seq_len: usize,
+    centroids: &[f32; 4],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let polar_bytes = head_dim / 4;
+        debug_assert!(
+            polar_bytes <= 32,
+            "head_dim > 128 not supported by NEON path"
+        );
+
+        // Stack-allocated accumulator: up to 32 float32x4 = 128 floats.
+        // One set per group member; reused across the group loop.
+        const MAX_VECS: usize = 32;
+
+        for g in 0..group_size {
+            let h = group_start + g;
+            let head_scores = scores.as_ptr().add(g * seq_len);
+
+            // Initialize accumulator to zero.
+            let mut acc = [vdupq_n_f32(0.0); MAX_VECS];
+
+            // Accumulate weighted centroid vectors across all timesteps.
+            for t in 0..seq_len {
+                let w = *head_scores.add(t) * *norms_f32.get_unchecked(t);
+                let w_vec = vdupq_n_f32(w);
+                let base = t * polar_bytes;
+                for i in 0..polar_bytes {
+                    let b = *polar_data.get_unchecked(base + i);
+                    let c_vec = select_centroids_4(b, centroids);
+                    acc[i] = vfmaq_f32(acc[i], w_vec, c_vec);
+                }
+            }
+
+            // Store the per-head accumulator to attn_out. The caller applies
+            // rht_inverse afterwards — it's cheap (O(head_dim log head_dim))
+            // and doesn't benefit from being inline here.
+            let out_ptr = attn_out.as_mut_ptr().add(h * head_dim);
+            for i in 0..polar_bytes {
+                vst1q_f32(out_ptr.add(i * 4), acc[i]);
+            }
+        }
+    }
+}
+
 /// Select 4 centroid values from a packed 2-bit byte.
 /// Returns float32x4 with centroids[idx0], centroids[idx1], centroids[idx2], centroids[idx3].
 #[cfg(target_arch = "aarch64")]

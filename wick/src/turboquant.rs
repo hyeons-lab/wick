@@ -431,6 +431,67 @@ impl CompressedKeyCache {
     }
 }
 
+// ── Compressed Value Cache ──────────────────────────────────────────────────
+
+/// Per-head value cache compressed with PolarQuant only (no QJL residual).
+///
+/// Values are reconstructed by weighted summing centroid lookups in rotated
+/// space and applying `rht_inverse` once per attention head, not once per
+/// timestep — see `attn_values_turboquant_gqa`.
+///
+/// Storage per vector: `head_dim / 4` bytes (2 bits/elem) + 2 bytes f16 norm.
+/// For `head_dim = 128`: 34 bytes, ~15× smaller than f32 (512 bytes).
+pub struct CompressedValueCache {
+    /// Packed 2-bit PolarQuant indices per KV head.
+    /// Each head: contiguous `[seq_len * polar_bytes_per_value]` where `polar_bytes_per_value = head_dim / 4`.
+    pub polar_data: Vec<Vec<u8>>,
+    /// Per-vector norms per KV head (stored as f16 bits for space).
+    pub norms: Vec<Vec<u16>>,
+    /// Pre-converted f32 norms per KV head, populated at append time.
+    /// Matches the pattern used by `CompressedKeyCache` to avoid O(seq_len)
+    /// per-call f16→f32 conversion in the attention hot path.
+    pub norms_f32: Vec<Vec<f32>>,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+}
+
+impl CompressedValueCache {
+    /// Create a new empty compressed value cache.
+    pub fn new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Self {
+        let polar_bytes = head_dim / 4;
+        Self {
+            polar_data: (0..n_kv_heads)
+                .map(|_| Vec::with_capacity(capacity * polar_bytes))
+                .collect(),
+            norms: (0..n_kv_heads)
+                .map(|_| Vec::with_capacity(capacity))
+                .collect(),
+            norms_f32: (0..n_kv_heads)
+                .map(|_| Vec::with_capacity(capacity))
+                .collect(),
+            head_dim,
+            n_kv_heads,
+        }
+    }
+
+    /// Number of cached value vectors per head.
+    pub fn seq_len(&self) -> usize {
+        self.norms.first().map_or(0, |v| v.len())
+    }
+
+    /// Append a compressed value for one KV head.
+    pub fn append(&mut self, kv_head: usize, polar_packed: &[u8], norm: u16) {
+        self.polar_data[kv_head].extend_from_slice(polar_packed);
+        self.norms[kv_head].push(norm);
+        self.norms_f32[kv_head].push(f16::from_bits(norm).to_f32());
+    }
+
+    /// Bytes of packed PolarQuant data per value vector.
+    pub fn polar_bytes_per_value(&self) -> usize {
+        self.head_dim / 4
+    }
+}
+
 // ── Encode Scratch Buffers ──────────────────────────────────────────────────
 
 /// Pre-allocated scratch buffers for TurboQuant encode, avoiding per-token heap allocations.
@@ -544,6 +605,70 @@ pub fn compress_and_append_keys(
             &scratch.jl_packed[..jl_bytes],
             f16::from_f32(norm).to_bits(),
             f16::from_f32(residual_norm).to_bits(),
+        );
+    }
+}
+
+/// Compress and append a full KV value vector `[n_kv_heads * head_dim]` to the cache.
+///
+/// Values use PolarQuant only (no QJL residual) — the attention read path is a
+/// weighted sum over values, not an inner product, so the JL sign-bit estimator
+/// doesn't apply. Reuses the same `EncodeScratch` and `RotationState` as keys;
+/// only the polar path is exercised.
+pub fn compress_and_append_values(
+    v: &[f32],
+    n_kv_heads: usize,
+    head_dim: usize,
+    rotation: &RotationState,
+    config: &TurboQuantConfig,
+    cache: &mut CompressedValueCache,
+    scratch: &mut EncodeScratch,
+) {
+    debug_assert_eq!(v.len(), n_kv_heads * head_dim);
+
+    let polar_bytes = head_dim / 4;
+
+    for h in 0..n_kv_heads {
+        let v_head = &v[h * head_dim..(h + 1) * head_dim];
+
+        // 1. Compute norm. Zero vectors short-circuit to all-zero packed bytes.
+        let norm = vec_norm(v_head);
+        if norm < 1e-12 {
+            scratch.polar_packed[..polar_bytes].fill(0);
+            cache.append(
+                h,
+                &scratch.polar_packed[..polar_bytes],
+                f16::from_f32(0.0).to_bits(),
+            );
+            continue;
+        }
+
+        // 2. Normalize and rotate using the same RHT as keys. Orthogonality
+        // holds regardless of seed reuse, and sharing avoids doubling the
+        // RotationState memory per layer.
+        let rot = &mut scratch.rot[..head_dim];
+        let inv_norm = 1.0 / norm;
+        for i in 0..head_dim {
+            rot[i] = v_head[i] * inv_norm;
+        }
+        rht_forward(rot, &rotation.polar_signs);
+
+        // 3. Fused quantize + pack. No residual pass, no JL step — values
+        // don't need either.
+        for (byte_idx, packed_byte) in scratch.polar_packed[..polar_bytes].iter_mut().enumerate() {
+            let base = byte_idx * 4;
+            let mut byte = 0u8;
+            for j in 0..4 {
+                let idx = quantize_scalar(rot[base + j], &config.boundaries);
+                byte |= idx << (j * 2);
+            }
+            *packed_byte = byte;
+        }
+
+        cache.append(
+            h,
+            &scratch.polar_packed[..polar_bytes],
+            f16::from_f32(norm).to_bits(),
         );
     }
 }
@@ -780,6 +905,130 @@ pub fn attn_scores_turboquant_gqa(
         }
     }
 }
+
+// ── Attention Value Weighted Sum (compressed values) ──────────────────────
+
+/// Weighted sum of compressed values for a GQA group.
+///
+/// For each query head `h` in `[group_start, group_start + group_size)`:
+/// ```text
+/// attn_out[h * head_dim + d] = sum_t scores[g * seq_len + t] * v[t, d]
+/// ```
+/// where `v[t]` is the decompressed value vector at timestep `t`.
+///
+/// Exploits linearity of RHT: we accumulate the weighted sum *in rotated
+/// 2-bit centroid space* and apply `rht_inverse` exactly once per head
+/// at the end. For `head_dim=128, seq_len=4096`, this is ~7× fewer
+/// operations than rotating each per-timestep contribution back.
+///
+/// NEON fast path is used when `head_dim <= 128` on aarch64; otherwise
+/// falls back to the scalar implementation (which has no `head_dim` limit).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_values_turboquant_gqa(
+    compressed: &CompressedValueCache,
+    kv_head_idx: usize,
+    group_start: usize,
+    group_size: usize,
+    scores: &[f32],       // [group_size * seq_len], row-major by head
+    attn_out: &mut [f32], // [n_heads * head_dim]
+    head_dim: usize,
+    seq_len: usize,
+    rotation: &RotationState,
+    config: &TurboQuantConfig,
+) {
+    debug_assert!(scores.len() >= group_size * seq_len);
+
+    if seq_len == 0 {
+        for g in 0..group_size {
+            let h = group_start + g;
+            attn_out[h * head_dim..(h + 1) * head_dim].fill(0.0);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if head_dim <= 128 {
+        unsafe {
+            crate::backend::cpu::attn_values_turboquant_neon(
+                &compressed.polar_data[kv_head_idx],
+                &compressed.norms_f32[kv_head_idx],
+                scores,
+                attn_out,
+                group_start,
+                group_size,
+                head_dim,
+                seq_len,
+                &config.centroids,
+            );
+        }
+        // Single rht_inverse per head moves the accumulator back to the original basis.
+        for g in 0..group_size {
+            let h = group_start + g;
+            let out_head = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+            rht_inverse(out_head, &rotation.polar_signs);
+        }
+        return;
+    }
+
+    attn_values_turboquant_gqa_scalar(
+        compressed,
+        kv_head_idx,
+        group_start,
+        group_size,
+        scores,
+        attn_out,
+        head_dim,
+        seq_len,
+        rotation,
+        config,
+    );
+}
+
+/// Scalar fallback for `attn_values_turboquant_gqa`. Has no `head_dim` limit.
+#[allow(clippy::too_many_arguments)]
+fn attn_values_turboquant_gqa_scalar(
+    compressed: &CompressedValueCache,
+    kv_head_idx: usize,
+    group_start: usize,
+    group_size: usize,
+    scores: &[f32],
+    attn_out: &mut [f32],
+    head_dim: usize,
+    seq_len: usize,
+    rotation: &RotationState,
+    config: &TurboQuantConfig,
+) {
+    let polar_data = &compressed.polar_data[kv_head_idx];
+    let norms_f32 = &compressed.norms_f32[kv_head_idx];
+    let polar_bytes = head_dim / 4;
+    let c = config.centroids;
+
+    for g in 0..group_size {
+        let h = group_start + g;
+        let head_scores = &scores[g * seq_len..(g + 1) * seq_len];
+        let out_head = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+
+        // Accumulate Σ_t (score[t] * norm[t]) * centroid[indices[t, d]]
+        // directly into out_head, using it as the rotated-space accumulator.
+        out_head.fill(0.0);
+        for t in 0..seq_len {
+            let w = head_scores[t] * norms_f32[t];
+            let base = t * polar_bytes;
+            for byte_idx in 0..polar_bytes {
+                let b = polar_data[base + byte_idx];
+                let d = byte_idx * 4;
+                out_head[d] += w * c[(b & 0b11) as usize];
+                out_head[d + 1] += w * c[((b >> 2) & 0b11) as usize];
+                out_head[d + 2] += w * c[((b >> 4) & 0b11) as usize];
+                out_head[d + 3] += w * c[((b >> 6) & 0b11) as usize];
+            }
+        }
+
+        // rht_inverse maps the accumulator from rotated → original basis.
+        rht_inverse(out_head, &rotation.polar_signs);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1114,5 +1363,335 @@ mod tests {
             relative_mse < 0.5,
             "Reconstruction too poor: relative RMSE = {relative_mse:.4}"
         );
+    }
+
+    // ── Value compression tests ────────────────────────────────────────────
+
+    /// Helper: generate a random normal-distributed f32 vector via Box-Muller.
+    fn random_normal_vec(rng: &mut Xoshiro256SS, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                let u1 = (rng.next_u64() as f64 / u64::MAX as f64).max(1e-10);
+                let u2 = rng.next_u64() as f64 / u64::MAX as f64;
+                ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+            })
+            .collect()
+    }
+
+    /// Compress one value, call attn_values_turboquant_gqa with a single unit
+    /// score, and verify the reconstruction is reasonably close to the original.
+    #[test]
+    fn test_value_compress_decompress_roundtrip() {
+        let head_dim = 128;
+        let rotation = RotationState::from_seed(42, head_dim);
+        let config = TurboQuantConfig::for_head_dim(head_dim);
+
+        let mut rng = Xoshiro256SS::new(789);
+        let v = random_normal_vec(&mut rng, head_dim);
+        let v_norm = vec_norm(&v);
+
+        let mut cache = CompressedValueCache::new(1, head_dim, 1);
+        let mut scratch = EncodeScratch::new(head_dim);
+        compress_and_append_values(
+            &v,
+            1,
+            head_dim,
+            &rotation,
+            &config,
+            &mut cache,
+            &mut scratch,
+        );
+
+        // Reconstruct via attn_values with a single unit score.
+        let mut out = vec![0.0f32; head_dim];
+        let scores = vec![1.0f32; 1];
+        attn_values_turboquant_gqa(
+            &cache, 0, // kv_head_idx
+            0, // group_start
+            1, // group_size
+            &scores, &mut out, head_dim, 1, // seq_len
+            &rotation, &config,
+        );
+
+        let mut mse = 0.0f64;
+        for i in 0..head_dim {
+            let err = (v[i] - out[i]) as f64;
+            mse += err * err;
+        }
+        let rrmse = (mse / head_dim as f64).sqrt() as f32 / v_norm;
+        assert!(
+            rrmse < 0.3,
+            "Value reconstruction relative RMSE too high: {rrmse:.4}"
+        );
+    }
+
+    /// Check that the weighted-sum attention output stays close to the ground
+    /// truth across many random values + softmax-like scores.
+    #[test]
+    fn test_value_weighted_sum_accuracy() {
+        let head_dim = 64;
+        let seq_len = 100;
+        let rotation = RotationState::from_seed(123, head_dim);
+        let config = TurboQuantConfig::for_head_dim(head_dim);
+
+        let mut rng = Xoshiro256SS::new(321);
+
+        // Generate random values + compress them.
+        let mut cache = CompressedValueCache::new(1, head_dim, seq_len);
+        let mut scratch = EncodeScratch::new(head_dim);
+        let mut values: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        for _ in 0..seq_len {
+            let v = random_normal_vec(&mut rng, head_dim);
+            compress_and_append_values(
+                &v,
+                1,
+                head_dim,
+                &rotation,
+                &config,
+                &mut cache,
+                &mut scratch,
+            );
+            values.push(v);
+        }
+
+        // Generate softmax-like scores (exponentials + normalize).
+        let raw_scores: Vec<f32> = random_normal_vec(&mut rng, seq_len);
+        let max = raw_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut scores: Vec<f32> = raw_scores.iter().map(|&s| (s - max).exp()).collect();
+        let sum: f32 = scores.iter().sum();
+        for s in &mut scores {
+            *s /= sum;
+        }
+
+        // Ground truth: plain weighted sum in f32.
+        let mut truth = vec![0.0f32; head_dim];
+        for t in 0..seq_len {
+            let s = scores[t];
+            for d in 0..head_dim {
+                truth[d] += s * values[t][d];
+            }
+        }
+
+        // TurboQuant path.
+        let mut out = vec![0.0f32; head_dim];
+        attn_values_turboquant_gqa(
+            &cache, 0, 0, 1, &scores, &mut out, head_dim, seq_len, &rotation, &config,
+        );
+
+        let truth_norm = vec_norm(&truth);
+        let mut max_abs_err = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        for d in 0..head_dim {
+            let e = (out[d] - truth[d]).abs();
+            max_abs_err = max_abs_err.max(e);
+            sum_sq_err += (e as f64) * (e as f64);
+        }
+        let rmse = (sum_sq_err / head_dim as f64).sqrt() as f32;
+        let rel_rmse = rmse / truth_norm.max(1e-12);
+
+        assert!(
+            rel_rmse < 0.25,
+            "Weighted-sum relative RMSE too high: {rel_rmse:.4} (truth_norm={truth_norm:.3})"
+        );
+    }
+
+    /// A zero-norm value vector takes the short-circuit path in
+    /// `compress_and_append_values`. The weighted sum against any scores
+    /// must be finite and close to zero.
+    #[test]
+    fn test_value_zero_vector() {
+        let head_dim = 64;
+        let rotation = RotationState::from_seed(1, head_dim);
+        let config = TurboQuantConfig::for_head_dim(head_dim);
+
+        let mut cache = CompressedValueCache::new(1, head_dim, 1);
+        let mut scratch = EncodeScratch::new(head_dim);
+        let zero = vec![0.0f32; head_dim];
+        compress_and_append_values(
+            &zero,
+            1,
+            head_dim,
+            &rotation,
+            &config,
+            &mut cache,
+            &mut scratch,
+        );
+
+        assert_eq!(f16::from_bits(cache.norms[0][0]).to_f32(), 0.0);
+        assert!(cache.polar_data[0].iter().all(|&b| b == 0));
+
+        let scores = vec![0.7f32; 1];
+        let mut out = vec![f32::NAN; head_dim];
+        attn_values_turboquant_gqa(
+            &cache, 0, 0, 1, &scores, &mut out, head_dim, 1, &rotation, &config,
+        );
+        for &x in &out {
+            assert!(x.is_finite(), "zero-value score output must be finite");
+            assert!(x.abs() < 1e-6, "zero-value output magnitude too high: {x}");
+        }
+    }
+
+    /// GQA with `group_size=4` — exercises the per-head output indexing
+    /// and ensures the group inner loop matches a scalar reference.
+    #[test]
+    fn test_value_gqa_group_size_4() {
+        let head_dim = 64;
+        let seq_len = 50;
+        let group_size = 4;
+        let n_heads = group_size; // one KV head, 4 query heads
+        let rotation = RotationState::from_seed(7, head_dim);
+        let config = TurboQuantConfig::for_head_dim(head_dim);
+
+        let mut rng = Xoshiro256SS::new(11);
+
+        // Compress `seq_len` values for a single KV head.
+        let mut cache = CompressedValueCache::new(1, head_dim, seq_len);
+        let mut scratch = EncodeScratch::new(head_dim);
+        let mut values: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        for _ in 0..seq_len {
+            let v = random_normal_vec(&mut rng, head_dim);
+            compress_and_append_values(
+                &v,
+                1,
+                head_dim,
+                &rotation,
+                &config,
+                &mut cache,
+                &mut scratch,
+            );
+            values.push(v);
+        }
+
+        // 4 independent score vectors (one per query head in the group).
+        let mut scores_flat = vec![0.0f32; group_size * seq_len];
+        for g in 0..group_size {
+            let raw = random_normal_vec(&mut rng, seq_len);
+            let max = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sm: Vec<f32> = raw.iter().map(|&s| (s - max).exp()).collect();
+            let sum: f32 = sm.iter().sum();
+            for s in &mut sm {
+                *s /= sum;
+            }
+            scores_flat[g * seq_len..(g + 1) * seq_len].copy_from_slice(&sm);
+        }
+
+        // TurboQuant path.
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        attn_values_turboquant_gqa(
+            &cache,
+            0, // kv_head_idx
+            0, // group_start
+            group_size,
+            &scores_flat,
+            &mut out,
+            head_dim,
+            seq_len,
+            &rotation,
+            &config,
+        );
+
+        // Ground truth: plain weighted sum per head.
+        for g in 0..group_size {
+            let head_scores = &scores_flat[g * seq_len..(g + 1) * seq_len];
+            let mut truth = vec![0.0f32; head_dim];
+            for t in 0..seq_len {
+                let s = head_scores[t];
+                for d in 0..head_dim {
+                    truth[d] += s * values[t][d];
+                }
+            }
+            let truth_norm = vec_norm(&truth);
+            let out_head = &out[g * head_dim..(g + 1) * head_dim];
+            let mut sum_sq = 0.0f64;
+            for d in 0..head_dim {
+                let e = (out_head[d] - truth[d]) as f64;
+                sum_sq += e * e;
+            }
+            let rrmse = ((sum_sq / head_dim as f64).sqrt() as f32) / truth_norm.max(1e-12);
+            assert!(
+                rrmse < 0.25,
+                "head {g}: weighted-sum rel RMSE too high: {rrmse:.4}"
+            );
+        }
+    }
+
+    /// NEON ↔ scalar parity for attn_values_turboquant_gqa.
+    ///
+    /// The dispatcher uses NEON on aarch64 (head_dim <= 128); this test
+    /// runs the same inputs through the scalar fallback directly and
+    /// asserts the two outputs match within a tight tolerance.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_value_neon_scalar_parity() {
+        for &head_dim in &[64usize, 128] {
+            for &group_size in &[1usize, 2, 4] {
+                for &seq_len in &[17usize, 128] {
+                    let rotation = RotationState::from_seed(99, head_dim);
+                    let config = TurboQuantConfig::for_head_dim(head_dim);
+
+                    let mut rng = Xoshiro256SS::new(
+                        (head_dim as u64) ^ (group_size as u64) ^ (seq_len as u64) * 0xDEADBEEF,
+                    );
+
+                    // Compress random values.
+                    let mut cache = CompressedValueCache::new(1, head_dim, seq_len);
+                    let mut scratch = EncodeScratch::new(head_dim);
+                    for _ in 0..seq_len {
+                        let v = random_normal_vec(&mut rng, head_dim);
+                        compress_and_append_values(
+                            &v,
+                            1,
+                            head_dim,
+                            &rotation,
+                            &config,
+                            &mut cache,
+                            &mut scratch,
+                        );
+                    }
+
+                    // Random scores [group_size * seq_len].
+                    let scores = random_normal_vec(&mut rng, group_size * seq_len);
+
+                    let mut out_neon = vec![0.0f32; group_size * head_dim];
+                    attn_values_turboquant_gqa(
+                        &cache,
+                        0,
+                        0,
+                        group_size,
+                        &scores,
+                        &mut out_neon,
+                        head_dim,
+                        seq_len,
+                        &rotation,
+                        &config,
+                    );
+
+                    let mut out_scalar = vec![0.0f32; group_size * head_dim];
+                    attn_values_turboquant_gqa_scalar(
+                        &cache,
+                        0,
+                        0,
+                        group_size,
+                        &scores,
+                        &mut out_scalar,
+                        head_dim,
+                        seq_len,
+                        &rotation,
+                        &config,
+                    );
+
+                    let max_scalar = out_scalar.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    let tol = 1e-3 * max_scalar.max(1e-6);
+                    let mut max_diff = 0.0f32;
+                    for i in 0..out_neon.len() {
+                        max_diff = max_diff.max((out_neon[i] - out_scalar[i]).abs());
+                    }
+                    assert!(
+                        max_diff < tol,
+                        "NEON↔scalar mismatch hd={head_dim} gs={group_size} sl={seq_len}: max_diff={max_diff:.6} tol={tol:.6}"
+                    );
+                }
+            }
+        }
     }
 }

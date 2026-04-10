@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::model::{BlockType, ModelConfig};
-use crate::turboquant::{CompressedKeyCache, EncodeScratch, QueryRotationScratch};
+use crate::turboquant::{
+    CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch,
+};
 
 /// KV cache compression mode.
 #[derive(Clone, Debug, Default)]
@@ -12,13 +14,37 @@ pub enum KvCompression {
     /// No compression — keys and values stored as f32 (default).
     #[default]
     None,
-    /// TurboQuant compression for both keys and values.
-    /// Keys: 2-bit PolarQuant + 1-bit QJL residual (3 bits/elem + f16 norms).
-    /// Values: 2-bit PolarQuant only (2 bits/elem + f16 norms).
-    TurboQuant { seed: u64 },
+    /// TurboQuant compression. Keys and values can be toggled independently
+    /// for debugging (e.g. to isolate how much drift each side contributes).
+    /// The common production configuration sets both `keys` and `values` to
+    /// `true`.
+    ///
+    /// - Keys: 2-bit PolarQuant + 1-bit QJL residual (3 bits/elem + f16 norms).
+    /// - Values: 2-bit PolarQuant only (2 bits/elem + f16 norms).
+    TurboQuant { seed: u64, keys: bool, values: bool },
+}
+
+impl KvCompression {
+    /// Shortcut for the common "compress everything" configuration.
+    pub fn turboquant(seed: u64) -> Self {
+        Self::TurboQuant {
+            seed,
+            keys: true,
+            values: true,
+        }
+    }
+
+    /// Returns `(compress_keys, compress_values)` for the current mode.
+    pub fn flags(&self) -> (bool, bool) {
+        match self {
+            Self::None => (false, false),
+            Self::TurboQuant { keys, values, .. } => (*keys, *values),
+        }
+    }
 }
 
 /// Per-layer inference state.
+#[allow(clippy::large_enum_variant)]
 pub enum LayerState {
     /// KV cache for attention layers.
     Attention {
@@ -26,6 +52,8 @@ pub enum LayerState {
         value_cache: Vec<f32>,
         /// Compressed key cache (populated when TurboQuant is active; key_cache stays empty).
         compressed_keys: Option<CompressedKeyCache>,
+        /// Compressed value cache (populated when TurboQuant is active; value_cache stays empty).
+        compressed_values: Option<CompressedValueCache>,
     },
     /// Rolling buffer for convolution layers.
     /// Stores previous `d_conv` pre-conv activations (bx values), time-major.
@@ -85,6 +113,7 @@ impl InferenceState {
                     key_cache: Vec::new(),
                     value_cache: Vec::new(),
                     compressed_keys: None,
+                    compressed_values: None,
                 })
                 .collect(),
             seq_len: 0,
@@ -128,6 +157,7 @@ impl InferenceState {
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
 
         let initial_capacity = 2048; // Pre-allocate for typical context
+        let (compress_keys, compress_values) = compression.flags();
         let layers = config
             .block_types
             .iter()
@@ -135,16 +165,29 @@ impl InferenceState {
             .map(|(layer_idx, bt)| match bt {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[layer_idx];
-                    let compressed = match compression {
-                        KvCompression::TurboQuant { .. } if n_kv_heads > 0 => Some(
-                            CompressedKeyCache::new(n_kv_heads, head_dim, initial_capacity),
-                        ),
-                        _ => None,
+                    let compressed_keys = if compress_keys && n_kv_heads > 0 {
+                        Some(CompressedKeyCache::new(
+                            n_kv_heads,
+                            head_dim,
+                            initial_capacity,
+                        ))
+                    } else {
+                        None
+                    };
+                    let compressed_values = if compress_values && n_kv_heads > 0 {
+                        Some(CompressedValueCache::new(
+                            n_kv_heads,
+                            head_dim,
+                            initial_capacity,
+                        ))
+                    } else {
+                        None
                     };
                     LayerState::Attention {
                         key_cache: Vec::new(),
                         value_cache: Vec::new(),
-                        compressed_keys: compressed,
+                        compressed_keys,
+                        compressed_values,
                     }
                 }
                 BlockType::GatedConv => LayerState::Conv {
@@ -172,15 +215,19 @@ impl InferenceState {
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
             },
-            tq_encode_scratch: match compression {
-                KvCompression::TurboQuant { .. } => Some(EncodeScratch::new(head_dim)),
-                _ => None,
+            // Scratch is needed whenever either side is compressed. The
+            // EncodeScratch `rot` buffer is shared between key and value
+            // encode; QueryRotationScratch is shared between key score
+            // computation and value weighted-sum reconstruction.
+            tq_encode_scratch: if compress_keys || compress_values {
+                Some(EncodeScratch::new(head_dim))
+            } else {
+                None
             },
-            tq_query_scratch: match compression {
-                KvCompression::TurboQuant { .. } => {
-                    Some(QueryRotationScratch::new(config.n_heads, head_dim))
-                }
-                _ => None,
+            tq_query_scratch: if compress_keys || compress_values {
+                Some(QueryRotationScratch::new(config.n_heads, head_dim))
+            } else {
+                None
             },
         }
     }

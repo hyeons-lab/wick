@@ -77,14 +77,17 @@ Measured with `wick bench --runs 20 --warmup 3` (sustained in-process, p50 repor
 
 ## TurboQuant KV Cache Compression
 
-Wick includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**. The Liquid4All llama.cpp fork already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
+Wick includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**, compressing **both keys and values**. The Liquid4All llama.cpp fork already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
 
 ### What it is
 
-TurboQuant compresses KV cache **keys to ~3 bits per element** (9.8× reduction vs f32) with near-lossless accuracy and **no calibration or fine-tuning** required. It's a two-stage compression:
+TurboQuant compresses KV cache **keys to ~3 bits/element** and **values to ~2 bits/element** (together ~12× reduction vs f32) with near-lossless accuracy and **no calibration or fine-tuning** required.
 
+**Keys (3-bit)** — two-stage compression:
 1. **PolarQuant (2-bit)** — Randomized Hadamard Transform rotates each key vector, then quantizes coordinates to 4 Lloyd-Max centroids for the resulting Beta distribution. The rotation makes the distribution predictable, so no per-block scale factors are needed.
 2. **QJL (1-bit)** — Quantized Johnson-Lindenstrauss sign bits on the residual provide an *unbiased* inner-product estimator that corrects PolarQuant bias during attention score computation.
+
+**Values (2-bit)** — PolarQuant only. The attention operation on values is a weighted sum (not an inner product), so the QJL residual estimator doesn't apply — values need actual vector reconstruction, which PolarQuant gives directly. The weighted sum is computed in *rotated* 2-bit centroid space; a single `rht_inverse` per attention head at the end recovers the original basis (exploiting linearity of the transform). This makes values even cheaper than keys while maintaining good quality.
 
 ### How it compares
 
@@ -94,44 +97,95 @@ TurboQuant compresses KV cache **keys to ~3 bits per element** (9.8× reduction 
 | f16 (llama.cpp default) | 16 | 16 | — | — |
 | llama.cpp q8_0 KV | 8 | 8 | — | — |
 | llama.cpp q4_0 KV | 4 | 4 | — | — |
-| **wick TurboQuant tq3** | **3** | **32** (keys-only) | **no** | **yes** |
+| **wick TurboQuant tq3** | **3** | **2** | **no** | **yes** (keys) |
 
 TurboQuant's differentiators:
 
-- **Fewer bits per key** — 3 bits vs q4_0's 4 bits, via the rotation that eliminates the need for per-block scales.
-- **Unbiased attention score estimator** — the QJL correction term is provably unbiased, while q4_0/q8_0 introduce bias that can compound across long contexts.
+- **Fewer bits per element** — 3+2 bits/KV vs q4_0's 4+4 bits/KV, via the rotation that eliminates the need for per-block scales.
+- **Unbiased attention score estimator** — the QJL correction term is provably unbiased for keys, while q4_0/q8_0 introduce bias that can compound across long contexts.
 - **Data-oblivious** — no calibration pass or fine-tuning; works on any model at any time.
-
-Current **limitation**: the wick implementation only compresses keys; values remain f32. llama.cpp's q4_0/q8_0 compresses both, so total KV memory savings in llama.cpp can exceed wick's for the same compression level. Value compression is planned as a follow-up.
 
 ### Memory footprint
 
-| Format | Bytes/key (head_dim=128) | Key compression |
+| Format | Bytes/key + value (head_dim=128) | Compression |
 |--------|---:|---:|
-| f32 (wick default) | 512 | 1× |
-| f16 | 256 | 2× |
-| **TurboQuant tq3** | **52** | **9.8×** |
+| f32 (wick default) | 512 + 512 = 1024 | 1× |
+| f16 | 256 + 256 = 512 | 2× |
+| **TurboQuant tq3** | **52 + 34 = 86** | **~12×** |
 
-Peak RSS on LFM2-VL-450M (wick CPU, 300-tok prompt):
+For a 1.6B LFM2 model with 6 attention layers, n_kv_heads=8, at 4096 tokens:
+- **Uncompressed:** ~192 MB
+- **TurboQuant tq3:** ~16 MB
 
-| Context | wick f32 | wick tq3 | Savings |
-|---|---:|---:|---:|
-| +1024 gen | 120 MB | 92 MB | **-23%** |
-| +3072 gen | 207 MB | 132 MB | **-36%** |
-
-Savings scale linearly with context length — at 8K+ tokens the KV cache dominates and savings approach the theoretical 9.8×.
+Savings scale linearly with context length — at 8K+ tokens the KV cache dominates and savings approach the theoretical ~12×.
 
 ### Throughput
 
-After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of wick f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts).
+After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of wick f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts). Values reuse the same NEON kernel pattern as keys for the hot inner loop.
+
+### CLI: enabling TurboQuant
+
+Both `wick run` and `wick bench` accept `--kv-cache-keys` (the flag name is kept for backwards compatibility; it now covers values too):
 
 ```bash
-# Enable via CLI flag
-wick run --model lfm2.gguf --kv-cache-keys tq3 --prompt "Hello"
-wick bench --model lfm2.gguf --kv-cache-keys tq3 --max-tokens 256
+# Uncompressed (default) — keys and values stored as f32
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys f32
+
+# Full TurboQuant — 3-bit keys + 2-bit values (production default)
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3
+
+# Keys only — 3-bit keys, values stay f32 (debugging: isolate key error)
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys
+
+# Values only — values stay 2-bit, keys stay f32 (debugging: isolate value error)
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values
 ```
 
-See `wick/src/turboquant.rs` for the implementation.
+Accepted values for `--kv-cache-keys`:
+
+| Value | Keys | Values | Use case |
+|-------|:-:|:-:|---|
+| `f32` / `none` | f32 | f32 | Baseline, no compression (default) |
+| `tq3` / `turboquant` | 3-bit | 2-bit | Production — both sides compressed |
+| `tq3-keys` | 3-bit | f32 | Debug: measure key-only drift |
+| `tq3-values` | f32 | 2-bit | Debug: measure value-only drift |
+
+The same flag applies to `wick bench` for A/B benchmarking:
+
+```bash
+wick bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256
+```
+
+And to audio generation via `wick run --vocoder`:
+
+```bash
+wick run -m lfm2-audio.gguf --vocoder vocoder.gguf \
+  --system "Respond with interleaved text and audio." \
+  -p "Hello, how are you today?" \
+  --audio-out /tmp/out.wav \
+  --kv-cache-keys tq3
+```
+
+### Programmatic API
+
+From Rust, construct a `KvCompression` and pass it to `InferenceState::from_config_with_compression` or via `GenerateConfig`:
+
+```rust
+use wick::kv_cache::KvCompression;
+
+// Production: both sides compressed
+let cfg = KvCompression::turboquant(42);
+
+// Explicit toggles (matches the CLI modes)
+let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: true  }; // == tq3
+let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: false }; // == tq3-keys
+let cfg = KvCompression::TurboQuant { seed: 42, keys: false, values: true  }; // == tq3-values
+
+// Disable entirely
+let cfg = KvCompression::None;
+```
+
+See `wick/src/turboquant.rs` for the implementation and `wick/src/kv_cache.rs` for the `KvCompression` enum.
 
 ## Features
 
@@ -139,7 +193,7 @@ See `wick/src/turboquant.rs` for the implementation.
 - **Three compute backends** — CPU (NEON SIMD), native Metal (MSL), wgpu (WGSL/Vulkan/Metal/DX12)
 - **Hybrid architectures** — LFM2/LFM2.5 (gated conv + grouped query attention)
 - **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M for weights
-- **TurboQuant KV cache compression** — 9.8× key cache reduction, unbiased attention estimator (first TurboQuant implementation for LFM2)
+- **TurboQuant KV cache compression** — ~12× KV reduction (3-bit keys + 2-bit values), unbiased attention estimator, first TurboQuant implementation for LFM2
 - **Built-in BPE tokenizer** — no Python, no runtime dependencies
 - **Bench harness** — `wick bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering

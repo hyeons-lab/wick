@@ -269,26 +269,42 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 }
 
 /// Parse KV cache compression mode and apply to model.
+///
+/// Modes:
+/// - `f32` / `none`: uncompressed (default)
+/// - `tq3` / `turboquant`: TurboQuant on both keys (3-bit) and values (2-bit)
+/// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging
+/// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging
 fn setup_kv_compression(
     model: &dyn wick::model::Model,
     kv_cache_mode: &str,
 ) -> Result<wick::kv_cache::KvCompression> {
-    match kv_cache_mode {
-        "f32" | "none" => Ok(wick::kv_cache::KvCompression::None),
-        "tq3" | "turboquant" => {
-            let seed = 42; // deterministic default seed
-            model.enable_turboquant(seed);
-            if model.turboquant_enabled() {
-                eprintln!("TurboQuant KV compression enabled (keys: 3-bit, values: 2-bit)");
-                Ok(wick::kv_cache::KvCompression::TurboQuant { seed })
-            } else {
-                eprintln!(
-                    "warning: TurboQuant not supported by this model/backend; falling back to f32 KV"
-                );
-                Ok(wick::kv_cache::KvCompression::None)
-            }
-        }
-        other => anyhow::bail!("unknown --kv-cache-keys mode: {other} (use f32 or tq3)"),
+    use wick::kv_cache::KvCompression;
+    let seed: u64 = 42; // deterministic default seed
+
+    let (keys, values) = match kv_cache_mode {
+        "f32" | "none" => return Ok(KvCompression::None),
+        "tq3" | "turboquant" => (true, true),
+        "tq3-keys" => (true, false),
+        "tq3-values" => (false, true),
+        other => anyhow::bail!(
+            "unknown --kv-cache-keys mode: {other} (use f32, tq3, tq3-keys, or tq3-values)"
+        ),
+    };
+
+    model.enable_turboquant(seed);
+    if model.turboquant_enabled() {
+        eprintln!(
+            "TurboQuant KV compression enabled (keys: {}, values: {})",
+            if keys { "3-bit" } else { "f32" },
+            if values { "2-bit" } else { "f32" }
+        );
+        Ok(KvCompression::TurboQuant { seed, keys, values })
+    } else {
+        eprintln!(
+            "warning: TurboQuant not supported by this model/backend; falling back to f32 KV"
+        );
+        Ok(KvCompression::None)
     }
 }
 
