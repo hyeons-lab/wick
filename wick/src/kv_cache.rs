@@ -6,13 +6,15 @@ use std::time::Instant;
 use crate::model::{BlockType, ModelConfig};
 use crate::turboquant::{CompressedKeyCache, EncodeScratch, QueryRotationScratch};
 
-/// Key cache compression mode.
+/// KV cache compression mode.
 #[derive(Clone, Debug, Default)]
-pub enum KeyCompression {
-    /// No compression — keys stored as f32 (default).
+pub enum KvCompression {
+    /// No compression — keys and values stored as f32 (default).
     #[default]
     None,
-    /// TurboQuant 3-bit compression (2-bit PolarQuant + 1-bit QJL).
+    /// TurboQuant compression for both keys and values.
+    /// Keys: 2-bit PolarQuant + 1-bit QJL residual (3 bits/elem + f16 norms).
+    /// Values: 2-bit PolarQuant only (2 bits/elem + f16 norms).
     TurboQuant { seed: u64 },
 }
 
@@ -111,14 +113,11 @@ impl InferenceState {
     /// Attention layers get empty KV caches; conv layers get zero-filled rolling buffers.
     /// Scratch buffers are pre-allocated to avoid per-token allocations.
     pub fn from_config(config: &ModelConfig) -> Self {
-        Self::from_config_with_compression(config, &KeyCompression::None)
+        Self::from_config_with_compression(config, &KvCompression::None)
     }
 
     /// Create inference state with optional key compression.
-    pub fn from_config_with_compression(
-        config: &ModelConfig,
-        compression: &KeyCompression,
-    ) -> Self {
+    pub fn from_config_with_compression(config: &ModelConfig, compression: &KvCompression) -> Self {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         assert!(
             kernel_size >= 2,
@@ -137,7 +136,7 @@ impl InferenceState {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[layer_idx];
                     let compressed = match compression {
-                        KeyCompression::TurboQuant { .. } if n_kv_heads > 0 => Some(
+                        KvCompression::TurboQuant { .. } if n_kv_heads > 0 => Some(
                             CompressedKeyCache::new(n_kv_heads, head_dim, initial_capacity),
                         ),
                         _ => None,
@@ -174,11 +173,11 @@ impl InferenceState {
                 q8_quants: Vec::new(), // resized per GEMV input dimension
             },
             tq_encode_scratch: match compression {
-                KeyCompression::TurboQuant { .. } => Some(EncodeScratch::new(head_dim)),
+                KvCompression::TurboQuant { .. } => Some(EncodeScratch::new(head_dim)),
                 _ => None,
             },
             tq_query_scratch: match compression {
-                KeyCompression::TurboQuant { .. } => {
+                KvCompression::TurboQuant { .. } => {
                     Some(QueryRotationScratch::new(config.n_heads, head_dim))
                 }
                 _ => None,

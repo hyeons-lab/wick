@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::kv_cache::{InferenceState, KeyCompression};
+use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
@@ -17,7 +17,7 @@ pub struct GenerateConfig {
     /// stdout I/O inside the timed decode loop.
     pub silent: bool,
     /// Key cache compression mode.
-    pub key_compression: KeyCompression,
+    pub kv_compression: KvCompression,
 }
 
 impl Default for GenerateConfig {
@@ -26,7 +26,7 @@ impl Default for GenerateConfig {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
             silent: false,
-            key_compression: KeyCompression::None,
+            kv_compression: KvCompression::None,
         }
     }
 }
@@ -50,7 +50,7 @@ pub fn generate(
 ) -> Result<GenerateResult> {
     let model_config = model.config();
     let mut state =
-        InferenceState::from_config_with_compression(model_config, &config.key_compression);
+        InferenceState::from_config_with_compression(model_config, &config.kv_compression);
     let mut sampler = Sampler::new(config.sampler.clone());
 
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt tokens cannot be empty");
