@@ -205,15 +205,24 @@ impl BpeTokenizer {
         let mut raw_bytes = Vec::new();
         for &id in token_ids {
             if let Some(token_bytes) = self.vocab.get(id as usize) {
-                let token_str = String::from_utf8_lossy(token_bytes);
-                for ch in token_str.chars() {
-                    if let Some(&b) = self.unicode_to_byte.get(&ch) {
-                        raw_bytes.push(b);
-                    } else {
-                        // Fallback: emit the raw UTF-8 bytes of the char
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        raw_bytes.extend_from_slice(s.as_bytes());
+                // Try to parse as UTF-8 and reverse the GPT-2 byte-to-unicode mapping.
+                // For raw byte tokens (e.g., <0x80> → [0x80], not valid UTF-8),
+                // emit the bytes directly — they're already the raw values we want.
+                match std::str::from_utf8(token_bytes) {
+                    Ok(s) => {
+                        for ch in s.chars() {
+                            if let Some(&b) = self.unicode_to_byte.get(&ch) {
+                                raw_bytes.push(b);
+                            } else {
+                                let mut buf = [0u8; 4];
+                                let encoded = ch.encode_utf8(&mut buf);
+                                raw_bytes.extend_from_slice(encoded.as_bytes());
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Non-UTF-8 token (raw byte token) — emit as-is
+                        raw_bytes.extend_from_slice(token_bytes);
                     }
                 }
             }

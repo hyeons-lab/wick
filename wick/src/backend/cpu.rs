@@ -2,8 +2,10 @@
 //
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
-use crate::backend::simd::{vec_dot_q4_k_m_f32, vec_dot_q8_0_f32};
-use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q6_k_f32};
+use crate::quant::{
+    BlockQ4_0, BlockQ4KM, BlockQ6K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32,
+    vec_dot_q6_k_f32, vec_dot_q8_0_f32,
+};
 use crate::tensor::DType;
 use std::mem::size_of;
 
