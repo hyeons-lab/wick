@@ -16,3 +16,8 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = []
+gpu = ["wick/gpu"]
+metal = ["wick/metal"]
