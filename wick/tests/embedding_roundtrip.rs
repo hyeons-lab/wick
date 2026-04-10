@@ -1,13 +1,11 @@
-// Verify forward_embedding → forward_from_embedding roundtrip matches forward.
+// Verify forward_embedding → forward_from_embedding roundtrip produces valid logits (no crash, correct length, finite values).
 // Run with: cargo test -p wick --features metal --test embedding_roundtrip
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use std::path::Path;
-
 #[test]
 fn embedding_roundtrip() {
-    let path =
-        Path::new(env!("HOME")).join(".leap/models/LFM2-VL-450M-Q4_0/LFM2-VL-450M-Q4_0.gguf");
+    let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
+        .join(".leap/models/LFM2-VL-450M-Q4_0/LFM2-VL-450M-Q4_0.gguf");
     if !path.exists() {
         eprintln!("skipping — model not found");
         return;

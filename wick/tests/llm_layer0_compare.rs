@@ -25,7 +25,7 @@ fn llm_layer0_conv_standalone() {
     use wick::model::Model;
     use wick::model::lfm2::Lfm2Model;
 
-    let model_path = std::path::Path::new(env!("HOME"))
+    let model_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !model_path.exists() {
         eprintln!("model not found, skipping");

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 fn find_model(name: &str) -> Option<std::path::PathBuf> {
-    let p = Path::new(env!("HOME"))
+    let p = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models")
         .join(name)
         .join(format!("{name}.gguf"));

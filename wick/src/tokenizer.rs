@@ -165,8 +165,12 @@ impl BpeTokenizer {
             let mut best: Option<(usize, usize, u32)> = None; // (start, end, id)
             for (tok_str, &tok_id) in &self.special_tokens {
                 if let Some(pos) = remaining.find(tok_str.as_str()) {
-                    if best.is_none() || pos < best.unwrap().0 {
-                        best = Some((pos, pos + tok_str.len(), tok_id));
+                    let end = pos + tok_str.len();
+                    if best.is_none()
+                        || pos < best.unwrap().0
+                        || (pos == best.unwrap().0 && end > best.unwrap().1)
+                    {
+                        best = Some((pos, end, tok_id));
                     }
                 }
             }

@@ -1255,6 +1255,10 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
         return vec![];
     }
 
+    // Pre-plan the IFFT (reused for every frame).
+    let mut planner = rustfft::FftPlanner::new();
+    let ifft = planner.plan_fft_inverse(n_fft);
+
     // Periodic Hann window: w[n] = 0.5 * (1 - cos(2π*n/N)).
     let hann: Vec<f32> = (0..n_fft)
         .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
@@ -1280,7 +1284,7 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
         }
 
         // IFFT.
-        let time_domain = ifft_frame(&complex, n_fft);
+        let time_domain = ifft_frame(&complex, n_fft, ifft.as_ref());
 
         // Add to overlap buffer with Hann window.
         for j in 0..n_fft {
@@ -1314,11 +1318,9 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
     output
 }
 
-/// Inverse FFT of one frame using rustfft.
-fn ifft_frame(complex: &[(f32, f32)], n_fft: usize) -> Vec<f32> {
-    use rustfft::{FftPlanner, num_complex::Complex32};
-    let mut planner = FftPlanner::new();
-    let ifft = planner.plan_fft_inverse(n_fft);
+/// Inverse FFT of one frame using a pre-planned FFT.
+fn ifft_frame(complex: &[(f32, f32)], n_fft: usize, ifft: &dyn rustfft::Fft<f32>) -> Vec<f32> {
+    use rustfft::num_complex::Complex32;
     let mut buf: Vec<Complex32> = complex
         .iter()
         .map(|&(re, im)| Complex32::new(re, im))

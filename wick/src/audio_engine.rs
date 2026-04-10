@@ -23,6 +23,9 @@ pub struct AudioGenerateConfig {
     pub audio_top_k: usize,
     /// Generation mode.
     pub mode: AudioMode,
+    /// Use GPU for depthformer (code sampling). Disabled by default because
+    /// GEMV accumulation order differences can produce different codes.
+    pub gpu_depthformer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -69,11 +72,20 @@ pub fn generate_audio(
     mut text_callback: impl FnMut(&str),
     mut audio_callback: impl FnMut(&[f32], u32),
 ) -> Result<AudioGenerateResult> {
+    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config);
     let mut sampler = Sampler::new(config.sampler.clone());
     let mut df_state = DepthformerState::new(&decoder_weights.depthformer_config);
     let mut detok_state = DetokenizerState::new(&detok_weights.config);
+
+    // Reset GPU backend to ensure clean state across calls.
+    if let Some(g) = gpu {
+        g.reset_detokenizer();
+        g.reset_depthformer();
+    }
+
     // Accumulate all spectrum data for a single ISTFT pass at the end.
     // This avoids discontinuities from per-frame ISTFT with fresh overlap buffers.
     let mut all_spectrum = Vec::new();
@@ -168,10 +180,7 @@ pub fn generate_audio(
                 // Run audio loop with this embedding.
                 loop {
                     let t0 = Instant::now();
-                    // GPU depthformer disabled by default: GEMV accumulation
-                    // order differences produce wrong codes. Set WICK_GPU_DF=1 to test.
-                    let use_gpu_df =
-                        gpu.is_some() && std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                    let use_gpu_df = gpu.is_some() && config.gpu_depthformer;
                     let codes = if use_gpu_df {
                         gpu.unwrap().sample_audio_frame(
                             &emb,

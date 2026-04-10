@@ -1,7 +1,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn single_token_attention() {
-    let vocoder_path = std::path::Path::new(env!("HOME"))
+    let vocoder_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !vocoder_path.exists() {
         return;

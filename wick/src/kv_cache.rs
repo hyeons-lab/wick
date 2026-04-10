@@ -296,15 +296,17 @@ impl KvPrefixCache {
             self.save_cold(dir, tokens, &snapshot);
         }
 
-        self.warm_bytes += snap_bytes;
-        self.warm.insert(
+        if let Some(old) = self.warm.insert(
             hash,
             CacheEntry {
                 tokens: tokens.to_vec(),
                 snapshot,
                 last_used: Cell::new(Instant::now()),
             },
-        );
+        ) {
+            self.warm_bytes -= old.snapshot.byte_size() as u64;
+        }
+        self.warm_bytes += snap_bytes;
     }
 
     /// Total bytes in warm tier.
@@ -400,27 +402,23 @@ impl KvPrefixCache {
     }
 
     fn find_cold_prefix(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
-        let entries = std::fs::read_dir(dir).ok()?;
-        let fp_prefix = format!("{:016x}_", self.model_fingerprint);
+        // Check specific filenames by pre-computing hashes for all prefixes,
+        // longest first. This avoids reading the entire directory.
+        let mut best: Option<StateSnapshot> = None;
 
-        let mut best: Option<(StateSnapshot, usize)> = None;
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.starts_with(&fp_prefix) || !name_str.ends_with(".kvcache") {
-                continue;
-            }
-
-            if let Some(snapshot) = self.load_cold_file(&entry.path(), tokens) {
-                let len = snapshot.seq_len;
-                if best.as_ref().is_none_or(|(_, bl)| len > *bl) {
-                    best = Some((snapshot, len));
+        for prefix_len in (1..=tokens.len()).rev() {
+            let prefix = &tokens[..prefix_len];
+            let hash = hash_tokens(prefix);
+            let path = dir.join(self.cold_filename(hash));
+            if path.exists() {
+                if let Some(snapshot) = self.load_cold_file(&path, tokens) {
+                    best = Some(snapshot);
+                    break; // longest prefix first, so first match is best
                 }
             }
         }
 
-        best.map(|(s, _)| s)
+        best
     }
 
     fn load_cold_file(&self, path: &Path, expected_prefix: &[u32]) -> Option<StateSnapshot> {
@@ -434,6 +432,11 @@ impl KvPrefixCache {
 
         let cached_tokens = entry.tokens()?;
         let seq_len = entry.seq_len() as usize;
+
+        // Validate seq_len matches token count.
+        if seq_len != cached_tokens.len() {
+            return None;
+        }
 
         // Check that cached tokens are a prefix of expected tokens.
         if cached_tokens.len() > expected_prefix.len() {
@@ -452,13 +455,13 @@ impl KvPrefixCache {
             match l.type_tag() {
                 0 => {
                     layers.push(LayerSnapshot::Attention {
-                        k_data: l.k_data()?.iter().collect(),
-                        v_data: l.v_data()?.iter().collect(),
+                        k_data: l.k_data()?.bytes().to_vec(),
+                        v_data: l.v_data()?.bytes().to_vec(),
                     });
                 }
                 1 => {
                     layers.push(LayerSnapshot::Conv {
-                        buffer: l.k_data()?.iter().collect(),
+                        buffer: l.k_data()?.bytes().to_vec(),
                     });
                 }
                 _ => return None,
@@ -472,9 +475,14 @@ impl KvPrefixCache {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
+        let fp_prefix = format!("{:016x}_", self.model_fingerprint);
         let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "kvcache"))
+            .filter(|e| {
+                let name = e.file_name();
+                let name_str = name.to_string_lossy();
+                name_str.starts_with(&fp_prefix) && name_str.ends_with(".kvcache")
+            })
             .filter_map(|e| {
                 let meta = e.metadata().ok()?;
                 Some((e.path(), meta.len(), meta.modified().ok()?))

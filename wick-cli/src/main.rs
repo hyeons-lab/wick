@@ -406,6 +406,7 @@ fn main() -> Result<()> {
                     audio_temperature,
                     audio_top_k,
                     mode,
+                    gpu_depthformer: std::env::var("WICK_GPU_DF").as_deref() == Ok("1"),
                 };
 
                 #[cfg(all(feature = "metal", target_os = "macos"))]

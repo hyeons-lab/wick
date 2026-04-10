@@ -1347,10 +1347,11 @@ impl MetalDepthformer {
 // ── AudioGpu trait implementation ───────────────────────────────────────────
 
 impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
-    fn sample_audio_frame(&self, _embedding: &[f32], _temperature: f32, _top_k: usize) -> [i32; 8] {
-        // GPU depthformer is slower than CPU NEON (21ms vs 17ms) and produces
-        // different codes due to GEMV accumulation order. Keep on CPU.
-        panic!("Use CPU depthformer fallback")
+    fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
+        match &self.depthformer {
+            Some(df) => df.sample_frame(embedding, temperature, top_k),
+            None => panic!("Metal depthformer not loaded — use CPU fallback"),
+        }
     }
 
     fn detokenize_to_spectrum(
@@ -1361,7 +1362,11 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
         self.detokenize_to_spectrum(cpu_weights, codes)
     }
 
-    fn reset_depthformer(&self) {}
+    fn reset_depthformer(&self) {
+        if let Some(df) = &self.depthformer {
+            df.reset();
+        }
+    }
 
     fn reset_detokenizer(&self) {
         self.reset();

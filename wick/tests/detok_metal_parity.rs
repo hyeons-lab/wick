@@ -10,8 +10,6 @@
 //! Thresholds assume both paths use F32 dequantized weights. If the GPU
 //! path switches to quantized weights, thresholds must be re-evaluated.
 
-use std::path::Path;
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
@@ -41,7 +39,7 @@ fn band_energy(log_abs: &[f32], start: usize, end: usize) -> f64 {
 }
 
 fn load_vocoder() -> Option<(wick::gguf::GgufFile, std::path::PathBuf)> {
-    let path = Path::new(env!("HOME"))
+    let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !path.exists() {
         eprintln!("vocoder not found at {}, skipping", path.display());

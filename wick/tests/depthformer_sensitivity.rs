@@ -4,7 +4,7 @@
 /// embedding, compare cb2 logits to see why argmax flips.
 #[test]
 fn depthformer_cb2_sensitivity() {
-    let vocoder_path = std::path::Path::new(env!("HOME"))
+    let vocoder_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     let wick_emb_path = std::path::Path::new("/tmp/wick_frame1_emb.bin");
     let ref_emb_path = std::path::Path::new("/tmp/ref_frame1_emb.bin");

@@ -2,7 +2,7 @@
 
 #[test]
 fn frame2_codes_from_ref_embedding() {
-    let vocoder_path = std::path::Path::new(env!("HOME"))
+    let vocoder_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
 
     let load_emb = |path: &str| -> Vec<f32> {
@@ -14,6 +14,17 @@ fn frame2_codes_from_ref_embedding() {
     };
 
     if !vocoder_path.exists() {
+        return;
+    }
+    // These reference files are created by external comparison scripts.
+    let ref_files = [
+        "/tmp/ref_frame0_emb.bin",
+        "/tmp/ref_frame1_emb.bin",
+        "/tmp/ref_frame2_emb.bin",
+        "/tmp/wick_frame2_emb.bin",
+    ];
+    if ref_files.iter().any(|f| !std::path::Path::new(f).exists()) {
+        eprintln!("skipping — reference embedding files not found in /tmp/");
         return;
     }
     let ref_f0 = load_emb("/tmp/ref_frame0_emb.bin");

@@ -1,6 +1,6 @@
 #[test]
 fn detokenize_smoke() {
-    let path = std::path::Path::new(env!("HOME"))
+    let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !path.exists() {
         eprintln!("skipping — vocoder not found");
