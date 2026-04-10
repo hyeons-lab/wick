@@ -228,18 +228,18 @@ pub struct KvPrefixCache {
 }
 
 impl KvPrefixCache {
-    pub fn new(config: KvCacheConfig, model_config: &ModelConfig) -> Self {
+    pub fn new(config: KvCacheConfig, model_config: &ModelConfig, model_id: &str) -> Self {
         Self {
             warm: HashMap::new(),
-            model_fingerprint: model_fingerprint(model_config),
+            model_fingerprint: model_fingerprint(model_config, model_id),
             config,
             warm_bytes: 0,
         }
     }
 
     /// Find the longest cached prefix matching the start of `tokens`.
+    /// Checks both warm and cold tiers and returns whichever has the longer match.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
-        // Warm tier: flat scan. Clone the snapshot to avoid borrow issues.
         let warm_hit = self
             .warm
             .values()
@@ -250,33 +250,48 @@ impl KvPrefixCache {
                 (e.snapshot.clone(), e.tokens.len())
             });
 
-        if warm_hit.is_some() {
-            return warm_hit;
-        }
-
-        // Cold tier: scan cache dir for matching files.
-        if let Some(dir) = self.config.cache_dir.clone() {
-            if let Some(snapshot) = self.find_cold_prefix(&dir, tokens) {
+        // Check cold tier too — it may have a longer prefix than the warm hit.
+        let cold_hit = self
+            .config
+            .cache_dir
+            .clone()
+            .and_then(|dir| self.find_cold_prefix(&dir, tokens))
+            .map(|snapshot| {
                 let len = snapshot.seq_len;
-                // Promote to warm.
-                let hash = hash_tokens(&tokens[..len]);
+                (snapshot, len)
+            });
+
+        let best = match (warm_hit, cold_hit) {
+            (Some(w), Some(c)) if c.1 > w.1 => Some(c),
+            (Some(w), _) => Some(w),
+            (None, c) => c,
+        };
+
+        // If the best hit came from the cold tier, promote it to warm.
+        if let Some((snapshot, len)) = &best {
+            if !self
+                .warm
+                .values()
+                .any(|e| e.tokens.len() >= *len && tokens.starts_with(&e.tokens))
+            {
+                let hash = hash_tokens(&tokens[..*len]);
                 let snap_bytes = snapshot.byte_size() as u64;
                 self.evict_warm_if_needed(snap_bytes);
-                self.warm_bytes += snap_bytes;
-                let snapshot_clone = snapshot.clone();
-                self.warm.insert(
+                if let Some(old) = self.warm.insert(
                     hash,
                     CacheEntry {
-                        tokens: tokens[..len].to_vec(),
-                        snapshot,
+                        tokens: tokens[..*len].to_vec(),
+                        snapshot: snapshot.clone(),
                         last_used: Cell::new(Instant::now()),
                     },
-                );
-                return Some((snapshot_clone, len));
+                ) {
+                    self.warm_bytes -= old.snapshot.byte_size() as u64;
+                }
+                self.warm_bytes += snap_bytes;
             }
         }
 
-        None
+        best
     }
 
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
@@ -507,23 +522,50 @@ impl KvPrefixCache {
     }
 }
 
+/// Stable 64-bit FNV-1a hash. Unlike `DefaultHasher`, the output is guaranteed
+/// to be identical across Rust versions and platforms — required for the
+/// on-disk cold cache where filenames embed the token hash.
+fn fnv1a_u64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
 fn hash_tokens(tokens: &[u32]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tokens.hash(&mut hasher);
-    hasher.finish()
+    let bytes: &[u8] = bytemuck::cast_slice(tokens);
+    fnv1a_u64(bytes)
 }
 
 /// Compute a fingerprint for a model configuration.
 /// Two models with different fingerprints have incompatible KV cache layouts.
-pub fn model_fingerprint(config: &ModelConfig) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.architecture.hash(&mut hasher);
-    config.n_layers.hash(&mut hasher);
-    config.hidden_size.hash(&mut hasher);
-    config.n_heads.hash(&mut hasher);
-    config.block_types.hash(&mut hasher);
-    config.kv_heads_per_layer.hash(&mut hasher);
-    hasher.finish()
+/// Callers should pass a `model_id` that uniquely identifies the specific
+/// model weights (e.g. a hash of the GGUF file or the model name from metadata),
+/// so different models with the same architecture don't share cache entries.
+pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
+    // Build a stable byte representation and hash it via FNV-1a. Using
+    // DefaultHasher would make the fingerprint non-stable across Rust versions,
+    // invalidating on-disk cache files at every toolchain bump.
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(model_id.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(config.architecture.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&(config.n_layers as u64).to_le_bytes());
+    buf.extend_from_slice(&(config.hidden_size as u64).to_le_bytes());
+    buf.extend_from_slice(&(config.n_heads as u64).to_le_bytes());
+    for bt in &config.block_types {
+        buf.push(match bt {
+            crate::model::BlockType::Attention => 0,
+            crate::model::BlockType::GatedConv => 1,
+        });
+    }
+    for k in &config.kv_heads_per_layer {
+        buf.extend_from_slice(&(*k as u64).to_le_bytes());
+    }
+    fnv1a_u64(&buf)
 }

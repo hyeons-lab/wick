@@ -186,6 +186,12 @@ pub struct MetalLfm2Model {
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
     pub prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
+    /// Cached env var values: read once at init to avoid per-dispatch syscalls.
+    force_flash: bool,
+    attn_mode: String,
+    /// Unique model identifier (GGUF file path). Used as part of the cache
+    /// fingerprint so different models with the same architecture don't collide.
+    model_id: String,
 }
 
 impl MetalLfm2Model {
@@ -407,9 +413,13 @@ impl MetalLfm2Model {
                 .upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32, hs as u32])),
         };
 
+        // Use the GGUF file path as the model identifier so different model
+        // files (even with the same architecture) don't share cache entries.
+        let model_id = path.to_string_lossy();
         let prefix_cache = std::cell::RefCell::new(crate::kv_cache::KvPrefixCache::new(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
+            &model_id,
         ));
 
         // GPU timestamp profiler. Must be built before `ctx` is moved into the struct.
@@ -478,6 +488,9 @@ impl MetalLfm2Model {
             },
             gpu_timer,
             prefix_cache,
+            force_flash: std::env::var("WICK_FLASH").as_deref() == Ok("1"),
+            attn_mode: std::env::var("WICK_ATTN").unwrap_or_default(),
+            model_id: model_id.into_owned(),
         })
     }
 }
@@ -1526,8 +1539,8 @@ impl MetalLfm2Model {
         // - WICK_FLASH=1: force FlashAttention at any seq_len
         // - seq_len > 4096: auto-switch to flash (classic TG memory limit)
         // - default (seq_len ≤ 4096): classic 3-phase attention
-        let attn_mode = std::env::var("WICK_ATTN").unwrap_or_default();
-        let use_flash = std::env::var("WICK_FLASH").as_deref() == Ok("1") || seq_len > 4096;
+        let attn_mode = self.attn_mode.as_str();
+        let use_flash = self.force_flash || seq_len > 4096;
         let group_size = n_heads / n_kv_heads;
         let use_gqa = attn_mode == "gqa" && group_size > 1 && group_size <= 4;
         let use_splitk = attn_mode == "splitk";
@@ -1629,7 +1642,7 @@ impl MetalLfm2Model {
         if std::env::var("WICK_PROFILE").as_deref() == Ok("noattn") {
             return;
         }
-        let use_flash = std::env::var("WICK_FLASH").as_deref() == Ok("1") || seq_len > 4096;
+        let use_flash = self.force_flash || seq_len > 4096;
         let (pipeline, tg_count) = if use_flash {
             (&self.pipelines.flash_attention, n_heads as u64)
         } else {
@@ -1942,7 +1955,8 @@ impl Model for MetalLfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
-        *self.prefix_cache.borrow_mut() = crate::kv_cache::KvPrefixCache::new(config, &self.config);
+        *self.prefix_cache.borrow_mut() =
+            crate::kv_cache::KvPrefixCache::new(config, &self.config, &self.model_id);
     }
 
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {

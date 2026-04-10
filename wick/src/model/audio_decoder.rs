@@ -1269,22 +1269,29 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
     let mut window_sum = vec![0.0f32; n_fft];
     let mut output = Vec::with_capacity(n_frames * hop_length);
 
+    // Pre-allocated scratch (reused across frames to avoid per-frame heap allocs).
+    use rustfft::num_complex::Complex32;
+    let mut fft_buf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); n_fft];
+    let mut time_domain = vec![0.0f32; n_fft];
+
     for i in 0..n_frames {
-        // Convert (log_abs, angle) → interleaved complex.
-        let mut complex = vec![(0.0f32, 0.0f32); n_fft];
+        // Convert (log_abs, angle) → complex, write directly into fft_buf.
+        for c in fft_buf.iter_mut() {
+            *c = Complex32::new(0.0, 0.0);
+        }
         for j in 0..n_fft_bins {
             let log_abs = spectrum[i * frame_size + j];
             let angle = spectrum[i * frame_size + n_fft_bins + j];
             let mag = log_abs.exp();
-            complex[j] = (mag * angle.cos(), mag * angle.sin());
+            fft_buf[j] = Complex32::new(mag * angle.cos(), mag * angle.sin());
         }
         // Mirror negative frequencies (conjugate).
         for j in 1..n_fft_bins - 1 {
-            complex[n_fft - j] = (complex[j].0, -complex[j].1);
+            fft_buf[n_fft - j] = Complex32::new(fft_buf[j].re, -fft_buf[j].im);
         }
 
-        // IFFT.
-        let time_domain = ifft_frame(&complex, n_fft, ifft.as_ref());
+        // IFFT (in-place on fft_buf, results written to time_domain).
+        ifft_frame(&mut fft_buf, &mut time_domain, n_fft, ifft.as_ref());
 
         // Add to overlap buffer with Hann window.
         for j in 0..n_fft {
@@ -1319,13 +1326,16 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
 }
 
 /// Inverse FFT of one frame using a pre-planned FFT.
-fn ifft_frame(complex: &[(f32, f32)], n_fft: usize, ifft: &dyn rustfft::Fft<f32>) -> Vec<f32> {
-    use rustfft::num_complex::Complex32;
-    let mut buf: Vec<Complex32> = complex
-        .iter()
-        .map(|&(re, im)| Complex32::new(re, im))
-        .collect();
-    ifft.process(&mut buf);
+/// Processes `fft_buf` in place and writes real parts (scaled by 1/n_fft) into `out`.
+fn ifft_frame(
+    fft_buf: &mut [rustfft::num_complex::Complex32],
+    out: &mut [f32],
+    n_fft: usize,
+    ifft: &dyn rustfft::Fft<f32>,
+) {
+    ifft.process(fft_buf);
     let inv_n = 1.0 / n_fft as f32;
-    buf.iter().map(|c| c.re * inv_n).collect()
+    for (o, c) in out.iter_mut().zip(fft_buf.iter()) {
+        *o = c.re * inv_n;
+    }
 }

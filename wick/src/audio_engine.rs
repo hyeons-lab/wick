@@ -258,8 +258,7 @@ pub fn generate_audio(
 
             loop {
                 let t0 = Instant::now();
-                let use_gpu_df =
-                    gpu.is_some() && std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                let use_gpu_df = gpu.is_some() && config.gpu_depthformer;
                 let codes = if use_gpu_df {
                     gpu.unwrap().sample_audio_frame(
                         &emb,
