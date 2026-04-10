@@ -27,7 +27,7 @@ kernel void flash_attention(
     const device float* k_cache [[buffer(1)]],
     const device float* v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
-    const device Params& params [[buffer(4)]],
+    constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -87,7 +87,7 @@ kernel void flash_attention(
             if (simd_lane == 0u) {
                 float new_max = max(running_max, tile_max);
                 broadcast[0] = new_max;
-                broadcast[1] = fast::exp(running_max - new_max);
+                broadcast[1] = exp(running_max - new_max);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -96,7 +96,7 @@ kernel void flash_attention(
 
         // Step 3: exponentiate tile scores in place.
         if (tid < tile_len) {
-            tile_scores[tid] = fast::exp(tile_scores[tid] - new_max);
+            tile_scores[tid] = exp(tile_scores[tid] - new_max);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

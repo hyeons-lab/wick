@@ -7,13 +7,16 @@ pub mod gpu_lfm2;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_lfm2;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_audio_decoder;
+
 use anyhow::{Result, bail};
 
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 
 /// Per-layer block type (for hybrid architectures like LFM2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockType {
     Attention,
     GatedConv,
@@ -65,6 +68,42 @@ pub trait Model: Send {
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
 
+    /// Run a forward pass and return the hidden state BEFORE logit projection.
+    /// Used by the audio decoder to extract the LLM embedding for audio frame sampling.
+    /// Default: panics (must be overridden by backends that support audio).
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _ = tokens;
+        unimplemented!("forward_embedding not supported by this backend")
+    }
+
+    /// Forward pass with a float embedding as input (instead of a token ID).
+    /// Used to feed audio codec embeddings back into the LLM after an audio frame.
+    /// Default: panics (must be overridden by backends that support audio).
+    fn forward_from_embedding(
+        &self,
+        _embedding: &[f32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        unimplemented!("forward_from_embedding not supported by this backend")
+    }
+
+    /// Forward pass with embedding input, returning hidden state (not logits).
+    /// Used in audio mode: embedding → layers → hidden state → sample audio → embed → loop.
+    fn forward_hidden_from_embedding(
+        &self,
+        _embedding: &[f32],
+        _pos: usize,
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        unimplemented!("forward_hidden_from_embedding not supported by this backend")
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///
@@ -73,6 +112,24 @@ pub trait Model: Send {
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let logits = self.forward(tokens, pos, state);
         crate::sampler::cpu_argmax(&logits)
+    }
+
+    /// GPU memory allocated by this model (bytes). 0 for CPU-only backends.
+    fn gpu_memory_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Configure the KV prefix cache. No-op for backends without caching.
+    fn configure_cache(&self, _config: crate::kv_cache::KvCacheConfig) {}
+
+    /// Snapshot the current KV and conv state for prefix caching.
+    fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
+        unimplemented!("snapshot_state not supported by this backend")
+    }
+
+    /// Restore a previously snapshotted state. Sets internal seq_len.
+    fn restore_state(&self, _snapshot: &crate::kv_cache::StateSnapshot) {
+        unimplemented!("restore_state not supported by this backend")
     }
 }
 
@@ -124,3 +181,10 @@ pub fn load_model_metal(
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::manual_saturating_arithmetic,
+    unused_variables
+)]
+pub mod audio_decoder;

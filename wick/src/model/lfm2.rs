@@ -318,6 +318,38 @@ impl Lfm2Model {
         self.conv_weights[layer].as_deref()
     }
 
+    /// Dequantize a token embedding row to f32.
+    pub fn dequantize_embedding(&self, token_id: usize) -> Vec<f32> {
+        self.dequantize_row(&self.embd_ref, token_id)
+    }
+
+    /// Conv in_proj GEMV for a layer.
+    pub fn conv_in_proj_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
+        let wref = self.layer_refs[layer].shortconv_in_proj.as_ref().unwrap();
+        self.gemv(wref, x, y);
+    }
+
+    /// Conv out_proj GEMV for a layer.
+    pub fn conv_out_proj_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
+        let wref = self.layer_refs[layer].shortconv_out_proj.as_ref().unwrap();
+        self.gemv(wref, x, y);
+    }
+
+    /// FFN gate GEMV for a layer.
+    pub fn ffn_gate_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
+        self.gemv(&self.layer_refs[layer].ffn_gate, x, y);
+    }
+
+    /// FFN up GEMV for a layer.
+    pub fn ffn_up_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
+        self.gemv(&self.layer_refs[layer].ffn_up, x, y);
+    }
+
+    /// FFN down GEMV for a layer.
+    pub fn ffn_down_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
+        self.gemv(&self.layer_refs[layer].ffn_down, x, y);
+    }
+
     /// Returns (ffn_gate_m, ffn_gate_k, ffn_down_m, ffn_down_k) for a layer.
     pub fn layer_weight_info(&self, layer: usize) -> LayerWeightDims {
         let refs = &self.layer_refs[layer];
@@ -732,56 +764,41 @@ impl Lfm2Model {
             out,
         );
     }
-}
-
-impl Model for Lfm2Model {
-    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
-        let token_id = tokens[0] as usize;
+    /// Run all layers + output norm on a hidden state vector. Shared by
+    /// forward(), forward_embedding(), and forward_hidden_from_embedding().
+    fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let cfg = &self.config;
-        assert!(
-            token_id < cfg.vocab_size,
-            "token_id {token_id} out of range (vocab_size={})",
-            cfg.vocab_size
-        );
-
-        // 1. Embedding lookup (no embedding norm — raw into layers)
-        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
-
-        // 2. Per-layer loop
-        // Pre-allocate norm buffers outside the loop to avoid per-layer allocation.
         let hs = cfg.hidden_size;
-        let mut normed = vec![0.0f32; hs];
-        let mut ffn_input = vec![0.0f32; hs];
+        // Reuse pre-allocated scratch from InferenceState instead of allocating
+        // fresh Vecs on every call. Take them out of `state.scratch` to avoid
+        // borrow-checker conflicts with the mutable `state` passed to
+        // forward_attn_block / forward_conv_block below; put them back at the end.
+        let mut normed = std::mem::take(&mut state.scratch.normed);
+        let mut ffn_input = std::mem::take(&mut state.scratch.ffn_input);
+        normed.resize(hs, 0.0);
+        ffn_input.resize(hs, 0.0);
+
         for i in 0..cfg.n_layers {
-            // Pre-norm (operator_norm) — copy+norm, keep hidden as residual
-            normed.copy_from_slice(&hidden);
+            normed.copy_from_slice(hidden);
             cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
 
-            // Pre-quantize normed input for operator GEMVs (shared across all projections)
             #[cfg(target_arch = "aarch64")]
             Self::quantize_to_scratch(&normed, state);
 
-            // Operator: conv or attention (writes result to state.scratch.out)
             if cfg.block_types[i] == BlockType::GatedConv {
                 self.forward_conv_block(i, &normed, state);
             } else {
                 self.forward_attn_block(i, &normed, pos, state);
             }
 
-            // First residual: hidden += block_out
-            cpu::add_inplace(&mut hidden, &state.scratch.out[..hs]);
+            cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
-            // FFN pre-norm
-            ffn_input.copy_from_slice(&hidden);
+            ffn_input.copy_from_slice(hidden);
             cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
 
-            // SwiGLU FFN — quantize each unique input once
             let refs = &self.layer_refs[i];
-
             #[cfg(target_arch = "aarch64")]
             {
-                // Quantize ffn_input once for gate + up
                 Self::quantize_to_scratch(&ffn_input, state);
                 self.gemv_preq(
                     &refs.ffn_gate,
@@ -817,10 +834,8 @@ impl Model for Lfm2Model {
                 &state.scratch.up[..cfg.intermediate_size],
             );
 
-            // Quantize gate (after silu_mul) for down projection
             #[cfg(target_arch = "aarch64")]
             {
-                // Quantize directly using disjoint field access to avoid borrow conflict
                 let nb = cfg.intermediate_size / 32;
                 state.scratch.q8_scales.resize(nb, 0.0);
                 state.scratch.q8_quants.resize(cfg.intermediate_size, 0);
@@ -846,14 +861,34 @@ impl Model for Lfm2Model {
                 &mut state.scratch.out[..hs],
             );
 
-            // Second residual: hidden += ffn_out
-            cpu::add_inplace(&mut hidden, &state.scratch.out[..cfg.hidden_size]);
+            cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
         }
 
-        // 3. Output norm (token_embd_norm is the output norm, not embedding norm)
-        cpu::rmsnorm(&mut hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+        cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+        state.seq_len += 1;
 
-        // 4. Output projection (tied embeddings)
+        // Return the scratch buffers for the next call.
+        state.scratch.normed = normed;
+        state.scratch.ffn_input = ffn_input;
+    }
+}
+
+impl Model for Lfm2Model {
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        assert!(
+            token_id < cfg.vocab_size,
+            "token_id {token_id} out of range (vocab_size={})",
+            cfg.vocab_size
+        );
+
+        // 1. Embedding lookup → layers → output norm
+        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+        self.run_layers(&mut hidden, pos, state);
+
+        // 2. Output projection (tied embeddings)
         let mut logits = vec![0.0f32; cfg.vocab_size];
         #[cfg(target_arch = "aarch64")]
         {
@@ -869,10 +904,63 @@ impl Model for Lfm2Model {
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(&self.embd_ref, &hidden, &mut logits);
 
-        // Update sequence length
-        state.seq_len += 1;
+        logits
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let mut hidden = embedding.to_vec();
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+
+        // Output projection (tied embeddings)
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        self.gemv(&self.embd_ref, &hidden, &mut logits);
 
         logits
+    }
+
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1);
+        let token_id = tokens[0] as usize;
+        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+        hidden
+    }
+
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let mut hidden = embedding.to_vec();
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+        hidden
     }
 
     fn forward_prefill(

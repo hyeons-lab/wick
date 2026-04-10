@@ -31,7 +31,7 @@ kernel void attention_split_compute(
     device float* partials_out [[buffer(3)]],    // [n_heads × n_splits × head_dim]
     device float* partials_max [[buffer(4)]],    // [n_heads × n_splits]
     device float* partials_sum [[buffer(5)]],    // [n_heads × n_splits]
-    const device SplitParams& params [[buffer(6)]],
+    constant SplitParams& params [[buffer(6)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
 ) {
@@ -115,7 +115,7 @@ kernel void attention_split_compute(
 
     float partial_sum = 0.0f;
     for (uint i = tid; i < t_len; i += 256u) {
-        float e = fast::exp(scores[i] - max_val);
+        float e = exp(scores[i] - max_val);
         scores[i] = e;
         partial_sum += e;
     }
@@ -161,7 +161,7 @@ kernel void attention_split_merge(
     const device float* partials_max [[buffer(1)]],  // [n_heads × n_splits]
     const device float* partials_sum [[buffer(2)]],  // [n_heads × n_splits]
     device float* out [[buffer(3)]],                 // [n_heads × head_dim]
-    const device SplitParams& params [[buffer(4)]],
+    constant SplitParams& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -180,7 +180,7 @@ kernel void attention_split_merge(
         float m = partials_max[head * n_splits + s];
         if (!isinf(m)) {
             combined_sum += partials_sum[head * n_splits + s]
-                          * fast::exp(m - combined_max);
+                          * exp(m - combined_max);
         }
     }
     float inv_sum = 1.0f / combined_sum;
@@ -191,7 +191,7 @@ kernel void attention_split_merge(
         for (uint s = 0; s < n_splits; s++) {
             float m = partials_max[head * n_splits + s];
             if (!isinf(m)) {
-                float corr = fast::exp(m - combined_max);
+                float corr = exp(m - combined_max);
                 acc += partials_out[(head * n_splits + s) * head_dim + tid] * corr;
             }
         }

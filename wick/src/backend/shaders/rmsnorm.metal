@@ -11,7 +11,7 @@ kernel void rmsnorm(
     const device float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
     const device float* w [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint n = params.n;

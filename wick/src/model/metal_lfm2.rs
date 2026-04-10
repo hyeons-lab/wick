@@ -14,6 +14,15 @@ use crate::kv_cache::InferenceState;
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
 
+/// Minimum batch size (n) for using the GEMM kernel (simdgroup matrix ops).
+/// Below this, batch GEMV is used. GEMM tiles are 64×32 output; at n<16 the
+/// tile utilization drops below 50% and batch GEMV wins.
+const GEMM_MIN_N: u32 = 16;
+
+/// Maximum tokens for batched prefill. Larger prompts fall back to sequential.
+/// Determines batch buffer allocation: 5 buffers × O(hs × cap) floats.
+const MAX_PREFILL_TOKENS: usize = 512;
+
 /// A weight matrix on GPU — references the shared mmap buffer via byte offset.
 struct MetalWeight {
     /// Byte offset into the shared mmap_buf where this weight's data starts.
@@ -50,6 +59,9 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_f16: ComputePipelineState,
     gemv_q6_k: ComputePipelineState,
+    gemv_q8_0: ComputePipelineState,
+    gemv_q8_0_accum: ComputePipelineState,
+    gemv_q8_0_batch: ComputePipelineState,
     gemv_q4_0_fast_accum: ComputePipelineState,
     gemv_q4_0_fast_slim: ComputePipelineState,
     gemv_q4_0_fast_slim_accum: ComputePipelineState,
@@ -83,6 +95,15 @@ struct MetalPipelines {
     attention_split_merge: ComputePipelineState,
     conv1d: ComputePipelineState,
     argmax_f32: ComputePipelineState,
+    gemv_q4_0_batch: ComputePipelineState,
+    rmsnorm_batch: ComputePipelineState,
+    add_rmsnorm_batch: ComputePipelineState,
+    conv1d_fused: ComputePipelineState,
+    gemm_q4_0: ComputePipelineState,
+    gemm_q8_0: ComputePipelineState,
+    attention_prefill: ComputePipelineState,
+    qk_norm_rope_batch: ComputePipelineState,
+    conv1d_fused_batch: ComputePipelineState,
 }
 
 #[allow(dead_code)]
@@ -120,7 +141,8 @@ pub struct MetalLfm2Model {
     /// token_embd.weight as Q6_K natively in the GGUF (52 MB) — we upload
     /// those bytes directly and GEMV-decode on GPU. Avoids dequantization
     /// at load AND preserves original model precision.
-    embedding_q6k_offset: u64,
+    embedding_offset: u64,
+    embedding_dtype: DType,
     output_norm: Buffer,
 
     layers: Vec<MetalLayerWeights>,
@@ -144,6 +166,12 @@ pub struct MetalLfm2Model {
     conv_bx_buf: Buffer,
     conv_out_buf: Buffer,
     conv_gate_buf: Buffer,
+    /// Pre-allocated batch buffers for prefill. Sized for max_seq_len tokens.
+    prefill_batch_buf: Buffer, // [hs × max_seq_len] hidden states
+    prefill_normed_buf: Buffer, // [hs × max_seq_len] normed states
+    prefill_proj_buf: Buffer,   // [max(3*hs, hs+2*kv) × max_seq_len] projections
+    prefill_gate_buf: Buffer,   // [is × max_seq_len] FFN gate
+    prefill_up_buf: Buffer,     // [is × max_seq_len] FFN up
     state: MetalState,
     /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
     /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
@@ -157,6 +185,13 @@ pub struct MetalLfm2Model {
     mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
+    pub prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
+    /// Cached env var values: read once at init to avoid per-dispatch syscalls.
+    force_flash: bool,
+    attn_mode: String,
+    /// Unique model identifier (GGUF file path). Used as part of the cache
+    /// fingerprint so different models with the same architecture don't collide.
+    model_id: String,
 }
 
 impl MetalLfm2Model {
@@ -185,6 +220,9 @@ impl MetalLfm2Model {
             gemv_q4_0_fast: ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast")?,
             gemv_f16: ctx.create_pipeline(shaders::GEMV_F16, "gemv_f16")?,
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
+            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0")?,
+            gemv_q8_0_accum: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0_accum")?,
+            gemv_q8_0_batch: ctx.create_pipeline(shaders::GEMV_Q8_0_BATCH, "gemv_q8_0_batch")?,
             gemv_q4_0_fast_accum: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_accum")?,
             gemv_q4_0_fast_slim: ctx
@@ -220,6 +258,18 @@ impl MetalLfm2Model {
                 .create_pipeline(shaders::ATTENTION_SPLITK, "attention_split_merge")?,
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise")?,
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32")?,
+            gemv_q4_0_batch: ctx.create_pipeline(shaders::GEMV_Q4_0_BATCH, "gemv_q4_0_batch")?,
+            rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "rmsnorm_batch")?,
+            add_rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")?,
+            conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
+            gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+            gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
+            attention_prefill: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill")?,
+            qk_norm_rope_batch: ctx
+                .create_pipeline(shaders::QK_NORM_ROPE_BATCH, "qk_norm_rope_batch")?,
+            conv1d_fused_batch: ctx
+                .create_pipeline(shaders::CONV1D_FUSED_BATCH, "conv1d_fused_batch")?,
         };
 
         // Open a second mmap of the same file for the no-copy Metal buffer.
@@ -243,10 +293,11 @@ impl MetalLfm2Model {
             None,
         );
 
-        // Embedding Q6K: reference mmap directly via offset (no copy).
+        // Embedding: reference mmap directly via offset (no copy).
         let emb_data = cpu_model.gguf().tensor_data("token_embd.weight")?;
         let mmap_base = cpu_model.gguf().mmap_data().as_ptr() as usize;
-        let embedding_q6k_offset = (emb_data.as_ptr() as usize - mmap_base) as u64;
+        let embedding_offset = (emb_data.as_ptr() as usize - mmap_base) as u64;
+        let embedding_dtype = cpu_model.embd_ref().dtype;
 
         // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
         // tensor data region in a usable format (f32 vs mmap'd bytes).
@@ -362,6 +413,15 @@ impl MetalLfm2Model {
                 .upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32, hs as u32])),
         };
 
+        // Use the GGUF file path as the model identifier so different model
+        // files (even with the same architecture) don't share cache entries.
+        let model_id = path.to_string_lossy();
+        let prefix_cache = std::cell::RefCell::new(crate::kv_cache::KvPrefixCache::new(
+            crate::kv_cache::KvCacheConfig::default(),
+            &config,
+            &model_id,
+        ));
+
         // GPU timestamp profiler. Must be built before `ctx` is moved into the struct.
         let gpu_timer = if std::env::var("WICK_PROFILE").as_deref() == Ok("gpu") {
             build_gpu_timer(&ctx, 512)
@@ -395,11 +455,20 @@ impl MetalLfm2Model {
             conv_bx_buf: make_buf(hs),
             conv_out_buf: make_buf(hs),
             conv_gate_buf: make_buf(hs),
+            // Batch buffers for prefill. Cap at 2048 tokens to avoid massive
+            // allocations (672+ MB at max_seq_len=8192). Larger prefills fall back
+            // to the sequential forward() path.
+            prefill_batch_buf: make_buf(hs * max_seq_len.min(MAX_PREFILL_TOKENS)),
+            prefill_normed_buf: make_buf(hs * max_seq_len.min(MAX_PREFILL_TOKENS)),
+            prefill_proj_buf: make_buf(3 * hs * max_seq_len.min(MAX_PREFILL_TOKENS)),
+            prefill_gate_buf: make_buf(is * max_seq_len.min(MAX_PREFILL_TOKENS)),
+            prefill_up_buf: make_buf(is * max_seq_len.min(MAX_PREFILL_TOKENS)),
             ctx,
             config,
             pipelines,
             params,
-            embedding_q6k_offset,
+            embedding_offset,
+            embedding_dtype,
             output_norm,
             layers,
             _mmap: mmap,
@@ -418,6 +487,10 @@ impl MetalLfm2Model {
                 None
             },
             gpu_timer,
+            prefix_cache,
+            force_flash: std::env::var("WICK_FLASH").as_deref() == Ok("1"),
+            attn_mode: std::env::var("WICK_ATTN").unwrap_or_default(),
+            model_id: model_id.into_owned(),
         })
     }
 }
@@ -439,15 +512,28 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
 }
 
 impl MetalLfm2Model {
-    /// Dequantize one embedding row from Q6_K bytes into `dst`.
-    /// Dequantize one embedding row from Q6_K mmap data.
+    /// Dequantize one embedding row into `dst`. Handles Q6_K and Q8_0.
     fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
         let hs = self.state.embedding_hidden_size;
         debug_assert_eq!(dst.len(), hs);
-        let row_bytes = hs / 256 * 210; // Q6_K: 210 bytes per 256 elements
-        let mmap_start = self.embedding_q6k_offset as usize + token_id * row_bytes;
+        let row_bytes = match self.embedding_dtype {
+            DType::Q6K => hs / 256 * 210,
+            DType::Q8_0 => hs / 32 * 34,
+            DType::Q4_0 => hs / 32 * 18,
+            _ => hs * 4, // f32
+        };
+        let mmap_start = self.embedding_offset as usize + token_id * row_bytes;
         let row_data = &self._mmap[mmap_start..mmap_start + row_bytes];
-        crate::quant::dequantize_q6_k_row(row_data, dst);
+        match self.embedding_dtype {
+            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, dst),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, dst),
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, dst),
+            _ => {
+                // f32: direct copy
+                let src = bytemuck::cast_slice::<u8, f32>(row_data);
+                dst.copy_from_slice(src);
+            }
+        }
     }
 
     fn dispatch(
@@ -495,7 +581,7 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
-        self.encode_gemv_impl(enc, w, input, output, 0, false);
+        self.encode_gemv_impl(enc, w, input, 0, output, 0, false);
     }
 
     /// Q4_0 GEMV: y += W × x (fused residual add). Falls back to non-fused for f32.
@@ -506,19 +592,332 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
-        self.encode_gemv_impl(enc, w, input, output, 0, true);
+        self.encode_gemv_impl(enc, w, input, 0, output, 0, true);
     }
 
-    /// Q4_0/f32 GEMV writing `output` starting at the given byte offset.
+    /// Q4_0/f32 GEMV with input and output byte offsets.
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemv_weight_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         w: &MetalWeight,
         input: &Buffer,
+        input_off_bytes: u64,
         output: &Buffer,
         output_off_bytes: u64,
     ) {
-        self.encode_gemv_impl(enc, w, input, output, output_off_bytes, false);
+        self.encode_gemv_impl(
+            enc,
+            w,
+            input,
+            input_off_bytes,
+            output,
+            output_off_bytes,
+            false,
+        );
+    }
+
+    /// Q4_0 GEMV: y += W × x with input byte offset.
+    fn encode_gemv_weight_accumulate_from(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        input: &Buffer,
+        input_off_bytes: u64,
+        output: &Buffer,
+    ) {
+        self.encode_gemv_impl(enc, w, input, input_off_bytes, output, 0, true);
+    }
+
+    /// Q4_0 GEMV: output[output_off] += W × input[input_off].
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_weight_accumulate_offsets(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        input: &Buffer,
+        input_off_bytes: u64,
+        output: &Buffer,
+        output_off_bytes: u64,
+    ) {
+        self.encode_gemv_impl(
+            enc,
+            w,
+            input,
+            input_off_bytes,
+            output,
+            output_off_bytes,
+            true,
+        );
+    }
+
+    /// Batch GEMV (GEMM): Y = W × X for n input vectors in one dispatch.
+    ///
+    /// Input layout:  X[col * x_stride + i], col ∈ [0,n), i ∈ [0,k)
+    /// Output layout: Y[col * y_stride + row], col ∈ [0,n), row ∈ [0,m)
+    ///
+    /// Both input and output must be contiguous f32 buffers with the given strides.
+    /// The x/y buffers use the provided byte offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        x: &Buffer,
+        x_off_bytes: u64,
+        y: &Buffer,
+        y_off_bytes: u64,
+        n: u32,
+        x_stride: u32,
+        y_stride: u32,
+        accumulate: bool,
+    ) {
+        debug_assert_eq!(w.dtype, DType::Q4_0, "batch GEMV only supports Q4_0");
+        let params: [u32; 6] = [
+            w.m,
+            w.k,
+            n,
+            x_stride,
+            y_stride,
+            if accumulate { 1 } else { 0 },
+        ];
+        // 2 simdgroups × 4 rows/SG = 8 rows per TG, 4 columns per TG.
+        let rows_per_tg = 8u32;
+        let cols_per_tg = 4u32;
+        let row_groups = w.m.div_ceil(rows_per_tg);
+        let col_groups = n.div_ceil(cols_per_tg);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_batch);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(x), x_off_bytes);
+        enc.set_buffer(2, Some(y), y_off_bytes);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: row_groups as u64,
+                height: col_groups as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64, // 2 simdgroups × 32 threads
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    /// Q8_0 batch GEMV — same structure as Q4_0 but with Q8_0 dequant.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_q8_0_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        x: &Buffer,
+        x_off_bytes: u64,
+        y: &Buffer,
+        y_off_bytes: u64,
+        n: u32,
+        x_stride: u32,
+        y_stride: u32,
+        accumulate: bool,
+    ) {
+        debug_assert_eq!(w.dtype, DType::Q8_0);
+        let params: [u32; 6] = [
+            w.m,
+            w.k,
+            n,
+            x_stride,
+            y_stride,
+            if accumulate { 1 } else { 0 },
+        ];
+        let rows_per_tg = 8u32;
+        let cols_per_tg = 4u32;
+        let row_groups = w.m.div_ceil(rows_per_tg);
+        let col_groups = n.div_ceil(cols_per_tg);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0_batch);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(x), x_off_bytes);
+        enc.set_buffer(2, Some(y), y_off_bytes);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: row_groups as u64,
+                height: col_groups as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    /// True GEMM with simdgroup matrix ops. Falls back to batch GEMV for small n.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        x: &Buffer,
+        x_off_bytes: u64,
+        y: &Buffer,
+        y_off_bytes: u64,
+        n: u32,
+        x_stride: u32,
+        y_stride: u32,
+        accumulate: bool,
+    ) {
+        debug_assert!(
+            w.dtype == DType::Q4_0 || w.dtype == DType::Q8_0,
+            "GEMM only supports Q4_0 and Q8_0, got {:?}",
+            w.dtype
+        );
+        if n < GEMM_MIN_N || w.k % 32 != 0 {
+            if w.dtype == DType::Q4_0 {
+                return self.encode_gemv_batch(
+                    enc,
+                    w,
+                    x,
+                    x_off_bytes,
+                    y,
+                    y_off_bytes,
+                    n,
+                    x_stride,
+                    y_stride,
+                    accumulate,
+                );
+            }
+            if w.dtype == DType::Q8_0 {
+                return self.encode_gemv_q8_0_batch(
+                    enc,
+                    w,
+                    x,
+                    x_off_bytes,
+                    y,
+                    y_off_bytes,
+                    n,
+                    x_stride,
+                    y_stride,
+                    accumulate,
+                );
+            }
+            // Per-token GEMV fallback for other dtypes.
+            let b4 = |off: usize| (off * 4) as u64;
+            let m = w.m as usize;
+            for i in 0..n as usize {
+                if accumulate {
+                    self.encode_gemv_impl(
+                        enc,
+                        w,
+                        x,
+                        x_off_bytes + b4(i * x_stride as usize),
+                        y,
+                        y_off_bytes + b4(i * y_stride as usize),
+                        true,
+                    );
+                } else {
+                    self.encode_gemv_impl(
+                        enc,
+                        w,
+                        x,
+                        x_off_bytes + b4(i * x_stride as usize),
+                        y,
+                        y_off_bytes + b4(i * y_stride as usize),
+                        false,
+                    );
+                }
+            }
+            return;
+        }
+        let params: [u32; 6] = [
+            w.m,
+            w.k,
+            n,
+            x_stride,
+            y_stride,
+            if accumulate { 1 } else { 0 },
+        ];
+        let tg_rows = (w.m + 63) / 64; // ceil(m/64)
+        let tg_cols = (n + 31) / 32; // ceil(n/32)
+        let gemm_pipeline = match w.dtype {
+            DType::Q8_0 => &self.pipelines.gemm_q8_0,
+            _ => &self.pipelines.gemm_q4_0,
+        };
+        enc.set_compute_pipeline_state(gemm_pipeline);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(x), x_off_bytes);
+        enc.set_buffer(2, Some(y), y_off_bytes);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_threadgroup_memory_length(0, 8192); // 4KB weights + 4KB input
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: tg_cols as u64,
+                height: tg_rows as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128, // 4 simdgroups × 32 threads
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    /// GEMM (non-accumulate) → scratch, then add scratch into dst.
+    /// Uses the fast simdgroup_store path for the GEMM, avoids the slow
+    /// threadgroup-bounce accumulate path. scratch_buf must be ≥ y_stride × n floats.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_add(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        x: &Buffer,
+        x_off_bytes: u64,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        scratch: &Buffer,
+        n: u32,
+        x_stride: u32,
+        y_stride: u32,
+    ) {
+        // GEMM to scratch (fast path, no accumulate).
+        self.encode_gemm(
+            enc,
+            w,
+            x,
+            x_off_bytes,
+            scratch,
+            0,
+            n,
+            x_stride,
+            y_stride,
+            false,
+        );
+        // Add scratch → dst.
+        let total = n * y_stride;
+        let grid = sz1d(total.div_ceil(256) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.add_inplace);
+        enc.set_buffer(0, Some(dst), dst_off_bytes);
+        enc.set_buffer(1, Some(scratch), 0);
+        let params: [u32; 2] = [total, 0];
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(grid, sz1d(256));
     }
 
     /// Fused gate+up GEMV: y_gate = W_gate × x, y_up = W_up × x in one dispatch.
@@ -548,6 +947,36 @@ impl MetalLfm2Model {
         enc.set_buffer(2, Some(x), 0);
         enc.set_buffer(3, Some(y_gate), 0);
         enc.set_buffer(4, Some(y_up), 0);
+        enc.set_buffer(5, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(32));
+    }
+
+    /// Fused gate+up GEMV with byte offsets for input and both outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_gate_up_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        x_off: u64,
+        y_gate: &Buffer,
+        y_gate_off: u64,
+        y_up: &Buffer,
+        y_up_off: u64,
+    ) {
+        debug_assert_eq!(w_gate.dtype, DType::Q4_0);
+        debug_assert_eq!(w_up.dtype, DType::Q4_0);
+        debug_assert_eq!(w_gate.m, w_up.m);
+        debug_assert_eq!(w_gate.k, w_up.k);
+        let m = w_gate.m;
+        let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_slim_gate_up);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
+        enc.set_buffer(2, Some(x), x_off);
+        enc.set_buffer(3, Some(y_gate), y_gate_off);
+        enc.set_buffer(4, Some(y_up), y_up_off);
         enc.set_buffer(5, Some(&w_gate.params_buf), 0);
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
@@ -592,6 +1021,7 @@ impl MetalLfm2Model {
         enc: &metal::ComputeCommandEncoderRef,
         w: &MetalWeight,
         input: &Buffer,
+        input_off_bytes: u64,
         output: &Buffer,
         output_off_bytes: u64,
         accumulate: bool,
@@ -658,12 +1088,21 @@ impl MetalLfm2Model {
                     ),
                 }
             }
+            DType::Q8_0 => (
+                if accumulate {
+                    &self.pipelines.gemv_q8_0_accum
+                } else {
+                    &self.pipelines.gemv_q8_0
+                },
+                w.m.div_ceil(2),
+                32u64,
+            ),
             _ => (&self.pipelines.gemv_f32, w.m, 32u64),
         };
         let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
-        enc.set_buffer(1, Some(input), 0);
+        enc.set_buffer(1, Some(input), input_off_bytes);
         enc.set_buffer(2, Some(output), output_off_bytes);
         enc.set_buffer(3, Some(&w.params_buf), 0);
         enc.dispatch_thread_groups(grid, sz1d(tpt));
@@ -675,18 +1114,41 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
-        // Q6_K vocab-head projection — reads the original 52 MB Q6_K bytes
-        // directly from GGUF (vs 268 MB f32 or 134 MB f16). 4 rows per TG,
-        // 64 threads/TG (2 simdgroups × 2 rows each).
         let m = self.config.vocab_size as u32;
-        let groups = m.div_ceil(4);
-        let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-        enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
-        enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_q6k_offset);
-        enc.set_buffer(1, Some(input), 0);
-        enc.set_buffer(2, Some(output), 0);
-        enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-        enc.dispatch_thread_groups(grid, sz1d(64));
+        match self.embedding_dtype {
+            DType::Q6K => {
+                // Q6_K: 4 rows/TG, 64 threads (2 simdgroups × 2 rows).
+                let groups = m.div_ceil(4);
+                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(64));
+            }
+            DType::Q8_0 => {
+                // Q8_0: 2 rows/TG, 32 threads.
+                let groups = m.div_ceil(2);
+                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(32));
+            }
+            _ => {
+                // Fallback: use f32 GEMV.
+                let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
+                enc.set_buffer(0, Some(&self.mmap_buf), self.embedding_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(32));
+            }
+        }
     }
 
     fn encode_rmsnorm(
@@ -704,6 +1166,87 @@ impl MetalLfm2Model {
             sz1d(1),
             sz1d(256),
         );
+    }
+
+    /// Batch RMSnorm: process N vectors in a single dispatch.
+    /// src_stride/dst_stride are in FLOATS (not bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rmsnorm_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        src_off_bytes: u64,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        weight: &Buffer,
+        n_tokens: u32,
+        src_stride: u32,
+        dst_stride: u32,
+    ) {
+        let hs = self.config.hidden_size as u32;
+        let params: [u32; 4] = [
+            hs,
+            self.config.rms_norm_eps.to_bits(),
+            src_stride,
+            dst_stride,
+        ];
+        enc.set_compute_pipeline_state(&self.pipelines.rmsnorm_batch);
+        enc.set_buffer(0, Some(src), src_off_bytes);
+        enc.set_buffer(1, Some(dst), dst_off_bytes);
+        enc.set_buffer(2, Some(weight), 0);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
+    }
+
+    /// Fused add + rmsnorm: src[i] += residual[i], then rmsnorm(src) → dst.
+    /// Eliminates a separate add_inplace dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_add_rmsnorm_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        n_tokens: u32,
+        stride: u32,
+    ) {
+        let hs = self.config.hidden_size as u32;
+        let params: [u32; 4] = [hs, self.config.rms_norm_eps.to_bits(), stride, stride];
+        enc.set_compute_pipeline_state(&self.pipelines.add_rmsnorm_batch);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        enc.set_buffer(2, Some(weight), 0);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_buffer(4, Some(residual), 0);
+        enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
+    }
+
+    /// RMSnorm with explicit byte offsets into src and dst buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rmsnorm_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        src_off: u64,
+        dst: &Buffer,
+        dst_off: u64,
+        weight: &Buffer,
+    ) {
+        enc.set_compute_pipeline_state(&self.pipelines.rmsnorm);
+        enc.set_buffer(0, Some(src), src_off);
+        enc.set_buffer(1, Some(dst), dst_off);
+        enc.set_buffer(2, Some(weight), 0);
+        enc.set_buffer(3, Some(&self.params.rmsnorm_hs), 0);
+        enc.dispatch_thread_groups(sz1d(1), sz1d(256));
     }
 
     fn encode_per_head_rmsnorm(
@@ -744,6 +1287,29 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
     }
 
+    /// Cast f32→f16 with both source and destination byte offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_cast_f32_to_f16_offsets(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        src_off_bytes: u64,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        n_elements: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.pipelines.cast_f32_to_f16);
+        enc.set_buffer(0, Some(src), src_off_bytes);
+        enc.set_buffer(1, Some(dst), dst_off_bytes);
+        let params: [u32; 2] = [n_elements, 0];
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
+    }
+
     fn encode_qk_norm_rope(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -759,9 +1325,57 @@ impl MetalLfm2Model {
     ) {
         let eps_bits = self.config.rms_norm_eps.to_bits();
         let freq_base_bits = self.config.rope_theta.to_bits();
-        let params: [u32; 6] = [pos, n_heads, n_kv_heads, head_dim, eps_bits, freq_base_bits];
+        let params: [u32; 7] = [
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            eps_bits,
+            freq_base_bits,
+            0,
+        ]; // rope_type=0 (NeoX)
         enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope);
         enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k), k_off_bytes);
+        enc.set_buffer(2, Some(q_norm_w), 0);
+        enc.set_buffer(3, Some(k_norm_w), 0);
+        enc.set_bytes(
+            4,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d((n_heads + n_kv_heads) as u64), sz1d(256));
+    }
+
+    /// Fused per-head RMSnorm + RoPE with explicit Q and K byte offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_qk_norm_rope_offsets(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: &Buffer,
+        q_off_bytes: u64,
+        k: &Buffer,
+        k_off_bytes: u64,
+        q_norm_w: &Buffer,
+        k_norm_w: &Buffer,
+        pos: u32,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+    ) {
+        let eps_bits = self.config.rms_norm_eps.to_bits();
+        let freq_base_bits = self.config.rope_theta.to_bits();
+        let params: [u32; 7] = [
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            eps_bits,
+            freq_base_bits,
+            0,
+        ];
+        enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope);
+        enc.set_buffer(0, Some(q), q_off_bytes);
         enc.set_buffer(1, Some(k), k_off_bytes);
         enc.set_buffer(2, Some(q_norm_w), 0);
         enc.set_buffer(3, Some(k_norm_w), 0);
@@ -829,6 +1443,29 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(256));
     }
 
+    /// Out-of-place elementwise multiply with destination offset: dst[dst_off] = a[a_off] * b[b_off].
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mul_out_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        a: &Buffer,
+        a_off: u64,
+        b: &Buffer,
+        b_off: u64,
+        dst: &Buffer,
+        dst_off: u64,
+        params_buf: &Buffer,
+        n: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.pipelines.mul_out);
+        enc.set_buffer(0, Some(a), a_off);
+        enc.set_buffer(1, Some(b), b_off);
+        enc.set_buffer(2, Some(dst), dst_off);
+        enc.set_buffer(3, Some(params_buf), 0);
+        let grid = sz1d(n.div_ceil(256) as u64);
+        enc.dispatch_thread_groups(grid, sz1d(256));
+    }
+
     fn encode_elementwise(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -840,6 +1477,26 @@ impl MetalLfm2Model {
     ) {
         let grid = sz1d(n.div_ceil(256) as u64);
         self.dispatch(enc, pipeline, &[a, b, params_buf], &[], grid, sz1d(256));
+    }
+
+    /// Elementwise op with byte offsets into a and b buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_elementwise_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        a: &Buffer,
+        a_off: u64,
+        b: &Buffer,
+        b_off: u64,
+        n: u32,
+    ) {
+        let grid = sz1d(n.div_ceil(256) as u64);
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(a), a_off);
+        enc.set_buffer(1, Some(b), b_off);
+        enc.set_buffer(2, Some(&self.params.elementwise_is), 0);
+        enc.dispatch_thread_groups(grid, sz1d(256));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -882,8 +1539,8 @@ impl MetalLfm2Model {
         // - WICK_FLASH=1: force FlashAttention at any seq_len
         // - seq_len > 4096: auto-switch to flash (classic TG memory limit)
         // - default (seq_len ≤ 4096): classic 3-phase attention
-        let attn_mode = std::env::var("WICK_ATTN").unwrap_or_default();
-        let use_flash = std::env::var("WICK_FLASH").as_deref() == Ok("1") || seq_len > 4096;
+        let attn_mode = self.attn_mode.as_str();
+        let use_flash = self.force_flash || seq_len > 4096;
         let group_size = n_heads / n_kv_heads;
         let use_gqa = attn_mode == "gqa" && group_size > 1 && group_size <= 4;
         let use_splitk = attn_mode == "splitk";
@@ -954,6 +1611,56 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(sz1d(tg_count), sz1d(256));
     }
 
+    /// Attention with Q/out offsets for batched prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_attention_q_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: &Buffer,
+        q_off_bytes: u64,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        out: &Buffer,
+        out_off_bytes: u64,
+        seq_len: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let kv_dim = n_kv_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 8] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            seq_len,
+            scale.to_bits(),
+            0,
+            0,
+        ];
+        if std::env::var("WICK_PROFILE").as_deref() == Ok("noattn") {
+            return;
+        }
+        let use_flash = self.force_flash || seq_len > 4096;
+        let (pipeline, tg_count) = if use_flash {
+            (&self.pipelines.flash_attention, n_heads as u64)
+        } else {
+            (&self.pipelines.attention, n_heads as u64)
+        };
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(q), q_off_bytes);
+        enc.set_buffer(1, Some(k_cache), 0);
+        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(3, Some(out), out_off_bytes);
+        enc.set_bytes(
+            4,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d(tg_count), sz1d(256));
+    }
+
     fn encode_conv1d(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -972,6 +1679,36 @@ impl MetalLfm2Model {
             grid,
             sz1d(256),
         );
+    }
+
+    /// Fused: bx = x * b → conv1d(bx, state) → output = c * conv_out.
+    /// Combines 3 dispatches into 1.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_conv1d_fused(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        b: &Buffer,
+        b_off: u64,
+        c: &Buffer,
+        c_off: u64,
+        rbuf: &Buffer,
+        weight: &Buffer,
+        output: &Buffer,
+        output_off: u64,
+        hs: u32,
+    ) {
+        let grid = sz1d(hs.div_ceil(256) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(b), b_off);
+        enc.set_buffer(2, Some(c), c_off);
+        enc.set_buffer(3, Some(rbuf), 0);
+        enc.set_buffer(4, Some(weight), 0);
+        enc.set_buffer(5, Some(output), output_off);
+        enc.set_buffer(6, Some(&self.params.conv1d), 0);
+        enc.dispatch_thread_groups(grid, sz1d(256));
     }
 }
 
@@ -1096,11 +1833,242 @@ impl Model for MetalLfm2Model {
         unsafe { *(self.argmax_token_buf.contents() as *const u32) }
     }
 
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1);
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        // 1. Dequant embedding → hidden_buf.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // 2. Run layers only (no output norm, no logit projection).
+        // The reference's llama_get_embeddings returns the raw hidden state
+        // without the output norm weight multiplication (RMS ~0.14), not the
+        // normed+weighted state (RMS ~1.5). This was confirmed by feeding the
+        // reference's embedding to wick's depthformer → 8/8 matching codes.
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+
+        // Apply output norm.
+        let cb2 = self.ctx.queue.new_command_buffer();
+        let enc2 = cb2.new_compute_command_encoder();
+        self.encode_rmsnorm(enc2, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        enc2.end_encoding();
+        cb2.commit();
+        cb2.wait_until_completed();
+
+        self.ctx.read_f32(&self.normed_buf, hs)
+    }
+
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        assert_eq!(embedding.len(), hs);
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        unsafe {
+            let dst = self.hidden_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // Run layers + output norm.
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.normed_buf, hs)
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        assert_eq!(embedding.len(), hs);
+        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+
+        // 1. Write embedding directly into hidden_buf (skip token lookup).
+        unsafe {
+            let dst = self.hidden_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
+        }
+
+        let pos = self.state.seq_len.get();
+
+        // 2. Run layers + logit projection.
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_layers(enc, pos);
+        self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+        self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }
 
+    fn gpu_memory_bytes(&self) -> u64 {
+        self.ctx.device.current_allocated_size()
+    }
+
+    fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        *self.prefix_cache.borrow_mut() =
+            crate::kv_cache::KvPrefixCache::new(config, &self.config, &self.model_id);
+    }
+
+    fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
+        use crate::kv_cache::{LayerSnapshot, StateSnapshot};
+        let seq_len = self.state.seq_len.get();
+        let cfg = &self.config;
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::Attention {
+                let head_dim = cfg.hidden_size / cfg.n_heads;
+                let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                let byte_len = seq_len * kv_dim * 2; // f16 = 2 bytes
+                let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                let k_data = unsafe {
+                    std::slice::from_raw_parts(k_cache.contents() as *const u8, byte_len).to_vec()
+                };
+                let v_data = unsafe {
+                    std::slice::from_raw_parts(v_cache.contents() as *const u8, byte_len).to_vec()
+                };
+                layers.push(LayerSnapshot::Attention { k_data, v_data });
+            } else {
+                let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+                let byte_len = conv_buf.length() as usize;
+                let buffer = unsafe {
+                    std::slice::from_raw_parts(conv_buf.contents() as *const u8, byte_len).to_vec()
+                };
+                layers.push(LayerSnapshot::Conv { buffer });
+            }
+        }
+
+        StateSnapshot { layers, seq_len }
+    }
+
+    fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
+        use crate::kv_cache::LayerSnapshot;
+        let cfg = &self.config;
+        for (i, layer_snap) in snapshot.layers.iter().enumerate() {
+            match layer_snap {
+                LayerSnapshot::Attention { k_data, v_data } => {
+                    let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            k_data.as_ptr(),
+                            k_cache.contents() as *mut u8,
+                            k_data.len(),
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            v_data.as_ptr(),
+                            v_cache.contents() as *mut u8,
+                            v_data.len(),
+                        );
+                    }
+                }
+                LayerSnapshot::Conv { buffer } => {
+                    let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buffer.as_ptr(),
+                            conv_buf.contents() as *mut u8,
+                            buffer.len(),
+                        );
+                    }
+                }
+            }
+        }
+        self.state.seq_len.set(snapshot.seq_len);
+    }
+
     fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
+        // doesn't carry KV history from a previous generation. The CPU-side
+        // InferenceState is already fresh when callers invoke generate() again,
+        // but the Metal model holds its own seq_len counter and GPU KV buffers.
+        if start_pos == 0 {
+            self.state.seq_len.set(0);
+
+            // Cache lookup: only for fresh prefills.
+            let hit = self.prefix_cache.borrow_mut().find_longest_prefix(tokens);
+            if let Some((snapshot, prefix_len)) = hit {
+                // Always keep at least 1 token for forward_prefill_inner to produce logits.
+                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                if use_len > 0 {
+                    self.restore_state(&snapshot);
+                    state.seq_len = use_len;
+
+                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                    self.prefix_cache
+                        .borrow_mut()
+                        .insert(tokens, self.snapshot_state());
+                    return logits;
+                }
+            }
+        }
+
+        let logits = self.forward_prefill_inner(tokens, start_pos, state);
+        if start_pos == 0 {
+            self.prefix_cache
+                .borrow_mut()
+                .insert(tokens, self.snapshot_state());
+        }
+        logits
+    }
+}
+
+impl MetalLfm2Model {
+    fn forward_prefill_inner(
         &self,
         tokens: &[u32],
         start_pos: usize,
@@ -1119,35 +2087,492 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Stage all N embedding rows (dequantized from Q6_K) into one GPU buffer.
-        let mut stage = vec![0.0f32; hs * n];
-        for (i, &t) in tokens.iter().enumerate() {
-            self.dequant_embedding_row(t as usize, &mut stage[i * hs..(i + 1) * hs]);
+        // Chunked prefill: process in MAX_PREFILL_TOKENS-sized chunks, each using
+        // the GEMM path. This keeps memory constant while avoiding the 14× slower
+        // sequential fallback for prompts > MAX_PREFILL_TOKENS.
+        let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        if n > max_chunk {
+            let mut logits = Vec::new();
+            let mut pos = start_pos;
+            let mut remaining = tokens;
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(max_chunk);
+                let chunk = &remaining[..chunk_len];
+                logits = self.forward_prefill_inner(chunk, pos, state);
+                pos += chunk_len;
+                remaining = &remaining[chunk_len..];
+            }
+            return logits;
         }
-        let emb_staging = self.ctx.upload_f32(&stage);
 
-        // Single command buffer for ALL prompt tokens — no CPU sync between them.
+        // Reuse pre-allocated batch buffer (sized for max_seq_len).
+        let batch_buf = &self.prefill_batch_buf;
+
+        // Stage all N embedding rows directly into batch_buf's mapped memory.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
+            }
+        }
+
+        // Op-first batching: within each layer, batch each operation across
+        // all N tokens before moving to the next operation. GEMV dispatches
+        // against the same weight matrix execute consecutively, keeping
+        // weights in GPU SLC (read once from DRAM instead of N times).
+        //
+        // Conv1d and attention are sequential (state dependencies) and use
+        // the single-token hidden_buf scratch.
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
+        let is = cfg.intermediate_size;
+        let b4 = |off: usize| (off * 4) as u64; // byte offset for f32
 
-        for i in 0..n {
-            let pos = start_pos + i;
-            // Copy this token's embedding into hidden_buf.
+        for layer in 0..cfg.n_layers {
+            let lw = &self.layers[layer];
+
+            // Phase 1: fused add(FFN_down residual) + rmsnorm, or plain rmsnorm for layer 0.
+            // The previous layer's FFN down GEMM wrote to normed_buf as scratch.
+            if layer > 0 {
+                // Fuse: batch_buf += normed_buf (FFN down residual), then rmsnorm → normed_buf
+                self.encode_add_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.attn_norm,
+                    &self.prefill_normed_buf, // residual from prev layer's FFN down
+                    n as u32,
+                    hs as u32,
+                );
+            } else {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.attn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            }
+
+            if cfg.block_types[layer] == BlockType::GatedConv {
+                let conv_buf = self.state.conv_buffers[layer].as_ref().unwrap();
+                let w_in = lw.conv_in_proj.as_ref().unwrap();
+                let w_out = lw.conv_out_proj.as_ref().unwrap();
+
+                // Phase 2: batch in_proj (GEMM for Q4_0/Q8_0, per-token GEMV for others)
+                if w_in.dtype == DType::Q4_0 || w_in.dtype == DType::Q8_0 {
+                    self.encode_gemm(
+                        enc,
+                        w_in,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        (3 * hs) as u32,
+                        false,
+                    );
+                } else {
+                    for i in 0..n {
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_in,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_proj_buf,
+                            b4(i * 3 * hs),
+                        );
+                    }
+                }
+
+                // Phase 3-5: batched fused conv1d (1 dispatch for ALL N tokens)
+                {
+                    let conv_weight = lw.conv_weight.as_ref().unwrap();
+                    let d_conv = self.config.conv_kernel_size.unwrap_or(3) - 1;
+                    let params: [u32; 6] = [
+                        hs as u32,
+                        (d_conv + 1) as u32, // kernel_size
+                        d_conv as u32,
+                        n as u32,
+                        (3 * hs) as u32, // proj_stride
+                        hs as u32,       // out_stride
+                    ];
+                    let grid = sz1d((hs as u32).div_ceil(256) as u64);
+                    enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(conv_buf), 0);
+                    enc.set_buffer(2, Some(conv_weight), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    enc.dispatch_thread_groups(grid, sz1d(256));
+                }
+
+                // Phase 6: out_proj GEMM → gate_buf scratch (no add yet — fused into FFN norm)
+                if w_out.dtype == DType::Q4_0 || w_out.dtype == DType::Q8_0 {
+                    self.encode_gemm(
+                        enc,
+                        w_out,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                        false,
+                    );
+                } else {
+                    // Write to gate_buf as scratch (same as Q4_0 GEMM path).
+                    // The fused add_rmsnorm_batch will add gate_buf to batch_buf.
+                    for i in 0..n {
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_out,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_gate_buf,
+                            b4(i * hs),
+                        );
+                    }
+                }
+            } else {
+                // Attention: batch Q/K/V projections, then sequential attention.
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let kv_dim = (n_kv_heads * head_dim) as usize;
+                let n_heads = cfg.n_heads as u32;
+                let (k_cache, v_cache) = self.state.kv_caches[layer].as_ref().unwrap();
+
+                // Batch Q/K/V GEMV: 1 dispatch each for all N tokens.
+                let w_q = lw.attn_q.as_ref().unwrap();
+                let w_k = lw.attn_k.as_ref().unwrap();
+                let w_v = lw.attn_v.as_ref().unwrap();
+                if w_q.dtype == DType::Q4_0 || w_q.dtype == DType::Q8_0 {
+                    // Q → prefill_proj_buf, stride = hs
+                    self.encode_gemm(
+                        enc,
+                        w_q,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                        false,
+                    );
+                    // K → prefill_gate_buf, stride = kv_dim
+                    self.encode_gemm(
+                        enc,
+                        w_k,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                    // V → prefill_up_buf, stride = kv_dim
+                    self.encode_gemm(
+                        enc,
+                        w_v,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_up_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                } else {
+                    for i in 0..n {
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_q,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_proj_buf,
+                            b4(i * hs),
+                        );
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_k,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_gate_buf,
+                            b4(i * kv_dim),
+                        );
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_v,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_up_buf,
+                            b4(i * kv_dim),
+                        );
+                    }
+                }
+
+                // Phase A: batched qk_norm_rope (1 dispatch for all N tokens).
+                {
+                    let params: [u32; 10] = [
+                        start_pos as u32,
+                        n as u32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        self.config.rms_norm_eps.to_bits(),
+                        self.config.rope_theta.to_bits(),
+                        0,             // rope_type = NeoX
+                        hs as u32,     // q_stride
+                        kv_dim as u32, // k_stride
+                    ];
+                    let tg_count = n as u32 * (n_heads + n_kv_heads);
+                    enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(&self.prefill_gate_buf), 0);
+                    enc.set_buffer(2, Some(lw.attn_q_norm.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(lw.attn_k_norm.as_ref().unwrap()), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    enc.dispatch_thread_groups(sz1d(tg_count as u64), sz1d(256));
+                }
+
+                // Phase B: bulk cast K and V to cache (1 dispatch each).
+                // K values are contiguous in prefill_gate_buf, V in prefill_up_buf.
+                // Writing all K/V before attention is safe: the attention kernel
+                // only reads up to seq_len entries per token.
+                let kv_cache_off = (start_pos * kv_dim * 2) as u64; // f16 bytes
+                self.encode_cast_f32_to_f16_offsets(
+                    enc,
+                    &self.prefill_gate_buf,
+                    0,
+                    k_cache,
+                    kv_cache_off,
+                    (n * kv_dim) as u32,
+                );
+                self.encode_cast_f32_to_f16_offsets(
+                    enc,
+                    &self.prefill_up_buf,
+                    0,
+                    v_cache,
+                    kv_cache_off,
+                    (n * kv_dim) as u32,
+                );
+
+                // Phase C: batched causal attention (1 dispatch for all N queries).
+                {
+                    let scale = 1.0f32 / (head_dim as f32).sqrt();
+                    let params: [u32; 9] = [
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim as u32,
+                        start_pos as u32,
+                        n as u32,
+                        scale.to_bits(),
+                        hs as u32, // q_stride
+                        hs as u32, // out_stride
+                    ];
+                    enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(k_cache), 0);
+                    enc.set_buffer(2, Some(v_cache), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    let hd_val = head_dim as usize;
+                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+                    let q_per_tg = 8u32;
+                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
+                }
+
+                // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
+                let w_o = lw.attn_output.as_ref().unwrap();
+                if w_o.dtype == DType::Q4_0 || w_o.dtype == DType::Q8_0 {
+                    self.encode_gemm(
+                        enc,
+                        w_o,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                        false,
+                    );
+                } else {
+                    // Write to gate_buf scratch (fused add+norm follows).
+                    for i in 0..n {
+                        self.encode_gemv_weight_offset(
+                            enc,
+                            w_o,
+                            &self.prefill_normed_buf,
+                            b4(i * hs),
+                            &self.prefill_gate_buf,
+                            b4(i * hs),
+                        );
+                    }
+                }
+            }
+
+            // Phase 7: batch FFN for ALL N tokens
+            // Fused add(out_proj residual) + rmsnorm in 1 dispatch.
+            // gate_buf holds the out_proj/attn_out GEMM result; add it to batch_buf
+            // and rmsnorm the result in one pass.
+            self.encode_add_rmsnorm_batch(
+                enc,
+                batch_buf,
+                &self.prefill_normed_buf,
+                &lw.ffn_norm,
+                &self.prefill_gate_buf,
+                n as u32,
+                hs as u32,
+            );
+            // gate+up GEMM (1 dispatch each for all N tokens)
+            if (lw.ffn_gate.dtype == DType::Q4_0 || lw.ffn_gate.dtype == DType::Q8_0)
+                && (lw.ffn_up.dtype == DType::Q4_0 || lw.ffn_up.dtype == DType::Q8_0)
+            {
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_gate,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_gate_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_up,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_up_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+            } else {
+                for i in 0..n {
+                    self.encode_gemv_weight_offset(
+                        enc,
+                        &lw.ffn_gate,
+                        &self.prefill_normed_buf,
+                        b4(i * hs),
+                        &self.prefill_gate_buf,
+                        b4(i * is),
+                    );
+                    self.encode_gemv_weight_offset(
+                        enc,
+                        &lw.ffn_up,
+                        &self.prefill_normed_buf,
+                        b4(i * hs),
+                        &self.prefill_up_buf,
+                        b4(i * is),
+                    );
+                }
+            }
+            // silu_mul (1 dispatch for all N*is contiguous elements)
+            {
+                let total = (n * is) as u32;
+                let grid = sz1d(total.div_ceil(256) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+                enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
+                enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
+                let params: [u32; 2] = [total, 0];
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&params) as u64,
+                    params.as_ptr() as *const _,
+                );
+                enc.dispatch_thread_groups(grid, sz1d(256));
+            }
+            // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
+            if lw.ffn_down.dtype == DType::Q4_0 || lw.ffn_down.dtype == DType::Q8_0 {
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_down,
+                    &self.prefill_gate_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    n as u32,
+                    is as u32,
+                    hs as u32,
+                    false,
+                );
+            } else {
+                // Write to normed_buf scratch (fused add into next layer's norm).
+                for i in 0..n {
+                    self.encode_gemv_weight_offset(
+                        enc,
+                        &lw.ffn_down,
+                        &self.prefill_gate_buf,
+                        b4(i * is),
+                        &self.prefill_normed_buf,
+                        b4(i * hs),
+                    );
+                }
+            }
+        }
+
+        // Add last layer's FFN down residual (in normed_buf) to batch_buf.
+        {
+            let total = (n * hs) as u32;
+            let grid = sz1d(total.div_ceil(256) as u64);
+            enc.set_compute_pipeline_state(&self.pipelines.add_inplace);
+            enc.set_buffer(0, Some(batch_buf), 0);
+            enc.set_buffer(1, Some(&self.prefill_normed_buf), 0);
+            let params: [u32; 2] = [total, 0];
+            enc.set_bytes(
+                2,
+                std::mem::size_of_val(&params) as u64,
+                params.as_ptr() as *const _,
+            );
+            enc.dispatch_thread_groups(grid, sz1d(256));
+        }
+
+        // Final: output norm + logits for last token only.
+        {
+            let last_off = ((n - 1) * hs * 4) as u64;
             self.copy_compute(
                 enc,
-                &emb_staging,
-                (i * hs * 4) as u64,
+                batch_buf,
+                last_off,
                 &self.hidden_buf,
                 0,
                 &self.params.elementwise_hs,
                 hs as u64,
             );
-            self.encode_layers(enc, pos);
-            // Only produce logits for the LAST token.
-            if i == n - 1 {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            }
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
         }
 
         enc.end_encoding();
@@ -1157,6 +2582,377 @@ impl Model for MetalLfm2Model {
         self.state.seq_len.set(start_pos + n);
         state.seq_len = start_pos + n;
         self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+    }
+}
+
+impl MetalLfm2Model {
+    /// Profiled prefill: same as forward_prefill but commits/waits after each
+    /// phase category to measure wall-clock GPU time per phase. Much slower
+    /// due to per-phase serialization — for analysis only, not production.
+    pub fn forward_prefill_profiled(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<(String, f64)> {
+        use std::time::Instant;
+
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        let is = cfg.intermediate_size;
+        let b4 = |off: usize| (off * 4) as u64;
+        let batch_buf = &self.prefill_batch_buf;
+
+        // Stage all N embedding rows directly into batch_buf's mapped memory.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
+            }
+        }
+
+        let mut timings: Vec<(String, f64)> = Vec::new();
+        let mut run_phase = |name: &str, f: &dyn Fn(&metal::ComputeCommandEncoderRef)| {
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            f(enc);
+            enc.end_encoding();
+            let t0 = Instant::now();
+            cb.commit();
+            cb.wait_until_completed();
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            timings.push((name.to_string(), us));
+        };
+
+        for layer in 0..cfg.n_layers {
+            let lw = &self.layers[layer];
+            let lt = if cfg.block_types[layer] == BlockType::GatedConv {
+                "conv"
+            } else {
+                "attn"
+            };
+
+            // Norm
+            run_phase(&format!("L{layer}_{lt}_norm"), &|enc| {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.attn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            });
+
+            if cfg.block_types[layer] == BlockType::GatedConv {
+                let conv_buf = self.state.conv_buffers[layer].as_ref().unwrap();
+                let w_in = lw.conv_in_proj.as_ref().unwrap();
+                let w_out = lw.conv_out_proj.as_ref().unwrap();
+
+                // In_proj GEMM
+                run_phase(&format!("L{layer}_conv_inproj"), &|enc| {
+                    self.encode_gemm(
+                        enc,
+                        w_in,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        (3 * hs) as u32,
+                        false,
+                    );
+                });
+
+                // Fused conv1d batch
+                run_phase(&format!("L{layer}_conv1d"), &|enc| {
+                    let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
+                    let params: [u32; 6] = [
+                        hs as u32,
+                        (d_conv + 1) as u32,
+                        d_conv as u32,
+                        n as u32,
+                        (3 * hs) as u32,
+                        hs as u32,
+                    ];
+                    let grid = sz1d((hs as u32).div_ceil(256) as u64);
+                    enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(conv_buf), 0);
+                    enc.set_buffer(2, Some(lw.conv_weight.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    enc.dispatch_thread_groups(grid, sz1d(256));
+                });
+
+                // Out_proj GEMM + add
+                run_phase(&format!("L{layer}_conv_outproj"), &|enc| {
+                    self.encode_gemm_add(
+                        enc,
+                        w_out,
+                        &self.prefill_normed_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                });
+            } else {
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let kv_dim = (n_kv_heads * head_dim) as usize;
+                let n_heads = cfg.n_heads as u32;
+                let (k_cache, v_cache) = self.state.kv_caches[layer].as_ref().unwrap();
+
+                // Q/K/V GEMM
+                run_phase(&format!("L{layer}_attn_qkv"), &|enc| {
+                    let w_q = lw.attn_q.as_ref().unwrap();
+                    let w_k = lw.attn_k.as_ref().unwrap();
+                    let w_v = lw.attn_v.as_ref().unwrap();
+                    self.encode_gemm(
+                        enc,
+                        w_q,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                        false,
+                    );
+                    self.encode_gemm(
+                        enc,
+                        w_k,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                    self.encode_gemm(
+                        enc,
+                        w_v,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_up_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                });
+
+                // QK norm + rope + cast
+                run_phase(&format!("L{layer}_attn_rope_cast"), &|enc| {
+                    let params: [u32; 10] = [
+                        start_pos as u32,
+                        n as u32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        self.config.rms_norm_eps.to_bits(),
+                        self.config.rope_theta.to_bits(),
+                        0,
+                        hs as u32,
+                        kv_dim as u32,
+                    ];
+                    enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(&self.prefill_gate_buf), 0);
+                    enc.set_buffer(2, Some(lw.attn_q_norm.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(lw.attn_k_norm.as_ref().unwrap()), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    let tg_count = n as u32 * (n_heads + n_kv_heads);
+                    enc.dispatch_thread_groups(sz1d(tg_count as u64), sz1d(256));
+
+                    let kv_cache_off = (start_pos * kv_dim * 2) as u64;
+                    self.encode_cast_f32_to_f16_offsets(
+                        enc,
+                        &self.prefill_gate_buf,
+                        0,
+                        k_cache,
+                        kv_cache_off,
+                        (n * kv_dim) as u32,
+                    );
+                    self.encode_cast_f32_to_f16_offsets(
+                        enc,
+                        &self.prefill_up_buf,
+                        0,
+                        v_cache,
+                        kv_cache_off,
+                        (n * kv_dim) as u32,
+                    );
+                });
+
+                // Attention
+                run_phase(&format!("L{layer}_attn_kernel"), &|enc| {
+                    let scale = 1.0f32 / (head_dim as f32).sqrt();
+                    let params: [u32; 9] = [
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim as u32,
+                        start_pos as u32,
+                        n as u32,
+                        scale.to_bits(),
+                        hs as u32,
+                        hs as u32,
+                    ];
+                    enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(k_cache), 0);
+                    enc.set_buffer(2, Some(v_cache), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    let hd_val = head_dim as usize;
+                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+                    let q_per_tg = 8u32;
+                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
+                });
+
+                // Output proj GEMM + add
+                run_phase(&format!("L{layer}_attn_outproj"), &|enc| {
+                    let w_o = lw.attn_output.as_ref().unwrap();
+                    self.encode_gemm_add(
+                        enc,
+                        w_o,
+                        &self.prefill_normed_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                });
+            }
+
+            // FFN norm
+            run_phase(&format!("L{layer}_{lt}_ffn_norm"), &|enc| {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.ffn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            });
+
+            // FFN gate+up GEMM
+            run_phase(&format!("L{layer}_{lt}_ffn_gemm"), &|enc| {
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_gate,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_gate_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_up,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_up_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+            });
+
+            // FFN silu_mul
+            run_phase(&format!("L{layer}_{lt}_ffn_silu"), &|enc| {
+                let total = (n * is) as u32;
+                let grid = sz1d(total.div_ceil(256) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+                enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
+                enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
+                let params: [u32; 2] = [total, 0];
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&params) as u64,
+                    params.as_ptr() as *const _,
+                );
+                enc.dispatch_thread_groups(grid, sz1d(256));
+            });
+
+            // FFN down GEMM + add
+            run_phase(&format!("L{layer}_{lt}_ffn_down"), &|enc| {
+                self.encode_gemm_add(
+                    enc,
+                    &lw.ffn_down,
+                    &self.prefill_gate_buf,
+                    0,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    n as u32,
+                    is as u32,
+                    hs as u32,
+                );
+            });
+        }
+
+        // Final logits.
+        run_phase("output", &|enc| {
+            let last_off = ((n - 1) * hs * 4) as u64;
+            self.copy_compute(
+                enc,
+                batch_buf,
+                last_off,
+                &self.hidden_buf,
+                0,
+                &self.params.elementwise_hs,
+                hs as u64,
+            );
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+        });
+
+        self.state.seq_len.set(start_pos + n);
+        state.seq_len = start_pos + n;
+        let _ = self.ctx.read_f32(&self.logits_buf, cfg.vocab_size);
+
+        timings
     }
 }
 
@@ -1388,12 +3184,164 @@ impl MetalLfm2Model {
 
     /// Encode one full token's layer stack (all attn/conv + FFN blocks). `pos` is the
     /// sequence position for RoPE and the KV cache write offset.
-    fn encode_layers(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+    /// Encode a SINGLE layer for the current hidden_buf state at position pos.
+    fn encode_single_layer(&self, enc: &metal::ComputeCommandEncoderRef, i: usize, pos: usize) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
         let phs = &self.params.elementwise_hs;
+        {
+            let lw = &self.layers[i];
 
+            if cfg.block_types[i] == BlockType::GatedConv {
+                let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
+                self.encode_gemv_weight(
+                    enc,
+                    lw.conv_in_proj.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.conv_proj_buf,
+                );
+                self.encode_mul_out(
+                    enc,
+                    &self.conv_proj_buf,
+                    0,
+                    &self.conv_proj_buf,
+                    (2 * hs * 4) as u64,
+                    &self.conv_bx_buf,
+                    phs,
+                    hs32,
+                );
+                self.encode_conv1d(
+                    enc,
+                    &self.conv_bx_buf,
+                    conv_buf,
+                    lw.conv_weight.as_ref().unwrap(),
+                    &self.conv_out_buf,
+                    hs32,
+                );
+                self.encode_mul_out(
+                    enc,
+                    &self.conv_proj_buf,
+                    (hs * 4) as u64,
+                    &self.conv_out_buf,
+                    0,
+                    &self.conv_gate_buf,
+                    phs,
+                    hs32,
+                );
+                self.encode_gemv_weight_accumulate(
+                    enc,
+                    lw.conv_out_proj.as_ref().unwrap(),
+                    &self.conv_gate_buf,
+                    &self.hidden_buf,
+                );
+            } else {
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
+                let kv_dim = n_kv_heads * head_dim;
+                let n_heads = cfg.n_heads as u32;
+
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
+                let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                let kv_offset = (pos * kv_dim as usize * 2) as u64;
+
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_q.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.q_buf,
+                );
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_k.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.k_buf,
+                );
+                self.encode_gemv_weight(
+                    enc,
+                    lw.attn_v.as_ref().unwrap(),
+                    &self.normed_buf,
+                    &self.v_buf,
+                );
+
+                self.encode_qk_norm_rope(
+                    enc,
+                    &self.q_buf,
+                    &self.k_buf,
+                    0,
+                    lw.attn_q_norm.as_ref().unwrap(),
+                    lw.attn_k_norm.as_ref().unwrap(),
+                    pos as u32,
+                    head_dim,
+                    n_heads,
+                    n_kv_heads,
+                );
+
+                self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, kv_offset, kv_dim);
+                self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, kv_offset, kv_dim);
+
+                self.encode_attention(
+                    enc,
+                    &self.q_buf,
+                    k_cache,
+                    v_cache,
+                    &self.attn_out_buf,
+                    (pos + 1) as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                );
+                self.encode_gemv_weight_accumulate(
+                    enc,
+                    lw.attn_output.as_ref().unwrap(),
+                    &self.attn_out_buf,
+                    &self.hidden_buf,
+                );
+            }
+
+            // FFN
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
+            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+                self.encode_gemv_gate_up(
+                    enc,
+                    &lw.ffn_gate,
+                    &lw.ffn_up,
+                    &self.ffn_input_buf,
+                    &self.gate_buf,
+                    &self.up_buf,
+                );
+            } else {
+                self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
+                self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+            }
+            self.encode_elementwise(
+                enc,
+                &self.pipelines.silu_mul_inplace,
+                &self.gate_buf,
+                &self.up_buf,
+                &self.params.elementwise_is,
+                lw.ffn_gate.m,
+            );
+            self.encode_gemv_weight_accumulate(enc, &lw.ffn_down, &self.gate_buf, &self.hidden_buf);
+        }
+    }
+
+    fn encode_layers(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+        for i in 0..self.config.n_layers {
+            self.encode_single_layer(enc, i, pos);
+        }
+    }
+
+    // The gpu_timed and profiled variants below still use the inline
+    // pattern for per-category instrumentation.
+    #[allow(dead_code)]
+    fn _encode_layers_old_removed(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let hs32 = hs as u32;
+        let phs = &self.params.elementwise_hs;
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
 

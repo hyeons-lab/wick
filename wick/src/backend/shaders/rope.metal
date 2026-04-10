@@ -15,7 +15,7 @@ struct Params {
 kernel void rope(
     device float* q [[buffer(0)]],
     device float* k [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint pos = params.pos;
@@ -30,10 +30,10 @@ kernel void rope(
     if (gid < q_total) {
         uint head = gid / half_dim;
         uint d = gid % half_dim;
-        float freq = 1.0f / fast::powr(freq_base, float(2u * d) / float(head_dim));
+        float freq = 1.0f / powr(freq_base, float(2u * d) / float(head_dim));
         float angle = float(pos) * freq;
-        float cos_a = fast::cos(angle);
-        float sin_a = fast::sin(angle);
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
         uint i0 = head * head_dim + d;
         uint i1 = i0 + half_dim;
         float x0 = q[i0];
@@ -47,10 +47,10 @@ kernel void rope(
     if (gid < k_total) {
         uint head = gid / half_dim;
         uint d = gid % half_dim;
-        float freq = 1.0f / fast::powr(freq_base, float(2u * d) / float(head_dim));
+        float freq = 1.0f / powr(freq_base, float(2u * d) / float(head_dim));
         float angle = float(pos) * freq;
-        float cos_a = fast::cos(angle);
-        float sin_a = fast::sin(angle);
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
         uint i0 = head * head_dim + d;
         uint i1 = i0 + half_dim;
         float x0 = k[i0];

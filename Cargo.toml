@@ -27,6 +27,8 @@ wgpu = "24"
 pollster = "0.4"
 metal = "0.31"
 objc = "0.2"
+rustfft = "6.4"
+flatbuffers = "25"
 
 [profile.release]
 lto = "thin"

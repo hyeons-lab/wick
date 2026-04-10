@@ -88,7 +88,7 @@ kernel void gemv_q4_0(
     const device uint* a [[buffer(0)]],
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
 ) {
@@ -130,7 +130,7 @@ kernel void gemv_q4_0_gate_up(
     const device float* x [[buffer(2)]],
     device float* y_gate [[buffer(3)]],
     device float* y_up [[buffer(4)]],
-    const device Params& params [[buffer(5)]],
+    constant Params& params [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
 ) {
@@ -171,7 +171,7 @@ kernel void gemv_q4_0_accum(
     const device uint* a [[buffer(0)]],
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
 ) {
