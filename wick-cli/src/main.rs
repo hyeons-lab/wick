@@ -79,6 +79,10 @@ enum Command {
         /// Disable KV prefix caching entirely.
         #[arg(long)]
         no_cache: bool,
+
+        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "f32")]
+        kv_cache_keys: String,
     },
 
     /// Inspect a GGUF model file.
@@ -148,6 +152,10 @@ enum Command {
         /// Disable KV prefix caching entirely.
         #[arg(long)]
         no_cache: bool,
+
+        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "f32")]
+        kv_cache_keys: String,
     },
 }
 
@@ -260,6 +268,30 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
     Ok(())
 }
 
+/// Parse KV cache key compression mode and apply to model.
+fn setup_key_compression(
+    model: &dyn wick::model::Model,
+    kv_cache_keys: &str,
+) -> Result<wick::kv_cache::KeyCompression> {
+    match kv_cache_keys {
+        "f32" | "none" => Ok(wick::kv_cache::KeyCompression::None),
+        "tq3" | "turboquant" => {
+            let seed = 42; // deterministic default seed
+            model.enable_turboquant(seed);
+            if model.turboquant_enabled() {
+                eprintln!("TurboQuant 3-bit key compression enabled");
+                Ok(wick::kv_cache::KeyCompression::TurboQuant { seed })
+            } else {
+                eprintln!(
+                    "warning: TurboQuant not supported by this model/backend; falling back to f32 keys"
+                );
+                Ok(wick::kv_cache::KeyCompression::None)
+            }
+        }
+        other => anyhow::bail!("unknown --kv-cache-keys mode: {other} (use f32 or tq3)"),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -285,6 +317,7 @@ fn main() -> Result<()> {
             cache_warm_mb,
             cache_disk_gb,
             no_cache,
+            kv_cache_keys,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -293,6 +326,7 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
 
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+            let key_compression = setup_key_compression(loaded_model.as_ref(), &kv_cache_keys)?;
 
             // Configure KV prefix cache.
             if no_cache {
@@ -482,6 +516,7 @@ fn main() -> Result<()> {
                         ..Default::default()
                     },
                     silent: false,
+                    key_compression,
                 };
 
                 let result =
@@ -518,6 +553,7 @@ fn main() -> Result<()> {
             device,
             context_size,
             no_cache,
+            kv_cache_keys,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("WICK_PROFILE").is_ok() {
@@ -532,6 +568,7 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+            let key_compression = setup_key_compression(loaded_model.as_ref(), &kv_cache_keys)?;
 
             if no_cache {
                 loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
@@ -572,6 +609,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 silent: true,
+                key_compression,
             };
 
             let run_once = || -> Result<(f64, f64)> {

@@ -131,6 +131,15 @@ pub trait Model: Send {
     fn restore_state(&self, _snapshot: &crate::kv_cache::StateSnapshot) {
         unimplemented!("restore_state not supported by this backend")
     }
+
+    /// Enable TurboQuant KV cache key compression.
+    /// Must be called before inference begins. No-op for models that don't support it.
+    fn enable_turboquant(&self, _seed: u64) {}
+
+    /// Whether TurboQuant is enabled on this model.
+    fn turboquant_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Load a model from a GGUF file, dispatching on the architecture.

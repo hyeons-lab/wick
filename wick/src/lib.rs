@@ -19,3 +19,4 @@ pub mod quant;
 pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
+pub mod turboquant;

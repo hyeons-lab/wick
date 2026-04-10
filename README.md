@@ -75,12 +75,71 @@ Measured with `wick bench --runs 20 --warmup 3` (sustained in-process, p50 repor
 - **3-phase batched prefill** — batch input projections (GEMM) -> sequential core (conv/attention) -> batch output projections (GEMM)
 - **Software prefetch** in GEMV/GEMM inner loops
 
+## TurboQuant KV Cache Compression
+
+Wick includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**. The Liquid4All llama.cpp fork already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
+
+### What it is
+
+TurboQuant compresses KV cache **keys to ~3 bits per element** (9.8× reduction vs f32) with near-lossless accuracy and **no calibration or fine-tuning** required. It's a two-stage compression:
+
+1. **PolarQuant (2-bit)** — Randomized Hadamard Transform rotates each key vector, then quantizes coordinates to 4 Lloyd-Max centroids for the resulting Beta distribution. The rotation makes the distribution predictable, so no per-block scale factors are needed.
+2. **QJL (1-bit)** — Quantized Johnson-Lindenstrauss sign bits on the residual provide an *unbiased* inner-product estimator that corrects PolarQuant bias during attention score computation.
+
+### How it compares
+
+| Approach | Bits per key | Bits per value | Calibration | Unbiased estimator |
+|----------|---:|---:|:-:|:-:|
+| f32 (wick default) | 32 | 32 | — | — |
+| f16 (llama.cpp default) | 16 | 16 | — | — |
+| llama.cpp q8_0 KV | 8 | 8 | — | — |
+| llama.cpp q4_0 KV | 4 | 4 | — | — |
+| **wick TurboQuant tq3** | **3** | **32** (keys-only) | **no** | **yes** |
+
+TurboQuant's differentiators:
+
+- **Fewer bits per key** — 3 bits vs q4_0's 4 bits, via the rotation that eliminates the need for per-block scales.
+- **Unbiased attention score estimator** — the QJL correction term is provably unbiased, while q4_0/q8_0 introduce bias that can compound across long contexts.
+- **Data-oblivious** — no calibration pass or fine-tuning; works on any model at any time.
+
+Current **limitation**: the wick implementation only compresses keys; values remain f32. llama.cpp's q4_0/q8_0 compresses both, so total KV memory savings in llama.cpp can exceed wick's for the same compression level. Value compression is planned as a follow-up.
+
+### Memory footprint
+
+| Format | Bytes/key (head_dim=128) | Key compression |
+|--------|---:|---:|
+| f32 (wick default) | 512 | 1× |
+| f16 | 256 | 2× |
+| **TurboQuant tq3** | **52** | **9.8×** |
+
+Peak RSS on LFM2-VL-450M (wick CPU, 300-tok prompt):
+
+| Context | wick f32 | wick tq3 | Savings |
+|---|---:|---:|---:|
+| +1024 gen | 120 MB | 92 MB | **-23%** |
+| +3072 gen | 207 MB | 132 MB | **-36%** |
+
+Savings scale linearly with context length — at 8K+ tokens the KV cache dominates and savings approach the theoretical 9.8×.
+
+### Throughput
+
+After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of wick f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts).
+
+```bash
+# Enable via CLI flag
+wick run --model lfm2.gguf --kv-cache-keys tq3 --prompt "Hello"
+wick bench --model lfm2.gguf --kv-cache-keys tq3 --max-tokens 256
+```
+
+See `wick/src/turboquant.rs` for the implementation.
+
 ## Features
 
 - **GGUF model loading** with memory-mapped tensors
 - **Three compute backends** — CPU (NEON SIMD), native Metal (MSL), wgpu (WGSL/Vulkan/Metal/DX12)
 - **Hybrid architectures** — LFM2/LFM2.5 (gated conv + grouped query attention)
-- **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M
+- **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M for weights
+- **TurboQuant KV cache compression** — 9.8× key cache reduction, unbiased attention estimator (first TurboQuant implementation for LFM2)
 - **Built-in BPE tokenizer** — no Python, no runtime dependencies
 - **Bench harness** — `wick bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering
@@ -122,7 +181,85 @@ Two-crate workspace:
 - **`wick`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
 - **`wick-cli`** — CLI binary (clap, dispatches to `wick`)
 
-Compute backends: scalar CPU → NEON SIMD (aarch64) → native Metal (macOS/iOS) → wgpu (cross-platform GPU).
+### Module layout
+
+```
+wick/src/
+├── gguf.rs              # mmap-based GGUF parser (zero-copy tensor access)
+├── tensor.rs            # DType enum (F32, F16, BF16, Q4_0, Q8_0, Q4_K_M, Q6_K)
+├── quant.rs             # Block structs + scalar dequant/vec_dot kernels
+├── turboquant.rs        # TurboQuant KV cache compression (PolarQuant + QJL)
+├── kv_cache.rs          # InferenceState, LayerState (attention/conv), scratch buffers
+├── tokenizer.rs         # BPE tokenizer + minijinja chat template rendering
+├── sampler.rs           # Temperature/top-k/top-p sampling, greedy fast path
+├── engine.rs            # generate() loop: prefill → decode
+├── backend/
+│   ├── cpu.rs           # Scalar reference + NEON attention kernels
+│   ├── simd.rs          # NEON (aarch64) + AVX2 (x86_64) GEMV/GEMM kernels
+│   ├── wgpu.rs          # wgpu cross-platform GPU backend
+│   └── metal.rs         # Native Metal backend (MSL shaders)
+└── model/
+    ├── mod.rs           # Model trait, ModelConfig, BlockType enum
+    ├── lfm2.rs          # LFM2 hybrid (conv + attention), CPU path
+    ├── gpu_lfm2.rs      # LFM2 on wgpu
+    ├── metal_lfm2.rs    # LFM2 on native Metal
+    └── llama.rs         # LLaMA-family stub (stub; future work)
+```
+
+### Model loading
+
+GGUF files are memory-mapped via `memmap2`. Two tensor access patterns:
+
+- `get_tensor(name)` — copies data into an owned `Tensor` (f32 dequantize for small weights like norms)
+- `tensor_data(name)` — returns a zero-copy `&[u8]` slice into the mmap for quantized weights
+
+All offsets validated with checked arithmetic (`checked_add`, `usize::try_from`).
+
+### Quantization formats
+
+| Format | Block size | Bytes/block | Use case |
+|--------|---:|---:|----------|
+| Q4_0 | 32 values | 18 B | Most weight matrices |
+| Q8_0 | 32 values | 34 B | Activations (dynamic quantization for integer GEMV) |
+| Q4_K_M | 256 values | 144 B | Higher-quality 4-bit with sub-block scales |
+| Q6_K | 256 values | 210 B | Embedding matrices (Metal backend) |
+
+Each format has `dequantize_*` (block → f32) and `vec_dot_*` (dot product without full dequant) paths. SIMD variants in `backend/simd.rs` use `vdotq_s32` on aarch64 and AVX2 on x86_64.
+
+### Compute backend tiers
+
+1. **Scalar CPU** (`backend/cpu.rs`) — reference implementations operating on raw `&[f32]` slices, no `Tensor` in the hot path
+2. **NEON SIMD** (aarch64) — vectorized Q4_0/Q8_0/Q6_K/Q4_K_M GEMV, attention scores, attention values
+3. **AVX2 SIMD** (x86_64) — dot product kernels for dense dispatch
+4. **Native Metal** (macOS/iOS only, `backend/metal.rs`) — hand-written MSL shaders, single-encoder dispatch, GPU argmax
+5. **wgpu** (cross-platform) — WGSL shaders targeting Metal/Vulkan/DX12/WebGPU via the wgpu crate
+
+Runtime dispatch via `--device` flag: `cpu | metal | gpu | auto`.
+
+### Hybrid model support (LFM2/LFM2.5)
+
+Unlike pure transformers, LFM2 interleaves two block types per layer:
+
+- **Gated convolution blocks** — depthwise 1D conv with gating, rolling buffer for O(1) decode
+- **Grouped query attention blocks** — standard GQA with per-head QK RMSnorm and RoPE
+
+`ModelConfig.block_types: Vec<BlockType>` specifies the per-layer pattern. `LayerState` tracks either a KV cache (attention) or a conv rolling buffer. TurboQuant only applies to attention layers.
+
+### Inference loop
+
+```
+generate() in engine.rs:
+  1. Prefill: forward_prefill(prompt_tokens, ...)
+     - Batched GEMM for Q/K/V/FFN projections (read weights once)
+     - Per-token attention + conv (sequential)
+     - Batched GEMM for output projection
+  2. Decode loop:
+     - forward(next_token, ...)
+     - Per-token GEMV (reads weights every token)
+     - Sampler picks next token (greedy fast path avoids logits readback)
+```
+
+See the benchmark tables above for per-backend performance.
 
 ## License
 

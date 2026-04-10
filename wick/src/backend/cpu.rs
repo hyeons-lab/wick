@@ -778,6 +778,188 @@ unsafe fn attn_values_neon(
     }
 }
 
+// ── TurboQuant NEON attention ───────────────────────────────────────────────
+
+/// NEON-optimized TurboQuant attention scores for one KV head, multiple query heads.
+///
+/// Replaces the scalar bucket-sum + QJL loops with NEON intrinsics.
+/// For head_dim=128: processes 32 polar bytes and 16 JL bytes per timestep.
+///
+/// # Safety
+/// Caller must ensure all buffer lengths match head_dim, seq_len, and group_size.
+/// Requires aarch64 NEON.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attn_scores_turboquant_neon(
+    q_rot_all: &[f32], // [n_heads * head_dim] pre-rotated queries
+    q_jl_all: &[f32],  // [n_heads * head_dim] pre-JL-projected queries
+    polar_data: &[u8], // packed 2-bit data for this KV head
+    jl_data: &[u8],    // packed 1-bit data for this KV head
+    norms_f32: &[f32], // pre-converted f32 norms
+    residual_norms_f32: &[f32],
+    q_jl_total_sums: &[f32], // pre-computed sum(q_jl) per head
+    group_start: usize,      // first query head index in the group
+    group_size: usize,       // number of query heads in the group
+    scores_flat: &mut [f32], // [group_size * seq_len] output, row-major by head
+    head_dim: usize,
+    centroids: &[f32; 4],
+    scale: f32,
+    qjl_scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let polar_bytes = head_dim / 4;
+        let jl_bytes = head_dim / 8;
+        let c_arr = *centroids;
+
+        // Comment #13: Pre-unpack centroid f32x4 vectors per timestep,
+        // shared across all query heads in the GQA group.
+        // Max head_dim=128 → 32 polar bytes → 32 float32x4 centroids.
+        // Comment #18: Same for QJL masks — 16 jl bytes × 2 halves = 32 float32x4.
+        const MAX_VECS: usize = 32;
+        let n_cent_vecs = polar_bytes; // one float32x4 per packed byte
+        let n_mask_vecs = jl_bytes * 2; // two float32x4 per jl byte (lo/hi)
+        debug_assert!(n_cent_vecs <= MAX_VECS);
+        debug_assert!(n_mask_vecs <= MAX_VECS);
+        let mut cent_vecs = [vdupq_n_f32(0.0); MAX_VECS];
+        let mut mask_vecs = [vdupq_n_f32(0.0); MAX_VECS];
+
+        for t in 0..seq_len {
+            let p_base = t * polar_bytes;
+            let j_base = t * jl_bytes;
+            let norm = norms_f32[t];
+            let residual_norm = residual_norms_f32[t];
+
+            // Unpack centroids once per timestep (hoisted from head loop)
+            for (i, cv) in cent_vecs.iter_mut().enumerate().take(n_cent_vecs) {
+                let b = *polar_data.get_unchecked(p_base + i);
+                *cv = select_centroids_4(b, &c_arr);
+            }
+
+            // Unpack QJL masks once per timestep (hoisted from head loop, Comment #18)
+            for i in 0..jl_bytes {
+                let b = *jl_data.get_unchecked(j_base + i) as u32;
+                mask_vecs[i * 2] = bits_to_f32_mask_lo(b);
+                mask_vecs[i * 2 + 1] = bits_to_f32_mask_hi(b);
+            }
+
+            // Process each query head in the GQA group
+            for g in 0..group_size {
+                let h = group_start + g;
+                let q_rot = &q_rot_all[h * head_dim..];
+                let q_jl = &q_jl_all[h * head_dim..];
+
+                // PolarQuant dot: FMA pre-unpacked centroids with query
+                let mut dot_acc0 = vdupq_n_f32(0.0);
+                let mut dot_acc1 = vdupq_n_f32(0.0);
+                let mut ci = 0usize;
+                let mut q_off = 0usize;
+                while ci + 4 <= n_cent_vecs {
+                    let qv0 = vld1q_f32(q_rot.as_ptr().add(q_off));
+                    let qv1 = vld1q_f32(q_rot.as_ptr().add(q_off + 4));
+                    let qv2 = vld1q_f32(q_rot.as_ptr().add(q_off + 8));
+                    let qv3 = vld1q_f32(q_rot.as_ptr().add(q_off + 12));
+                    dot_acc0 = vfmaq_f32(dot_acc0, qv0, cent_vecs[ci]);
+                    dot_acc1 = vfmaq_f32(dot_acc1, qv1, cent_vecs[ci + 1]);
+                    dot_acc0 = vfmaq_f32(dot_acc0, qv2, cent_vecs[ci + 2]);
+                    dot_acc1 = vfmaq_f32(dot_acc1, qv3, cent_vecs[ci + 3]);
+                    ci += 4;
+                    q_off += 16;
+                }
+                while ci < n_cent_vecs {
+                    let qv = vld1q_f32(q_rot.as_ptr().add(q_off));
+                    dot_acc0 = vfmaq_f32(dot_acc0, qv, cent_vecs[ci]);
+                    ci += 1;
+                    q_off += 4;
+                }
+                let polar_dot = vaddvq_f32(vaddq_f32(dot_acc0, dot_acc1)) * norm;
+
+                // QJL: pos_sum only, total_sum pre-computed, masks pre-unpacked
+                let total_sum = *q_jl_total_sums.get_unchecked(h);
+                let mut pos_acc0 = vdupq_n_f32(0.0);
+                let mut pos_acc1 = vdupq_n_f32(0.0);
+                let mut mi = 0usize;
+                let mut jl_q_off = 0usize;
+                while mi + 4 <= n_mask_vecs {
+                    let q0 = vld1q_f32(q_jl.as_ptr().add(jl_q_off));
+                    let q1 = vld1q_f32(q_jl.as_ptr().add(jl_q_off + 4));
+                    let q2 = vld1q_f32(q_jl.as_ptr().add(jl_q_off + 8));
+                    let q3 = vld1q_f32(q_jl.as_ptr().add(jl_q_off + 12));
+                    pos_acc0 = vfmaq_f32(pos_acc0, q0, mask_vecs[mi]);
+                    pos_acc1 = vfmaq_f32(pos_acc1, q1, mask_vecs[mi + 1]);
+                    pos_acc0 = vfmaq_f32(pos_acc0, q2, mask_vecs[mi + 2]);
+                    pos_acc1 = vfmaq_f32(pos_acc1, q3, mask_vecs[mi + 3]);
+                    mi += 4;
+                    jl_q_off += 16;
+                }
+                while mi < n_mask_vecs {
+                    let q = vld1q_f32(q_jl.as_ptr().add(jl_q_off));
+                    pos_acc0 = vfmaq_f32(pos_acc0, q, mask_vecs[mi]);
+                    mi += 1;
+                    jl_q_off += 4;
+                }
+                let pos_sum = vaddvq_f32(vaddq_f32(pos_acc0, pos_acc1));
+                let signed_sum = 2.0 * pos_sum - total_sum;
+                let correction = residual_norm * qjl_scale * signed_sum;
+
+                scores_flat[g * seq_len + t] = (polar_dot + correction) * scale;
+            }
+        }
+    }
+}
+
+/// Select 4 centroid values from a packed 2-bit byte.
+/// Returns float32x4 with centroids[idx0], centroids[idx1], centroids[idx2], centroids[idx3].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn select_centroids_4(byte: u8, c: &[f32; 4]) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let vals: [f32; 4] = [
+            *c.get_unchecked((byte & 0x03) as usize),
+            *c.get_unchecked(((byte >> 2) & 0x03) as usize),
+            *c.get_unchecked(((byte >> 4) & 0x03) as usize),
+            *c.get_unchecked(((byte >> 6) & 0x03) as usize),
+        ];
+        vld1q_f32(vals.as_ptr())
+    }
+}
+
+/// Expand lower 4 bits of a byte to f32 mask: bit i → 0.0 or 1.0.
+/// Returns float32x4 for bits 0,1,2,3.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bits_to_f32_mask_lo(byte: u32) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let vals: [f32; 4] = [
+            (byte & 1) as f32,
+            ((byte >> 1) & 1) as f32,
+            ((byte >> 2) & 1) as f32,
+            ((byte >> 3) & 1) as f32,
+        ];
+        vld1q_f32(vals.as_ptr())
+    }
+}
+
+/// Expand upper 4 bits of a byte to f32 mask: bit i → 0.0 or 1.0.
+/// Returns float32x4 for bits 4,5,6,7.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bits_to_f32_mask_hi(byte: u32) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let vals: [f32; 4] = [
+            ((byte >> 4) & 1) as f32,
+            ((byte >> 5) & 1) as f32,
+            ((byte >> 6) & 1) as f32,
+            ((byte >> 7) & 1) as f32,
+        ];
+        vld1q_f32(vals.as_ptr())
+    }
+}
+
 // ── Positional encoding ─────────────────────────────────────────────────────
 
 /// Apply Rotary Position Embedding (RoPE) to Q and K vectors.
