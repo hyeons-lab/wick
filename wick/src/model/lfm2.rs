@@ -2,8 +2,6 @@
 //
 // Reference: Liquid4All/llama.cpp branch dberrios/updateLlama, src/models/lfm2.cpp
 
-use std::sync::OnceLock;
-
 use anyhow::{Context, Result};
 
 use crate::backend::cpu;
@@ -11,14 +9,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, LayerState};
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
-use crate::turboquant::{self, RotationState, TurboQuantConfig};
-
-/// TurboQuant per-model state (rotations + config), set once via `enable_turboquant`.
-struct TurboQuantState {
-    /// Per-layer rotation states; None for non-attention (conv) layers.
-    rotations: Vec<Option<RotationState>>,
-    config: TurboQuantConfig,
-}
+use crate::turboquant;
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
@@ -70,9 +61,6 @@ pub struct Lfm2Model {
     // Pre-resolved quantized weight refs
     embd_ref: WeightRef,
     layer_refs: Vec<LayerWeightRefs>,
-    // TurboQuant KV cache compression (None when disabled). OnceLock makes this
-    // set-once via &self (required by the Model trait).
-    tq_state: OnceLock<TurboQuantState>,
 }
 
 impl Lfm2Model {
@@ -267,43 +255,7 @@ impl Lfm2Model {
             conv_weights,
             embd_ref,
             layer_refs,
-            tq_state: OnceLock::new(),
         })
-    }
-
-    /// Enable TurboQuant KV cache key compression.
-    /// Must be called before inference begins. Uses interior mutability
-    /// (OnceLock) so the Model trait can keep `&self` receivers.
-    ///
-    /// No-ops when `head_dim` is not a power of 2 — TurboQuant's randomized
-    /// Hadamard transform requires a power-of-2 vector length.
-    pub fn enable_turboquant(&self, seed: u64) {
-        let head_dim = self.config.hidden_size / self.config.n_heads;
-        if !head_dim.is_power_of_two() {
-            return;
-        }
-        let rotations: Vec<Option<RotationState>> = self
-            .config
-            .block_types
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, bt)| {
-                if *bt == BlockType::Attention {
-                    Some(RotationState::from_seed(seed ^ layer_idx as u64, head_dim))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let _ = self.tq_state.set(TurboQuantState {
-            rotations,
-            config: TurboQuantConfig::for_head_dim(head_dim),
-        });
-    }
-
-    /// Whether TurboQuant is enabled.
-    pub fn turboquant_enabled(&self) -> bool {
-        self.tq_state.get().is_some()
     }
 
     /// Resolve a tensor name to a pre-computed byte range in the mmap.
@@ -750,9 +702,11 @@ impl Lfm2Model {
         cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
         // Grab per-model TurboQuant state once (None when disabled)
-        let tq_state = self.tq_state.get();
-        let tq_rotation = tq_state.and_then(|t| t.rotations[layer].as_ref());
-        let tq_config = tq_state.map(|t| &t.config);
+        // TurboQuant rotation state lives on InferenceState now (since PR #12
+        // refactor). A single KvCompression::TurboQuant { seed, ... } config
+        // on the state is enough — no separate model-side enable needed.
+        let tq_rotation = state.tq_rotations.get(layer).and_then(|r| r.as_ref());
+        let tq_config = state.tq_config.as_ref();
 
         // Append K, V to cache. Keys and values are compressed independently —
         // whichever side has a CompressedKvCache present gets the TurboQuant
@@ -1384,9 +1338,8 @@ impl Model for Lfm2Model {
                         // Hoist tq state capture so the reserve block can match the
                         // exact same condition as the actual append path below, and
                         // so the per-token loop can key off pre-computed bools.
-                        let tq_state = self.tq_state.get();
-                        let tq_rotation = tq_state.and_then(|t| t.rotations[layer].as_ref());
-                        let tq_config = tq_state.map(|t| &t.config);
+                        let tq_rotation = state.tq_rotations.get(layer).and_then(|r| r.as_ref());
+                        let tq_config = state.tq_config.as_ref();
                         // Needed to encode keys + values (append path).
                         let will_compress_kv = tq_rotation.is_some()
                             && tq_config.is_some()
@@ -1912,11 +1865,8 @@ impl Model for Lfm2Model {
         &self.config
     }
 
-    fn enable_turboquant(&self, seed: u64) {
-        Self::enable_turboquant(self, seed);
-    }
-
-    fn turboquant_enabled(&self) -> bool {
-        Self::turboquant_enabled(self)
+    fn turboquant_supported(&self) -> bool {
+        let head_dim = self.config.hidden_size / self.config.n_heads;
+        head_dim.is_power_of_two()
     }
 }

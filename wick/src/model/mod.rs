@@ -132,12 +132,12 @@ pub trait Model: Send {
         unimplemented!("restore_state not supported by this backend")
     }
 
-    /// Enable TurboQuant KV cache key compression.
-    /// Must be called before inference begins. No-op for models that don't support it.
-    fn enable_turboquant(&self, _seed: u64) {}
-
-    /// Whether TurboQuant is enabled on this model.
-    fn turboquant_enabled(&self) -> bool {
+    /// Whether this model/backend supports TurboQuant KV cache compression.
+    /// Used by the CLI to decide whether to request compression or fall back
+    /// to f32. TurboQuant is fully driven by `KvCompression` on the
+    /// `InferenceState`; models just need to honor the compressed buffers in
+    /// their forward pass. Currently only the CPU `Lfm2Model` does.
+    fn turboquant_supported(&self) -> bool {
         false
     }
 }

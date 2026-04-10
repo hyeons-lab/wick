@@ -268,7 +268,7 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
     Ok(())
 }
 
-/// Parse KV cache compression mode and apply to model.
+/// Parse a CLI KV-cache-compression flag value into a `KvCompression`.
 ///
 /// Modes:
 /// - `f32` / `none`: uncompressed (default)
@@ -292,8 +292,7 @@ fn setup_kv_compression(
         ),
     };
 
-    model.enable_turboquant(seed);
-    if model.turboquant_enabled() {
+    if model.turboquant_supported() {
         eprintln!(
             "TurboQuant KV compression enabled (keys: {}, values: {})",
             if keys { "3-bit" } else { "f32" },

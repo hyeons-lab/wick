@@ -5,10 +5,18 @@ use std::time::Instant;
 
 use crate::model::{BlockType, ModelConfig};
 use crate::turboquant::{
-    CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch,
+    CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
+    TurboQuantConfig,
 };
 
-/// KV cache compression mode.
+/// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
+/// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
+/// TurboQuant needs: the per-layer rotation states, the compressed key/value
+/// caches, and the scratch buffers. **No separate `enable_turboquant` call on
+/// the model is required.**
+///
+/// TurboQuant is currently honored only by the CPU backend (`Lfm2Model`); on the
+/// Metal/GPU backends this setting is ignored and the f32 KV path is used.
 #[derive(Clone, Debug, Default)]
 pub enum KvCompression {
     /// No compression — keys and values stored as f32 (default).
@@ -21,6 +29,9 @@ pub enum KvCompression {
     ///
     /// - Keys: 2-bit PolarQuant + 1-bit QJL residual (3 bits/elem + f16 norms).
     /// - Values: 2-bit PolarQuant only (2 bits/elem + f16 norms).
+    ///
+    /// `seed` drives the per-layer randomized Hadamard rotations — the same
+    /// seed reproduces the same rotations deterministically.
     TurboQuant { seed: u64, keys: bool, values: bool },
 }
 
@@ -102,6 +113,12 @@ pub struct InferenceState {
     pub tq_encode_scratch: Option<EncodeScratch>,
     /// TurboQuant query rotation scratch (None when disabled).
     pub tq_query_scratch: Option<QueryRotationScratch>,
+    /// Per-layer TurboQuant rotation state (None for conv layers or when
+    /// compression is disabled). Constructed from the `seed` in `KvCompression`
+    /// at `from_config_with_compression` time.
+    pub tq_rotations: Vec<Option<RotationState>>,
+    /// Shared TurboQuant config (Lloyd-Max centroids, derived from head_dim).
+    pub tq_config: Option<TurboQuantConfig>,
 }
 
 impl InferenceState {
@@ -135,6 +152,8 @@ impl InferenceState {
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
+            tq_rotations: Vec::new(),
+            tq_config: None,
         }
     }
 
@@ -145,7 +164,13 @@ impl InferenceState {
         Self::from_config_with_compression(config, &KvCompression::None)
     }
 
-    /// Create inference state with optional key compression.
+    /// Create inference state with optional KV cache compression.
+    ///
+    /// When `compression` is `KvCompression::TurboQuant`, this single call
+    /// sets up everything TurboQuant needs: the per-layer rotation states,
+    /// the compressed caches (keys and/or values), the encode scratch, and
+    /// the query rotation scratch. The model itself doesn't need to be
+    /// "enabled" separately — it reads all TurboQuant state from here.
     pub fn from_config_with_compression(config: &ModelConfig, compression: &KvCompression) -> Self {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         assert!(
@@ -158,6 +183,36 @@ impl InferenceState {
 
         let initial_capacity = 2048; // Pre-allocate for typical context
         let (compress_keys, compress_values) = compression.flags();
+
+        // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
+        // If the requirement isn't met, silently fall back to uncompressed f32.
+        let tq_enabled = (compress_keys || compress_values) && head_dim.is_power_of_two();
+        let (compress_keys, compress_values) = if tq_enabled {
+            (compress_keys, compress_values)
+        } else {
+            (false, false)
+        };
+
+        let (tq_rotations, tq_config) = if tq_enabled {
+            let seed = match compression {
+                KvCompression::TurboQuant { seed, .. } => *seed,
+                KvCompression::None => 0,
+            };
+            let rotations: Vec<Option<RotationState>> = config
+                .block_types
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, bt)| match bt {
+                    BlockType::Attention => {
+                        Some(RotationState::from_seed(seed ^ layer_idx as u64, head_dim))
+                    }
+                    BlockType::GatedConv => None,
+                })
+                .collect();
+            (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
+        } else {
+            (Vec::new(), None)
+        };
         let layers = config
             .block_types
             .iter()
@@ -219,16 +274,18 @@ impl InferenceState {
             // EncodeScratch `rot` buffer is shared between key and value
             // encode; QueryRotationScratch is shared between key score
             // computation and value weighted-sum reconstruction.
-            tq_encode_scratch: if compress_keys || compress_values {
+            tq_encode_scratch: if tq_enabled {
                 Some(EncodeScratch::new(head_dim))
             } else {
                 None
             },
-            tq_query_scratch: if compress_keys || compress_values {
+            tq_query_scratch: if tq_enabled {
                 Some(QueryRotationScratch::new(config.n_heads, head_dim))
             } else {
                 None
             },
+            tq_rotations,
+            tq_config,
         }
     }
 

@@ -86,14 +86,11 @@ fn test_kv_compression_quality_gate() {
     let tok_gguf = GgufFile::open(&model_path).expect("open gguf");
     let tokenizer = BpeTokenizer::from_gguf(&tok_gguf).expect("tokenizer");
 
-    // Two independent model instances — one for each compression mode.
-    let gguf_a = GgufFile::open(&model_path).expect("open gguf A");
-    let model_a = Lfm2Model::from_gguf(gguf_a).expect("load A");
-
-    let gguf_b = GgufFile::open(&model_path).expect("open gguf B");
-    let model_b = Lfm2Model::from_gguf(gguf_b).expect("load B");
-    model_b.enable_turboquant(42);
-    assert!(model_b.turboquant_enabled(), "TurboQuant failed to enable");
+    // One model instance is enough — TurboQuant state now lives entirely on
+    // the InferenceState, so the same model can be reused across modes.
+    let gguf = GgufFile::open(&model_path).expect("open gguf");
+    let model = Lfm2Model::from_gguf(gguf).expect("load model");
+    assert!(model.turboquant_supported(), "TurboQuant not supported");
 
     // Deterministic prompt.
     let prompt = "The capital of France is";
@@ -109,12 +106,9 @@ fn test_kv_compression_quality_gate() {
     eprintln!("prompt tokens: {} ({:?})", tokens.len(), tokens);
 
     // Compare logits at the next-token position after prefill.
-    let logits_a = prefill_and_next_logits(&model_a as &dyn Model, &tokens, KvCompression::None);
-    let logits_b = prefill_and_next_logits(
-        &model_b as &dyn Model,
-        &tokens,
-        KvCompression::turboquant(42),
-    );
+    let logits_a = prefill_and_next_logits(&model as &dyn Model, &tokens, KvCompression::None);
+    let logits_b =
+        prefill_and_next_logits(&model as &dyn Model, &tokens, KvCompression::turboquant(42));
     assert_eq!(logits_a.len(), logits_b.len(), "vocab sizes differ");
 
     let cos = cosine(&logits_a, &logits_b);
