@@ -3,7 +3,7 @@
 // Platform-specific implementations behind cfg gates.
 // The dispatch functions select the best available implementation at compile time.
 
-use crate::quant::{BlockQ4KM, BlockQ8_0};
+use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
@@ -37,6 +37,58 @@ mod neon {
 
                 sumv = vfmaq_f32(sumv, q_lo_f32, y_lo);
                 sumv = vfmaq_f32(sumv, q_hi_f32, y_hi);
+            }
+
+            d * vaddvq_f32(sumv)
+        }
+    }
+
+    /// NEON-optimized Q4_0 dot product with f32 vector.
+    ///
+    /// Q4_0 block: 16 bytes `qs` holding 32 4-bit unsigned values (low nibble first,
+    /// then high nibble). Values are offset by -8: value = (nibble - 8) * d.
+    ///
+    /// Uses vector nibble extraction (vand/vshr on uint8x8) then widens to f32
+    /// without scalar code in the inner loop.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vec_dot_q4_0_f32_neon(block: &BlockQ4_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.d).to_f32();
+            let offset = vdupq_n_f32(8.0);
+            let mask_lo = vdup_n_u8(0x0F);
+
+            let mut sumv = vdupq_n_f32(0.0);
+            let qs_ptr = block.qs.as_ptr();
+            let y_ptr = y.as_ptr();
+
+            // Process 8 bytes at a time → 8 low nibbles + 8 high nibbles = 16 values.
+            // Two iterations cover all 16 bytes (32 values).
+            for i in (0..16).step_by(8) {
+                // Load 8 bytes of quantized data
+                let qbytes = vld1_u8(qs_ptr.add(i));
+
+                // Extract low and high nibbles as u8 vectors
+                let lo_u8 = vand_u8(qbytes, mask_lo);
+                let hi_u8 = vshr_n_u8::<4>(qbytes);
+
+                // Widen low nibbles: u8x8 → u16x8 → split → u32x4 → f32x4
+                let lo_u16 = vmovl_u8(lo_u8);
+                let lo_f32_0 = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo_u16))), offset);
+                let lo_f32_1 = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo_u16))), offset);
+
+                // Widen high nibbles similarly
+                let hi_u16 = vmovl_u8(hi_u8);
+                let hi_f32_0 = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi_u16))), offset);
+                let hi_f32_1 = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi_u16))), offset);
+
+                // FMA with corresponding y values
+                // Low nibbles: y[i..i+4], y[i+4..i+8]
+                sumv = vfmaq_f32(sumv, lo_f32_0, vld1q_f32(y_ptr.add(i)));
+                sumv = vfmaq_f32(sumv, lo_f32_1, vld1q_f32(y_ptr.add(i + 4)));
+                // High nibbles: y[i+16..i+20], y[i+20..i+24]
+                sumv = vfmaq_f32(sumv, hi_f32_0, vld1q_f32(y_ptr.add(i + 16)));
+                sumv = vfmaq_f32(sumv, hi_f32_1, vld1q_f32(y_ptr.add(i + 16 + 4)));
             }
 
             d * vaddvq_f32(sumv)
@@ -164,6 +216,54 @@ mod avx2 {
         }
     }
 
+    /// AVX2-optimized Q4_0 dot product with f32 vector.
+    ///
+    /// Loads all 16 qs bytes at once, extracts nibbles with vector AND/SHIFT,
+    /// then widens to i32 and converts to f32 for FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn vec_dot_q4_0_f32_avx2(block: &BlockQ4_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.d).to_f32();
+            let offset = _mm256_set1_ps(8.0);
+            let mask_lo = _mm_set1_epi8(0x0F);
+
+            let mut sum256 = _mm256_setzero_ps();
+            let y_ptr = y.as_ptr();
+
+            // Load all 16 bytes of qs
+            let qbytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+
+            // Extract low nibbles (AND with 0x0F) and high nibbles (shift right 4)
+            let lo_bytes = _mm_and_si128(qbytes, mask_lo);
+            let hi_bytes = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
+
+            // Process low nibbles: 16 u8 values → 2 groups of 8 i32 → f32
+            // First 8 low nibbles
+            let lo_0_i32 = _mm256_cvtepu8_epi32(lo_bytes); // lower 8 bytes → 8 i32
+            let lo_0_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(lo_0_i32), offset);
+            sum256 = _mm256_fmadd_ps(lo_0_f32, _mm256_loadu_ps(y_ptr), sum256);
+
+            // Next 8 low nibbles
+            let lo_hi_half = _mm_srli_si128(lo_bytes, 8); // shift right 8 bytes
+            let lo_1_i32 = _mm256_cvtepu8_epi32(lo_hi_half);
+            let lo_1_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(lo_1_i32), offset);
+            sum256 = _mm256_fmadd_ps(lo_1_f32, _mm256_loadu_ps(y_ptr.add(8)), sum256);
+
+            // Process high nibbles: same pattern, y offset by 16
+            let hi_0_i32 = _mm256_cvtepu8_epi32(hi_bytes);
+            let hi_0_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(hi_0_i32), offset);
+            sum256 = _mm256_fmadd_ps(hi_0_f32, _mm256_loadu_ps(y_ptr.add(16)), sum256);
+
+            let hi_hi_half = _mm_srli_si128(hi_bytes, 8);
+            let hi_1_i32 = _mm256_cvtepu8_epi32(hi_hi_half);
+            let hi_1_f32 = _mm256_sub_ps(_mm256_cvtepi32_ps(hi_1_i32), offset);
+            sum256 = _mm256_fmadd_ps(hi_1_f32, _mm256_loadu_ps(y_ptr.add(24)), sum256);
+
+            d * hsum_avx(sum256)
+        }
+    }
+
     /// AVX2-optimized Q4_K_M dot product with f32 vector.
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn vec_dot_q4_k_m_f32_avx2(block: &BlockQ4KM, y: &[f32]) -> f32 {
@@ -246,11 +346,36 @@ mod avx2 {
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
-/// Best available Q8_0 dot product.
-pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
+/// Best available Q4_0 dot product.
+pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 32, "Q4_0 vec_dot requires y.len() == 32");
+
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is always available on aarch64
+        unsafe { neon::vec_dot_q4_0_f32_neon(block, y) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) }
+        } else {
+            crate::quant::vec_dot_q4_0_f32_scalar(block, y)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        crate::quant::vec_dot_q4_0_f32_scalar(block, y)
+    }
+}
+
+/// Best available Q8_0 dot product.
+pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 32, "Q8_0 vec_dot requires y.len() == 32");
+
+    #[cfg(target_arch = "aarch64")]
+    {
         unsafe { neon::vec_dot_q8_0_f32_neon(block, y) }
     }
 
@@ -271,6 +396,7 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
 
 /// Best available Q4_K_M dot product.
 pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
+    assert_eq!(y.len(), 256, "Q4_K_M vec_dot requires y.len() == 256");
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::vec_dot_q4_k_m_f32_neon(block, y) }
@@ -296,6 +422,29 @@ pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_simd_q4_0_matches_scalar() {
+        let block = BlockQ4_0 {
+            d: f16::from_f32(0.5).to_bits(),
+            qs: {
+                let mut q = [0u8; 16];
+                for i in 0..16 {
+                    q[i] = ((i % 13) as u8) | (((i % 7) as u8) << 4);
+                }
+                q
+            },
+        };
+        let y: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+
+        let scalar = crate::quant::vec_dot_q4_0_f32_scalar(&block, &y);
+        let simd = vec_dot_q4_0_f32(&block, &y);
+
+        assert!(
+            (scalar - simd).abs() < 1e-3,
+            "SIMD Q4_0 mismatch: scalar={scalar}, simd={simd}"
+        );
+    }
 
     #[test]
     fn test_simd_q8_0_matches_scalar() {
