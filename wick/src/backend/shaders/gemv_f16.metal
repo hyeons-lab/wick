@@ -19,7 +19,7 @@ kernel void gemv_f16(
     const device half* a [[buffer(0)]],
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]

@@ -11,7 +11,7 @@ kernel void conv1d_depthwise(
     device float* rbuffer [[buffer(1)]],
     const device float* weight [[buffer(2)]],
     device float* output [[buffer(3)]],
-    const device Params& params [[buffer(4)]],
+    constant Params& params [[buffer(4)]],
     uint ch [[thread_position_in_grid]]
 ) {
     uint hs = params.hidden_size;

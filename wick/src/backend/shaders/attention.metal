@@ -31,7 +31,7 @@ kernel void attention(
     const device half* k_cache [[buffer(1)]],
     const device half* v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
-    const device Params& params [[buffer(4)]],
+    constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -99,7 +99,7 @@ kernel void attention(
     // exp + sum.
     float partial_sum = 0.0f;
     for (uint t = tid; t < seq_len; t += 256u) {
-        float e = fast::exp(scores[t] - max_val);
+        float e = exp(scores[t] - max_val);
         scores[t] = e;
         partial_sum += e;
     }

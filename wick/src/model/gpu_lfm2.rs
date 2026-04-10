@@ -1436,6 +1436,11 @@ impl Model for GpuLfm2Model {
         self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
     }
 
+    // forward_embedding and forward_from_embedding use default impls
+    // (unimplemented). Audio generation requires Metal backend for now.
+    // wgpu support would need refactoring forward() to split the layer
+    // dispatch from the logit projection, plus a hidden_buf download path.
+
     fn forward_prefill(
         &self,
         tokens: &[u32],

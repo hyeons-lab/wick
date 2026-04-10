@@ -14,7 +14,7 @@ struct Params { uint n; };
 kernel void argmax_f32(
     const device float* logits [[buffer(0)]],
     device uint* out [[buffer(1)]],
-    const device Params& params [[buffer(2)]],
+    constant Params& params [[buffer(2)]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]]

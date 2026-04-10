@@ -140,6 +140,16 @@ pub mod shaders {
     pub const ATTENTION_GQA: &str = include_str!("shaders/attention_gqa.metal");
     pub const ATTENTION_SPLITK: &str = include_str!("shaders/attention_splitk.metal");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.metal");
+    pub const GEMV_Q4_0_BATCH: &str = include_str!("shaders/gemv_q4_0_batch.metal");
+    pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.metal");
+    pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.metal");
+    pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.metal");
+    pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
+    pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.metal");
+    pub const GEMV_Q8_0_BATCH: &str = include_str!("shaders/gemv_q8_0_batch.metal");
+    pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.metal");
+    pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
+    pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.metal");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

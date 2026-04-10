@@ -478,25 +478,76 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
     let n = x.len();
 
-    // Compute mean of squares
-    let mut sum_sq = 0.0f32;
+    // Accumulate sum of squares in f64 to match ggml's ggml_float (double) precision.
+    // This avoids f32 rounding that compounds across layers.
+    let mut sum_sq = 0.0f64;
     for &v in x.iter() {
-        sum_sq += v * v;
+        sum_sq += (v as f64) * (v as f64);
     }
-    let rms = (sum_sq / n as f32 + eps).sqrt();
-    let inv_rms = 1.0 / rms;
+    let mean = sum_sq / n as f64;
+    let rms = (mean + eps as f64).sqrt();
+    let inv_rms = (1.0 / rms) as f32;
 
     for i in 0..n {
         x[i] = x[i] * inv_rms * weight[i];
     }
 }
 
+// ── Exp approximation ──────────────────────────────────────────────────────
+
+/// Polynomial exp approximation matching ggml's `ggml_v_expf` (ARM optimized routine).
+/// Maximum error: 1.45358 + 0.5 ULPs.
+/// Inputs above 88.38 flush to infinity, below -103.97 flush to zero.
+#[inline(always)]
+fn ggml_expf(x: f32) -> f32 {
+    // Bit-exact constants from ggml's hex float literals.
+    const R: f32 = f32::from_bits(0x4B400000); // 0x1.8p23       = 12582912.0
+    const LOG2E: f32 = f32::from_bits(0x3FB8AA3B); // 0x1.715476p+0  = log2(e)
+    const LN2_HI: f32 = f32::from_bits(0x3F317200); // 0x1.62e4p-1    = ln(2) high
+    const LN2_LO: f32 = f32::from_bits(0x35BFBE8E); // 0x1.7f7d1cp-20 = ln(2) low
+    const C1: f32 = f32::from_bits(0x3F7FFFF6); // 0x1.ffffecp-1  ≈ 1/1!
+    const C2: f32 = f32::from_bits(0x3EFFFEDB); // 0x1.fffdb6p-2  ≈ 1/2!
+    const C3: f32 = f32::from_bits(0x3E2AAF33); // 0x1.555e66p-3  ≈ 1/3!
+    const C4: f32 = f32::from_bits(0x3D2B9F17); // 0x1.573e2ep-5  ≈ 1/4!
+    const C5: f32 = f32::from_bits(0x3C072010); // 0x1.0e4020p-7  ≈ 1/5!
+
+    // n = round(x / ln2) via magic number trick
+    let z = R + x * LOG2E;
+    let n = z - R;
+
+    // Cody-Waite range reduction: b = x - n*ln2
+    let b = x - n * LN2_HI - n * LN2_LO;
+
+    // 2^n via integer bit manipulation
+    let e = z.to_bits().wrapping_shl(23);
+    let k = f32::from_bits(e.wrapping_add(1.0f32.to_bits()));
+
+    // Polynomial approximation of exp(b) - 1 (Estrin's scheme)
+    let u = b * b;
+    let j = C1 * b + (C2 + C3 * b + (C4 + C5 * b) * u) * u;
+
+    // Combine: result = k * (1 + j) = 2^n * exp(b)
+    let abs_n = f32::from_bits(n.to_bits() & 0x7FFF_FFFF);
+
+    if abs_n <= 126.0 {
+        k + j * k
+    } else if abs_n > 192.0 {
+        if n > 0.0 { f32::INFINITY } else { 0.0 }
+    } else {
+        let d = if n <= 0.0 { 0x82000000u32 } else { 0u32 };
+        let s1 = f32::from_bits(d.wrapping_add(0x7f000000));
+        let s2 = f32::from_bits(e.wrapping_sub(d));
+        (s2 + s2 * j) * s1
+    }
+}
+
 // ── Activation functions ────────────────────────────────────────────────────
 
 /// SiLU (Swish) activation in-place: x = x * sigmoid(x).
+/// Uses ggml's polynomial exp approximation to match ggml's NEON silu path.
 pub fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
-        *v = *v / (1.0 + (-*v).exp());
+        *v = *v / (1.0 + ggml_expf(-*v));
     }
 }
 
@@ -505,26 +556,27 @@ pub fn silu_inplace(x: &mut [f32]) {
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
     for (g, &u) in gate.iter_mut().zip(up.iter()) {
-        *g = *g / (1.0 + (-*g).exp()) * u;
+        *g = *g / (1.0 + ggml_expf(-*g)) * u;
     }
 }
 
 // ── Softmax ─────────────────────────────────────────────────────────────────
 
 /// Softmax in-place over a 1D slice.
+/// Uses ggml's polynomial exp approximation and f64 accumulation to match ggml exactly.
 pub fn softmax_inplace(x: &mut [f32]) {
     // Find max for numerical stability
     let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
 
-    // Exponentiate and sum
-    let mut sum = 0.0f32;
+    // Exponentiate using ggml's polynomial exp and sum with f64 (matches ggml_float)
+    let mut sum = 0.0f64;
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
+        *v = ggml_expf(*v - max);
+        sum += *v as f64;
     }
 
     // Normalize
-    let inv_sum = 1.0 / sum;
+    let inv_sum = (1.0 / sum) as f32;
     for v in x.iter_mut() {
         *v *= inv_sum;
     }
@@ -758,18 +810,19 @@ pub fn rope(
 }
 
 /// Apply RoPE rotation to a single head vector.
+/// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
 fn apply_rope_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
     let half_dim = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = pos as f32;
     for i in 0..half_dim {
-        let freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
-        let theta = pos as f32 * freq;
-        let cos_t = theta.cos();
-        let sin_t = theta.sin();
+        let (sin_t, cos_t) = theta.sin_cos();
 
         let x0 = head[i];
         let x1 = head[i + half_dim];
         head[i] = x0 * cos_t - x1 * sin_t;
         head[i + half_dim] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
     }
 }
 
@@ -950,6 +1003,28 @@ mod tests {
         assert!((x[0] - 0.0900).abs() < 1e-3);
         assert!((x[1] - 0.2447).abs() < 1e-3);
         assert!((x[2] - 0.6652).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_ggml_expf() {
+        // ggml_expf should approximate exp() within ~1.5 ULPs
+        let test_vals = [0.0f32, 1.0, -1.0, 2.0, -5.0, -10.0, -50.0, 80.0];
+        for &x in &test_vals {
+            let got = ggml_expf(x);
+            let expected = x.exp();
+            let rel_err = if expected.abs() > 1e-10 {
+                ((got - expected) / expected).abs()
+            } else {
+                (got - expected).abs()
+            };
+            assert!(
+                rel_err < 1e-5,
+                "ggml_expf({x}) = {got}, expected {expected}, rel_err = {rel_err}"
+            );
+        }
+        // Edge cases
+        assert!(ggml_expf(100.0).is_infinite() || ggml_expf(100.0) > 1e30);
+        assert!(ggml_expf(-200.0) < 1e-30);
     }
 
     #[test]

@@ -283,9 +283,9 @@ pub(crate) mod neon {
                 let amax = vmaxvq_f32(a6);
 
                 let d = amax / 127.0;
-                let d = f16::from_f32(d).to_f32(); // f16 roundtrip
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                scales[bi] = d;
+                let d_stored = f16::from_f32(d).to_f32();
+                scales[bi] = d_stored;
 
                 // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
                 // f32→i32 (vcvtnq), then i32→i16→i8 via vqmovn (saturating narrow).
@@ -300,16 +300,15 @@ pub(crate) mod neon {
                 let vi6 = vcvtnq_s32_f32(vmulq_n_f32(s6, id));
                 let vi7 = vcvtnq_s32_f32(vmulq_n_f32(s7, id));
 
-                // i32x4 pairs → i16x8 → i8x8, then store 8 bytes at a time
-                let n16_01 = vcombine_s16(vqmovn_s32(vi0), vqmovn_s32(vi1));
-                let n16_23 = vcombine_s16(vqmovn_s32(vi2), vqmovn_s32(vi3));
-                let n16_45 = vcombine_s16(vqmovn_s32(vi4), vqmovn_s32(vi5));
-                let n16_67 = vcombine_s16(vqmovn_s32(vi6), vqmovn_s32(vi7));
-
-                vst1_s8(qp, vqmovn_s16(n16_01));
-                vst1_s8(qp.add(8), vqmovn_s16(n16_23));
-                vst1_s8(qp.add(16), vqmovn_s16(n16_45));
-                vst1_s8(qp.add(24), vqmovn_s16(n16_67));
+                // Extract i32 lanes to i8, matching ggml's vgetq_lane_s32 approach.
+                // This avoids the double-saturating-narrow path (vqmovn_s32 + vqmovn_s16)
+                // which may produce different results at boundary values.
+                for (j, vi) in [vi0, vi1, vi2, vi3, vi4, vi5, vi6, vi7].iter().enumerate() {
+                    *qp.add(4 * j) = vgetq_lane_s32::<0>(*vi) as i8;
+                    *qp.add(4 * j + 1) = vgetq_lane_s32::<1>(*vi) as i8;
+                    *qp.add(4 * j + 2) = vgetq_lane_s32::<2>(*vi) as i8;
+                    *qp.add(4 * j + 3) = vgetq_lane_s32::<3>(*vi) as i8;
+                }
             }
             n_blocks
         }

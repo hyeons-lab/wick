@@ -17,6 +17,7 @@ struct Params {
     uint head_dim;
     uint eps_bits;
     uint freq_base_bits;
+    uint rope_type; // 0 = NeoX (pairs at [i, i+half]), 1 = interleaved (pairs at [2i, 2i+1])
 };
 
 inline void head_rmsnorm(
@@ -57,23 +58,37 @@ inline void head_rmsnorm(
 }
 
 // Apply RoPE to buf[0..head_dim] in place.
+// rope_type 0 = NeoX: pairs at [d, d + half_dim]
+// rope_type 1 = interleaved (LLAMA_ROPE_TYPE_NORM): pairs at [2d, 2d+1]
 inline void head_rope(
     device float* buf,
     uint tid,
     uint head_dim,
     uint pos,
-    float freq_base
+    float freq_base,
+    uint rope_type
 ) {
     uint half_dim = head_dim / 2u;
+    // theta[d] = pos * freq_base^(-2d/head_dim). Compute with powr for O(1)
+    // per thread instead of an O(d) iterative multiplication loop.
+    float theta_scale = powr(freq_base, -2.0f / float(head_dim));
     for (uint d = tid; d < half_dim; d += 256u) {
-        float freq = 1.0f / fast::powr(freq_base, float(2u * d) / float(head_dim));
-        float angle = float(pos) * freq;
-        float cos_a = fast::cos(angle);
-        float sin_a = fast::sin(angle);
-        float x0 = buf[d];
-        float x1 = buf[d + half_dim];
-        buf[d] = x0 * cos_a - x1 * sin_a;
-        buf[d + half_dim] = x0 * sin_a + x1 * cos_a;
+        float theta = float(pos) * powr(theta_scale, float(d));
+        float cos_a = cos(theta);
+        float sin_a = sin(theta);
+        if (rope_type == 0u) {
+            // NeoX: pairs at [d, d + half_dim]
+            float x0 = buf[d];
+            float x1 = buf[d + half_dim];
+            buf[d] = x0 * cos_a - x1 * sin_a;
+            buf[d + half_dim] = x0 * sin_a + x1 * cos_a;
+        } else {
+            // Interleaved: pairs at [2d, 2d+1]
+            float x0 = buf[2u * d];
+            float x1 = buf[2u * d + 1u];
+            buf[2u * d] = x0 * cos_a - x1 * sin_a;
+            buf[2u * d + 1u] = x0 * sin_a + x1 * cos_a;
+        }
     }
 }
 
@@ -82,7 +97,7 @@ kernel void qk_norm_rope(
     device float* k_cache [[buffer(1)]],  // [seq_len × kv_dim], offset to current row
     const device float* q_norm_w [[buffer(2)]],
     const device float* k_norm_w [[buffer(3)]],
-    const device Params& params [[buffer(4)]],
+    constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -100,16 +115,18 @@ kernel void qk_norm_rope(
     // Dispatch: (n_heads + n_kv_heads) TGs. First n_heads handle Q heads;
     // remaining n_kv_heads handle K heads. Gives every TG equal work (no
     // load imbalance from doing 2× work in the first few TGs).
+    uint rope_type = params.rope_type;
+
     if (head < n_heads) {
         device float* q_head = q + head * head_dim;
         head_rmsnorm(q_head, q_norm_w, scratch, tid, head_dim, eps);
-        head_rope(q_head, tid, head_dim, pos, freq_base);
+        head_rope(q_head, tid, head_dim, pos, freq_base, rope_type);
     } else {
         uint kh = head - n_heads;
         if (kh < n_kv_heads) {
             device float* k_head = k_cache + kh * head_dim;
             head_rmsnorm(k_head, k_norm_w, scratch, tid, head_dim, eps);
-            head_rope(k_head, tid, head_dim, pos, freq_base);
+            head_rope(k_head, tid, head_dim, pos, freq_base, rope_type);
         }
     }
 }

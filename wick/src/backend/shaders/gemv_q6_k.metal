@@ -26,7 +26,7 @@ kernel void gemv_q6_k(
     const device uchar* a [[buffer(0)]],    // raw Q6_K bytes
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
-    const device Params& params [[buffer(3)]],
+    constant Params& params [[buffer(3)]],
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint tg_id [[threadgroup_position_in_grid]]
