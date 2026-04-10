@@ -4,6 +4,9 @@ pub mod simd;
 #[cfg(feature = "gpu")]
 pub mod wgpu;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+
 /// Compute operations supported by backends.
 #[derive(Debug)]
 pub enum Op {
