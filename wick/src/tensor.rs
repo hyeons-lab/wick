@@ -9,6 +9,7 @@ pub enum DType {
     Q4_0,
     Q4KM,
     Q8_0,
+    Q6K,
 }
 
 impl DType {
@@ -21,7 +22,7 @@ impl DType {
             DType::BF16 => Some(2),
             DType::I32 => Some(4),
             DType::U8 => Some(1),
-            DType::Q4_0 | DType::Q4KM | DType::Q8_0 => None,
+            DType::Q4_0 | DType::Q4KM | DType::Q8_0 | DType::Q6K => None,
         }
     }
 
@@ -31,6 +32,7 @@ impl DType {
             DType::Q4_0 => 32,
             DType::Q4KM => 256,
             DType::Q8_0 => 32,
+            DType::Q6K => 256,
             _ => 1,
         }
     }
@@ -41,6 +43,7 @@ impl DType {
             DType::Q4_0 => 18,
             DType::Q4KM => 144,
             DType::Q8_0 => 34,
+            DType::Q6K => 210,
             DType::F32 => 4,
             DType::F16 => 2,
             DType::BF16 => 2,
@@ -149,6 +152,11 @@ impl Tensor {
             DType::Q4KM => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q4_k_m_row(&self.data, &mut out);
+                out
+            }
+            DType::Q6K => {
+                let mut out = vec![0.0f32; self.numel()];
+                crate::quant::dequantize_q6_k_row(&self.data, &mut out);
                 out
             }
             _ => unimplemented!("to_f32_vec not implemented for {:?}", self.dtype),
