@@ -123,22 +123,26 @@ Savings scale linearly with context length — at 8K+ tokens the KV cache domina
 
 After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of wick f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts). Values reuse the same NEON kernel pattern as keys for the hot inner loop.
 
+### Backend support
+
+**TurboQuant is currently implemented only on the CPU backend (`Lfm2Model`).** The Metal and wgpu GPU backends do not yet honor the compressed caches — passing `--kv-cache-keys tq3` to a GPU run will log a warning and fall back to f32 KV. See the CPU-only limitation note in the memory-footprint comparison above if you need to pick a backend.
+
 ### CLI: enabling TurboQuant
 
 Both `wick run` and `wick bench` accept `--kv-cache-keys` (the flag name is kept for backwards compatibility; it now covers values too):
 
 ```bash
 # Uncompressed (default) — keys and values stored as f32
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys f32
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys f32 --device cpu
 
-# Full TurboQuant — 3-bit keys + 2-bit values (production default)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3
+# Full TurboQuant — 3-bit keys + 2-bit values (production default, CPU backend only)
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
 
 # Keys only — 3-bit keys, values stay f32 (debugging: isolate key error)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys --device cpu
 
 # Values only — values stay 2-bit, keys stay f32 (debugging: isolate value error)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values
+wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values --device cpu
 ```
 
 Accepted values for `--kv-cache-keys`:
@@ -153,37 +157,46 @@ Accepted values for `--kv-cache-keys`:
 The same flag applies to `wick bench` for A/B benchmarking:
 
 ```bash
-wick bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256
-```
-
-And to audio generation via `wick run --vocoder`:
-
-```bash
-wick run -m lfm2-audio.gguf --vocoder vocoder.gguf \
-  --system "Respond with interleaved text and audio." \
-  -p "Hello, how are you today?" \
-  --audio-out /tmp/out.wav \
-  --kv-cache-keys tq3
+wick bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256 --device cpu
 ```
 
 ### Programmatic API
 
-From Rust, construct a `KvCompression` and pass it to `InferenceState::from_config_with_compression` or via `GenerateConfig`:
+TurboQuant is configured in a **single call** — construct a `KvCompression` and pass it to `InferenceState::from_config_with_compression` or via `GenerateConfig`. No separate `enable_turboquant` call is needed; the rotation state, compressed caches, and scratch buffers are all set up on the `InferenceState` from the same configuration.
 
 ```rust
-use wick::kv_cache::KvCompression;
+use wick::kv_cache::{InferenceState, KvCompression};
 
-// Production: both sides compressed
+// Production: both sides compressed. The single `seed` drives the
+// per-layer randomized Hadamard rotations deterministically.
+let state = InferenceState::from_config_with_compression(
+    model.config(),
+    &KvCompression::turboquant(42),
+);
+
+// Or via the bench/engine config:
+let gen_cfg = wick::engine::GenerateConfig {
+    kv_compression: KvCompression::turboquant(42),
+    ..Default::default()
+};
+```
+
+All four modes:
+
+```rust
+// Disabled — f32 KV for both keys and values (default)
+let cfg = KvCompression::None;
+
+// Both compressed — the shortcut wraps the common case
 let cfg = KvCompression::turboquant(42);
 
-// Explicit toggles (matches the CLI modes)
+// Or with explicit key/value flags (matches the CLI modes)
 let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: true  }; // == tq3
 let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: false }; // == tq3-keys
 let cfg = KvCompression::TurboQuant { seed: 42, keys: false, values: true  }; // == tq3-values
-
-// Disable entirely
-let cfg = KvCompression::None;
 ```
+
+To check whether a loaded model's backend supports TurboQuant, call `model.turboquant_supported()` before asking for compression — it returns `false` on GPU backends and on any model whose `head_dim` isn't a power of 2 (the Walsh-Hadamard transform requires it).
 
 See `wick/src/turboquant.rs` for the implementation and `wick/src/kv_cache.rs` for the `KvCompression` enum.
 
