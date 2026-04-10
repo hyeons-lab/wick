@@ -43,6 +43,27 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         context_size: usize,
 
+        /// Path to vocoder GGUF for audio generation. Enables audio output.
+        #[arg(long)]
+        vocoder: Option<String>,
+
+        /// Output WAV file for generated audio.
+        #[arg(long)]
+        audio_out: Option<String>,
+
+        /// System prompt (used with --vocoder for audio mode selection).
+        /// E.g. "Perform TTS." or "Respond with interleaved text and audio."
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Audio sampling temperature (0.0 = greedy, >0 = stochastic).
+        #[arg(long, default_value_t = 0.8)]
+        audio_temperature: f32,
+
+        /// Audio top-k for stochastic sampling.
+        #[arg(long, default_value_t = 4)]
+        audio_top_k: usize,
+
         /// Directory for KV prefix cache files. Enables disk caching for prompt reuse.
         #[arg(long)]
         cache_dir: Option<String>,
@@ -212,6 +233,33 @@ fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     (p(0.1), p(0.5), p(0.9), mean, var.sqrt())
 }
 
+/// Write PCM float32 samples as a WAV file (16-bit PCM, mono).
+fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let n = samples.len() as u32;
+    let data_size = n * 2;
+    let file_size = 36 + data_size;
+    f.write_all(b"RIFF")?;
+    f.write_all(&file_size.to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&(sample_rate * 2).to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_size.to_le_bytes())?;
+    for &s in samples {
+        let i16_val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        f.write_all(&i16_val.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -228,6 +276,11 @@ fn main() -> Result<()> {
             device,
             token_ids,
             context_size,
+            vocoder,
+            audio_out,
+            system,
+            audio_temperature,
+            audio_top_k,
             cache_dir,
             cache_warm_mb,
             cache_disk_gb,
@@ -263,21 +316,44 @@ fn main() -> Result<()> {
                 });
             }
 
-            let tokens = if let Some(ids) = &token_ids {
-                // Parse comma-separated token IDs
-                ids.split(',')
+            // Build token sequence.
+            let mut tokens = Vec::new();
+            if system.is_some() || vocoder.is_some() {
+                // Use chat template when --system or --vocoder is set.
+                anyhow::ensure!(
+                    system.is_some(),
+                    "--system is required with --vocoder. Supported:\n  \
+                     \"Respond with interleaved text and audio.\"\n  \
+                     \"Perform TTS. <voice description>\"\n  \
+                     \"Perform ASR.\" (not yet supported — requires audio encoder)"
+                );
+                let sys = system.as_deref().unwrap();
+                let messages = vec![
+                    wick::tokenizer::ChatMessage {
+                        role: "system".into(),
+                        content: sys.into(),
+                    },
+                    wick::tokenizer::ChatMessage {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                    },
+                ];
+                let formatted = wick::tokenizer::apply_chat_template(&tokenizer, &messages, true)?;
+                eprintln!("Chat template applied ({} chars)", formatted.len());
+                tokens = tokenizer.encode(&formatted);
+            } else if let Some(ids) = &token_ids {
+                tokens = ids
+                    .split(',')
                     .map(|s| s.trim().parse::<u32>())
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Result<Vec<_>, _>>()?;
             } else {
-                let mut toks = Vec::new();
                 if add_bos {
                     if let Some(bos) = tokenizer.bos_token() {
-                        toks.push(bos);
+                        tokens.push(bos);
                     }
                 }
-                toks.extend_from_slice(&tokenizer.encode(&prompt));
-                toks
-            };
+                tokens.extend_from_slice(&tokenizer.encode(&prompt));
+            }
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",
@@ -287,24 +363,136 @@ fn main() -> Result<()> {
             );
             eprintln!("Prompt tokens: {}", tokens.len());
 
-            let config = wick::engine::GenerateConfig {
-                max_tokens,
-                sampler: wick::sampler::SamplerConfig {
-                    temperature,
-                    ..Default::default()
-                },
-                silent: false,
-            };
+            if let Some(vocoder_path) = &vocoder {
+                // Audio generation mode.
+                let voc_gguf = wick::gguf::GgufFile::open(Path::new(vocoder_path))?;
+                let decoder_weights =
+                    wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf)?;
+                let detok_weights =
+                    wick::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf)?;
 
-            let result =
-                wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let gpu_detok = {
+                    match wick::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(
+                        &voc_gguf,
+                        Path::new(vocoder_path),
+                    ) {
+                        Ok(d) => {
+                            eprintln!("Metal detokenizer loaded");
+                            Some(d)
+                        }
+                        Err(e) => {
+                            eprintln!("Metal detokenizer failed: {e}, using CPU");
+                            None
+                        }
+                    }
+                };
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                let _gpu_detok: Option<()> = None;
 
-            eprintln!();
-            eprintln!("---");
-            eprintln!("Prompt tokens: {}", result.prompt_tokens);
-            eprintln!("Generated tokens: {}", result.generated_tokens);
-            eprintln!("Prefill: {:.1} tok/s", result.prefill_tok_per_sec);
-            eprintln!("Decode: {:.1} tok/s", result.decode_tok_per_sec);
+                let mut all_pcm = Vec::new();
+                let sys = system.as_deref().unwrap();
+                let mode = if sys == "Respond with interleaved text and audio." {
+                    wick::audio_engine::AudioMode::Interleaved
+                } else {
+                    wick::audio_engine::AudioMode::Sequential
+                };
+                let audio_config = wick::audio_engine::AudioGenerateConfig {
+                    max_tokens,
+                    sampler: wick::sampler::SamplerConfig {
+                        temperature,
+                        ..Default::default()
+                    },
+                    audio_temperature,
+                    audio_top_k,
+                    mode,
+                };
+
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let gpu_ref: Option<&dyn wick::model::audio_decoder::AudioGpu> = gpu_detok
+                    .as_ref()
+                    .map(|d| d as &dyn wick::model::audio_decoder::AudioGpu);
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                let gpu_ref: Option<&dyn wick::model::audio_decoder::AudioGpu> = None;
+
+                let result = wick::audio_engine::generate_audio(
+                    loaded_model.as_ref(),
+                    &decoder_weights,
+                    &detok_weights,
+                    &tokenizer,
+                    &tokens,
+                    &audio_config,
+                    gpu_ref,
+                    |text| {
+                        print!("{text}");
+                    },
+                    |pcm, _sr| {
+                        all_pcm.extend_from_slice(pcm);
+                    },
+                )?;
+
+                eprintln!();
+                eprintln!("---");
+                eprintln!("Text tokens: {}", result.text_tokens);
+                eprintln!("Audio frames: {}", result.audio_frames);
+                eprintln!(
+                    "Audio: {} samples ({:.1}s at 24kHz)",
+                    all_pcm.len(),
+                    all_pcm.len() as f64 / 24000.0
+                );
+                eprintln!("Elapsed: {:.1}s", result.elapsed_secs);
+                eprintln!(
+                    "Breakdown: depthformer {}ms ({:.1}ms/frame), detokenizer {}ms ({:.1}ms/frame), other {}ms",
+                    (result.depthformer_secs * 1000.0) as u64,
+                    if result.audio_frames > 0 {
+                        result.depthformer_secs * 1000.0 / result.audio_frames as f64 * 1000.0
+                    } else {
+                        0.0
+                    },
+                    (result.detokenizer_secs * 1000.0) as u64,
+                    if result.audio_frames > 0 {
+                        result.detokenizer_secs * 1000.0 / result.audio_frames as f64 * 1000.0
+                    } else {
+                        0.0
+                    },
+                    (result.elapsed_secs * 1000.0
+                        - result.depthformer_secs * 1000.0
+                        - result.detokenizer_secs * 1000.0) as u64,
+                );
+                eprintln!(
+                    "Throughput: {:.1} tok/s (text+audio)",
+                    (result.text_tokens + result.audio_frames * 12) as f64 / result.elapsed_secs
+                );
+
+                if let Some(wav_path) = &audio_out {
+                    write_wav(wav_path, &all_pcm, 24000)?;
+                    eprintln!("Wrote {wav_path}");
+                } else if !all_pcm.is_empty() {
+                    let default_path = "/tmp/wick_audio.wav";
+                    write_wav(default_path, &all_pcm, 24000)?;
+                    eprintln!("Wrote {default_path}");
+                }
+            } else {
+                // Text-only generation.
+                let config = wick::engine::GenerateConfig {
+                    max_tokens,
+                    sampler: wick::sampler::SamplerConfig {
+                        temperature,
+                        ..Default::default()
+                    },
+                    silent: false,
+                };
+
+                let result =
+                    wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
+
+                eprintln!();
+                eprintln!("---");
+                eprintln!("Prompt tokens: {}", result.prompt_tokens);
+                eprintln!("Generated tokens: {}", result.generated_tokens);
+                eprintln!("Prefill: {:.1} tok/s", result.prefill_tok_per_sec);
+                eprintln!("Decode: {:.1} tok/s", result.decode_tok_per_sec);
+            }
         }
         Command::Inspect { model } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
