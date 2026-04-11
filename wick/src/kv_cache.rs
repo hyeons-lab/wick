@@ -4,13 +4,67 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::model::{BlockType, ModelConfig};
+use crate::turboquant::{
+    CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
+    TurboQuantConfig,
+};
+
+/// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
+/// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
+/// TurboQuant needs: the per-layer rotation states, the compressed key/value
+/// caches, and the scratch buffers. **No separate `enable_turboquant` call on
+/// the model is required.**
+///
+/// TurboQuant is currently honored only by the CPU backend (`Lfm2Model`); on the
+/// Metal/GPU backends this setting is ignored and the f32 KV path is used.
+#[derive(Clone, Debug, Default)]
+pub enum KvCompression {
+    /// No compression — keys and values stored as f32 (default).
+    #[default]
+    None,
+    /// TurboQuant compression. Keys and values can be toggled independently
+    /// for debugging (e.g. to isolate how much drift each side contributes).
+    /// The common production configuration sets both `keys` and `values` to
+    /// `true`.
+    ///
+    /// - Keys: 2-bit PolarQuant + 1-bit QJL residual (3 bits/elem + f16 norms).
+    /// - Values: 2-bit PolarQuant only (2 bits/elem + f16 norms).
+    ///
+    /// `seed` drives the per-layer randomized Hadamard rotations — the same
+    /// seed reproduces the same rotations deterministically.
+    TurboQuant { seed: u64, keys: bool, values: bool },
+}
+
+impl KvCompression {
+    /// Shortcut for the common "compress everything" configuration.
+    pub fn turboquant(seed: u64) -> Self {
+        Self::TurboQuant {
+            seed,
+            keys: true,
+            values: true,
+        }
+    }
+
+    /// Returns `(compress_keys, compress_values)` for the current mode.
+    pub fn flags(&self) -> (bool, bool) {
+        match self {
+            Self::None => (false, false),
+            Self::TurboQuant { keys, values, .. } => (*keys, *values),
+        }
+    }
+}
 
 /// Per-layer inference state.
+#[allow(clippy::large_enum_variant)]
 pub enum LayerState {
     /// KV cache for attention layers.
     Attention {
         key_cache: Vec<f32>,
         value_cache: Vec<f32>,
+        /// Compressed key cache (populated when TurboQuant is active; key_cache stays empty).
+        compressed_keys: Option<CompressedKeyCache>,
+        /// Compressed value cache (populated when TurboQuant is active; value_cache stays empty).
+        compressed_values: Option<CompressedValueCache>,
     },
     /// Rolling buffer for convolution layers.
     /// Stores previous `d_conv` pre-conv activations (bx values), time-major.
@@ -54,6 +108,17 @@ pub struct InferenceState {
     pub layers: Vec<LayerState>,
     pub seq_len: usize,
     pub scratch: ScratchBuffers,
+    /// TurboQuant encode scratch (None when disabled). Owned by InferenceState
+    /// rather than Model so the model remains Sync for concurrent inference.
+    pub tq_encode_scratch: Option<EncodeScratch>,
+    /// TurboQuant query rotation scratch (None when disabled).
+    pub tq_query_scratch: Option<QueryRotationScratch>,
+    /// Per-layer TurboQuant rotation state (None for conv layers or when
+    /// compression is disabled). Constructed from the `seed` in `KvCompression`
+    /// at `from_config_with_compression` time.
+    pub tq_rotations: Vec<Option<RotationState>>,
+    /// Shared TurboQuant config (Lloyd-Max centroids, derived from head_dim).
+    pub tq_config: Option<TurboQuantConfig>,
 }
 
 impl InferenceState {
@@ -64,6 +129,8 @@ impl InferenceState {
                 .map(|_| LayerState::Attention {
                     key_cache: Vec::new(),
                     value_cache: Vec::new(),
+                    compressed_keys: None,
+                    compressed_values: None,
                 })
                 .collect(),
             seq_len: 0,
@@ -83,6 +150,10 @@ impl InferenceState {
                 q8_scales: Vec::new(),
                 q8_quants: Vec::new(),
             },
+            tq_encode_scratch: None,
+            tq_query_scratch: None,
+            tq_rotations: Vec::new(),
+            tq_config: None,
         }
     }
 
@@ -90,23 +161,90 @@ impl InferenceState {
     /// Attention layers get empty KV caches; conv layers get zero-filled rolling buffers.
     /// Scratch buffers are pre-allocated to avoid per-token allocations.
     pub fn from_config(config: &ModelConfig) -> Self {
+        Self::from_config_with_compression(config, &KvCompression::None)
+    }
+
+    /// Create inference state with optional KV cache compression.
+    ///
+    /// When `compression` is `KvCompression::TurboQuant`, this single call
+    /// sets up everything TurboQuant needs: the per-layer rotation states,
+    /// the compressed caches (keys and/or values), the encode scratch, and
+    /// the query rotation scratch. The model itself doesn't need to be
+    /// "enabled" separately — it reads all TurboQuant state from here.
+    pub fn from_config_with_compression(config: &ModelConfig, compression: &KvCompression) -> Self {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         assert!(
             kernel_size >= 2,
             "conv_kernel_size must be at least 2, got {kernel_size}"
         );
         let d_conv = kernel_size - 1;
-        let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
-            * (config.hidden_size / config.n_heads);
+        let head_dim = config.hidden_size / config.n_heads;
+        let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
 
+        let initial_capacity = 2048; // Pre-allocate for typical context
+        let (compress_keys, compress_values) = compression.flags();
+
+        // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
+        // If the requirement isn't met, silently fall back to uncompressed f32.
+        let tq_enabled = (compress_keys || compress_values) && head_dim.is_power_of_two();
+        let (compress_keys, compress_values) = if tq_enabled {
+            (compress_keys, compress_values)
+        } else {
+            (false, false)
+        };
+
+        let (tq_rotations, tq_config) = if tq_enabled {
+            let seed = match compression {
+                KvCompression::TurboQuant { seed, .. } => *seed,
+                KvCompression::None => 0,
+            };
+            let rotations: Vec<Option<RotationState>> = config
+                .block_types
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, bt)| match bt {
+                    BlockType::Attention => {
+                        Some(RotationState::from_seed(seed ^ layer_idx as u64, head_dim))
+                    }
+                    BlockType::GatedConv => None,
+                })
+                .collect();
+            (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
+        } else {
+            (Vec::new(), None)
+        };
         let layers = config
             .block_types
             .iter()
-            .map(|bt| match bt {
-                BlockType::Attention => LayerState::Attention {
-                    key_cache: Vec::new(),
-                    value_cache: Vec::new(),
-                },
+            .enumerate()
+            .map(|(layer_idx, bt)| match bt {
+                BlockType::Attention => {
+                    let n_kv_heads = config.kv_heads_per_layer[layer_idx];
+                    let compressed_keys = if compress_keys && n_kv_heads > 0 {
+                        Some(CompressedKeyCache::new(
+                            n_kv_heads,
+                            head_dim,
+                            initial_capacity,
+                        ))
+                    } else {
+                        None
+                    };
+                    let compressed_values = if compress_values && n_kv_heads > 0 {
+                        Some(CompressedValueCache::new(
+                            n_kv_heads,
+                            head_dim,
+                            initial_capacity,
+                        ))
+                    } else {
+                        None
+                    };
+                    LayerState::Attention {
+                        key_cache: Vec::new(),
+                        value_cache: Vec::new(),
+                        compressed_keys,
+                        compressed_values,
+                    }
+                }
                 BlockType::GatedConv => LayerState::Conv {
                     buffer: vec![0.0; d_conv * config.hidden_size],
                 },
@@ -132,14 +270,31 @@ impl InferenceState {
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
             },
+            // Scratch is needed whenever either side is compressed. The
+            // EncodeScratch `rot` buffer is shared between key and value
+            // encode; QueryRotationScratch is shared between key score
+            // computation and value weighted-sum reconstruction.
+            tq_encode_scratch: if tq_enabled {
+                Some(EncodeScratch::new(head_dim))
+            } else {
+                None
+            },
+            tq_query_scratch: if tq_enabled {
+                Some(QueryRotationScratch::new(config.n_heads, head_dim))
+            } else {
+                None
+            },
+            tq_rotations,
+            tq_config,
         }
     }
 
-    /// Append K and V vectors to an attention layer's cache.
+    /// Append K and V vectors to an attention layer's cache (uncompressed path).
     pub fn append_kv(&mut self, layer: usize, k: &[f32], v: &[f32]) {
         if let LayerState::Attention {
             key_cache,
             value_cache,
+            ..
         } = &mut self.layers[layer]
         {
             key_cache.extend_from_slice(k);
@@ -153,11 +308,36 @@ impl InferenceState {
         if let LayerState::Attention {
             key_cache,
             value_cache,
+            ..
         } = &self.layers[layer]
         {
             (key_cache, value_cache)
         } else {
             panic!("kv_cache called on non-attention layer {layer}");
+        }
+    }
+
+    /// Borrow the compressed key cache for an attention layer, if present.
+    pub fn compressed_keys(&self, layer: usize) -> Option<&CompressedKeyCache> {
+        if let LayerState::Attention {
+            compressed_keys, ..
+        } = &self.layers[layer]
+        {
+            compressed_keys.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Mutably borrow the compressed key cache for an attention layer, if present.
+    pub fn compressed_keys_mut(&mut self, layer: usize) -> Option<&mut CompressedKeyCache> {
+        if let LayerState::Attention {
+            compressed_keys, ..
+        } = &mut self.layers[layer]
+        {
+            compressed_keys.as_mut()
+        } else {
+            None
         }
     }
 }
