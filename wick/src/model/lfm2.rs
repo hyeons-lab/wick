@@ -443,6 +443,12 @@ impl Lfm2Model {
     /// `false` if the caller should fall back to `gemm_preq`. When the `blas`
     /// feature is disabled at build time, this unconditionally returns false
     /// and the fallback path is taken.
+    ///
+    /// Gated to aarch64 to match the call sites: every caller lives inside the
+    /// aarch64-only `forward_prefill_inner` batched path. Non-aarch64 builds
+    /// still fall through to the per-token GEMV loop and don't go through this
+    /// helper.
+    #[cfg(target_arch = "aarch64")]
     #[allow(clippy::too_many_arguments)]
     fn try_blas_prefill_gemm(
         &self,
