@@ -1867,16 +1867,16 @@ impl Model for Lfm2Model {
                 }
             }
 
-            // FFN: batched GEMM on aarch64 Q4_0/Q8_0 (reads weights once for all n tokens)
+            // FFN: batched GEMM on aarch64 Q4_0/Q8_0 (reads weights once for all n tokens).
+            // Require all three projections (gate/up/down) to be Q4_0/Q8_0 — a
+            // mixed-dtype FFN block would leave later matrices silently
+            // uncomputed in the batched path and produce wrong outputs.
             let refs = &self.layer_refs[layer];
             #[cfg(target_arch = "aarch64")]
-            // Require all three FFN projections to be Q4_0/Q8_0 — a mixed-dtype
-            // FFN block would leave later matrices silently uncomputed in the
-            // batched path and produce wrong outputs.
-            let ffn_blas_ok = matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0)
+            let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0)
                 && matches!(refs.ffn_up.dtype, DType::Q4_0 | DType::Q8_0)
-                && matches!(refs.ffn_down.dtype, DType::Q4_0 | DType::Q8_0);
-            let used_gemm = if ffn_blas_ok {
+                && matches!(refs.ffn_down.dtype, DType::Q4_0 | DType::Q8_0)
+            {
                 // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
                 #[cfg(not(feature = "blas"))]
                 Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
