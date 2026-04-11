@@ -432,23 +432,25 @@ impl Lfm2Model {
         cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
     }
 
-    /// Try to run a prefill GEMM through BLAS (Accelerate on macOS → AMX,
-    /// OpenBLAS on Linux). Dequantizes `wref` into `dequant_scratch[..m*k]`
-    /// then calls SGEMM: `out[m, n] = weight[m, k] @ b[k, n]` in row-major.
+    /// Run a prefill GEMM through BLAS (Accelerate on macOS → AMX, OpenBLAS
+    /// on Linux). Dequantizes `wref` into `dequant_scratch[..m*k]` then calls
+    /// SGEMM: `out[m, n] = weight[m, k] @ b[k, n]` in row-major.
     ///
     /// Both `b` and `out` are row-major `[m|k, n]` with row stride `n`,
     /// matching the `mat[i * n + j]` layout used throughout `forward_prefill_inner`.
     ///
-    /// Returns `true` if BLAS handled the call (supported dtype + feature on),
-    /// `false` if the caller should fall back to `gemm_preq`. When the `blas`
-    /// feature is disabled at build time, this unconditionally returns false
-    /// and the fallback path is taken.
+    /// `dequant_scratch` is grown to `m * k` floats on first use and reused
+    /// across subsequent GEMM calls within a single forward pass and across
+    /// calls.
     ///
-    /// Gated to aarch64 to match the call sites: every caller lives inside the
-    /// aarch64-only `forward_prefill_inner` batched path. Non-aarch64 builds
-    /// still fall through to the per-token GEMV loop and don't go through this
-    /// helper.
-    #[cfg(target_arch = "aarch64")]
+    /// Returns `true` on supported dtypes (Q4_0 / Q8_0), `false` otherwise.
+    /// All current callers gate on dtype upfront so this only returns `false`
+    /// in unreachable defensive paths.
+    ///
+    /// Gated to `aarch64 + feature = "blas"` to match the call sites: every
+    /// caller lives inside the aarch64-only `forward_prefill_inner` batched
+    /// path under `#[cfg(feature = "blas")]`.
+    #[cfg(all(target_arch = "aarch64", feature = "blas"))]
     #[allow(clippy::too_many_arguments)]
     fn try_blas_prefill_gemm(
         &self,
@@ -458,33 +460,30 @@ impl Lfm2Model {
         m: usize,
         n: usize,
         k: usize,
-        dequant_scratch: &mut [f32],
+        dequant_scratch: &mut Vec<f32>,
     ) -> bool {
-        #[cfg(feature = "blas")]
-        {
-            assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
-            assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
-            let data = self.weight_data(wref);
-            let dequant = &mut dequant_scratch[..m * k];
-            match wref.dtype {
-                DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
-                DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
-                _ => return false,
-            }
-            crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
-            true
+        debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
+        debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
+        let data = self.weight_data(wref);
+        if dequant_scratch.len() < m * k {
+            dequant_scratch.resize(m * k, 0.0);
         }
-        #[cfg(not(feature = "blas"))]
-        {
-            let _ = (wref, b, out, m, n, k, dequant_scratch);
-            false
+        let dequant = &mut dequant_scratch[..m * k];
+        match wref.dtype {
+            DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+            _ => return false,
         }
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+        true
     }
 
     /// Batched GEMM with pre-quantized Q8_0 input columns.
     /// Dispatches to Q4_0 or Q8_0 GEMM kernel based on weight dtype.
     /// Returns true if GEMM was performed, false if dtype is unsupported.
-    #[cfg(target_arch = "aarch64")]
+    /// Only the NEON-fallback path uses this; with BLAS on, the SGEMM path
+    /// in `try_blas_prefill_gemm` replaces it.
+    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
     #[allow(clippy::too_many_arguments)]
     fn gemm_preq(
         &self,
@@ -515,8 +514,9 @@ impl Lfm2Model {
     }
 
     /// Quantize all N columns of a column-major matrix [dim × n] to Q8_0.
-    /// `col` is a scratch buffer of size `dim`.
-    #[cfg(target_arch = "aarch64")]
+    /// `col` is a scratch buffer of size `dim`. Only used by the NEON fallback
+    /// `gemm_preq` path; with BLAS on, the SGEMM path consumes f32 directly.
+    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
     fn quantize_columns(
         mat: &[f32],
         dim: usize,
@@ -1223,23 +1223,26 @@ impl Model for Lfm2Model {
         // Pre-allocated GEMM buffers (reused across layers)
         #[cfg(target_arch = "aarch64")]
         let is = cfg.intermediate_size;
-        #[cfg(target_arch = "aarch64")]
+        // bq_*/dq_*/inter_col are scratch for the NEON fallback `gemm_preq` path
+        // (they hold the pre-quantized Q8_0 input matrix). With BLAS on, the
+        // SGEMM path consumes f32 directly and these buffers are not needed.
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let nb_hs = hs / 32;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let nb_is = is / 32;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut bq_scales = vec![0.0f32; n * nb_hs];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut bq_quants = vec![0i8; n * hs];
         #[cfg(target_arch = "aarch64")]
         let mut gate_mat = vec![0.0f32; is * n];
         #[cfg(target_arch = "aarch64")]
         let mut up_mat = vec![0.0f32; is * n];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut dq_scales = vec![0.0f32; n * nb_is];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut dq_quants = vec![0i8; n * is];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut inter_col = vec![0.0f32; is];
 
         for layer in 0..cfg.n_layers {
@@ -1270,6 +1273,9 @@ impl Model for Lfm2Model {
                     let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
                     if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
                         // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
+                        // quantize_columns is only needed for the NEON fallback. With BLAS
+                        // on, the SGEMM path consumes f32 directly so this work is skipped.
+                        #[cfg(not(feature = "blas"))]
                         Self::quantize_columns(
                             &normed,
                             hs,
@@ -1278,25 +1284,28 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        if !self.try_blas_prefill_gemm(
-                            in_proj,
-                            &normed,
-                            &mut proj_mat,
-                            3 * hs,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
-                            self.gemm_preq(
+                        #[cfg(feature = "blas")]
+                        {
+                            self.try_blas_prefill_gemm(
                                 in_proj,
-                                &bq_scales,
-                                &bq_quants,
+                                &normed,
                                 &mut proj_mat,
                                 3 * hs,
                                 n,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                         }
+                        #[cfg(not(feature = "blas"))]
+                        self.gemm_preq(
+                            in_proj,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut proj_mat,
+                            3 * hs,
+                            n,
+                            hs,
+                        );
 
                         // Phase 2: Per-token sequential conv using pre-computed projections
                         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
@@ -1343,6 +1352,7 @@ impl Model for Lfm2Model {
                         }
 
                         // Phase 3: Batch out_proj GEMM
+                        #[cfg(not(feature = "blas"))]
                         Self::quantize_columns(
                             &out_proj_input,
                             hs,
@@ -1351,25 +1361,20 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        if !self.try_blas_prefill_gemm(
-                            out_proj,
-                            &out_proj_input,
-                            &mut block_out,
-                            hs,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
-                            self.gemm_preq(
+                        #[cfg(feature = "blas")]
+                        {
+                            self.try_blas_prefill_gemm(
                                 out_proj,
-                                &bq_scales,
-                                &bq_quants,
+                                &out_proj_input,
                                 &mut block_out,
                                 hs,
                                 n,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                         }
+                        #[cfg(not(feature = "blas"))]
+                        self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
                         true
                     } else {
                         false
@@ -1383,6 +1388,7 @@ impl Model for Lfm2Model {
                         let kv_dim = n_kv_heads * head_dim;
 
                         // Phase 1: Batch Q/K/V GEMM
+                        #[cfg(not(feature = "blas"))]
                         Self::quantize_columns(
                             &normed,
                             hs,
@@ -1391,28 +1397,41 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        if !self.try_blas_prefill_gemm(
-                            attn_q_ref,
-                            &normed,
-                            &mut q_mat,
-                            hs,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
+                        #[cfg(feature = "blas")]
+                        {
+                            self.try_blas_prefill_gemm(
+                                attn_q_ref,
+                                &normed,
+                                &mut q_mat,
+                                hs,
+                                n,
+                                hs,
+                                &mut state.scratch.dequant_weight_scratch,
+                            );
+                            self.try_blas_prefill_gemm(
+                                refs.attn_k.as_ref().unwrap(),
+                                &normed,
+                                &mut k_mat[..kv_dim * n],
+                                kv_dim,
+                                n,
+                                hs,
+                                &mut state.scratch.dequant_weight_scratch,
+                            );
+                            self.try_blas_prefill_gemm(
+                                refs.attn_v.as_ref().unwrap(),
+                                &normed,
+                                &mut v_mat[..kv_dim * n],
+                                kv_dim,
+                                n,
+                                hs,
+                                &mut state.scratch.dequant_weight_scratch,
+                            );
+                        }
+                        #[cfg(not(feature = "blas"))]
+                        {
                             self.gemm_preq(
                                 attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs,
                             );
-                        }
-                        if !self.try_blas_prefill_gemm(
-                            refs.attn_k.as_ref().unwrap(),
-                            &normed,
-                            &mut k_mat[..kv_dim * n],
-                            kv_dim,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
                             self.gemm_preq(
                                 refs.attn_k.as_ref().unwrap(),
                                 &bq_scales,
@@ -1422,16 +1441,6 @@ impl Model for Lfm2Model {
                                 n,
                                 hs,
                             );
-                        }
-                        if !self.try_blas_prefill_gemm(
-                            refs.attn_v.as_ref().unwrap(),
-                            &normed,
-                            &mut v_mat[..kv_dim * n],
-                            kv_dim,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
                             self.gemm_preq(
                                 refs.attn_v.as_ref().unwrap(),
                                 &bq_scales,
@@ -1757,6 +1766,7 @@ impl Model for Lfm2Model {
                         }
 
                         // Phase 3: Batch output projection GEMM
+                        #[cfg(not(feature = "blas"))]
                         Self::quantize_columns(
                             &out_proj_input,
                             hs,
@@ -1765,25 +1775,28 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        if !self.try_blas_prefill_gemm(
-                            refs.attn_output.as_ref().unwrap(),
-                            &out_proj_input,
-                            &mut block_out,
-                            hs,
-                            n,
-                            hs,
-                            &mut state.scratch.dequant_weight,
-                        ) {
-                            self.gemm_preq(
+                        #[cfg(feature = "blas")]
+                        {
+                            self.try_blas_prefill_gemm(
                                 refs.attn_output.as_ref().unwrap(),
-                                &bq_scales,
-                                &bq_quants,
+                                &out_proj_input,
                                 &mut block_out,
                                 hs,
                                 n,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                         }
+                        #[cfg(not(feature = "blas"))]
+                        self.gemm_preq(
+                            refs.attn_output.as_ref().unwrap(),
+                            &bq_scales,
+                            &bq_quants,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                        );
                         true
                     } else {
                         false
@@ -1841,19 +1854,34 @@ impl Model for Lfm2Model {
             let refs = &self.layer_refs[layer];
             #[cfg(target_arch = "aarch64")]
             let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0) {
-                // Pre-quantize all n columns to Q8_0
+                // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
+                #[cfg(not(feature = "blas"))]
                 Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
 
                 // Gate + Up via batched GEMM
-                if !self.try_blas_prefill_gemm(
-                    &refs.ffn_gate,
-                    &ffn_input,
-                    &mut gate_mat,
-                    is,
-                    n,
-                    hs,
-                    &mut state.scratch.dequant_weight,
-                ) {
+                #[cfg(feature = "blas")]
+                {
+                    self.try_blas_prefill_gemm(
+                        &refs.ffn_gate,
+                        &ffn_input,
+                        &mut gate_mat,
+                        is,
+                        n,
+                        hs,
+                        &mut state.scratch.dequant_weight_scratch,
+                    );
+                    self.try_blas_prefill_gemm(
+                        &refs.ffn_up,
+                        &ffn_input,
+                        &mut up_mat,
+                        is,
+                        n,
+                        hs,
+                        &mut state.scratch.dequant_weight_scratch,
+                    );
+                }
+                #[cfg(not(feature = "blas"))]
+                {
                     self.gemm_preq(
                         &refs.ffn_gate,
                         &bq_scales,
@@ -1863,23 +1891,14 @@ impl Model for Lfm2Model {
                         n,
                         hs,
                     );
-                }
-                if !self.try_blas_prefill_gemm(
-                    &refs.ffn_up,
-                    &ffn_input,
-                    &mut up_mat,
-                    is,
-                    n,
-                    hs,
-                    &mut state.scratch.dequant_weight,
-                ) {
                     self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
                 }
 
                 // Fused SiLU+mul (row-major is×n)
                 cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
-                // Re-quantize gate_mat columns for down projection
+                // Re-quantize gate_mat columns for down projection — only needed for NEON fallback.
+                #[cfg(not(feature = "blas"))]
                 Self::quantize_columns(
                     &gate_mat,
                     is,
@@ -1890,25 +1909,28 @@ impl Model for Lfm2Model {
                 );
 
                 // Down via batched GEMM
-                if !self.try_blas_prefill_gemm(
-                    &refs.ffn_down,
-                    &gate_mat,
-                    &mut ffn_out,
-                    hs,
-                    n,
-                    is,
-                    &mut state.scratch.dequant_weight,
-                ) {
-                    self.gemm_preq(
+                #[cfg(feature = "blas")]
+                {
+                    self.try_blas_prefill_gemm(
                         &refs.ffn_down,
-                        &dq_scales,
-                        &dq_quants,
+                        &gate_mat,
                         &mut ffn_out,
                         hs,
                         n,
                         is,
+                        &mut state.scratch.dequant_weight_scratch,
                     );
                 }
+                #[cfg(not(feature = "blas"))]
+                self.gemm_preq(
+                    &refs.ffn_down,
+                    &dq_scales,
+                    &dq_quants,
+                    &mut ffn_out,
+                    hs,
+                    n,
+                    is,
+                );
                 true
             } else {
                 false

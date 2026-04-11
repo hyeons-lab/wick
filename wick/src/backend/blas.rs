@@ -30,6 +30,15 @@ use cblas_sys::{CBLAS_ORDER, CBLAS_TRANSPOSE, cblas_sgemm};
 /// - if `a.len() < m * k`
 /// - if `b.len() < k * n`
 /// - if `c.len() < m * n`
+///
+/// # Aliasing
+/// `a`, `b`, and `c` must reference non-overlapping memory regions. The CBLAS
+/// contract requires distinct input and output buffers — passing the same
+/// allocation for two slots is undefined behavior. Rust's `&mut` rules already
+/// prevent `c` from aliasing `a` or `b` at the call site (you can't have a
+/// shared borrow alive alongside an exclusive borrow), but `a` and `b` could
+/// in principle be the same shared slice. We never do that and BLAS would
+/// happily compute a meaningless result if we did.
 pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     assert!(
         a.len() >= m * k,
@@ -60,9 +69,13 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
     let n_i = i32::try_from(n).expect("n overflow");
     let k_i = i32::try_from(k).expect("k overflow");
 
-    // SAFETY: we verified lengths above. The pointers are valid for the sizes
-    // passed to cblas_sgemm, and cblas_sgemm reads a/b and writes c without
-    // retaining them.
+    // SAFETY:
+    // - lengths verified above (a ≥ m*k, b ≥ k*n, c ≥ m*n).
+    // - row-major leading dims match: lda=k, ldb=n, ldc=n with no transpose.
+    // - non-aliasing: see the function-level Aliasing note. `&mut c` cannot
+    //   alias `&a` or `&b` at the call site due to Rust borrow rules.
+    // - cblas_sgemm reads a/b and writes c synchronously and does not retain
+    //   the pointers after returning.
     unsafe {
         cblas_sgemm(
             CBLAS_ORDER::CblasRowMajor,

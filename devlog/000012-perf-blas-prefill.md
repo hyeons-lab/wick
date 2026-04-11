@@ -15,6 +15,17 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
 - 2026-04-10T21:50-0700 `wick/src/backend/blas.rs` — added `microbench_ffn_up_gemm` (ignored by default) that times both paths in isolation on the `(m=6912, n=2002, k=2048)` shape. Provides a diagnostic gate for whether AMX is actually delivering, independent of end-to-end bench noise.
 - 2026-04-10T22:15-0700 `wick/src/model/lfm2.rs` — replaced `blas_prefill_gemm` with a unified `try_blas_prefill_gemm` that returns false when the `blas` feature is off (no cfg noise at call sites). Wired all 8 prefill GEMM call sites: conv in_proj/out_proj, attn Q/K/V/output, ffn_gate/up/down. Each site tries BLAS first and falls back to `gemm_preq` with the pre-quantized NEON inputs on failure.
 - 2026-04-10T22:35-0700 `README.md` — added a "CPU prefill via Accelerate BLAS (Apple AMX)" subsection with the 156 → 247 tok/s before/after table and the microbench GFLOPs/s numbers. Noted the `blas` feature flag and the pure-NEON fallback build.
+- 2026-04-11T11:00-0700 Review-pass refactor (PR review surfaced several issues, addressing them in one batch):
+  - **`#[cfg(not(feature = "blas"))]` gate around all `Self::quantize_columns(...)` call sites** in `forward_prefill_inner`. The BLAS path consumes f32 directly so the per-call quantize work (~3-6 ms × ~6 sites × 16 layers ≈ 250-500 ms per prefill) is no longer wasted. Restructured the 8 GEMM call sites with explicit `#[cfg(feature = "blas")]` / `#[cfg(not(feature = "blas"))]` branches instead of the runtime `if !try_blas { gemm_preq }` pattern, which let me also gate `bq_scales`/`bq_quants`/`dq_scales`/`dq_quants`/`inter_col` and `quantize_columns` itself out of BLAS builds. Added `#[allow(dead_code)]` to the two NEON GEMM functions in `simd.rs` since they're still referenced from the GEMM microbench under test.
+  - **Lazy `dequant_weight_scratch`**. Was unconditionally allocating ~54 MB on `from_config_with_compression` regardless of feature. Now `Vec::new()` everywhere; the helper resizes on first use. NEON-only builds get 0 bytes of BLAS scratch.
+  - **Renamed `dequant_weight` → `dequant_weight_scratch`** to match the `*_scratch` convention.
+  - **Strengthened `sgemm_rowmajor_nn` safety comment** to spell out the non-aliasing precondition (BLAS contract requires distinct a/b/c buffers; Rust borrow rules already prevent c from aliasing a/b at the call site, but a/b could in principle be the same shared slice).
+  - **Switched the helper's `assert_eq!` to `debug_assert_eq!`** to drop the release-mode panic cost on a check that's belt-and-suspenders rather than load-bearing.
+  - **Dropped `MATRIX_DEQUANT_PAR_THRESHOLD`** — all hot-path shapes have m >> 64, rayon's split-on-demand handles tiny inputs by running them on a single worker, no manual cutoff needed.
+  - **Added `wick/tests/blas_parity.rs`** with two `#[ignore]` parity tests (single-token and 9-token). Compares `forward_prefill` vs sequential `forward()` token-by-token and asserts cosine + top-1. NEON build is bit-identical (cosine = 1.000, max_diff = 0). BLAS build drifts by f32 reduction order: 0.999983 cosine on 1 token, 0.996 on 9 tokens (drift compounds through KV-cache feedback). Tight bound on 1 token (>0.9999) catches layout/dim/transpose bugs immediately; looser bound on 9 tokens (>0.99) catches real correctness regressions.
+  - **Made `blas` opt-in** instead of `default = ["blas"]`. CI on Linux was forcing an `openblas-src` system dependency that GitHub Actions Ubuntu happened to satisfy but other Linux users would not. Now matches the `metal` and `gpu` features — opt in via `--features blas` (or `--features wick/blas` from `wick-cli`). Added `blas = ["wick/blas"]` passthrough to `wick-cli`.
+  - **README**: footnote on the existing 32/117-token prefill table noting those numbers predate BLAS, plus the opt-in build instructions.
+- 2026-04-11T11:30-0700 Re-benchmarked after the refactor. Default (NEON only): 146 tok/s prefill. `--features blas`: **279 tok/s prefill (1.91× speedup)**. The improvement vs yesterday's 247 tok/s is exactly what skipping the wasted `quantize_columns` work would predict (~13% recovery on top of the existing 1.58×).
 
 ## Decisions
 - 2026-04-10T20:27-0700 Use `cblas-sys` + platform-gated providers (`accelerate-src` on macOS, `openblas-src` elsewhere). Avoids hand-rolling `extern "C"` bindings and keeps the BLAS dispatch behind a single `blas` feature flag.
@@ -70,7 +81,9 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
 - ffeb967 — feat(quant): dequantize_q4_0_matrix / dequantize_q8_0_matrix with rayon
 - e019702 — feat(blas): wire ffn_up smoke test + dequant scratch + GEMM microbench
 - 8caa923 — feat(blas): full rollout — all 8 prefill GEMM sites through Accelerate
-- HEAD — docs: README subsection for CPU prefill via Accelerate BLAS
+- d937af7 — docs: README subsection for CPU prefill via Accelerate BLAS
+- 1280688 — fix(blas): gate try_blas_prefill_gemm to aarch64 to silence x86_64 dead code
+- HEAD — refactor(blas): address PR review — opt-in feature, lazy scratch, parity test, skip wasted quantize
 
 ## Next Steps
 1. ~~Add Cargo deps~~ ✓

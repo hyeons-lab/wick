@@ -38,9 +38,11 @@ accelerate-src = { workspace = true, optional = true }
 openblas-src = { workspace = true, optional = true }
 
 [features]
-# BLAS is on by default on macOS (Accelerate is system-provided, zero install).
-# Disable with `--no-default-features` for a pure-NEON build.
-default = ["blas"]
+# Opt-in like `metal` and `gpu`. Enable with `--features blas` to route prefill
+# GEMM through Apple Accelerate (macOS, AMX) or OpenBLAS (Linux). Default builds
+# stay on the pure-NEON integer GEMM path so CI and Linux users don't pull in
+# a system OpenBLAS dependency.
+default = []
 gpu = ["dep:wgpu", "dep:pollster"]
 metal = ["dep:metal", "dep:objc"]
 blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]

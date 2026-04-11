@@ -1,9 +1,6 @@
 use half::f16;
 use rayon::prelude::*;
 
-/// Threshold above which matrix dequantization is parallelized across rows.
-const MATRIX_DEQUANT_PAR_THRESHOLD: usize = 64;
-
 // ── Block layouts ────────────────────────────────────────────────────────────
 
 /// Q4_0 quantization block: 32 values in 18 bytes.
@@ -108,7 +105,8 @@ pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
 /// Dequantize a Q4_0 matrix of shape `[m, k]` (row-major) to `out`.
 ///
 /// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
-/// Rows are dequantized in parallel with rayon when `m >= MATRIX_DEQUANT_PAR_THRESHOLD`.
+/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
+/// tiny inputs by running them on a single worker, so no manual cutoff needed).
 pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
     assert_eq!(
         k % 32,
@@ -127,17 +125,9 @@ pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         "dequantize_q4_0_matrix: out length mismatch"
     );
 
-    if m >= MATRIX_DEQUANT_PAR_THRESHOLD {
-        out.par_chunks_mut(k)
-            .zip(src.par_chunks(row_bytes))
-            .for_each(|(dst_row, src_row)| dequantize_q4_0_row(src_row, dst_row));
-    } else {
-        for i in 0..m {
-            let src_row = &src[i * row_bytes..(i + 1) * row_bytes];
-            let dst_row = &mut out[i * k..(i + 1) * k];
-            dequantize_q4_0_row(src_row, dst_row);
-        }
-    }
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q4_0_row(src_row, dst_row));
 }
 
 /// Dot product of a Q4_0 block with an f32 vector of length 32. Scalar version.
@@ -187,7 +177,8 @@ pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
 /// Dequantize a Q8_0 matrix of shape `[m, k]` (row-major) to `out`.
 ///
 /// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
-/// Rows are dequantized in parallel with rayon when `m >= MATRIX_DEQUANT_PAR_THRESHOLD`.
+/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
+/// tiny inputs by running them on a single worker, so no manual cutoff needed).
 pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
     assert_eq!(
         k % 32,
@@ -206,17 +197,9 @@ pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         "dequantize_q8_0_matrix: out length mismatch"
     );
 
-    if m >= MATRIX_DEQUANT_PAR_THRESHOLD {
-        out.par_chunks_mut(k)
-            .zip(src.par_chunks(row_bytes))
-            .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
-    } else {
-        for i in 0..m {
-            let src_row = &src[i * row_bytes..(i + 1) * row_bytes];
-            let dst_row = &mut out[i * k..(i + 1) * k];
-            dequantize_q8_0_row(src_row, dst_row);
-        }
-    }
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
 }
 
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
