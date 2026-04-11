@@ -79,6 +79,10 @@ enum Command {
         /// Disable KV prefix caching entirely.
         #[arg(long)]
         no_cache: bool,
+
+        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "f32")]
+        kv_cache_keys: String,
     },
 
     /// Inspect a GGUF model file.
@@ -148,6 +152,10 @@ enum Command {
         /// Disable KV prefix caching entirely.
         #[arg(long)]
         no_cache: bool,
+
+        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "f32")]
+        kv_cache_keys: String,
     },
 }
 
@@ -260,6 +268,45 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
     Ok(())
 }
 
+/// Parse a CLI KV-cache-compression flag value into a `KvCompression`.
+///
+/// Modes:
+/// - `f32` / `none`: uncompressed (default)
+/// - `tq3` / `turboquant`: TurboQuant on both keys (3-bit) and values (2-bit)
+/// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging
+/// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging
+fn setup_kv_compression(
+    model: &dyn wick::model::Model,
+    kv_cache_mode: &str,
+) -> Result<wick::kv_cache::KvCompression> {
+    use wick::kv_cache::KvCompression;
+    let seed: u64 = 42; // deterministic default seed
+
+    let (keys, values) = match kv_cache_mode {
+        "f32" | "none" => return Ok(KvCompression::None),
+        "tq3" | "turboquant" => (true, true),
+        "tq3-keys" => (true, false),
+        "tq3-values" => (false, true),
+        other => anyhow::bail!(
+            "unknown --kv-cache-keys mode: {other} (use f32, tq3, tq3-keys, or tq3-values)"
+        ),
+    };
+
+    if model.turboquant_supported() {
+        eprintln!(
+            "TurboQuant KV compression enabled (keys: {}, values: {})",
+            if keys { "3-bit" } else { "f32" },
+            if values { "2-bit" } else { "f32" }
+        );
+        Ok(KvCompression::TurboQuant { seed, keys, values })
+    } else {
+        eprintln!(
+            "warning: TurboQuant not supported by this model/backend; falling back to f32 KV"
+        );
+        Ok(KvCompression::None)
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -285,6 +332,7 @@ fn main() -> Result<()> {
             cache_warm_mb,
             cache_disk_gb,
             no_cache,
+            kv_cache_keys,
         } => {
             let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
@@ -293,6 +341,7 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
 
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+            let kv_compression = setup_kv_compression(loaded_model.as_ref(), &kv_cache_keys)?;
 
             // Configure KV prefix cache.
             if no_cache {
@@ -482,6 +531,7 @@ fn main() -> Result<()> {
                         ..Default::default()
                     },
                     silent: false,
+                    kv_compression,
                 };
 
                 let result =
@@ -518,6 +568,7 @@ fn main() -> Result<()> {
             device,
             context_size,
             no_cache,
+            kv_cache_keys,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("WICK_PROFILE").is_ok() {
@@ -532,6 +583,7 @@ fn main() -> Result<()> {
                 .get_bool("tokenizer.ggml.add_bos_token")
                 .unwrap_or(false);
             let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
+            let kv_compression = setup_kv_compression(loaded_model.as_ref(), &kv_cache_keys)?;
 
             if no_cache {
                 loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
@@ -572,6 +624,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 silent: true,
+                kv_compression,
             };
 
             let run_once = || -> Result<(f64, f64)> {

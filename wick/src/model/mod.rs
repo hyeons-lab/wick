@@ -131,6 +131,15 @@ pub trait Model: Send {
     fn restore_state(&self, _snapshot: &crate::kv_cache::StateSnapshot) {
         unimplemented!("restore_state not supported by this backend")
     }
+
+    /// Whether this model/backend supports TurboQuant KV cache compression.
+    /// Used by the CLI to decide whether to request compression or fall back
+    /// to f32. TurboQuant is fully driven by `KvCompression` on the
+    /// `InferenceState`; models just need to honor the compressed buffers in
+    /// their forward pass. Currently only the CPU `Lfm2Model` does.
+    fn turboquant_supported(&self) -> bool {
+        false
+    }
 }
 
 /// Load a model from a GGUF file, dispatching on the architecture.

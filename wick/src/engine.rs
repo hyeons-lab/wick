@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::kv_cache::InferenceState;
+use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
@@ -16,6 +16,8 @@ pub struct GenerateConfig {
     /// If true, suppress per-token stdout writes. Used by bench to avoid
     /// stdout I/O inside the timed decode loop.
     pub silent: bool,
+    /// Key cache compression mode.
+    pub kv_compression: KvCompression,
 }
 
 impl Default for GenerateConfig {
@@ -24,6 +26,7 @@ impl Default for GenerateConfig {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
             silent: false,
+            kv_compression: KvCompression::None,
         }
     }
 }
@@ -46,7 +49,8 @@ pub fn generate(
     config: &GenerateConfig,
 ) -> Result<GenerateResult> {
     let model_config = model.config();
-    let mut state = InferenceState::from_config(model_config);
+    let mut state =
+        InferenceState::from_config_with_compression(model_config, &config.kv_compression);
     let mut sampler = Sampler::new(config.sampler.clone());
 
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt tokens cannot be empty");

@@ -9,6 +9,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, LayerState};
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
+use crate::turboquant;
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
@@ -700,14 +701,57 @@ impl Lfm2Model {
         // RoPE
         cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-        // Append K, V to cache using disjoint field borrows (avoids to_vec() copies)
+        // Grab per-model TurboQuant state once (None when disabled)
+        // TurboQuant rotation state lives on InferenceState now (since PR #12
+        // refactor). A single KvCompression::TurboQuant { seed, ... } config
+        // on the state is enough — no separate model-side enable needed.
+        let tq_rotation = state.tq_rotations.get(layer).and_then(|r| r.as_ref());
+        let tq_config = state.tq_config.as_ref();
+
+        // Append K, V to cache. Keys and values are compressed independently —
+        // whichever side has a CompressedKvCache present gets the TurboQuant
+        // path; the other side falls through to the f32 cache.
         if let LayerState::Attention {
             key_cache,
             value_cache,
+            compressed_keys,
+            compressed_values,
         } = &mut state.layers[layer]
         {
-            key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-            value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+            let tq_ok =
+                tq_rotation.is_some() && tq_config.is_some() && state.tq_encode_scratch.is_some();
+            match (tq_ok, compressed_keys.as_mut()) {
+                (true, Some(k_cache_tq)) => {
+                    turboquant::compress_and_append_keys(
+                        &state.scratch.k[..kv_dim],
+                        n_kv_heads,
+                        head_dim,
+                        tq_rotation.unwrap(),
+                        tq_config.unwrap(),
+                        k_cache_tq,
+                        state.tq_encode_scratch.as_mut().unwrap(),
+                    );
+                }
+                _ => {
+                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                }
+            }
+            match (tq_ok, compressed_values.as_mut()) {
+                (true, Some(v_cache_tq)) => {
+                    turboquant::compress_and_append_values(
+                        &state.scratch.v[..kv_dim],
+                        n_kv_heads,
+                        head_dim,
+                        tq_rotation.unwrap(),
+                        tq_config.unwrap(),
+                        v_cache_tq,
+                        state.tq_encode_scratch.as_mut().unwrap(),
+                    );
+                }
+                _ => {
+                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                }
+            }
         }
 
         // GQA: grouped query attention
@@ -715,44 +759,151 @@ impl Lfm2Model {
         let scale = 1.0 / (head_dim as f32).sqrt();
         {
             // Access layers and scratch as disjoint fields to avoid whole-state borrow
-            let (k_cache, v_cache) = match &state.layers[layer] {
+            let (ck, cv, k_cache, v_cache) = match &state.layers[layer] {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
-                } => (key_cache.as_slice(), value_cache.as_slice()),
+                    compressed_keys,
+                    compressed_values,
+                } => (
+                    compressed_keys.as_ref(),
+                    compressed_values.as_ref(),
+                    key_cache.as_slice(),
+                    value_cache.as_slice(),
+                ),
                 _ => panic!("expected Attention state for layer {layer}"),
             };
-            let seq_len = k_cache.len() / kv_dim;
+
+            // Keys and values are compressed independently — determine which
+            // side of the attention read path uses TurboQuant.
+            let tq_prereq =
+                tq_rotation.is_some() && tq_config.is_some() && state.tq_query_scratch.is_some();
+            let use_tq_keys = tq_prereq && ck.is_some();
+            let use_tq_values = tq_prereq && cv.is_some();
+
+            // seq_len comes from whichever cache is populated. All four
+            // combinations agree on seq_len per layer because encode appends
+            // to one cache per side per token.
+            let seq_len = if use_tq_keys {
+                ck.unwrap().seq_len()
+            } else if use_tq_values {
+                cv.unwrap().seq_len()
+            } else {
+                k_cache.len() / kv_dim
+            };
             let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
             let q = &state.scratch.q[..cfg.hidden_size];
             let scores = &mut state.scratch.scores;
 
-            scores.resize(seq_len, 0.0);
-            for h in 0..cfg.n_heads {
-                let kv_h = h / group_size;
-                let q_head = &q[h * head_dim..(h + 1) * head_dim];
-                let kv_h_offset = kv_h * head_dim;
+            if use_tq_keys || use_tq_values {
+                // GQA batched path — one score buffer per group, shared
+                // between the key score and value weighted-sum stages.
+                let rotation = tq_rotation.unwrap();
+                let cfg_tq = tq_config.unwrap();
+                let qr_scratch = state.tq_query_scratch.as_mut().unwrap();
+                if use_tq_keys {
+                    turboquant::rotate_queries(q, cfg.n_heads, head_dim, rotation, qr_scratch);
+                }
+                scores.resize(seq_len * group_size, 0.0);
+                for kv_h in 0..n_kv_heads {
+                    let group_start = kv_h * group_size;
+                    let kv_h_offset = kv_h * head_dim;
 
-                cpu::attn_scores(
-                    q_head,
-                    k_cache,
-                    scores,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    seq_len,
-                );
-                cpu::softmax_inplace(scores);
-                cpu::attn_values(
-                    scores,
-                    v_cache,
-                    &mut attn_out[h * head_dim..(h + 1) * head_dim],
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    seq_len,
-                );
+                    // Scores: TurboQuant or f32.
+                    if use_tq_keys {
+                        turboquant::attn_scores_turboquant_gqa(
+                            ck.unwrap(),
+                            kv_h,
+                            group_start,
+                            group_size,
+                            scores,
+                            head_dim,
+                            scale,
+                            seq_len,
+                            cfg_tq,
+                            qr_scratch,
+                        );
+                    } else {
+                        for g in 0..group_size {
+                            let h = group_start + g;
+                            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                            let head_scores = &mut scores[g * seq_len..(g + 1) * seq_len];
+                            cpu::attn_scores(
+                                q_head,
+                                k_cache,
+                                head_scores,
+                                kv_dim,
+                                kv_h_offset,
+                                head_dim,
+                                scale,
+                                seq_len,
+                            );
+                        }
+                    }
+
+                    // Softmax each head's scores in place.
+                    for g in 0..group_size {
+                        let head_scores = &mut scores[g * seq_len..(g + 1) * seq_len];
+                        cpu::softmax_inplace(head_scores);
+                    }
+
+                    // Values: TurboQuant or f32.
+                    if use_tq_values {
+                        turboquant::attn_values_turboquant_gqa(
+                            cv.unwrap(),
+                            kv_h,
+                            group_start,
+                            group_size,
+                            scores,
+                            attn_out,
+                            head_dim,
+                            seq_len,
+                            rotation,
+                            cfg_tq,
+                        );
+                    } else {
+                        for g in 0..group_size {
+                            let h = group_start + g;
+                            let head_scores = &scores[g * seq_len..(g + 1) * seq_len];
+                            cpu::attn_values(
+                                head_scores,
+                                v_cache,
+                                &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                                kv_dim,
+                                kv_h_offset,
+                                head_dim,
+                                seq_len,
+                            );
+                        }
+                    }
+                }
+            } else {
+                scores.resize(seq_len, 0.0);
+                for h in 0..cfg.n_heads {
+                    let kv_h = h / group_size;
+                    let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                    let kv_h_offset = kv_h * head_dim;
+                    cpu::attn_scores(
+                        q_head,
+                        k_cache,
+                        scores,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        seq_len,
+                    );
+                    cpu::softmax_inplace(scores);
+                    cpu::attn_values(
+                        scores,
+                        v_cache,
+                        &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        seq_len,
+                    );
+                }
             }
         }
 
@@ -1184,19 +1335,81 @@ impl Model for Lfm2Model {
                         );
 
                         // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
-                        // Pre-reserve KV cache to avoid repeated reallocations
+                        // Hoist tq state capture so the reserve block can match the
+                        // exact same condition as the actual append path below, and
+                        // so the per-token loop can key off pre-computed bools.
+                        let tq_rotation = state.tq_rotations.get(layer).and_then(|r| r.as_ref());
+                        let tq_config = state.tq_config.as_ref();
+                        // Needed to encode keys + values (append path).
+                        let will_compress_kv = tq_rotation.is_some()
+                            && tq_config.is_some()
+                            && state.tq_encode_scratch.is_some();
+                        // Needed to read compressed keys/values (attention path).
+                        let will_read_compressed_kv = tq_rotation.is_some()
+                            && tq_config.is_some()
+                            && state.tq_query_scratch.is_some();
+
+                        // Pre-reserve KV cache to avoid repeated reallocations.
+                        // Keys and values are handled independently — whichever
+                        // side is compressed reserves the packed buffers;
+                        // the other side reserves the f32 flat cache.
                         if let LayerState::Attention {
                             key_cache,
                             value_cache,
+                            compressed_keys,
+                            compressed_values,
                         } = &mut state.layers[layer]
                         {
-                            key_cache.reserve(n * kv_dim);
-                            value_cache.reserve(n * kv_dim);
+                            match (will_compress_kv, compressed_keys.as_mut()) {
+                                (true, Some(c)) => {
+                                    for v in c.polar_data.iter_mut() {
+                                        v.reserve(n * head_dim / 4);
+                                    }
+                                    for v in c.jl_data.iter_mut() {
+                                        v.reserve(n * head_dim / 8);
+                                    }
+                                    for v in c.norms.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                    for v in c.residual_norms.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                    for v in c.norms_f32.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                    for v in c.residual_norms_f32.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                }
+                                _ => {
+                                    key_cache.reserve(n * kv_dim);
+                                }
+                            }
+                            match (will_compress_kv, compressed_values.as_mut()) {
+                                (true, Some(c)) => {
+                                    for v in c.polar_data.iter_mut() {
+                                        v.reserve(n * head_dim / 4);
+                                    }
+                                    for v in c.norms.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                    for v in c.norms_f32.iter_mut() {
+                                        v.reserve(n);
+                                    }
+                                }
+                                _ => {
+                                    value_cache.reserve(n * kv_dim);
+                                }
+                            }
                         }
                         let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
                         let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
                         let group_size = cfg.n_heads / n_kv_heads;
                         let scale = 1.0 / (head_dim as f32).sqrt();
+
+                        // Pre-reserve scores capacity for max seq_len so
+                        // per-token resize inside the loop doesn't reallocate.
+                        state.scratch.scores.reserve((start_pos + n) * group_size);
 
                         for j in 0..n {
                             let pos = start_pos + j;
@@ -1231,54 +1444,201 @@ impl Model for Lfm2Model {
                             // RoPE
                             cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-                            // Append K, V to cache
+                            // tq_rotation / tq_config already captured above (before reserve block)
+
+                            // Append K, V to cache. Keys and values are
+                            // compressed independently — whichever side has
+                            // a CompressedKvCache present gets the TurboQuant
+                            // path; the other side falls through to f32.
                             if let LayerState::Attention {
                                 key_cache,
                                 value_cache,
+                                compressed_keys,
+                                compressed_values,
                             } = &mut state.layers[layer]
                             {
-                                key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                                value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                                match (will_compress_kv, compressed_keys.as_mut()) {
+                                    (true, Some(k_cache_tq)) => {
+                                        turboquant::compress_and_append_keys(
+                                            &state.scratch.k[..kv_dim],
+                                            n_kv_heads,
+                                            head_dim,
+                                            tq_rotation.unwrap(),
+                                            tq_config.unwrap(),
+                                            k_cache_tq,
+                                            state.tq_encode_scratch.as_mut().unwrap(),
+                                        );
+                                    }
+                                    _ => {
+                                        key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                                    }
+                                }
+                                match (will_compress_kv, compressed_values.as_mut()) {
+                                    (true, Some(v_cache_tq)) => {
+                                        turboquant::compress_and_append_values(
+                                            &state.scratch.v[..kv_dim],
+                                            n_kv_heads,
+                                            head_dim,
+                                            tq_rotation.unwrap(),
+                                            tq_config.unwrap(),
+                                            v_cache_tq,
+                                            state.tq_encode_scratch.as_mut().unwrap(),
+                                        );
+                                    }
+                                    _ => {
+                                        value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                                    }
+                                }
                             }
 
                             // Attention scores + weighted values
-                            let (k_cache, v_cache) = match &state.layers[layer] {
+                            let (ck, cv, k_cache, v_cache) = match &state.layers[layer] {
                                 LayerState::Attention {
                                     key_cache,
                                     value_cache,
-                                } => (key_cache.as_slice(), value_cache.as_slice()),
+                                    compressed_keys,
+                                    compressed_values,
+                                } => (
+                                    compressed_keys.as_ref(),
+                                    compressed_values.as_ref(),
+                                    key_cache.as_slice(),
+                                    value_cache.as_slice(),
+                                ),
                                 _ => panic!("expected Attention state for layer {layer}"),
                             };
-                            let seq_len = k_cache.len() / kv_dim;
+
+                            // Keys and values can be compressed independently.
+                            let use_tq_keys = will_read_compressed_kv && ck.is_some();
+                            let use_tq_values = will_read_compressed_kv && cv.is_some();
+
+                            let seq_len = if use_tq_keys {
+                                ck.unwrap().seq_len()
+                            } else if use_tq_values {
+                                cv.unwrap().seq_len()
+                            } else {
+                                k_cache.len() / kv_dim
+                            };
                             let attn_out = &mut state.scratch.attn_out[..hs];
                             let q = &state.scratch.q[..hs];
                             let scores = &mut state.scratch.scores;
 
-                            scores.resize(seq_len, 0.0);
-                            for h in 0..cfg.n_heads {
-                                let kv_h = h / group_size;
-                                let q_head = &q[h * head_dim..(h + 1) * head_dim];
-                                let kv_h_offset = kv_h * head_dim;
-                                cpu::attn_scores(
-                                    q_head,
-                                    k_cache,
-                                    scores,
-                                    kv_dim,
-                                    kv_h_offset,
-                                    head_dim,
-                                    scale,
-                                    seq_len,
-                                );
-                                cpu::softmax_inplace(scores);
-                                cpu::attn_values(
-                                    scores,
-                                    v_cache,
-                                    &mut attn_out[h * head_dim..(h + 1) * head_dim],
-                                    kv_dim,
-                                    kv_h_offset,
-                                    head_dim,
-                                    seq_len,
-                                );
+                            if use_tq_keys || use_tq_values {
+                                let rotation = tq_rotation.unwrap();
+                                let cfg_tq = tq_config.unwrap();
+                                let qr_scratch = state.tq_query_scratch.as_mut().unwrap();
+                                if use_tq_keys {
+                                    turboquant::rotate_queries(
+                                        q,
+                                        cfg.n_heads,
+                                        head_dim,
+                                        rotation,
+                                        qr_scratch,
+                                    );
+                                }
+                                scores.resize(seq_len * group_size, 0.0);
+                                for kv_h in 0..n_kv_heads {
+                                    let group_start = kv_h * group_size;
+                                    let kv_h_offset = kv_h * head_dim;
+
+                                    // Scores: TurboQuant or f32.
+                                    if use_tq_keys {
+                                        turboquant::attn_scores_turboquant_gqa(
+                                            ck.unwrap(),
+                                            kv_h,
+                                            group_start,
+                                            group_size,
+                                            scores,
+                                            head_dim,
+                                            scale,
+                                            seq_len,
+                                            cfg_tq,
+                                            qr_scratch,
+                                        );
+                                    } else {
+                                        for g in 0..group_size {
+                                            let h = group_start + g;
+                                            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                                            let head_scores =
+                                                &mut scores[g * seq_len..(g + 1) * seq_len];
+                                            cpu::attn_scores(
+                                                q_head,
+                                                k_cache,
+                                                head_scores,
+                                                kv_dim,
+                                                kv_h_offset,
+                                                head_dim,
+                                                scale,
+                                                seq_len,
+                                            );
+                                        }
+                                    }
+
+                                    // Softmax each head's scores in place.
+                                    for g in 0..group_size {
+                                        let head_scores =
+                                            &mut scores[g * seq_len..(g + 1) * seq_len];
+                                        cpu::softmax_inplace(head_scores);
+                                    }
+
+                                    // Values: TurboQuant or f32.
+                                    if use_tq_values {
+                                        turboquant::attn_values_turboquant_gqa(
+                                            cv.unwrap(),
+                                            kv_h,
+                                            group_start,
+                                            group_size,
+                                            scores,
+                                            attn_out,
+                                            head_dim,
+                                            seq_len,
+                                            rotation,
+                                            cfg_tq,
+                                        );
+                                    } else {
+                                        for g in 0..group_size {
+                                            let h = group_start + g;
+                                            let head_scores =
+                                                &scores[g * seq_len..(g + 1) * seq_len];
+                                            cpu::attn_values(
+                                                head_scores,
+                                                v_cache,
+                                                &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                                                kv_dim,
+                                                kv_h_offset,
+                                                head_dim,
+                                                seq_len,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Capacity pre-reserved; this resize is O(1)
+                                scores.resize(seq_len, 0.0);
+                                for h in 0..cfg.n_heads {
+                                    let kv_h = h / group_size;
+                                    let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                                    let kv_h_offset = kv_h * head_dim;
+                                    cpu::attn_scores(
+                                        q_head,
+                                        k_cache,
+                                        scores,
+                                        kv_dim,
+                                        kv_h_offset,
+                                        head_dim,
+                                        scale,
+                                        seq_len,
+                                    );
+                                    cpu::softmax_inplace(scores);
+                                    cpu::attn_values(
+                                        scores,
+                                        v_cache,
+                                        &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                                        kv_dim,
+                                        kv_h_offset,
+                                        head_dim,
+                                        seq_len,
+                                    );
+                                }
                             }
 
                             // Store attn output for batched output projection
@@ -1503,5 +1863,10 @@ impl Model for Lfm2Model {
 
     fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    fn turboquant_supported(&self) -> bool {
+        let head_dim = self.config.hidden_size / self.config.n_heads;
+        head_dim.is_power_of_two()
     }
 }
