@@ -432,6 +432,37 @@ impl Lfm2Model {
         cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
     }
 
+    /// BLAS prefill GEMM. Dequantizes `wref` into `dequant_scratch[..m*k]`
+    /// then calls SGEMM: `out[m, n] = weight[m, k] @ b[k, n]` in row-major.
+    ///
+    /// Both `b` and `out` are row-major `[m|k, n]` with row stride `n` — matching
+    /// the `mat[i * n + j]` layout used throughout `forward_prefill_inner`.
+    /// Returns true on supported dtypes (Q4_0 / Q8_0), false otherwise.
+    #[cfg(feature = "blas")]
+    #[allow(clippy::too_many_arguments)]
+    fn blas_prefill_gemm(
+        &self,
+        wref: &WeightRef,
+        b: &[f32],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        dequant_scratch: &mut [f32],
+    ) -> bool {
+        assert_eq!(wref.m, m, "blas_prefill_gemm: weight m mismatch");
+        assert_eq!(wref.k, k, "blas_prefill_gemm: weight k mismatch");
+        let data = self.weight_data(wref);
+        let dequant = &mut dequant_scratch[..m * k];
+        match wref.dtype {
+            DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+            _ => return false,
+        }
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+        true
+    }
+
     /// Batched GEMM with pre-quantized Q8_0 input columns.
     /// Dispatches to Q4_0 or Q8_0 GEMM kernel based on weight dtype.
     /// Returns true if GEMM was performed, false if dtype is unsupported.
@@ -1735,7 +1766,24 @@ impl Model for Lfm2Model {
                     n,
                     hs,
                 );
-                self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
+                // Smoke test: route ffn_up through BLAS (Accelerate → AMX on macOS,
+                // OpenBLAS on Linux). Falls back to the NEON integer GEMM if the
+                // `blas` feature is disabled or the dtype isn't Q4_0/Q8_0.
+                #[cfg(feature = "blas")]
+                let used_blas_ffn_up = self.blas_prefill_gemm(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &mut up_mat,
+                    is,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight,
+                );
+                #[cfg(not(feature = "blas"))]
+                let used_blas_ffn_up = false;
+                if !used_blas_ffn_up {
+                    self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
+                }
 
                 // Fused SiLU+mul (row-major is×n)
                 cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);

@@ -115,4 +115,136 @@ mod tests {
         sgemm_rowmajor_nn(2, 2, 2, &a, &b, &mut c);
         assert_eq!(c, vec![19.0, 22.0, 43.0, 50.0]);
     }
+
+    /// Microbenchmark: ffn_up shape (m=6912, n=2002, k=2048) — compare the
+    /// NEON integer kernel (quantize input + q4_0×q8_0 GEMM) against the
+    /// dequant + cblas_sgemm path the smoke test is wiring up. Ignored by
+    /// default; run with:
+    /// `cargo test -p wick --release --lib backend::blas::tests::microbench_ffn_up_gemm -- --ignored --nocapture`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn microbench_ffn_up_gemm() {
+        use crate::backend::simd::neon;
+        use crate::quant::{BlockQ4_0, dequantize_q4_0_matrix};
+        use std::time::Instant;
+
+        fn gflops(m: usize, n: usize, k: usize, seconds: f64) -> f64 {
+            (2.0 * m as f64 * n as f64 * k as f64) / (seconds * 1e9)
+        }
+
+        let m = 6912; // is
+        let k = 2048; // hs
+        let n = 2002; // prompt length
+        let iters = 4;
+
+        // Random Q4_0 weight buffer — contents aren't statistically realistic
+        // but the kernel work is identical regardless of byte content.
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+        let mut weight = vec![0u8; m * row_bytes];
+        let mut s: u64 = 0xdead_beef;
+        for byte in weight.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (s >> 33) as u8;
+        }
+
+        let input: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
+            .collect();
+
+        // ── Path A: BLAS (dequant + cblas_sgemm) ──────────────────────
+        let mut dequant = vec![0.0f32; m * k];
+        let mut out_blas = vec![0.0f32; m * n];
+
+        // Warmup
+        dequantize_q4_0_matrix(&weight, m, k, &mut dequant);
+        sgemm_rowmajor_nn(m, n, k, &dequant, &input, &mut out_blas);
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            dequantize_q4_0_matrix(&weight, m, k, &mut dequant);
+        }
+        let dequant_per = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sgemm_rowmajor_nn(m, n, k, &dequant, &input, &mut out_blas);
+        }
+        let sgemm_per = t0.elapsed().as_secs_f64() / iters as f64;
+        let blas_total_per = dequant_per + sgemm_per;
+
+        // ── Path B: NEON integer GEMM ─────────────────────────────────
+        let nb_k = k / 32;
+        let mut b_scales = vec![0.0f32; n * nb_k];
+        let mut b_quants = vec![0i8; n * k];
+        let mut col = vec![0.0f32; k];
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for j in 0..n {
+                for i in 0..k {
+                    col[i] = input[i * n + j];
+                }
+                unsafe {
+                    neon::quantize_f32_to_q8_0_neon(
+                        &col,
+                        &mut b_scales[j * nb_k..(j + 1) * nb_k],
+                        &mut b_quants[j * k..(j + 1) * k],
+                    );
+                }
+            }
+        }
+        let quantize_per = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let mut out_neon = vec![0.0f32; m * n];
+        // Warmup
+        unsafe {
+            neon::gemm_q4_0_q8_0_neon(&weight, &b_scales, &b_quants, &mut out_neon, m, n, k);
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                neon::gemm_q4_0_q8_0_neon(&weight, &b_scales, &b_quants, &mut out_neon, m, n, k);
+            }
+        }
+        let neon_gemm_per = t0.elapsed().as_secs_f64() / iters as f64;
+        let neon_total_per = quantize_per + neon_gemm_per;
+
+        eprintln!("\n=== ffn_up GEMM microbench ({m} × {n} × {k}) ===");
+        eprintln!("BLAS (dequant + sgemm):");
+        eprintln!("  dequant:  {:>7.1} ms", dequant_per * 1000.0);
+        eprintln!(
+            "  sgemm:    {:>7.1} ms   ({:.1} GFLOPs/s)",
+            sgemm_per * 1000.0,
+            gflops(m, n, k, sgemm_per)
+        );
+        eprintln!(
+            "  total:    {:>7.1} ms   ({:.1} GFLOPs/s effective)",
+            blas_total_per * 1000.0,
+            gflops(m, n, k, blas_total_per)
+        );
+        eprintln!("NEON (quantize + q4_0×q8_0 gemm):");
+        eprintln!("  quantize: {:>7.1} ms", quantize_per * 1000.0);
+        eprintln!(
+            "  gemm:     {:>7.1} ms   ({:.1} GFLOPs/s)",
+            neon_gemm_per * 1000.0,
+            gflops(m, n, k, neon_gemm_per)
+        );
+        eprintln!(
+            "  total:    {:>7.1} ms   ({:.1} GFLOPs/s effective)",
+            neon_total_per * 1000.0,
+            gflops(m, n, k, neon_total_per)
+        );
+        eprintln!(
+            "\nNEON / BLAS total: {:.2}×   (>1 means NEON wins)",
+            neon_total_per / blas_total_per
+        );
+        eprintln!(
+            "NEON gemm / BLAS sgemm only: {:.2}×   (isolates kernel, excludes dequant/quantize)",
+            neon_gemm_per / sgemm_per
+        );
+    }
 }
