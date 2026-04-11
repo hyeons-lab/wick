@@ -1,3 +1,13 @@
+# `target-cpu=native` only makes sense when the build host matches the target.
+# Cross-compiling from Apple Silicon (e.g. `cargo check --target x86_64-unknown-linux-gnu`)
+# resolves "native" to `apple-m1`, which rustc then rejects for non-aarch64 targets.
+# macOS dev targets keep `native` (Mac is the primary dev platform). Linux targets
+# use a concrete baseline that works for both native Linux builds and cross-compiles;
+# per-function `#[target_feature(...)]` attributes still gate the NEON / AVX2 hot-path
+# kernels, so losing `native` on Linux only affects non-hot-path autovectorization.
+# Linux users who want host-specific tuning can set `RUSTFLAGS="-C target-cpu=native"`
+# themselves at build time.
+
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
 
@@ -5,7 +15,10 @@ rustflags = ["-C", "target-cpu=native"]
 rustflags = ["-C", "target-cpu=native"]
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+# `x86-64-v3` ≈ Haswell baseline: AVX2 + FMA + BMI1/BMI2. Matches what wick's
+# AVX2 kernels already opt into via `#[target_feature(enable = "avx2,fma")]`.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+# No extra flags — generic aarch64 baseline. The NEON / dotprod hot-path kernels
+# are opted in per-function via `#[target_feature(enable = "neon,dotprod")]`.
