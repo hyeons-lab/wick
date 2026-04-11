@@ -28,6 +28,21 @@ Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF
 
 Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
 
+#### CPU prefill via Accelerate BLAS (Apple AMX)
+
+On longer prompts the batched prefill GEMM dispatches SGEMM through Apple's Accelerate framework on macOS (unlocking the AMX matrix unit) and through OpenBLAS on Linux. Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then multiplied by the f32 input columns — eight call sites per layer (conv in/out proj, attn Q/K/V/output, FFN gate/up/down).
+
+On LFM2.5-VL-1.6B-Q4_0 with a 2002-token prompt (CPU, M-series):
+
+| Path | Prefill (tok/s, p50) |
+|---|---:|
+| NEON integer GEMM (pre-BLAS) | 156 |
+| **Accelerate SGEMM (AMX)** | **247** |
+
+That's a **1.58× end-to-end prefill speedup**. A standalone GEMM microbench on the ffn_up shape `(m=6912, n=2002, k=2048)` shows Accelerate SGEMM at **1885 GFLOPs/s** vs the NEON Q4_0 × Q8_0 kernel at **645 GFLOPs/s** — a ~3× kernel speedup, diluted at the end-to-end level by non-GEMM attention compute.
+
+Gated behind the `blas` feature, which is on by default on macOS (Accelerate is system-provided). Build without it for a pure-NEON path: `cargo build --release --no-default-features`.
+
 ### GPU backends
 
 Two GPU backends with runtime selection via `--device`:
