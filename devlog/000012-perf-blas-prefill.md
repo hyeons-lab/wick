@@ -7,7 +7,7 @@ Claude (claude-opus-4-6[1m]) @ wick branch perf/blas-prefill
 Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.5-VL-1.6B-Q4_0, 2k prompt) by routing prefill GEMM through Apple's Accelerate framework on macOS (unlocking AMX) and OpenBLAS on Linux. Also unlock CPU prefill on x86_64 which currently falls through to an unusable per-token GEMV loop.
 
 ## What Changed
-- 2026-04-10T20:45-0700 `Cargo.toml` (workspace) + `wick/Cargo.toml` — added `cblas-sys`, `accelerate-src` (macOS), `openblas-src` (Linux) as workspace deps; `blas` feature on `wick` defaults on and gates the new wrapper.
+- 2026-04-10T20:45-0700 `Cargo.toml` (workspace) + `wick/Cargo.toml` — added `cblas-sys`, `accelerate-src` (macOS), `openblas-src` (Linux) as workspace deps; `blas` feature on `wick` initially shipped as `default = ["blas"]` (later flipped to opt-in on 2026-04-11, see below).
 - 2026-04-10T20:45-0700 `wick/src/backend/blas.rs` (new) + `wick/src/backend/mod.rs` — `sgemm_rowmajor_nn(m, n, k, a, b, c)` wrapper around `cblas_sgemm` with `CblasRowMajor`, `CblasNoTrans`/`NoTrans`, α=1/β=0. Pulls in the provider crate via `use … as _` so its `#[link]` attribute fires. Two unit tests (identity and 2×2 multiply).
 - 2026-04-10T21:15-0700 `wick/src/quant.rs` — added `dequantize_q4_0_matrix` and `dequantize_q8_0_matrix` that loop the existing row helpers. Parallelized with rayon via `par_chunks_mut(k).zip(par_chunks(row_bytes))` when `m >= MATRIX_DEQUANT_PAR_THRESHOLD` (64). Two parity tests verify the matrix helper output matches a sequential row-by-row loop byte-for-byte.
 - 2026-04-10T21:30-0700 `wick/src/kv_cache.rs` — added `dequant_weight: Vec<f32>` scratch to `ScratchBuffers`, sized at `max(3*hs*hs, is*hs)` in `from_config_with_compression` (~54 MB for LFM2.5-VL-1.6B). Grows nothing during hot path.
@@ -26,12 +26,18 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
   - **Made `blas` opt-in** instead of `default = ["blas"]`. CI on Linux was forcing an `openblas-src` system dependency that GitHub Actions Ubuntu happened to satisfy but other Linux users would not. Now matches the `metal` and `gpu` features — opt in via `--features blas` (or `--features wick/blas` from `wick-cli`). Added `blas = ["wick/blas"]` passthrough to `wick-cli`.
   - **README**: footnote on the existing 32/117-token prefill table noting those numbers predate BLAS, plus the opt-in build instructions.
 - 2026-04-11T11:30-0700 Re-benchmarked after the refactor. Default (NEON only): 146 tok/s prefill. `--features blas`: **279 tok/s prefill (1.91× speedup)**. The improvement vs yesterday's 247 tok/s is exactly what skipping the wasted `quantize_columns` work would predict (~13% recovery on top of the existing 1.58×).
+- 2026-04-11T12:15-0700 Second review pass on PR #13 after the refactor commit. Bot flagged four real concerns on `3d01c1a`:
+  1. Batched block entry gates only checked the *first* weight's dtype (e.g. `in_proj.dtype` for conv, `attn_q_ref.dtype` for attention, `ffn_gate.dtype` for FFN), but then routed *all* the projections in the block through the BLAS branch. If a future model had mixed dtypes within a block, `try_blas_prefill_gemm` would return false on the non-matching projection and the corresponding output matrix would be left with stale/zero data, silently producing wrong outputs. **Fixed** by extending each entry gate to require every involved weight (in_proj+out_proj for conv, Q/K/V/output for attention, gate/up/down for FFN) to be Q4_0/Q8_0 — any mismatch falls through to the per-token path. LFM2 ships with all same-dtype weights today so this is purely defensive.
+  2. `dequantize_q4_0_matrix` / `dequantize_q8_0_matrix` used `assert_eq!` for shape checks, which remain active in release. **Fixed**: switched to `debug_assert_eq!` to match the surrounding row helpers; removes the per-call check cost in release-mode inference.
+  3. README section about BLAS "through OpenBLAS on Linux" implied the BLAS path is active anywhere Linux runs, but `forward_prefill_inner` is still `#[cfg(target_arch = "aarch64")]` so x86_64 Linux doesn't actually benefit. **Fixed**: clarified the README to spell out "aarch64 only" and noted that `--features blas` on x86_64 Linux links OpenBLAS but the batched path stays gated out.
+  4. Devlog had an internal inconsistency — an earlier entry said the `blas` feature "defaults on" while a later entry describes the opt-in flip, making it hard to follow the history. **Fixed**: added a forward-pointer on the earlier entry.
+  Additionally updated the PR description to reflect the final state (1.91× speedup, opt-in, aarch64-only scope) since the original description was written against the pre-refactor numbers.
 
 ## Decisions
 - 2026-04-10T20:27-0700 Use `cblas-sys` + platform-gated providers (`accelerate-src` on macOS, `openblas-src` elsewhere). Avoids hand-rolling `extern "C"` bindings and keeps the BLAS dispatch behind a single `blas` feature flag.
 - 2026-04-10T20:27-0700 Staged rollout: start with a single call site (`ffn_up`, largest matrix) as a smoke test. If measured prefill doesn't improve, stop and profile before refactoring all 8 call sites.
 - 2026-04-10T20:27-0700 Dequantize weights into a scratch buffer on `ScratchBuffers`, reused across layers. Sized at `max(3*hs*hs, is*hs)` floats at `from_config_with_compression` time.
-- 2026-04-10T20:27-0700 Default the `blas` feature on for macOS only. Linux users opt in via `cargo build --features blas` and bring their own OpenBLAS.
+- 2026-04-10T20:27-0700 Default the `blas` feature on for macOS only. Linux users opt in via `cargo build --features blas` and bring their own OpenBLAS. *(Superseded 2026-04-11: cargo features cannot be target-conditional, so the PR shipped with `default = ["blas"]` on all platforms. PR review flagged this as a Linux footgun and the feature was flipped to fully opt-in to match `metal` / `gpu`. See the 2026-04-11T11:00 entry.)*
 
 ## Issues
 - 2026-04-10T21:50-0700 **Smoke test looks flat in end-to-end bench, but microbench proves AMX works.**
@@ -83,7 +89,8 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
 - 8caa923 — feat(blas): full rollout — all 8 prefill GEMM sites through Accelerate
 - d937af7 — docs: README subsection for CPU prefill via Accelerate BLAS
 - 1280688 — fix(blas): gate try_blas_prefill_gemm to aarch64 to silence x86_64 dead code
-- HEAD — refactor(blas): address PR review — opt-in feature, lazy scratch, parity test, skip wasted quantize
+- 3d01c1a — refactor(blas): address PR review — opt-in feature, lazy scratch, parity test, skip wasted quantize
+- HEAD — fix(blas): tighten batched-GEMM dtype checks + debug_assert in quant helpers + README/devlog consistency
 
 ## Next Steps
 1. ~~Add Cargo deps~~ ✓

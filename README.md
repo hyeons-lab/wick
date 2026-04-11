@@ -33,9 +33,11 @@ Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF
 
 Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
 
-#### CPU prefill via Accelerate BLAS (Apple AMX) — opt-in
+#### CPU prefill via Accelerate BLAS (Apple AMX) — opt-in, aarch64 only
 
-On longer prompts the batched prefill GEMM can dispatch SGEMM through Apple's Accelerate framework on macOS (unlocking the AMX matrix unit) and through OpenBLAS on Linux. Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then multiplied by the f32 input columns — eight call sites per layer (conv in/out proj, attn Q/K/V/output, FFN gate/up/down).
+The batched prefill GEMM path is currently `#[cfg(target_arch = "aarch64")]`, so the BLAS rewrite only takes effect on Apple Silicon (and aarch64 Linux if anyone runs wick there). On x86_64 Linux `forward_prefill` still falls through to the per-token GEMV loop regardless of the `blas` feature — enabling BLAS on x86_64 just pulls in OpenBLAS for nothing. Extending the batched path to x86_64 is a separate follow-up.
+
+On aarch64 with the feature on, SGEMM dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit) or through OpenBLAS on aarch64 Linux. Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then multiplied by the f32 input columns — eight call sites per layer (conv in/out proj, attn Q/K/V/output, FFN gate/up/down).
 
 On LFM2.5-VL-1.6B-Q4_0 with a 2002-token prompt (CPU, M-series):
 

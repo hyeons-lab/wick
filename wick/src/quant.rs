@@ -108,18 +108,18 @@ pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
 /// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
 /// tiny inputs by running them on a single worker, so no manual cutoff needed).
 pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    assert_eq!(
+    debug_assert_eq!(
         k % 32,
         0,
         "dequantize_q4_0_matrix: k must be a multiple of 32"
     );
     let row_bytes = (k / 32) * size_of::<BlockQ4_0>();
-    assert_eq!(
+    debug_assert_eq!(
         src.len(),
         m * row_bytes,
         "dequantize_q4_0_matrix: src length mismatch"
     );
-    assert_eq!(
+    debug_assert_eq!(
         out.len(),
         m * k,
         "dequantize_q4_0_matrix: out length mismatch"
@@ -180,18 +180,18 @@ pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
 /// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
 /// tiny inputs by running them on a single worker, so no manual cutoff needed).
 pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    assert_eq!(
+    debug_assert_eq!(
         k % 32,
         0,
         "dequantize_q8_0_matrix: k must be a multiple of 32"
     );
     let row_bytes = (k / 32) * size_of::<BlockQ8_0>();
-    assert_eq!(
+    debug_assert_eq!(
         src.len(),
         m * row_bytes,
         "dequantize_q8_0_matrix: src length mismatch"
     );
-    assert_eq!(
+    debug_assert_eq!(
         out.len(),
         m * k,
         "dequantize_q8_0_matrix: out length mismatch"

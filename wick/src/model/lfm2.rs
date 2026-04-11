@@ -1271,7 +1271,14 @@ impl Model for Lfm2Model {
                     // --- Conv: batch in_proj + out_proj via GEMM ---
                     let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
                     let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
-                    if matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0) {
+                    // Require BOTH projections to be Q4_0/Q8_0: the batched-GEMM
+                    // path (NEON gemm_preq and BLAS SGEMM) only handles those
+                    // dtypes, and a mixed-dtype conv block would leave the second
+                    // matrix silently uncomputed. Any other combo falls through
+                    // to the per-token fallback.
+                    let blas_ok = matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0)
+                        && matches!(out_proj.dtype, DType::Q4_0 | DType::Q8_0);
+                    if blas_ok {
                         // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
                         // quantize_columns is only needed for the NEON fallback. With BLAS
                         // on, the SGEMM path consumes f32 directly so this work is skipped.
@@ -1382,7 +1389,17 @@ impl Model for Lfm2Model {
                 } else {
                     // --- Attention: batch Q/K/V + output projections via GEMM ---
                     let attn_q_ref = refs.attn_q.as_ref().unwrap();
-                    if matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0) {
+                    let attn_k_ref = refs.attn_k.as_ref().unwrap();
+                    let attn_v_ref = refs.attn_v.as_ref().unwrap();
+                    let attn_output_ref = refs.attn_output.as_ref().unwrap();
+                    // Require ALL four projections to be Q4_0/Q8_0 — a mixed-dtype
+                    // attention block would leave later matrices silently uncomputed
+                    // in the batched path and produce wrong outputs.
+                    let blas_ok = matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0)
+                        && matches!(attn_k_ref.dtype, DType::Q4_0 | DType::Q8_0)
+                        && matches!(attn_v_ref.dtype, DType::Q4_0 | DType::Q8_0)
+                        && matches!(attn_output_ref.dtype, DType::Q4_0 | DType::Q8_0);
+                    if blas_ok {
                         let head_dim = hs / cfg.n_heads;
                         let n_kv_heads = cfg.kv_heads_per_layer[layer];
                         let kv_dim = n_kv_heads * head_dim;
@@ -1409,7 +1426,7 @@ impl Model for Lfm2Model {
                                 &mut state.scratch.dequant_weight_scratch,
                             );
                             self.try_blas_prefill_gemm(
-                                refs.attn_k.as_ref().unwrap(),
+                                attn_k_ref,
                                 &normed,
                                 &mut k_mat[..kv_dim * n],
                                 kv_dim,
@@ -1418,7 +1435,7 @@ impl Model for Lfm2Model {
                                 &mut state.scratch.dequant_weight_scratch,
                             );
                             self.try_blas_prefill_gemm(
-                                refs.attn_v.as_ref().unwrap(),
+                                attn_v_ref,
                                 &normed,
                                 &mut v_mat[..kv_dim * n],
                                 kv_dim,
@@ -1433,7 +1450,7 @@ impl Model for Lfm2Model {
                                 attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs,
                             );
                             self.gemm_preq(
-                                refs.attn_k.as_ref().unwrap(),
+                                attn_k_ref,
                                 &bq_scales,
                                 &bq_quants,
                                 &mut k_mat[..kv_dim * n],
@@ -1442,7 +1459,7 @@ impl Model for Lfm2Model {
                                 hs,
                             );
                             self.gemm_preq(
-                                refs.attn_v.as_ref().unwrap(),
+                                attn_v_ref,
                                 &bq_scales,
                                 &bq_quants,
                                 &mut v_mat[..kv_dim * n],
@@ -1778,7 +1795,7 @@ impl Model for Lfm2Model {
                         #[cfg(feature = "blas")]
                         {
                             self.try_blas_prefill_gemm(
-                                refs.attn_output.as_ref().unwrap(),
+                                attn_output_ref,
                                 &out_proj_input,
                                 &mut block_out,
                                 hs,
@@ -1789,7 +1806,7 @@ impl Model for Lfm2Model {
                         }
                         #[cfg(not(feature = "blas"))]
                         self.gemm_preq(
-                            refs.attn_output.as_ref().unwrap(),
+                            attn_output_ref,
                             &bq_scales,
                             &bq_quants,
                             &mut block_out,
@@ -1853,7 +1870,13 @@ impl Model for Lfm2Model {
             // FFN: batched GEMM on aarch64 Q4_0/Q8_0 (reads weights once for all n tokens)
             let refs = &self.layer_refs[layer];
             #[cfg(target_arch = "aarch64")]
-            let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0) {
+            // Require all three FFN projections to be Q4_0/Q8_0 — a mixed-dtype
+            // FFN block would leave later matrices silently uncomputed in the
+            // batched path and produce wrong outputs.
+            let ffn_blas_ok = matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0)
+                && matches!(refs.ffn_up.dtype, DType::Q4_0 | DType::Q8_0)
+                && matches!(refs.ffn_down.dtype, DType::Q4_0 | DType::Q8_0);
+            let used_gemm = if ffn_blas_ok {
                 // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
                 #[cfg(not(feature = "blas"))]
                 Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
