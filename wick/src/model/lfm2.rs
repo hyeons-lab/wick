@@ -432,15 +432,19 @@ impl Lfm2Model {
         cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
     }
 
-    /// BLAS prefill GEMM. Dequantizes `wref` into `dequant_scratch[..m*k]`
+    /// Try to run a prefill GEMM through BLAS (Accelerate on macOS → AMX,
+    /// OpenBLAS on Linux). Dequantizes `wref` into `dequant_scratch[..m*k]`
     /// then calls SGEMM: `out[m, n] = weight[m, k] @ b[k, n]` in row-major.
     ///
-    /// Both `b` and `out` are row-major `[m|k, n]` with row stride `n` — matching
-    /// the `mat[i * n + j]` layout used throughout `forward_prefill_inner`.
-    /// Returns true on supported dtypes (Q4_0 / Q8_0), false otherwise.
-    #[cfg(feature = "blas")]
+    /// Both `b` and `out` are row-major `[m|k, n]` with row stride `n`,
+    /// matching the `mat[i * n + j]` layout used throughout `forward_prefill_inner`.
+    ///
+    /// Returns `true` if BLAS handled the call (supported dtype + feature on),
+    /// `false` if the caller should fall back to `gemm_preq`. When the `blas`
+    /// feature is disabled at build time, this unconditionally returns false
+    /// and the fallback path is taken.
     #[allow(clippy::too_many_arguments)]
-    fn blas_prefill_gemm(
+    fn try_blas_prefill_gemm(
         &self,
         wref: &WeightRef,
         b: &[f32],
@@ -450,17 +454,25 @@ impl Lfm2Model {
         k: usize,
         dequant_scratch: &mut [f32],
     ) -> bool {
-        assert_eq!(wref.m, m, "blas_prefill_gemm: weight m mismatch");
-        assert_eq!(wref.k, k, "blas_prefill_gemm: weight k mismatch");
-        let data = self.weight_data(wref);
-        let dequant = &mut dequant_scratch[..m * k];
-        match wref.dtype {
-            DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
-            _ => return false,
+        #[cfg(feature = "blas")]
+        {
+            assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
+            assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
+            let data = self.weight_data(wref);
+            let dequant = &mut dequant_scratch[..m * k];
+            match wref.dtype {
+                DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+                DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+                _ => return false,
+            }
+            crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+            true
         }
-        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
-        true
+        #[cfg(not(feature = "blas"))]
+        {
+            let _ = (wref, b, out, m, n, k, dequant_scratch);
+            false
+        }
     }
 
     /// Batched GEMM with pre-quantized Q8_0 input columns.
@@ -1260,15 +1272,25 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        self.gemm_preq(
+                        if !self.try_blas_prefill_gemm(
                             in_proj,
-                            &bq_scales,
-                            &bq_quants,
+                            &normed,
                             &mut proj_mat,
                             3 * hs,
                             n,
                             hs,
-                        );
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                in_proj,
+                                &bq_scales,
+                                &bq_quants,
+                                &mut proj_mat,
+                                3 * hs,
+                                n,
+                                hs,
+                            );
+                        }
 
                         // Phase 2: Per-token sequential conv using pre-computed projections
                         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
@@ -1323,7 +1345,25 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        self.gemm_preq(out_proj, &bq_scales, &bq_quants, &mut block_out, hs, n, hs);
+                        if !self.try_blas_prefill_gemm(
+                            out_proj,
+                            &out_proj_input,
+                            &mut block_out,
+                            hs,
+                            n,
+                            hs,
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                out_proj,
+                                &bq_scales,
+                                &bq_quants,
+                                &mut block_out,
+                                hs,
+                                n,
+                                hs,
+                            );
+                        }
                         true
                     } else {
                         false
@@ -1345,25 +1385,57 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        self.gemm_preq(attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs);
-                        self.gemm_preq(
+                        if !self.try_blas_prefill_gemm(
+                            attn_q_ref,
+                            &normed,
+                            &mut q_mat,
+                            hs,
+                            n,
+                            hs,
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                attn_q_ref, &bq_scales, &bq_quants, &mut q_mat, hs, n, hs,
+                            );
+                        }
+                        if !self.try_blas_prefill_gemm(
                             refs.attn_k.as_ref().unwrap(),
-                            &bq_scales,
-                            &bq_quants,
+                            &normed,
                             &mut k_mat[..kv_dim * n],
                             kv_dim,
                             n,
                             hs,
-                        );
-                        self.gemm_preq(
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                refs.attn_k.as_ref().unwrap(),
+                                &bq_scales,
+                                &bq_quants,
+                                &mut k_mat[..kv_dim * n],
+                                kv_dim,
+                                n,
+                                hs,
+                            );
+                        }
+                        if !self.try_blas_prefill_gemm(
                             refs.attn_v.as_ref().unwrap(),
-                            &bq_scales,
-                            &bq_quants,
+                            &normed,
                             &mut v_mat[..kv_dim * n],
                             kv_dim,
                             n,
                             hs,
-                        );
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                refs.attn_v.as_ref().unwrap(),
+                                &bq_scales,
+                                &bq_quants,
+                                &mut v_mat[..kv_dim * n],
+                                kv_dim,
+                                n,
+                                hs,
+                            );
+                        }
 
                         // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
                         // Hoist tq state capture so the reserve block can match the
@@ -1687,15 +1759,25 @@ impl Model for Lfm2Model {
                             &mut bq_scales,
                             &mut bq_quants,
                         );
-                        self.gemm_preq(
+                        if !self.try_blas_prefill_gemm(
                             refs.attn_output.as_ref().unwrap(),
-                            &bq_scales,
-                            &bq_quants,
+                            &out_proj_input,
                             &mut block_out,
                             hs,
                             n,
                             hs,
-                        );
+                            &mut state.scratch.dequant_weight,
+                        ) {
+                            self.gemm_preq(
+                                refs.attn_output.as_ref().unwrap(),
+                                &bq_scales,
+                                &bq_quants,
+                                &mut block_out,
+                                hs,
+                                n,
+                                hs,
+                            );
+                        }
                         true
                     } else {
                         false
@@ -1757,20 +1839,26 @@ impl Model for Lfm2Model {
                 Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
 
                 // Gate + Up via batched GEMM
-                self.gemm_preq(
+                if !self.try_blas_prefill_gemm(
                     &refs.ffn_gate,
-                    &bq_scales,
-                    &bq_quants,
+                    &ffn_input,
                     &mut gate_mat,
                     is,
                     n,
                     hs,
-                );
-                // Smoke test: route ffn_up through BLAS (Accelerate → AMX on macOS,
-                // OpenBLAS on Linux). Falls back to the NEON integer GEMM if the
-                // `blas` feature is disabled or the dtype isn't Q4_0/Q8_0.
-                #[cfg(feature = "blas")]
-                let used_blas_ffn_up = self.blas_prefill_gemm(
+                    &mut state.scratch.dequant_weight,
+                ) {
+                    self.gemm_preq(
+                        &refs.ffn_gate,
+                        &bq_scales,
+                        &bq_quants,
+                        &mut gate_mat,
+                        is,
+                        n,
+                        hs,
+                    );
+                }
+                if !self.try_blas_prefill_gemm(
                     &refs.ffn_up,
                     &ffn_input,
                     &mut up_mat,
@@ -1778,10 +1866,7 @@ impl Model for Lfm2Model {
                     n,
                     hs,
                     &mut state.scratch.dequant_weight,
-                );
-                #[cfg(not(feature = "blas"))]
-                let used_blas_ffn_up = false;
-                if !used_blas_ffn_up {
+                ) {
                     self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
                 }
 
@@ -1799,15 +1884,25 @@ impl Model for Lfm2Model {
                 );
 
                 // Down via batched GEMM
-                self.gemm_preq(
+                if !self.try_blas_prefill_gemm(
                     &refs.ffn_down,
-                    &dq_scales,
-                    &dq_quants,
+                    &gate_mat,
                     &mut ffn_out,
                     hs,
                     n,
                     is,
-                );
+                    &mut state.scratch.dequant_weight,
+                ) {
+                    self.gemm_preq(
+                        &refs.ffn_down,
+                        &dq_scales,
+                        &dq_quants,
+                        &mut ffn_out,
+                        hs,
+                        n,
+                        is,
+                    );
+                }
                 true
             } else {
                 false

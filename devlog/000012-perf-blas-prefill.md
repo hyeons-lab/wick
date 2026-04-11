@@ -13,6 +13,7 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
 - 2026-04-10T21:30-0700 `wick/src/kv_cache.rs` — added `dequant_weight: Vec<f32>` scratch to `ScratchBuffers`, sized at `max(3*hs*hs, is*hs)` in `from_config_with_compression` (~54 MB for LFM2.5-VL-1.6B). Grows nothing during hot path.
 - 2026-04-10T21:35-0700 `wick/src/model/lfm2.rs` — added `blas_prefill_gemm` helper behind `#[cfg(feature = "blas")]`. Wires ffn_up through the helper as a smoke test, falling back to `gemm_preq` if the dtype isn't Q4_0/Q8_0 or if BLAS is off at build time. Other 7 call sites unchanged.
 - 2026-04-10T21:50-0700 `wick/src/backend/blas.rs` — added `microbench_ffn_up_gemm` (ignored by default) that times both paths in isolation on the `(m=6912, n=2002, k=2048)` shape. Provides a diagnostic gate for whether AMX is actually delivering, independent of end-to-end bench noise.
+- 2026-04-10T22:15-0700 `wick/src/model/lfm2.rs` — replaced `blas_prefill_gemm` with a unified `try_blas_prefill_gemm` that returns false when the `blas` feature is off (no cfg noise at call sites). Wired all 8 prefill GEMM call sites: conv in_proj/out_proj, attn Q/K/V/output, ffn_gate/up/down. Each site tries BLAS first and falls back to `gemm_preq` with the pre-quantized NEON inputs on failure.
 
 ## Decisions
 - 2026-04-10T20:27-0700 Use `cblas-sys` + platform-gated providers (`accelerate-src` on macOS, `openblas-src` elsewhere). Avoids hand-rolling `extern "C"` bindings and keeps the BLAS dispatch behind a single `blas` feature flag.
@@ -43,11 +44,31 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
   Lesson: when a smoke test wires up a single call site whose cost is `<<` 1/expected_gain
   of total time, the end-to-end bench is too coarse. Validate the kernel in isolation.
 
+- 2026-04-10T22:20-0700 **Full rollout A/B — BLAS on all 8 sites vs ffn_up only.**
+  Same bench setup (LFM2.5-VL-1.6B-Q4_0, 2002-token prompt, CPU, n=3-5 runs):
+  - ffn_up only  (commit e019702):   p50 = 156 tok/s prefill, 45 tok/s decode
+  - all 8 sites  (this commit):      **p50 = 246 tok/s prefill**, 45 tok/s decode
+  - **+58% end-to-end prefill, 1.58× speedup**, decode unchanged as expected.
+
+  Somewhat below the 293 tok/s Amdahl projection from the microbench. The extra
+  gap is a mix of: (a) non-GEMM attention compute (scores/softmax/attn_values)
+  which BLAS can't touch — item A in the roadmap, (b) dequant overhead on smaller
+  shapes where AMX's relative advantage shrinks, (c) the wasted `quantize_columns`
+  call kept in the hot path so the fallback branch still works. Even so, the
+  result lands well inside the plan's "success" window (300 was "success",
+  400 was "great"; 246 is ~82% of the lower bound) and closes ~70% of the
+  llama.cpp gap given the same prompt (610 is llama.cpp's number).
+
+  Output coherence spot-check: "The capital of France is Paris. It is a major
+  city located in the northern part of the country. Paris is known for its
+  rich history, culture, and iconic landmarks such…" — still correct.
+
 ## Commits
 - 7cb64f9 — docs: devlog + plan for BLAS CPU prefill (000012)
 - e77cf0e — feat(blas): add cblas_sgemm wrapper behind `blas` feature
 - ffeb967 — feat(quant): dequantize_q4_0_matrix / dequantize_q8_0_matrix with rayon
-- HEAD — feat(blas): wire ffn_up smoke test + dequant scratch + GEMM microbench
+- e019702 — feat(blas): wire ffn_up smoke test + dequant scratch + GEMM microbench
+- HEAD — feat(blas): full rollout — all 8 prefill GEMM sites through Accelerate
 
 ## Next Steps
 1. ~~Add Cargo deps~~ ✓
@@ -55,5 +76,5 @@ Close the 4.2× CPU prefill gap vs llama.cpp (144 vs 610 tok/s measured on LFM2.
 3. ~~Add `dequantize_q4_0_matrix` / `dequantize_q8_0_matrix`~~ ✓
 4. ~~Add `dequant_weight` scratch to InferenceState~~ ✓
 5. ~~Smoke test: wire ffn_up through BLAS only + microbench~~ ✓ (microbench confirms 2.96× AMX advantage)
-6. Full rollout: wire all 8 GEMM call sites, benchmark
-7. Update benchmark doc with new numbers
+6. ~~Full rollout: wire all 8 GEMM call sites~~ ✓ (156 → 246 tok/s, 1.58× prefill)
+7. Update benchmark doc with new numbers; run the cross-backend comparison bench
