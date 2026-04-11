@@ -26,8 +26,21 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft.workspace = true
 flatbuffers.workspace = true
+cblas-sys = { workspace = true, optional = true }
+
+# BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
+# Only the provider crate for the current target is pulled in, so cross-platform
+# builds with the `blas` feature work out of the box on supported hosts.
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openblas-src = { workspace = true, optional = true }
 
 [features]
-default = []
+# BLAS is on by default on macOS (Accelerate is system-provided, zero install).
+# Disable with `--no-default-features` for a pure-NEON build.
+default = ["blas"]
 gpu = ["dep:wgpu", "dep:pollster"]
 metal = ["dep:metal", "dep:objc"]
+blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
