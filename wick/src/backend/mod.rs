@@ -1,6 +1,9 @@
 pub mod cpu;
 pub mod simd;
 
+#[cfg(feature = "blas")]
+pub mod blas;
+
 #[cfg(feature = "gpu")]
 pub mod wgpu;
 

@@ -29,6 +29,13 @@ metal = "0.31"
 objc = "0.2"
 rustfft = "6.4"
 flatbuffers = "25"
+# BLAS bindings for SGEMM on CPU prefill. On macOS the `accelerate-src` provider
+# dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit);
+# on Linux the `openblas-src` provider pulls in OpenBLAS. Gated behind the `blas`
+# feature in the wick crate so non-BLAS builds still work via the NEON integer path.
+cblas-sys = "0.1"
+accelerate-src = "0.3"
+openblas-src = { version = "0.10", features = ["system"] }
 
 [profile.release]
 lto = "thin"

@@ -679,6 +679,11 @@ pub(crate) mod neon {
     /// Reads each weight row once and dots against all n Q8_0 columns.
     /// Uses 4-column grouping to amortize Q4_0 nibble extraction.
     /// Parallelized across output rows with rayon.
+    ///
+    /// Unused under the `blas` feature (SGEMM via Accelerate replaces it on
+    /// the prefill hot path) but kept compiled so the GEMM microbench can
+    /// still A/B against it.
+    #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_0_q8_0_neon(
         a_quant: &[u8],
@@ -915,6 +920,11 @@ pub(crate) mod neon {
     ///
     /// Same layout and shared dot-product macros as Q4_0 GEMM, but with
     /// Q8_0 weight blocks (direct i8 load, no nibble extraction).
+    ///
+    /// Unused under the `blas` feature (SGEMM via Accelerate replaces it on
+    /// the prefill hot path) but kept compiled so the GEMM microbench can
+    /// still A/B against it.
+    #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q8_0_q8_0_neon(
         a_quant: &[u8],

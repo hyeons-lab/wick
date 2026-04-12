@@ -26,8 +26,23 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft.workspace = true
 flatbuffers.workspace = true
+cblas-sys = { workspace = true, optional = true }
+
+# BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
+# Only the provider crate for the current target is pulled in, so cross-platform
+# builds with the `blas` feature work out of the box on supported hosts.
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openblas-src = { workspace = true, optional = true }
 
 [features]
+# Opt-in like `metal` and `gpu`. Enable with `--features blas` to route prefill
+# GEMM through Apple Accelerate (macOS, AMX) or OpenBLAS (Linux). Default builds
+# stay on the pure-NEON integer GEMM path so CI and Linux users don't pull in
+# a system OpenBLAS dependency.
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
 metal = ["dep:metal", "dep:objc"]
+blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
