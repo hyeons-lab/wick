@@ -1,4 +1,5 @@
 use half::f16;
+use rayon::prelude::*;
 
 // ── Block layouts ────────────────────────────────────────────────────────────
 
@@ -101,6 +102,34 @@ pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Dequantize a Q4_0 matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
+/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
+/// tiny inputs by running them on a single worker, so no manual cutoff needed).
+pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 32,
+        0,
+        "dequantize_q4_0_matrix: k must be a multiple of 32"
+    );
+    let row_bytes = (k / 32) * size_of::<BlockQ4_0>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q4_0_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q4_0_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q4_0_row(src_row, dst_row));
+}
+
 /// Dot product of a Q4_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
@@ -143,6 +172,34 @@ pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
         let values = dequantize_q8_0_block(block);
         dst[i * 32..(i + 1) * 32].copy_from_slice(&values);
     }
+}
+
+/// Dequantize a Q8_0 matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
+/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
+/// tiny inputs by running them on a single worker, so no manual cutoff needed).
+pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 32,
+        0,
+        "dequantize_q8_0_matrix: k must be a multiple of 32"
+    );
+    let row_bytes = (k / 32) * size_of::<BlockQ8_0>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q8_0_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q8_0_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
 }
 
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
@@ -569,6 +626,94 @@ mod tests {
                 dst[32 + i]
             );
         }
+    }
+
+    #[test]
+    fn test_dequantize_q4_0_matrix_matches_row() {
+        // Build `m` rows of Q4_0 blocks with distinct content, dequantize via
+        // both the matrix helper and a loop of `dequantize_q4_0_row` calls, and
+        // verify they produce byte-identical output.
+        let m = 128; // above the parallelization threshold
+        let k = 64; // 2 blocks per row
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+
+        let mut src = vec![0u8; m * row_bytes];
+        for row in 0..m {
+            for b in 0..blocks_per_row {
+                let block = BlockQ4_0 {
+                    d: f16::from_f32(0.1 + (row as f32) * 0.01).to_bits(),
+                    qs: {
+                        let mut qs = [0u8; 16];
+                        for (i, q) in qs.iter_mut().enumerate() {
+                            *q = ((row + b * 7 + i * 3) as u8).wrapping_mul(17);
+                        }
+                        qs
+                    },
+                };
+                let offset = row * row_bytes + b * size_of::<BlockQ4_0>();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &block as *const _ as *const u8,
+                        src.as_mut_ptr().add(offset),
+                        size_of::<BlockQ4_0>(),
+                    );
+                }
+            }
+        }
+
+        let mut matrix_out = vec![0.0f32; m * k];
+        dequantize_q4_0_matrix(&src, m, k, &mut matrix_out);
+
+        let mut expected = vec![0.0f32; m * k];
+        for row in 0..m {
+            let src_row = &src[row * row_bytes..(row + 1) * row_bytes];
+            let dst_row = &mut expected[row * k..(row + 1) * k];
+            dequantize_q4_0_row(src_row, dst_row);
+        }
+
+        assert_eq!(matrix_out, expected);
+    }
+
+    #[test]
+    fn test_dequantize_q8_0_matrix_matches_row() {
+        let m = 96;
+        let k = 96; // 3 blocks per row
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
+
+        let mut src = vec![0u8; m * row_bytes];
+        for row in 0..m {
+            for b in 0..blocks_per_row {
+                let block = make_q8_0_block(0.05 * (1 + row) as f32 + 0.001 * b as f32, {
+                    let mut q = [0i8; 32];
+                    for (i, slot) in q.iter_mut().enumerate() {
+                        *slot = ((row + b + i) as i8).wrapping_mul(5).wrapping_sub(64);
+                    }
+                    q
+                });
+                let offset = row * row_bytes + b * size_of::<BlockQ8_0>();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &block as *const _ as *const u8,
+                        src.as_mut_ptr().add(offset),
+                        size_of::<BlockQ8_0>(),
+                    );
+                }
+            }
+        }
+
+        let mut matrix_out = vec![0.0f32; m * k];
+        dequantize_q8_0_matrix(&src, m, k, &mut matrix_out);
+
+        let mut expected = vec![0.0f32; m * k];
+        for row in 0..m {
+            let src_row = &src[row * row_bytes..(row + 1) * row_bytes];
+            let dst_row = &mut expected[row * k..(row + 1) * k];
+            dequantize_q8_0_row(src_row, dst_row);
+        }
+
+        assert_eq!(matrix_out, expected);
     }
 
     #[test]

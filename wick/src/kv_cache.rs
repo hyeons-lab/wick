@@ -101,6 +101,11 @@ pub struct ScratchBuffers {
     pub q8_scales: Vec<f32>,
     /// Q8_0 quantization scratch: quants for the input vector (max_k entries).
     pub q8_quants: Vec<i8>,
+    /// Dequantized weight scratch for BLAS prefill. Grown lazily on first use
+    /// to the largest weight matrix the BLAS path encounters; reused across
+    /// every subsequent GEMM call within and between forward passes. Stays
+    /// empty when the `blas` feature is off — the NEON fallback never touches it.
+    pub dequant_weight_scratch: Vec<f32>,
 }
 
 /// Inference state across all layers.
@@ -149,6 +154,7 @@ impl InferenceState {
                 scores: Vec::new(),
                 q8_scales: Vec::new(),
                 q8_quants: Vec::new(),
+                dequant_weight_scratch: Vec::new(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
@@ -269,6 +275,9 @@ impl InferenceState {
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
+                // Grown lazily to max(3*hs*hs, is*hs) on the first BLAS GEMM
+                // call. Stays empty if the `blas` feature is off.
+                dequant_weight_scratch: Vec::new(),
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
