@@ -1244,6 +1244,11 @@ impl Model for Lfm2Model {
         let mut dq_quants = vec![0i8; n * is];
         #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
         let mut inter_col = vec![0.0f32; is];
+        // Flash attention scratch: contiguous output buffer reused across
+        // layers. Sized for the largest possible attention layer (max
+        // n_kv_heads * group_size * n * head_dim = hs * n).
+        #[cfg(target_arch = "aarch64")]
+        let mut flash_out = vec![0.0f32; hs * n];
 
         for layer in 0..cfg.n_layers {
             // RMSnorm each column independently
@@ -1542,13 +1547,12 @@ impl Model for Lfm2Model {
                         let group_size = cfg.n_heads / n_kv_heads;
                         let scale = 1.0 / (head_dim as f32).sqrt();
 
-                        // Pre-reserve scores capacity for max seq_len so
-                        // per-token resize inside the loop doesn't reallocate.
-                        state.scratch.scores.reserve((start_pos + n) * group_size);
-
+                        // ── Pass A: QK-norm + RoPE + KV cache append ──────────
+                        // Processes all n tokens sequentially (O(n) per token).
+                        // After this loop, q_mat contains post-RoPE Q and the
+                        // KV cache is fully populated through start_pos + n - 1.
                         for j in 0..n {
                             let pos = start_pos + j;
-                            // Extract Q, K, V for this token
                             let q = &mut state.scratch.q[..hs];
                             let k = &mut state.scratch.k[..kv_dim];
                             let v = &mut state.scratch.v[..kv_dim];
@@ -1579,12 +1583,13 @@ impl Model for Lfm2Model {
                             // RoPE
                             cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
 
-                            // tq_rotation / tq_config already captured above (before reserve block)
+                            // Write processed Q back to q_mat so flash attention
+                            // can read it. K/V go into the cache below.
+                            for i in 0..hs {
+                                q_mat[i * n + j] = q[i];
+                            }
 
-                            // Append K, V to cache. Keys and values are
-                            // compressed independently — whichever side has
-                            // a CompressedKvCache present gets the TurboQuant
-                            // path; the other side falls through to f32.
+                            // Append K, V to cache (f32 or TurboQuant-compressed).
                             if let LayerState::Attention {
                                 key_cache,
                                 value_cache,
@@ -1625,39 +1630,133 @@ impl Model for Lfm2Model {
                                     }
                                 }
                             }
+                        }
 
-                            // Attention scores + weighted values
-                            let (ck, cv, k_cache, v_cache) = match &state.layers[layer] {
+                        // ── Pass B: attention ────────────────────────────────
+                        // The KV cache is now fully populated. Branch on
+                        // whether TurboQuant compressed KV is active.
+                        let use_tq = will_read_compressed_kv
+                            && match &state.layers[layer] {
+                                LayerState::Attention {
+                                    compressed_keys,
+                                    compressed_values,
+                                    ..
+                                } => compressed_keys.is_some() || compressed_values.is_some(),
+                                _ => false,
+                            };
+
+                        // Flash attention (tiled + rayon) is faster at longer
+                        // prompts. Below the threshold the overhead of the
+                        // two-pass decomposition + online softmax exceeds the
+                        // naive NEON path, so fall back.
+                        // Flash attention (tiled + rayon) is faster than the naive
+                        // NEON path only for longer prompts. The crossover is around
+                        // pp200 on Apple Silicon (measured: naive wins at pp128 by 5%,
+                        // flash wins at pp252 by 6%). Use 256 to avoid regressions.
+                        const FLASH_ATTN_THRESHOLD: usize = 256;
+                        let use_flash = !use_tq && n >= FLASH_ATTN_THRESHOLD;
+
+                        if use_flash {
+                            // f32 path: flash attention over the full KV cache,
+                            // parallel across KV heads via rayon.
+                            //
+                            // Each KV head writes to a contiguous chunk of
+                            // flash_out [group_size * n * head_dim], split via
+                            // par_chunks_mut so there's no aliased &mut.
+                            // After the par_iter we scatter-copy back to
+                            // out_proj_input in stride-n layout for Phase 3.
+                            let (k_cache, v_cache) = match &state.layers[layer] {
                                 LayerState::Attention {
                                     key_cache,
                                     value_cache,
-                                    compressed_keys,
-                                    compressed_values,
-                                } => (
-                                    compressed_keys.as_ref(),
-                                    compressed_values.as_ref(),
-                                    key_cache.as_slice(),
-                                    value_cache.as_slice(),
-                                ),
-                                _ => panic!("expected Attention state for layer {layer}"),
+                                    ..
+                                } => (key_cache.as_slice(), value_cache.as_slice()),
+                                _ => unreachable!(),
                             };
+                            let chunk_size = group_size * n * head_dim;
+                            let flash_len = n_kv_heads * chunk_size;
+                            let flash_buf = &mut flash_out[..flash_len];
+                            let q_ref = &q_mat[..];
 
-                            // Keys and values can be compressed independently.
-                            let use_tq_keys = will_read_compressed_kv && ck.is_some();
-                            let use_tq_values = will_read_compressed_kv && cv.is_some();
+                            use rayon::prelude::*;
+                            flash_buf.par_chunks_mut(chunk_size).enumerate().for_each(
+                                |(kv_h, chunk)| {
+                                    cpu::flash_attention_gqa_cpu(
+                                        q_ref,
+                                        k_cache,
+                                        v_cache,
+                                        chunk,
+                                        kv_h * group_size,
+                                        group_size,
+                                        n,
+                                        n,
+                                        kv_dim,
+                                        kv_h * head_dim,
+                                        head_dim,
+                                        scale,
+                                        start_pos,
+                                    );
+                                },
+                            );
 
-                            let seq_len = if use_tq_keys {
-                                ck.unwrap().seq_len()
-                            } else if use_tq_values {
-                                cv.unwrap().seq_len()
-                            } else {
-                                k_cache.len() / kv_dim
-                            };
-                            let attn_out = &mut state.scratch.attn_out[..hs];
-                            let q = &state.scratch.q[..hs];
-                            let scores = &mut state.scratch.scores;
+                            // Scatter-copy: flash_buf [n_heads, n, head_dim]
+                            // → out_proj_input [hs, n] stride-n.
+                            // Loop order d-then-j gives sequential writes to
+                            // out_proj_input (stride 1) and small-stride reads
+                            // from flash_buf (stride head_dim).
+                            for kv_h in 0..n_kv_heads {
+                                for g in 0..group_size {
+                                    let h = kv_h * group_size + g;
+                                    let src_base = kv_h * chunk_size + g * n * head_dim;
+                                    for d in 0..head_dim {
+                                        let row_idx = (h * head_dim + d) * n;
+                                        for j in 0..n {
+                                            out_proj_input[row_idx + j] =
+                                                flash_buf[src_base + j * head_dim + d];
+                                        }
+                                    }
+                                }
+                            }
+                        } else if use_tq {
+                            // TurboQuant path: per-token attention using the
+                            // compressed KV cache. Re-extract post-RoPE Q from
+                            // q_mat for each token.
+                            state.scratch.scores.reserve((start_pos + n) * group_size);
+                            for j in 0..n {
+                                let q = &mut state.scratch.q[..hs];
+                                for i in 0..hs {
+                                    q[i] = q_mat[i * n + j];
+                                }
 
-                            if use_tq_keys || use_tq_values {
+                                let (ck, cv, k_cache, v_cache) = match &state.layers[layer] {
+                                    LayerState::Attention {
+                                        key_cache,
+                                        value_cache,
+                                        compressed_keys,
+                                        compressed_values,
+                                    } => (
+                                        compressed_keys.as_ref(),
+                                        compressed_values.as_ref(),
+                                        key_cache.as_slice(),
+                                        value_cache.as_slice(),
+                                    ),
+                                    _ => unreachable!(),
+                                };
+
+                                let use_tq_keys = will_read_compressed_kv && ck.is_some();
+                                let use_tq_values = will_read_compressed_kv && cv.is_some();
+
+                                let seq_len = if use_tq_keys {
+                                    ck.unwrap().seq_len()
+                                } else if use_tq_values {
+                                    cv.unwrap().seq_len()
+                                } else {
+                                    k_cache.len() / kv_dim
+                                };
+                                let attn_out = &mut state.scratch.attn_out[..hs];
+                                let q = &state.scratch.q[..hs];
+                                let scores = &mut state.scratch.scores;
+
                                 let rotation = tq_rotation.unwrap();
                                 let cfg_tq = tq_config.unwrap();
                                 let qr_scratch = state.tq_query_scratch.as_mut().unwrap();
@@ -1675,7 +1774,6 @@ impl Model for Lfm2Model {
                                     let group_start = kv_h * group_size;
                                     let kv_h_offset = kv_h * head_dim;
 
-                                    // Scores: TurboQuant or f32.
                                     if use_tq_keys {
                                         turboquant::attn_scores_turboquant_gqa(
                                             ck.unwrap(),
@@ -1708,14 +1806,12 @@ impl Model for Lfm2Model {
                                         }
                                     }
 
-                                    // Softmax each head's scores in place.
                                     for g in 0..group_size {
                                         let head_scores =
                                             &mut scores[g * seq_len..(g + 1) * seq_len];
                                         cpu::softmax_inplace(head_scores);
                                     }
 
-                                    // Values: TurboQuant or f32.
                                     if use_tq_values {
                                         turboquant::attn_values_turboquant_gqa(
                                             cv.unwrap(),
@@ -1746,8 +1842,35 @@ impl Model for Lfm2Model {
                                         }
                                     }
                                 }
-                            } else {
-                                // Capacity pre-reserved; this resize is O(1)
+
+                                for i in 0..hs {
+                                    out_proj_input[i * n + j] = attn_out[i];
+                                }
+                            }
+                        } else {
+                            // Short-prompt f32 fallback: naive per-token
+                            // attention (no tiling, no rayon). Faster than
+                            // flash attention when n < FLASH_ATTN_THRESHOLD
+                            // because the attention portion is trivially small.
+                            let (k_cache, v_cache) = match &state.layers[layer] {
+                                LayerState::Attention {
+                                    key_cache,
+                                    value_cache,
+                                    ..
+                                } => (key_cache.as_slice(), value_cache.as_slice()),
+                                _ => unreachable!(),
+                            };
+                            state.scratch.scores.reserve((start_pos + n) * group_size);
+                            for j in 0..n {
+                                let seq_len = (start_pos + j + 1).min(k_cache.len() / kv_dim);
+                                // Q is already post-RoPE in q_mat from Pass A;
+                                // re-extract into scratch for the naive path.
+                                for i in 0..hs {
+                                    state.scratch.q[i] = q_mat[i * n + j];
+                                }
+                                let q = &state.scratch.q[..hs];
+                                let attn_out = &mut state.scratch.attn_out[..hs];
+                                let scores = &mut state.scratch.scores;
                                 scores.resize(seq_len, 0.0);
                                 for h in 0..cfg.n_heads {
                                     let kv_h = h / group_size;
@@ -1774,11 +1897,10 @@ impl Model for Lfm2Model {
                                         seq_len,
                                     );
                                 }
-                            }
 
-                            // Store attn output for batched output projection
-                            for i in 0..hs {
-                                out_proj_input[i * n + j] = attn_out[i];
+                                for i in 0..hs {
+                                    out_proj_input[i * n + j] = attn_out[i];
+                                }
                             }
                         }
 
