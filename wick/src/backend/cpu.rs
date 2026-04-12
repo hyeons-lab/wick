@@ -2,6 +2,77 @@
 //
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
 
+// ── Thread pool configuration ──────────────────────────────────────────────
+
+/// Configure rayon's global thread pool to use only performance cores.
+///
+/// On Apple Silicon, the efficiency cores (E-cores) have lower clock speed
+/// and share memory bandwidth. Including them in rayon's pool creates
+/// straggler threads that slow down synchronized `par_chunks_mut` dispatches
+/// — measured as a 12% decode regression on M1 Max (58.6 vs 66.4 tok/s).
+///
+/// This function queries `hw.perflevel0.logicalcpu` (the P-core count) and
+/// configures rayon to use at most that many threads. If the user has set
+/// `RAYON_NUM_THREADS`, that takes precedence (rayon respects it before our
+/// `build_global` call). On non-macOS or if the sysctl fails, rayon's
+/// default (all logical cores) is used.
+///
+/// Must be called once before any rayon work (e.g., early in `main()`).
+/// Returns the number of threads configured.
+pub fn configure_thread_pool() -> usize {
+    // If the user explicitly set RAYON_NUM_THREADS, respect it.
+    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+        return rayon::current_num_threads();
+    }
+
+    let n = performance_core_count().unwrap_or(0);
+    if n > 0 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+        n
+    } else {
+        rayon::current_num_threads()
+    }
+}
+
+/// Returns the number of performance cores on macOS (Apple Silicon).
+/// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` directly — no subprocess.
+#[cfg(target_os = "macos")]
+fn performance_core_count() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let name = c"hw.perflevel0.logicalcpu";
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    let ret = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ret == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_core_count() -> Option<usize> {
+    None
+}
+
 use crate::quant::{
     BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32,
 };
@@ -1995,5 +2066,97 @@ mod tests {
             max_diff < 1e-4,
             "flash vs naive max_diff = {max_diff} (expected < 1e-4)"
         );
+    }
+
+    /// Microbenchmark: measure GEMV throughput and effective memory bandwidth
+    /// for the Q4_0 × Q8_0 pre-quantized kernel at FFN gate shape.
+    ///
+    /// Run with:
+    /// `cargo test -p wick --release --lib backend::cpu::tests::microbench_gemv_q4_0 -- --ignored --nocapture`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn microbench_gemv_q4_0() {
+        use std::time::Instant;
+
+        let m = 6912; // FFN gate rows
+        let k = 2048; // hidden_size
+        let iters = 200;
+
+        // Random Q4_0 weight
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ4_0>();
+        let mut weight = vec![0u8; m * row_bytes];
+        let mut s: u64 = 0xdead_beef;
+        for b in weight.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+
+        // Random input, pre-quantized to Q8_0
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
+            .collect();
+        let (x_scales, x_quants) = quantize_f32_to_q8_0(&x);
+        let mut y = vec![0.0f32; m];
+
+        // Warmup
+        gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / iters as f64;
+
+        let weight_bytes = m * row_bytes;
+        let input_bytes = x_scales.len() * 4 + x_quants.len();
+        let total_bytes = weight_bytes + input_bytes;
+        let bw_gbps = (total_bytes as f64 / per_call) / 1e9;
+
+        eprintln!("\n=== GEMV Q4_0×Q8_0 microbench (m={m}, k={k}) ===");
+        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+        eprintln!("  weight:   {:.2} MB", weight_bytes as f64 / 1e6);
+        eprintln!("  bandwidth: {:.1} GB/s", bw_gbps);
+        eprintln!("  rayon threads: {}", rayon::current_num_threads());
+
+        // Also measure a large GEMV (output projection shape)
+        let m_large = 65536;
+        let mut weight_large = vec![0u8; m_large * row_bytes];
+        for b in weight_large.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let mut y_large = vec![0.0f32; m_large];
+        gemv_q4_0_with_q8(
+            &weight_large,
+            &x_scales,
+            &x_quants,
+            &mut y_large,
+            m_large,
+            k,
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            gemv_q4_0_with_q8(
+                &weight_large,
+                &x_scales,
+                &x_quants,
+                &mut y_large,
+                m_large,
+                k,
+            );
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / 20.0;
+        let weight_bytes_large = m_large * row_bytes;
+        let bw_large = ((weight_bytes_large + input_bytes) as f64 / per_call) / 1e9;
+
+        eprintln!("\n=== GEMV Q4_0×Q8_0 large (m={m_large}, k={k}) ===");
+        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+        eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
+        eprintln!("  bandwidth: {:.1} GB/s", bw_large);
     }
 }
