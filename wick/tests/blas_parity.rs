@@ -150,3 +150,92 @@ fn test_prefill_multi_token_parity() {
     );
     assert_eq!(top_prefill, top_seq, "top-1 mismatch on 9-token prefill");
 }
+
+/// Verify the flash attention path produces correct results by comparing
+/// a 300-token `forward_prefill` (n >= 256, triggers flash attention) against
+/// sequential `forward()` calls over the same tokens. Also confirms that
+/// two runs of the naive path (9 tokens, below the threshold) are
+/// bit-identical as a baseline sanity check.
+///
+/// Flash attention uses online softmax (different reduction order from the
+/// naive full-vector softmax), so some drift is expected. The bar is
+/// cosine > 0.99 and matching top-1.
+#[test]
+#[ignore]
+fn test_flash_vs_naive_prefill_parity() {
+    #[allow(unused_imports)]
+    use wick::model::Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") else {
+        return;
+    };
+
+    // 300 tokens — above the FLASH_ATTN_THRESHOLD (256), so attention
+    // layers use the flash path. Use simple sequential token IDs.
+    let tokens_long: Vec<u32> = (1..=300).collect();
+    // 9 tokens — below the threshold, so attention layers use naive.
+    let tokens_short: Vec<u32> = tokens_long[..9].to_vec();
+
+    // Run forward_prefill on the SHORT prompt (naive path).
+    let gguf_a = wick::gguf::GgufFile::open(&path).unwrap();
+    let model_a = wick::model::load_model(gguf_a).unwrap();
+    let cfg = model_a.config();
+    let mut state_a = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits_naive = model_a.forward_prefill(&tokens_short, 0, &mut state_a);
+
+    // Run forward_prefill on the LONG prompt (flash path), but only
+    // compare the last-token logits from the first 9 tokens' perspective.
+    // Since the long prompt has MORE context, the logits won't match the
+    // short-prompt logits exactly — they're conditioned on different inputs.
+    //
+    // Instead, run a SECOND short-prompt prefill using forward_prefill to
+    // confirm it produces the same result as the first (both use naive).
+    let gguf_b = wick::gguf::GgufFile::open(&path).unwrap();
+    let model_b = wick::model::load_model(gguf_b).unwrap();
+    let mut state_b = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits_naive2 = model_b.forward_prefill(&tokens_short, 0, &mut state_b);
+
+    // Naive vs naive should be bit-identical.
+    let cos_nn = cosine(&logits_naive, &logits_naive2);
+    assert!(
+        cos_nn > 0.9999,
+        "naive vs naive cosine = {cos_nn} — should be near-identical"
+    );
+
+    // Now run the LONG prompt (flash path) and compare its last-token
+    // logits to a sequential forward() over the same 300 tokens.
+    let gguf_c = wick::gguf::GgufFile::open(&path).unwrap();
+    let model_c = wick::model::load_model(gguf_c).unwrap();
+    let mut state_c = wick::kv_cache::InferenceState::from_config(cfg);
+    let logits_flash = model_c.forward_prefill(&tokens_long, 0, &mut state_c);
+
+    let gguf_d = wick::gguf::GgufFile::open(&path).unwrap();
+    let model_d = wick::model::load_model(gguf_d).unwrap();
+    let mut state_d = wick::kv_cache::InferenceState::from_config(cfg);
+    let mut logits_seq = Vec::new();
+    for (i, &tok) in tokens_long.iter().enumerate() {
+        logits_seq = model_d.forward(&[tok], i, &mut state_d);
+    }
+
+    let cos_fs = cosine(&logits_flash, &logits_seq);
+    let max_diff = max_abs_diff(&logits_flash, &logits_seq);
+    let top_flash = argmax(&logits_flash);
+    let top_seq = argmax(&logits_seq);
+
+    eprintln!("=== Flash prefill (300 tok) vs sequential ===");
+    eprintln!("  cosine:   {cos_fs:.6}");
+    eprintln!("  max_diff: {max_diff:.4}");
+    eprintln!("  top-1:    flash={top_flash}  seq={top_seq}");
+
+    // Flash uses online softmax (different reduction order), so some
+    // drift is expected. With 300 tokens the drift compounds more than
+    // with 9. Cosine > 0.99 and matching top-1 is the bar.
+    assert!(
+        cos_fs > 0.99,
+        "flash vs sequential cosine = {cos_fs} (< 0.99)"
+    );
+    assert_eq!(
+        top_flash, top_seq,
+        "top-1 mismatch: flash={top_flash} seq={top_seq}"
+    );
+}

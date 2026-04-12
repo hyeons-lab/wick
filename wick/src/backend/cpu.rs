@@ -778,6 +778,347 @@ unsafe fn attn_values_neon(
     }
 }
 
+// ── Flash attention (tiled, online softmax) ────────────────────────────────
+
+const FLASH_TILE_KV: usize = 32;
+
+/// Tiled flash attention for one KV head group (GQA).
+///
+/// Processes `group_size` query heads against a single KV head's cache. For
+/// each query position, tiles over the KV cache with `FLASH_TILE_KV`-sized
+/// chunks, using online softmax (running max + sum) so the full score vector
+/// is never materialized.
+///
+/// **Layouts:**
+/// - `q_mat`: `[hs, n]` stride-n (the batched projection output). Q for head
+///   h, token j, dim d lives at `q_mat[(h * head_dim + d) * q_stride + j]`.
+///   Gathered into a local contiguous array per query.
+/// - `k_cache` / `v_cache`: `[total_seq, kv_dim]`, stride `kv_dim`. Position
+///   t, dim d of KV head kv_h is at `cache[t * kv_dim + kv_h_offset + d]`.
+/// - `out`: contiguous `[group_size, n_queries, head_dim]`. Element
+///   `out[(g * n_queries + j) * head_dim + d]` is dim d of query j, group
+///   member g. Caller is responsible for scatter-copying back to stride-n
+///   layout if needed.
+///
+/// **Causal masking:** query at position `start_pos + j` attends only to KV
+/// positions `0 .. start_pos + j` (inclusive). Tiles beyond the causal limit
+/// are skipped entirely; individual positions within a boundary tile are
+/// masked to `-INF` before the softmax update.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn flash_attention_gqa_cpu(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+) {
+    // NEON kernel requires head_dim to be a multiple of 4 and <= 128.
+    // Fall back to scalar for unsupported dimensions.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if head_dim % 4 == 0 && head_dim <= 128 {
+            unsafe {
+                flash_attention_gqa_neon(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                );
+            }
+            return;
+        }
+    }
+    flash_attention_gqa_scalar(
+        q_mat,
+        k_cache,
+        v_cache,
+        out,
+        n_heads_start,
+        group_size,
+        n_queries,
+        q_stride,
+        kv_dim,
+        kv_h_offset,
+        head_dim,
+        scale,
+        start_pos,
+    );
+}
+
+#[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
+fn flash_attention_gqa_scalar(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+) {
+    // Stack-allocated scratch to avoid heap alloc contention in parallel
+    // dispatch. 256 covers all known model head_dims (64, 128, 160, 256).
+    // The NEON kernel falls back to this scalar path for head_dim > 128.
+    assert!(
+        head_dim <= 256,
+        "flash_attention_gqa_scalar: head_dim {head_dim} > 256"
+    );
+    let mut q_buf = [0.0f32; 256];
+    let mut acc_buf = [0.0f32; 256];
+    let q_local = &mut q_buf[..head_dim];
+    let acc = &mut acc_buf[..head_dim];
+    let mut tile_scores = [0.0f32; FLASH_TILE_KV];
+
+    for g in 0..group_size {
+        let h = n_heads_start + g;
+        let h_off = h * head_dim;
+
+        for j in 0..n_queries {
+            let max_kv = start_pos + j + 1;
+
+            for d in 0..head_dim {
+                q_local[d] = q_mat[(h_off + d) * q_stride + j];
+            }
+
+            let mut running_max = f32::NEG_INFINITY;
+            let mut running_sum = 0.0f64;
+            acc.fill(0.0);
+
+            for kv_start in (0..max_kv).step_by(FLASH_TILE_KV) {
+                let kv_end = (kv_start + FLASH_TILE_KV).min(max_kv);
+                let tile_len = kv_end - kv_start;
+
+                for ti in 0..tile_len {
+                    let k_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_local[d] * k_cache[k_off + d];
+                    }
+                    tile_scores[ti] = dot * scale;
+                }
+
+                let tile_max = tile_scores[..tile_len]
+                    .iter()
+                    .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let new_max = running_max.max(tile_max);
+
+                let rescale = if running_max > f32::NEG_INFINITY {
+                    ggml_expf(running_max - new_max)
+                } else {
+                    0.0
+                };
+
+                let mut tile_sum = 0.0f64;
+                for ti in 0..tile_len {
+                    tile_scores[ti] = ggml_expf(tile_scores[ti] - new_max);
+                    tile_sum += tile_scores[ti] as f64;
+                }
+
+                for d in 0..head_dim {
+                    acc[d] *= rescale;
+                }
+                for ti in 0..tile_len {
+                    let s = tile_scores[ti];
+                    let v_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                    for d in 0..head_dim {
+                        acc[d] += s * v_cache[v_off + d];
+                    }
+                }
+
+                running_sum = running_sum * rescale as f64 + tile_sum;
+                running_max = new_max;
+            }
+
+            let inv_sum = (1.0 / running_sum) as f32;
+            let out_off = (g * n_queries + j) * head_dim;
+            for d in 0..head_dim {
+                out[out_off + d] = acc[d] * inv_sum;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_neon(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        debug_assert!(
+            q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries,
+            "q_mat too small for the given head range and q_stride"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || k_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "k_cache too small"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || v_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "v_cache too small"
+        );
+        debug_assert!(
+            out.len() >= group_size * n_queries * head_dim,
+            "out buffer too small for contiguous [group_size, n_queries, head_dim] output"
+        );
+
+        let q_ptr = q_mat.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let n_vecs = head_dim / 4;
+        debug_assert!(
+            head_dim % 4 == 0 && n_vecs <= 32,
+            "head_dim must be a multiple of 4 and <= 128"
+        );
+
+        const MAX_VECS: usize = 32;
+        let mut q_vecs = [vdupq_n_f32(0.0); MAX_VECS];
+        let mut acc_vecs = [vdupq_n_f32(0.0); MAX_VECS];
+        let mut tile_scores = [0.0f32; FLASH_TILE_KV];
+
+        for g in 0..group_size {
+            let h = n_heads_start + g;
+            let h_off = h * head_dim;
+
+            for j in 0..n_queries {
+                let max_kv = start_pos + j + 1;
+
+                // Gather Q[h, j] from stride-n layout into NEON registers
+                for i in 0..n_vecs {
+                    let d = i * 4;
+                    let q = [
+                        *q_ptr.add((h_off + d) * q_stride + j),
+                        *q_ptr.add((h_off + d + 1) * q_stride + j),
+                        *q_ptr.add((h_off + d + 2) * q_stride + j),
+                        *q_ptr.add((h_off + d + 3) * q_stride + j),
+                    ];
+                    q_vecs[i] = vld1q_f32(q.as_ptr());
+                }
+
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f64;
+                for i in 0..n_vecs {
+                    acc_vecs[i] = vdupq_n_f32(0.0);
+                }
+
+                for kv_start in (0..max_kv).step_by(FLASH_TILE_KV) {
+                    let kv_end = (kv_start + FLASH_TILE_KV).min(max_kv);
+                    let tile_len = kv_end - kv_start;
+
+                    // QK dot products for the tile
+                    for ti in 0..tile_len {
+                        let k_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                        let mut sum0 = vdupq_n_f32(0.0);
+                        let mut sum1 = vdupq_n_f32(0.0);
+                        let mut i = 0;
+                        while i + 2 <= n_vecs {
+                            let k0 = vld1q_f32(k_ptr.add(k_off + i * 4));
+                            let k1 = vld1q_f32(k_ptr.add(k_off + i * 4 + 4));
+                            sum0 = vfmaq_f32(sum0, q_vecs[i], k0);
+                            sum1 = vfmaq_f32(sum1, q_vecs[i + 1], k1);
+                            i += 2;
+                        }
+                        if i < n_vecs {
+                            let k0 = vld1q_f32(k_ptr.add(k_off + i * 4));
+                            sum0 = vfmaq_f32(sum0, q_vecs[i], k0);
+                        }
+                        tile_scores[ti] = vaddvq_f32(vaddq_f32(sum0, sum1)) * scale;
+                    }
+
+                    // Online softmax: tile max
+                    let mut tile_max = f32::NEG_INFINITY;
+                    for ti in 0..tile_len {
+                        if tile_scores[ti] > tile_max {
+                            tile_max = tile_scores[ti];
+                        }
+                    }
+                    let new_max = running_max.max(tile_max);
+
+                    let rescale = if running_max > f32::NEG_INFINITY {
+                        ggml_expf(running_max - new_max)
+                    } else {
+                        0.0
+                    };
+
+                    // Exp scores and sum
+                    let mut tile_sum = 0.0f64;
+                    for ti in 0..tile_len {
+                        tile_scores[ti] = ggml_expf(tile_scores[ti] - new_max);
+                        tile_sum += tile_scores[ti] as f64;
+                    }
+
+                    // Rescale accumulator
+                    let rescale_v = vdupq_n_f32(rescale);
+                    for i in 0..n_vecs {
+                        acc_vecs[i] = vmulq_f32(acc_vecs[i], rescale_v);
+                    }
+
+                    // Accumulate weighted V: acc += score * V
+                    for ti in 0..tile_len {
+                        let s = vdupq_n_f32(tile_scores[ti]);
+                        let v_base = (kv_start + ti) * kv_dim + kv_h_offset;
+                        for i in 0..n_vecs {
+                            let v = vld1q_f32(v_ptr.add(v_base + i * 4));
+                            acc_vecs[i] = vfmaq_f32(acc_vecs[i], s, v);
+                        }
+                    }
+
+                    running_sum = running_sum * rescale as f64 + tile_sum;
+                    running_max = new_max;
+                }
+
+                // Normalize and write contiguous output
+                let inv_sum = (1.0 / running_sum) as f32;
+                let inv_sum_v = vdupq_n_f32(inv_sum);
+                let out_off = (g * n_queries + j) * head_dim;
+                for i in 0..n_vecs {
+                    let result = vmulq_f32(acc_vecs[i], inv_sum_v);
+                    vst1q_f32(out_ptr.add(out_off + i * 4), result);
+                }
+            }
+        }
+    }
+}
+
 // ── TurboQuant NEON attention ───────────────────────────────────────────────
 
 /// NEON-optimized TurboQuant attention scores for one KV head, multiple query heads.
@@ -1519,5 +1860,140 @@ mod tests {
         let mut scores = vec![];
         attn_scores(&[0.0; 64], &[], &mut scores, 64, 0, 64, 0.125, 0);
         assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn test_flash_attention_matches_naive() {
+        // Compare flash attention output against the naive
+        // attn_scores + softmax_inplace + attn_values pipeline.
+        //
+        // Setup: 4 query heads, 2 KV heads (group_size=2), head_dim=64,
+        // 8 query tokens, start_pos=4 (so total seq_len up to 12).
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let group_size = n_heads / n_kv_heads;
+        let head_dim = 64;
+        let hs = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let n = 8;
+        let start_pos = 4;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let total_seq = start_pos + n; // 12
+
+        // Random Q in [hs, n] stride-n layout
+        let mut q_mat = vec![0.0f32; hs * n];
+        let mut seed: u64 = 0xCAFE_BABE;
+        for v in q_mat.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+
+        // Random K/V cache in [total_seq, kv_dim] layout
+        let mut k_cache = vec![0.0f32; total_seq * kv_dim];
+        for v in k_cache.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+        let mut v_cache = vec![0.0f32; total_seq * kv_dim];
+        for v in v_cache.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+
+        // ── Flash attention ────────────────────────────────────────
+        // Kernel writes contiguous [group_size, n, head_dim] per KV head.
+        // Scatter-copy back to [hs, n] stride-n for comparison with naive.
+        let chunk_size = group_size * n * head_dim;
+        let mut flash_raw = vec![0.0f32; n_kv_heads * chunk_size];
+        for kv_h in 0..n_kv_heads {
+            let chunk = &mut flash_raw[kv_h * chunk_size..(kv_h + 1) * chunk_size];
+            flash_attention_gqa_cpu(
+                &q_mat,
+                &k_cache,
+                &v_cache,
+                chunk,
+                kv_h * group_size,
+                group_size,
+                n,
+                n, // q_stride
+                kv_dim,
+                kv_h * head_dim,
+                head_dim,
+                scale,
+                start_pos,
+            );
+        }
+        let mut flash_out = vec![0.0f32; hs * n];
+        for kv_h in 0..n_kv_heads {
+            for g in 0..group_size {
+                let h = kv_h * group_size + g;
+                let src_base = kv_h * chunk_size + g * n * head_dim;
+                for j in 0..n {
+                    for d in 0..head_dim {
+                        flash_out[(h * head_dim + d) * n + j] =
+                            flash_raw[src_base + j * head_dim + d];
+                    }
+                }
+            }
+        }
+
+        // ── Naive reference ────────────────────────────────────────
+        let mut naive_out = vec![0.0f32; hs * n];
+        for j in 0..n {
+            let seq_len = start_pos + j + 1; // causal: attend to 0..seq_len
+            for h in 0..n_heads {
+                let kv_h = h / group_size;
+                let kv_h_offset = kv_h * head_dim;
+
+                // Gather Q[h, j] from stride-n layout
+                let mut q_head = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    q_head[d] = q_mat[(h * head_dim + d) * n + j];
+                }
+
+                // Scores
+                let mut scores = vec![0.0f32; seq_len];
+                attn_scores(
+                    &q_head,
+                    &k_cache,
+                    &mut scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+
+                // Softmax
+                softmax_inplace(&mut scores);
+
+                // Weighted values
+                let mut attn_out = vec![0.0f32; head_dim];
+                attn_values(
+                    &scores,
+                    &v_cache,
+                    &mut attn_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
+
+                // Scatter-write to stride-n output
+                for d in 0..head_dim {
+                    naive_out[(h * head_dim + d) * n + j] = attn_out[d];
+                }
+            }
+        }
+
+        // ── Compare ────────────────────────────────────────────────
+        let mut max_diff = 0.0f32;
+        for i in 0..hs * n {
+            max_diff = max_diff.max((flash_out[i] - naive_out[i]).abs());
+        }
+        assert!(
+            max_diff < 1e-4,
+            "flash vs naive max_diff = {max_diff} (expected < 1e-4)"
+        );
     }
 }
