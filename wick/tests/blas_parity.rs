@@ -77,13 +77,13 @@ fn run_parity(model_name: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usiz
     let path = find_model(model_name)?;
 
     let gguf_a = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_a = wick::model::load_model(gguf_a).unwrap();
+    let model_a = wick::model::load_model(gguf_a, 8192).unwrap();
     let cfg = model_a.config();
     let mut state_a = wick::kv_cache::InferenceState::from_config(cfg);
     let logits_prefill = model_a.forward_prefill(tokens, 0, &mut state_a);
 
     let gguf_b = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_b = wick::model::load_model(gguf_b).unwrap();
+    let model_b = wick::model::load_model(gguf_b, 8192).unwrap();
     let mut state_b = wick::kv_cache::InferenceState::from_config(cfg);
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
@@ -178,7 +178,7 @@ fn test_flash_vs_naive_prefill_parity() {
 
     // Run forward_prefill on the SHORT prompt (naive path).
     let gguf_a = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_a = wick::model::load_model(gguf_a).unwrap();
+    let model_a = wick::model::load_model(gguf_a, 8192).unwrap();
     let cfg = model_a.config();
     let mut state_a = wick::kv_cache::InferenceState::from_config(cfg);
     let logits_naive = model_a.forward_prefill(&tokens_short, 0, &mut state_a);
@@ -191,7 +191,7 @@ fn test_flash_vs_naive_prefill_parity() {
     // Instead, run a SECOND short-prompt prefill using forward_prefill to
     // confirm it produces the same result as the first (both use naive).
     let gguf_b = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_b = wick::model::load_model(gguf_b).unwrap();
+    let model_b = wick::model::load_model(gguf_b, 8192).unwrap();
     let mut state_b = wick::kv_cache::InferenceState::from_config(cfg);
     let logits_naive2 = model_b.forward_prefill(&tokens_short, 0, &mut state_b);
 
@@ -205,12 +205,12 @@ fn test_flash_vs_naive_prefill_parity() {
     // Now run the LONG prompt (flash path) and compare its last-token
     // logits to a sequential forward() over the same 300 tokens.
     let gguf_c = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_c = wick::model::load_model(gguf_c).unwrap();
+    let model_c = wick::model::load_model(gguf_c, 8192).unwrap();
     let mut state_c = wick::kv_cache::InferenceState::from_config(cfg);
     let logits_flash = model_c.forward_prefill(&tokens_long, 0, &mut state_c);
 
     let gguf_d = wick::gguf::GgufFile::open(&path).unwrap();
-    let model_d = wick::model::load_model(gguf_d).unwrap();
+    let model_d = wick::model::load_model(gguf_d, 8192).unwrap();
     let mut state_d = wick::kv_cache::InferenceState::from_config(cfg);
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens_long.iter().enumerate() {

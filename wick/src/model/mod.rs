@@ -143,13 +143,17 @@ pub trait Model: Send {
 }
 
 /// Load a model from a GGUF file, dispatching on the architecture.
-pub fn load_model(gguf: GgufFile) -> Result<Box<dyn Model>> {
+///
+/// `context_size` caps the model's `max_seq_len` and determines KV cache
+/// pre-allocation in `InferenceState::from_config_with_compression`. Smaller
+/// values reduce startup memory; larger values allow longer prompts/decodes.
+pub fn load_model(gguf: GgufFile, context_size: usize) -> Result<Box<dyn Model>> {
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf(gguf)?)),
+        "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf(gguf, context_size)?)),
         other => bail!("unsupported architecture: {other}"),
     }
 }

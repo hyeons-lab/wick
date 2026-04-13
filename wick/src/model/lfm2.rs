@@ -1,6 +1,6 @@
 // LFM2 / LFM2.5 hybrid conv+attention model.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
@@ -62,7 +62,8 @@ pub struct Lfm2Model {
 }
 
 impl Lfm2Model {
-    pub fn from_gguf(gguf: GgufFile) -> Result<Self> {
+    pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
+        ensure!(context_size > 0, "context_size must be > 0");
         let prefix = "lfm2";
 
         let n_layers = gguf
@@ -80,9 +81,14 @@ impl Lfm2Model {
         let vocab_size = gguf
             .get_u32(&format!("{prefix}.vocab_size"))
             .context("missing lfm2.vocab_size")? as usize;
-        let max_seq_len = gguf
+        // Cap the model's max_seq_len by the user's requested context_size so
+        // KV cache pre-allocation in `InferenceState::from_config_with_compression`
+        // matches the actual budget. Mirrors the pattern used by metal_lfm2 and
+        // gpu_lfm2.
+        let gguf_max_seq_len = gguf
             .get_u32(&format!("{prefix}.context_length"))
             .unwrap_or(128000) as usize;
+        let max_seq_len = context_size.min(gguf_max_seq_len);
         let rope_theta = gguf
             .get_f32(&format!("{prefix}.rope.freq_base"))
             .unwrap_or(1_000_000.0);

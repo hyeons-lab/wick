@@ -198,7 +198,7 @@ impl MetalLfm2Model {
     pub fn from_gguf(gguf: GgufFile, path: &std::path::Path, context_size: usize) -> Result<Self> {
         let ctx = MetalContext::new()?;
         let data_offset = gguf.data_offset();
-        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf)?;
+        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
         let mut config = cpu_model.config().clone();
         // Clamp context to user request and model limit. Classic attention
         // handles up to 4096 (TG memory); beyond that, auto-switches to flash.
