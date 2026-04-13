@@ -26,4 +26,15 @@ Investigate and close the 2.4× CPU decode gap vs llama.cpp (59.5 vs 143 tok/s).
 ## Next Steps
 - Profile `run_layers` with fine-grained per-operation timing to identify the biggest overhead contributors
 - Consider operator-level optimizations: fuse gate+up GEMVs, reduce buffer copies, restructure dispatch
-- On newer hardware (M3+/M4 with FEAT_I8MM), vmmlaq_s32 2-row kernel would give ~2× per-core improvement
+
+## Future: I8MM GEMV kernel (M3+/M4)
+
+Apple M3 and later (and some M2 variants) support ARM FEAT_I8MM, which provides the `vmmlaq_s32` instruction — a 2×2 tile of 8-element int8 dot products in a single cycle. This is exactly what llama.cpp's `nrc=2` code path uses (quants.c:158-228).
+
+**Design**: process 2 output rows per iteration. Load Q4_0 blocks from both rows, decode nibbles, interleave via `vzip1q_s64` / `vzip2q_s64` into the 2×8 tile format vmmlaq expects. The input vector is duplicated across the tile's 2 columns. Four `vmmlaq_s32` calls per block produce partial sums for both rows simultaneously.
+
+**Expected gain**: ~2× per-core GEMV bandwidth (same weight bytes loaded, 2× the useful output). Combined with rayon threading: 66 → ~130 tok/s on I8MM hardware, matching llama.cpp.
+
+**Implementation**: new `gemv_q4_0_q8_0_i8mm` kernel in simd.rs gated on `#[target_feature(enable = "i8mm")]`. Runtime dispatch: check `FEAT_I8MM` via sysctl at startup, select kernel variant. Fallback to existing vdotq kernel on M1/M2.
+
+**Blocked on**: access to M3+ hardware for testing and benchmarking. The kernel can be written and tested for correctness on M1 (compile with target feature, test output parity) but perf measurement requires actual I8MM hardware.
