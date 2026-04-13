@@ -26,13 +26,24 @@ pub fn configure_thread_pool() -> usize {
     }
 
     let n = performance_core_count().unwrap_or(0);
-    if n > 0 {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global();
-        n
-    } else {
-        rayon::current_num_threads()
+    if n == 0 {
+        return rayon::current_num_threads();
+    }
+
+    // build_global() can only succeed once per process. If rayon's global
+    // pool was already initialized (e.g. by another caller, a test harness,
+    // or a dependency), we can't apply the P-core limit here — surface that
+    // by warning and returning the actual current thread count so callers
+    // don't get a misleading value.
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+    {
+        Ok(()) => n,
+        Err(err) => {
+            tracing::warn!("failed to configure rayon global thread pool to {n} threads: {err}");
+            rayon::current_num_threads()
+        }
     }
 }
 
@@ -2079,67 +2090,67 @@ mod tests {
     fn microbench_gemv_q4_0() {
         use std::time::Instant;
 
-        let m = 6912; // FFN gate rows
-        let k = 2048; // hidden_size
-        let iters = 200;
+        // Build a *local* rayon pool sized to P-cores. Using `build_global`
+        // here would silently fail because cargo's test harness initializes
+        // rayon early — `pool.install` instead applies the P-core limit only
+        // for the closure body via rayon's thread-local current-pool.
+        let n_threads = performance_core_count().unwrap_or(8);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
+            .expect("local pool build");
 
-        // Random Q4_0 weight
-        let blocks_per_row = k / 32;
-        let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ4_0>();
-        let mut weight = vec![0u8; m * row_bytes];
-        let mut s: u64 = 0xdead_beef;
-        for b in weight.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (s >> 33) as u8;
-        }
+        pool.install(|| {
+            let m = 6912; // FFN gate rows
+            let k = 2048; // hidden_size
+            let iters = 200;
 
-        // Random input, pre-quantized to Q8_0
-        let x: Vec<f32> = (0..k)
-            .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
-            .collect();
-        let (x_scales, x_quants) = quantize_f32_to_q8_0(&x);
-        let mut y = vec![0.0f32; m];
+            // Random Q4_0 weight
+            let blocks_per_row = k / 32;
+            let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ4_0>();
+            let mut weight = vec![0u8; m * row_bytes];
+            let mut s: u64 = 0xdead_beef;
+            for b in weight.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (s >> 33) as u8;
+            }
 
-        // Warmup
-        gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
+            // Random input, pre-quantized to Q8_0
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
+                .collect();
+            let (x_scales, x_quants) = quantize_f32_to_q8_0(&x);
+            let mut y = vec![0.0f32; m];
 
-        let t0 = Instant::now();
-        for _ in 0..iters {
+            // Warmup
             gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
-        }
-        let elapsed = t0.elapsed().as_secs_f64();
-        let per_call = elapsed / iters as f64;
 
-        let weight_bytes = m * row_bytes;
-        let input_bytes = x_scales.len() * 4 + x_quants.len();
-        let total_bytes = weight_bytes + input_bytes;
-        let bw_gbps = (total_bytes as f64 / per_call) / 1e9;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            let per_call = elapsed / iters as f64;
 
-        eprintln!("\n=== GEMV Q4_0×Q8_0 microbench (m={m}, k={k}) ===");
-        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
-        eprintln!("  weight:   {:.2} MB", weight_bytes as f64 / 1e6);
-        eprintln!("  bandwidth: {:.1} GB/s", bw_gbps);
-        eprintln!("  rayon threads: {}", rayon::current_num_threads());
+            let weight_bytes = m * row_bytes;
+            let input_bytes = x_scales.len() * 4 + x_quants.len();
+            let total_bytes = weight_bytes + input_bytes;
+            let bw_gbps = (total_bytes as f64 / per_call) / 1e9;
 
-        // Also measure a large GEMV (output projection shape)
-        let m_large = 65536;
-        let mut weight_large = vec![0u8; m_large * row_bytes];
-        for b in weight_large.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (s >> 33) as u8;
-        }
-        let mut y_large = vec![0.0f32; m_large];
-        gemv_q4_0_with_q8(
-            &weight_large,
-            &x_scales,
-            &x_quants,
-            &mut y_large,
-            m_large,
-            k,
-        );
+            eprintln!("\n=== GEMV Q4_0×Q8_0 microbench (m={m}, k={k}) ===");
+            eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+            eprintln!("  weight:   {:.2} MB", weight_bytes as f64 / 1e6);
+            eprintln!("  bandwidth: {:.1} GB/s", bw_gbps);
+            eprintln!("  rayon threads: {n_threads} (local pool, P-cores)");
 
-        let t0 = Instant::now();
-        for _ in 0..20 {
+            // Also measure a large GEMV (output projection shape)
+            let m_large = 65536;
+            let mut weight_large = vec![0u8; m_large * row_bytes];
+            for b in weight_large.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (s >> 33) as u8;
+            }
+            let mut y_large = vec![0.0f32; m_large];
             gemv_q4_0_with_q8(
                 &weight_large,
                 &x_scales,
@@ -2148,15 +2159,27 @@ mod tests {
                 m_large,
                 k,
             );
-        }
-        let elapsed = t0.elapsed().as_secs_f64();
-        let per_call = elapsed / 20.0;
-        let weight_bytes_large = m_large * row_bytes;
-        let bw_large = ((weight_bytes_large + input_bytes) as f64 / per_call) / 1e9;
 
-        eprintln!("\n=== GEMV Q4_0×Q8_0 large (m={m_large}, k={k}) ===");
-        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
-        eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
-        eprintln!("  bandwidth: {:.1} GB/s", bw_large);
+            let t0 = Instant::now();
+            for _ in 0..20 {
+                gemv_q4_0_with_q8(
+                    &weight_large,
+                    &x_scales,
+                    &x_quants,
+                    &mut y_large,
+                    m_large,
+                    k,
+                );
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            let per_call = elapsed / 20.0;
+            let weight_bytes_large = m_large * row_bytes;
+            let bw_large = ((weight_bytes_large + input_bytes) as f64 / per_call) / 1e9;
+
+            eprintln!("\n=== GEMV Q4_0×Q8_0 large (m={m_large}, k={k}) ===");
+            eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+            eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
+            eprintln!("  bandwidth: {:.1} GB/s", bw_large);
+        });
     }
 }
