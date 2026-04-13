@@ -33,7 +33,7 @@ fn llm_layer0_conv_standalone() {
     }
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-    let model = Lfm2Model::from_gguf(gguf).unwrap();
+    let model = Lfm2Model::from_gguf(gguf, 8192).unwrap();
     let cfg = model.config();
     let hs = cfg.hidden_size;
 

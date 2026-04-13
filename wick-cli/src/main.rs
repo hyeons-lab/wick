@@ -185,17 +185,14 @@ fn load_model_for_device(
         "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
         "cpu" => {
             eprintln!("Using CPU backend");
-            wick::model::load_model(open()?)
+            wick::model::load_model(open()?, context_size)
         }
         _ => load_model_auto(path, context_size),
     }
 }
 
 /// Auto device selection: metal > wgpu > cpu, with runtime fallback.
-fn load_model_auto(
-    path: &Path,
-    #[allow(unused)] context_size: usize,
-) -> Result<Box<dyn wick::model::Model>> {
+fn load_model_auto(path: &Path, context_size: usize) -> Result<Box<dyn wick::model::Model>> {
     let open = || wick::gguf::GgufFile::open(path);
 
     // Try Metal first (macOS/iOS only).
@@ -224,7 +221,7 @@ fn load_model_auto(
 
     // CPU fallback — always available.
     eprintln!("Using CPU backend (auto)");
-    wick::model::load_model(open()?)
+    wick::model::load_model(open()?, context_size)
 }
 
 /// (p10, p50, p90, mean, stddev)

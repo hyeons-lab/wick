@@ -132,8 +132,10 @@ impl GpuLfm2Model {
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
         let ctx = GpuContext::new()?;
 
-        // Parse config (same as CPU Lfm2Model)
-        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf)?;
+        // Parse config (same as CPU Lfm2Model). The CPU loader already caps
+        // max_seq_len to context_size internally, so the second .min() below
+        // is redundant but kept for clarity.
+        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
         let mut config = cpu_model.config().clone();
         let max_seq_len = context_size.min(config.max_seq_len);
         config.max_seq_len = max_seq_len;
