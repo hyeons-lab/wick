@@ -58,4 +58,5 @@ Skipped:
 
 - 5aae066 — perf(kv-cache): pre-allocate f32 KV vecs via context_size loader API
 - d8b6fb4 — devlog: record commit hash for kv-ring
-- HEAD — fix(kv-cache): validate context_size, checked_mul KV capacity, preallocate compressed caches
+- a34e601 — fix(kv-cache): validate context_size, checked_mul KV capacity, preallocate compressed caches
+- HEAD — devlog: record review-fix commit hash
