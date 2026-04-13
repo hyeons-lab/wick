@@ -42,7 +42,20 @@ Eliminate Vec-doubling reallocations in the CPU KV cache by plumbing `context_si
 
 The 13% decode improvement is the headline. With ~13 Vec doublings during a long decode and several MB per memcpy each time, that overhead dominated the steady-state decode loop more than expected. The 26 MB RSS drop is the doubled-capacity slack going away.
 
+## PR review fixes (2026-04-13T13:48-0700)
+
+Address Copilot + Junie review on PR #16:
+
+- `wick/src/model/lfm2.rs` — reject `context_size == 0` early via `ensure!`. A zero-context loader would silently produce a model that hits the `pos >= max_seq_len` guard on the first token; better to bail at load time with a clear message.
+- `wick/src/kv_cache.rs` — compute `kv_capacity = max_seq_len.checked_mul(kv_dim)` once and `expect()` on overflow, instead of unchecked `*`. Wrapping in release would silently produce a too-small capacity and reintroduce the very reallocations this PR removes.
+- `wick/src/kv_cache.rs` — also use `config.max_seq_len` as the `initial_capacity` for `CompressedKeyCache::new` / `CompressedValueCache::new` (was hardcoded `2048`). Per Junie's review: the compressed path should benefit from the same no-realloc preallocation as f32.
+
+Skipped:
+- "Breaking API change" Copilot note — wick is not a published library yet, no downstream consumers; the API churn is internal.
+- "Pre-allocate `state.scratch.scores`" Junie note — `scores` is sized per-call inside the attention loops; needs separate investigation, out of scope here.
+
 ## Commits
 
 - 5aae066 — perf(kv-cache): pre-allocate f32 KV vecs via context_size loader API
-- HEAD — devlog: record commit hash
+- d8b6fb4 — devlog: record commit hash for kv-ring
+- HEAD — fix(kv-cache): validate context_size, checked_mul KV capacity, preallocate compressed caches

@@ -2,7 +2,7 @@
 //
 // Reference: Liquid4All/llama.cpp branch dberrios/updateLlama, src/models/lfm2.cpp
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
@@ -65,6 +65,7 @@ pub struct Lfm2Model {
 
 impl Lfm2Model {
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
+        ensure!(context_size > 0, "context_size must be > 0");
         let prefix = "lfm2";
 
         let n_layers = gguf

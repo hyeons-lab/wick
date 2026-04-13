@@ -187,7 +187,9 @@ impl InferenceState {
         let head_dim = config.hidden_size / config.n_heads;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
 
-        let initial_capacity = 2048; // Pre-allocate for typical context
+        // Compressed (TurboQuant) caches start at the same per-layer cap as the
+        // f32 path, so the compressed-side Vecs also avoid mid-decode reallocs.
+        let initial_capacity = config.max_seq_len;
         let (compress_keys, compress_values) = compression.flags();
 
         // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
@@ -227,6 +229,14 @@ impl InferenceState {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[layer_idx];
                     let kv_dim = n_kv_heads * head_dim;
+                    // Use checked_mul so a config bug (e.g. wildly large
+                    // max_seq_len from a malformed GGUF) surfaces as a
+                    // clean panic instead of a wrapped capacity that
+                    // silently reintroduces reallocs.
+                    let kv_capacity = config
+                        .max_seq_len
+                        .checked_mul(kv_dim)
+                        .expect("KV cache capacity overflow: max_seq_len * kv_dim");
                     let compressed_keys = if compress_keys && n_kv_heads > 0 {
                         Some(CompressedKeyCache::new(
                             n_kv_heads,
@@ -253,12 +263,12 @@ impl InferenceState {
                     let key_cache = if compress_keys && n_kv_heads > 0 {
                         Vec::new()
                     } else {
-                        Vec::with_capacity(config.max_seq_len * kv_dim)
+                        Vec::with_capacity(kv_capacity)
                     };
                     let value_cache = if compress_values && n_kv_heads > 0 {
                         Vec::new()
                     } else {
-                        Vec::with_capacity(config.max_seq_len * kv_dim)
+                        Vec::with_capacity(kv_capacity)
                     };
                     LayerState::Attention {
                         key_cache,
