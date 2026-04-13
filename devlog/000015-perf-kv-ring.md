@@ -44,4 +44,5 @@ The 13% decode improvement is the headline. With ~13 Vec doublings during a long
 
 ## Commits
 
-- HEAD — perf(kv-cache): pre-allocate f32 KV vecs via context_size loader API
+- 5aae066 — perf(kv-cache): pre-allocate f32 KV vecs via context_size loader API
+- HEAD — devlog: record commit hash
