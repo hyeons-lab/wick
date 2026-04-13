@@ -226,6 +226,7 @@ impl InferenceState {
             .map(|(layer_idx, bt)| match bt {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[layer_idx];
+                    let kv_dim = n_kv_heads * head_dim;
                     let compressed_keys = if compress_keys && n_kv_heads > 0 {
                         Some(CompressedKeyCache::new(
                             n_kv_heads,
@@ -244,9 +245,24 @@ impl InferenceState {
                     } else {
                         None
                     };
+                    // Pre-allocate the f32 KV cache to exactly
+                    // `max_seq_len * kv_dim` floats so writes never trigger
+                    // Vec doubling/reallocation. When TurboQuant compression
+                    // is active for that side, the f32 vec stays empty and
+                    // the compressed cache (above) does the storage.
+                    let key_cache = if compress_keys && n_kv_heads > 0 {
+                        Vec::new()
+                    } else {
+                        Vec::with_capacity(config.max_seq_len * kv_dim)
+                    };
+                    let value_cache = if compress_values && n_kv_heads > 0 {
+                        Vec::new()
+                    } else {
+                        Vec::with_capacity(config.max_seq_len * kv_dim)
+                    };
                     LayerState::Attention {
-                        key_cache: Vec::new(),
-                        value_cache: Vec::new(),
+                        key_cache,
+                        value_cache,
                         compressed_keys,
                         compressed_values,
                     }

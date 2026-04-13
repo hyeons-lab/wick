@@ -682,7 +682,7 @@ fn test_q8_0_gemv_parity() {
 
     // Also run on CPU for reference.
     let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
-    let cpu_model = wick::model::load_model(gguf2).unwrap();
+    let cpu_model = wick::model::load_model(gguf2, 8192).unwrap();
     let mut state_cpu = wick::kv_cache::InferenceState::from_config(cpu_model.config());
     let logits_cpu = cpu_model.forward(&[1], 0, &mut state_cpu);
 
@@ -746,7 +746,7 @@ fn test_q8_0_prefill_parity() {
 
     // CPU reference
     let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
-    let cpu_model = wick::model::load_model(gguf2).unwrap();
+    let cpu_model = wick::model::load_model(gguf2, 8192).unwrap();
     let mut state_cpu = wick::kv_cache::InferenceState::from_config(cpu_model.config());
     let logits_cpu = cpu_model.forward_prefill(&tokens, 0, &mut state_cpu);
 

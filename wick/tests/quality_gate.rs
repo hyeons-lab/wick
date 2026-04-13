@@ -89,7 +89,7 @@ fn test_kv_compression_quality_gate() {
     // One model instance is enough — TurboQuant state now lives entirely on
     // the InferenceState, so the same model can be reused across modes.
     let gguf = GgufFile::open(&model_path).expect("open gguf");
-    let model = Lfm2Model::from_gguf(gguf).expect("load model");
+    let model = Lfm2Model::from_gguf(gguf, 8192).expect("load model");
     assert!(model.turboquant_supported(), "TurboQuant not supported");
 
     // Deterministic prompt.
