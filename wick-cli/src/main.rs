@@ -312,6 +312,9 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Configure rayon to use P-cores only on Apple Silicon.
+    wick::backend::cpu::configure_thread_pool();
+
     let cli = Cli::parse();
 
     match cli.command {
