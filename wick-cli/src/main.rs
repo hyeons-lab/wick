@@ -129,6 +129,10 @@ enum Command {
         #[arg(short, long, default_value = "The capital of France is")]
         prompt: String,
 
+        /// Number of tokens to use for the prompt (ignores --prompt if set).
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+
         /// Number of measured runs.
         #[arg(long, default_value_t = 20)]
         runs: usize,
@@ -562,6 +566,7 @@ fn main() -> Result<()> {
         Command::Bench {
             model,
             prompt,
+            prompt_tokens,
             runs,
             warmup,
             max_tokens,
@@ -595,12 +600,17 @@ fn main() -> Result<()> {
             }
 
             let mut tokens = Vec::new();
-            if add_bos {
-                if let Some(bos) = tokenizer.bos_token() {
-                    tokens.push(bos);
+            if let Some(n) = prompt_tokens {
+                // Generate N unique tokens (avoiding 0/EOS/BOS range).
+                tokens = (0..n as u32).map(|i| (i % 1000) + 100).collect();
+            } else {
+                if add_bos {
+                    if let Some(bos) = tokenizer.bos_token() {
+                        tokens.push(bos);
+                    }
                 }
+                tokens.extend_from_slice(&tokenizer.encode(&prompt));
             }
-            tokens.extend_from_slice(&tokenizer.encode(&prompt));
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",

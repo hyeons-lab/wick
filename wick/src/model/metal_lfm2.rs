@@ -65,6 +65,9 @@ struct MetalPipelines {
     gemv_q4_0_fast_accum: ComputePipelineState,
     gemv_q4_0_fast_slim: ComputePipelineState,
     gemv_q4_0_fast_slim_accum: ComputePipelineState,
+    gemv_q4_0_fast_splitk: ComputePipelineState,
+    gemv_q4_0_splitk_merge: ComputePipelineState,
+    gemv_q4_0_splitk_merge_accum: ComputePipelineState,
     #[allow(dead_code)]
     gemv_q4_0_gate_up: ComputePipelineState,
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
@@ -83,10 +86,13 @@ struct MetalPipelines {
     mul_out: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
     rmsnorm: ComputePipelineState,
+    #[allow(dead_code)]
     per_head_rmsnorm: ComputePipelineState,
     #[allow(dead_code)]
     softmax: ComputePipelineState,
+    #[allow(dead_code)]
     rope: ComputePipelineState,
+    #[allow(dead_code)]
     qk_norm_rope: ComputePipelineState,
     attention: ComputePipelineState,
     flash_attention: ComputePipelineState,
@@ -98,6 +104,7 @@ struct MetalPipelines {
     gemv_q4_0_batch: ComputePipelineState,
     rmsnorm_batch: ComputePipelineState,
     add_rmsnorm_batch: ComputePipelineState,
+    #[allow(dead_code)]
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
@@ -121,6 +128,7 @@ struct ParamsBufs {
     /// [hs, eps_bits, 0, 0] — rmsnorm over full hidden state.
     rmsnorm_hs: Buffer,
     /// [head_dim, eps_bits, 0, 0] — per-head rmsnorm for Q/K.
+    #[allow(dead_code)]
     per_head_rmsnorm: Buffer,
     /// [hs, 0] — elementwise ops on hidden state.
     elementwise_hs: Buffer,
@@ -159,6 +167,8 @@ pub struct MetalLfm2Model {
     splitk_partials_out: Buffer,
     splitk_partials_max: Buffer,
     splitk_partials_sum: Buffer,
+    // Split-K GEMV scratch (sized for max n_splits = 8, max m = 65536).
+    gemv_splitk_partials: Buffer,
     logits_buf: Buffer,
     argmax_token_buf: Buffer,
     argmax_params_buf: Buffer,
@@ -182,6 +192,7 @@ pub struct MetalLfm2Model {
     /// newBufferWithBytesNoCopy. All weights reference this buffer
     /// via byte offsets instead of having their own copied buffers.
     mmap_buf: Buffer,
+    #[allow(dead_code)]
     mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
@@ -229,6 +240,12 @@ impl MetalLfm2Model {
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim")?,
             gemv_q4_0_fast_slim_accum: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_accum")?,
+            gemv_q4_0_fast_splitk: ctx
+                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_splitk")?,
+            gemv_q4_0_splitk_merge: ctx
+                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_splitk_merge")?,
+            gemv_q4_0_splitk_merge_accum: ctx
+                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_splitk_merge_accum")?,
             gemv_q4_0_gate_up: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_gate_up")?,
             gemv_q4_0_fast_slim_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
@@ -448,6 +465,7 @@ impl MetalLfm2Model {
             splitk_partials_out: make_buf(config.n_heads * 8 * (hs / config.n_heads)),
             splitk_partials_max: make_buf(config.n_heads * 8),
             splitk_partials_sum: make_buf(config.n_heads * 8),
+            gemv_splitk_partials: make_buf(65536 * 8),
             logits_buf: make_buf(config.vocab_size),
             argmax_token_buf: ctx.create_buffer(4),
             argmax_params_buf: ctx.upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32])),
@@ -618,6 +636,7 @@ impl MetalLfm2Model {
     }
 
     /// Q4_0 GEMV: y += W × x with input byte offset.
+    #[allow(dead_code)]
     fn encode_gemv_weight_accumulate_from(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -631,6 +650,7 @@ impl MetalLfm2Model {
 
     /// Q4_0 GEMV: output[output_off] += W × input[input_off].
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_gemv_weight_accumulate_offsets(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -811,7 +831,7 @@ impl MetalLfm2Model {
             }
             // Per-token GEMV fallback for other dtypes.
             let b4 = |off: usize| (off * 4) as u64;
-            let m = w.m as usize;
+            let _m = w.m as usize;
             for i in 0..n as usize {
                 if accumulate {
                     self.encode_gemv_impl(
@@ -953,6 +973,7 @@ impl MetalLfm2Model {
 
     /// Fused gate+up GEMV with byte offsets for input and both outputs.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_gemv_gate_up_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1016,6 +1037,45 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
+    fn encode_gemv_splitk_q4_0(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        input: &Buffer,
+        input_off_bytes: u64,
+        output: &Buffer,
+        output_off_bytes: u64,
+        accumulate: bool,
+        n_splits: u32,
+    ) {
+        let grid = MTLSize::new(
+            (w.m as u64 + 7) / 8, // ROWS_PER_TG = 8
+            n_splits as u64,
+            1,
+        );
+        let split_params = [w.m, w.k, n_splits];
+
+        // Phase A: Partial GEMV
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_splitk);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(input), input_off_bytes);
+        enc.set_buffer(2, Some(&self.gemv_splitk_partials), 0);
+        enc.set_bytes(3, 12, split_params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(grid, sz1d(64));
+
+        // Phase B: Merge
+        let merge_pipeline = if accumulate {
+            &self.pipelines.gemv_q4_0_splitk_merge_accum
+        } else {
+            &self.pipelines.gemv_q4_0_splitk_merge
+        };
+        enc.set_compute_pipeline_state(merge_pipeline);
+        enc.set_buffer(0, Some(&self.gemv_splitk_partials), 0);
+        enc.set_buffer(1, Some(output), output_off_bytes);
+        enc.set_bytes(2, 12, split_params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(w.m as u64, 1, 1), sz1d(32));
+    }
+
     fn encode_gemv_impl(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1028,6 +1088,20 @@ impl MetalLfm2Model {
     ) {
         let (pipeline, groups, tpt) = match w.dtype {
             DType::Q4_0 => {
+                if w.m <= 1024 && w.k >= 2048 {
+                    // Small m, large k: use Split-K to increase occupancy.
+                    // Especially important for ffn-down (1024x2048).
+                    return self.encode_gemv_splitk_q4_0(
+                        enc,
+                        w,
+                        input,
+                        input_off_bytes,
+                        output,
+                        output_off_bytes,
+                        accumulate,
+                        4, // n_splits
+                    );
+                }
                 // Three Q4_0 GEMV kernels with different row-tile / thread configs:
                 //  - "slim": 2 rows/TG, 32 threads — best at m ≤ 4096 (matches the
                 //    classic TG count but uses the llama.cpp-style inner loop with
@@ -1232,6 +1306,7 @@ impl MetalLfm2Model {
 
     /// RMSnorm with explicit byte offsets into src and dst buffers.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_rmsnorm_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1249,6 +1324,7 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(sz1d(1), sz1d(256));
     }
 
+    #[allow(dead_code)]
     fn encode_per_head_rmsnorm(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1349,6 +1425,7 @@ impl MetalLfm2Model {
 
     /// Fused per-head RMSnorm + RoPE with explicit Q and K byte offsets.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_qk_norm_rope_offsets(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1388,6 +1465,7 @@ impl MetalLfm2Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_rope(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1445,6 +1523,7 @@ impl MetalLfm2Model {
 
     /// Out-of-place elementwise multiply with destination offset: dst[dst_off] = a[a_off] * b[b_off].
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_mul_out_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1481,6 +1560,7 @@ impl MetalLfm2Model {
 
     /// Elementwise op with byte offsets into a and b buffers.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_elementwise_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1613,6 +1693,7 @@ impl MetalLfm2Model {
 
     /// Attention with Q/out offsets for batched prefill.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_attention_q_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1684,6 +1765,7 @@ impl MetalLfm2Model {
     /// Fused: bx = x * b → conv1d(bx, state) → output = c * conv_out.
     /// Combines 3 dispatches into 1.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn encode_conv1d_fused(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1993,7 +2075,7 @@ impl Model for MetalLfm2Model {
 
     fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
         use crate::kv_cache::LayerSnapshot;
-        let cfg = &self.config;
+        let _cfg = &self.config;
         for (i, layer_snap) in snapshot.layers.iter().enumerate() {
             match layer_snap {
                 LayerSnapshot::Attention { k_data, v_data } => {
@@ -2601,7 +2683,7 @@ impl MetalLfm2Model {
         let hs = cfg.hidden_size;
         let n = tokens.len();
         let is = cfg.intermediate_size;
-        let b4 = |off: usize| (off * 4) as u64;
+        let _b4 = |off: usize| (off * 4) as u64;
         let batch_buf = &self.prefill_batch_buf;
 
         // Stage all N embedding rows directly into batch_buf's mapped memory.

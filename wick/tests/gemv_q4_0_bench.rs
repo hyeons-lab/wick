@@ -183,7 +183,7 @@ fn bench_wgpu(
 
     // Timed batch — submit all iters, then a single readback to drain.
     let start = std::time::Instant::now();
-    for _ in 0..iters {
+    for _i in 0..iters {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
@@ -218,6 +218,9 @@ fn bench_metal(
 
     // Switch via env: WICK_Q4_FAST=1 to bench the fast variant.
     let mode = std::env::var("WICK_Q4_FAST").unwrap_or_default();
+    if mode == "splitk" {
+        return bench_metal_splitk(ctx, &a_buf, &x_buf, shape, iters, expected);
+    }
     let (pipeline, groups, threads) = if mode == "slim" {
         (
             ctx.create_pipeline(
@@ -284,7 +287,7 @@ fn bench_metal(
     // Timed batch — queue all commands, wait on the last one.
     let start = std::time::Instant::now();
     let mut last = None;
-    for i in 0..iters {
+    for _i in 0..iters {
         let cb = ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -366,4 +369,88 @@ fn bench_q4_0_gemv_wgsl_vs_msl() {
     for s in &shapes {
         bench_shape(s, 200);
     }
+}
+
+fn bench_metal_splitk(
+    ctx: &MetalContext,
+    a_buf: &metal::Buffer,
+    x_buf: &metal::Buffer,
+    shape: &Shape,
+    iters: u32,
+    expected: &[f32],
+) -> f64 {
+    use metal::MTLSize;
+    let n_splits = 4u32;
+    let y_partial = ctx.create_buffer((shape.m as u64) * (n_splits as u64) * 4);
+    let y_final = ctx.create_buffer((shape.m as u64) * 4);
+    
+    // SplitKParams struct layout: { uint m; uint k; uint n_splits; }
+    let params = [shape.m, shape.k, n_splits];
+    
+    let pipe_split = ctx.create_pipeline(
+        wick::backend::metal::shaders::GEMV_Q4_0_FAST,
+        "gemv_q4_0_fast_splitk",
+    ).expect("MSL compile splitk");
+    
+    let pipe_merge = ctx.create_pipeline(
+        wick::backend::metal::shaders::GEMV_Q4_0_FAST,
+        "gemv_q4_0_splitk_merge",
+    ).expect("MSL compile merge");
+
+    let rows_per_split = (shape.m + 7) / 8;
+    let grid_split = MTLSize::new((rows_per_split * n_splits) as u64, 1, 1);
+    let threads_split = MTLSize::new(64, 1, 1);
+    let grid_merge = MTLSize::new(shape.m as u64, 1, 1);
+    let threads_merge = MTLSize::new(32, 1, 1);
+
+    let dispatch = || {
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        
+        // Phase A
+        enc.set_compute_pipeline_state(&pipe_split);
+        enc.set_buffer(0, Some(a_buf), 0);
+        enc.set_buffer(1, Some(x_buf), 0);
+        enc.set_buffer(2, Some(&y_partial), 0);
+        enc.set_bytes(3, 12, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(grid_split, threads_split);
+        
+        // Phase B
+        enc.set_compute_pipeline_state(&pipe_merge);
+        enc.set_buffer(0, Some(&y_partial), 0);
+        enc.set_buffer(1, Some(&y_final), 0);
+        enc.set_bytes(2, 12, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(grid_merge, threads_merge);
+        
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    };
+
+    for _ in 0..3 { dispatch(); }
+    let result = ctx.read_f32(&y_final, shape.m as usize);
+    check_parity("metal-splitk", expected, &result);
+
+    let start = std::time::Instant::now();
+    for _i in 0..iters {
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe_split);
+        enc.set_buffer(0, Some(a_buf), 0);
+        enc.set_buffer(1, Some(x_buf), 0);
+        enc.set_buffer(2, Some(&y_partial), 0);
+        enc.set_bytes(3, 12, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(grid_split, threads_split);
+        enc.set_compute_pipeline_state(&pipe_merge);
+        enc.set_buffer(0, Some(&y_partial), 0);
+        enc.set_buffer(1, Some(&y_final), 0);
+        enc.set_bytes(2, 12, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(grid_merge, threads_merge);
+        enc.end_encoding();
+        cb.commit();
+        if i == iters - 1 {
+            cb.wait_until_completed();
+        }
+    }
+    start.elapsed().as_secs_f64() / iters as f64
 }

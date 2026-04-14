@@ -10,13 +10,12 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use anyhow::{Result, ensure};
-use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions};
+use anyhow::Result;
+use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
 
 use crate::backend::metal::{MetalContext, shaders};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{DetokenizerConfig, DetokenizerWeights};
-use crate::tensor::DType;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -24,9 +23,6 @@ fn sz1d(x: u64) -> metal::MTLSize {
     metal::MTLSize::new(x, 1, 1)
 }
 
-fn sz2d(x: u64, y: u64) -> metal::MTLSize {
-    metal::MTLSize::new(x, y, 1)
-}
 
 // ── GPU weight ──────────────────────────────────────────────────────────────
 
@@ -35,7 +31,6 @@ fn sz2d(x: u64, y: u64) -> metal::MTLSize {
 struct MetalWeight {
     buf: Buffer, // uploaded F32 data [m * k]
     m: u32,
-    k: u32,
     params_buf: Buffer,
 }
 
@@ -78,9 +73,6 @@ struct Pipelines {
 
 struct Params {
     rmsnorm_hs: Buffer,
-    per_head_rmsnorm: Buffer,
-    elementwise_hs: Buffer,
-    elementwise_3hs: Buffer,
     elementwise_is: Buffer,
     conv1d: Buffer,
 }
@@ -125,7 +117,7 @@ pub struct MetalAudioDecoder {
 }
 
 impl MetalAudioDecoder {
-    pub fn from_gguf(gguf: &GgufFile, vocoder_path: &Path) -> Result<Self> {
+    pub fn from_gguf(gguf: &GgufFile, __vocoder_path: &Path) -> Result<Self> {
         // Also load the CPU decoder weights for depthformer config
         let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
         let ctx = MetalContext::new()?;
@@ -189,14 +181,6 @@ impl MetalAudioDecoder {
                 0u32,
                 0u32,
             ])),
-            per_head_rmsnorm: ctx.upload_bytes(bytemuck::cast_slice(&[
-                head_dim as u32,
-                eps_bits,
-                0u32,
-                0u32,
-            ])),
-            elementwise_hs: ctx.upload_bytes(bytemuck::cast_slice(&[n_embd as u32, 0u32])),
-            elementwise_3hs: ctx.upload_bytes(bytemuck::cast_slice(&[(3 * n_embd) as u32, 0u32])),
             elementwise_is: ctx.upload_bytes(bytemuck::cast_slice(&[ffn_dim as u32, 0u32])),
             conv1d: ctx.upload_bytes(bytemuck::cast_slice(&[n_embd as u32, 3u32, 2u32, 0u32])),
         };
@@ -217,7 +201,6 @@ impl MetalAudioDecoder {
             Ok(MetalWeight {
                 buf,
                 m: rows as u32,
-                k: cols as u32,
                 params_buf,
             })
         };
@@ -337,7 +320,7 @@ impl MetalAudioDecoder {
         // Build Metal depthformer
         let depthformer = match MetalDepthformer::from_gguf(
             gguf,
-            vocoder_path,
+            __vocoder_path,
             &cpu_dec.depthformer_config,
             &cpu_dec.decoder_config,
         ) {
@@ -900,7 +883,6 @@ pub struct MetalDepthformer {
     pipes: DfPipelines,
     layers: Vec<DfLayerGpu>,
     depth_linear_slices: Vec<MetalWeight>, // 8 × [2048→1024] F32
-    depth_linear_b: Buffer,
     codebook_norms: Vec<Buffer>,
     codebook_to_logits: Vec<MetalWeight>, // 8 × [1024→2049] F32
     codebook_emb_f32: Vec<Buffer>,        // 8 × [2049 × 1024] F32 for CPU lookup
@@ -925,7 +907,7 @@ pub struct MetalDepthformer {
 impl MetalDepthformer {
     pub fn from_gguf(
         gguf: &GgufFile,
-        vocoder_path: &Path,
+        __vocoder_path: &Path,
         df_cfg: &crate::model::audio_decoder::DepthformerConfig,
         dec_cfg: &crate::model::audio_decoder::DecoderConfig,
     ) -> Result<Self> {
@@ -960,7 +942,6 @@ impl MetalDepthformer {
             Ok(MetalWeight {
                 buf,
                 m: rows as u32,
-                k: cols as u32,
                 params_buf,
             })
         };
@@ -1015,11 +996,9 @@ impl MetalDepthformer {
             depth_linear_slices.push(MetalWeight {
                 buf,
                 m: n_embd_d as u32,
-                k: dl_cols as u32,
                 params_buf,
             });
         }
-        let depth_linear_b = ctx.upload_f32(&gguf.get_tensor("depth_linear.bias")?.to_f32_vec());
 
         // Per-codebook weights
         let mut codebook_norms = Vec::with_capacity(dec_cfg.n_codebook);
@@ -1076,7 +1055,6 @@ impl MetalDepthformer {
             pipes,
             layers,
             depth_linear_slices,
-            depth_linear_b,
             codebook_norms,
             codebook_to_logits,
             codebook_emb_f32,

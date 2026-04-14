@@ -423,18 +423,6 @@ fn test_gemm_isolation() {
     let median = times[times.len() / 2];
 
     // Compute total Q4_0 weight bytes
-    let mut total_weight_bytes = 0u64;
-    for tensor_line in [
-        "blk.0.ffn_gate.weight",
-        "blk.0.ffn_up.weight",
-        "blk.0.ffn_down.weight",
-        "blk.0.shortconv.in_proj.weight",
-        "blk.0.shortconv.out_proj.weight",
-    ] {
-        // Approximate: 16 layers, each has these weights
-        // FFN: gate(2048×8192) + up(2048×8192) + down(8192×2048) = 3 × 2048×8192/32×18
-        // Conv: in_proj(2048×6144) + out_proj(2048×2048)
-    }
     // Manual calculation for 1.6B:
     // 10 conv layers: (2048*6144 + 2048*2048)/32*18 = (12.6M + 4.2M)/32*18 = 9.45M bytes per layer
     // 6 attn layers: (2048*2048*3 + 2048*512*2 + 2048*2048)/32*18 per layer
@@ -442,7 +430,7 @@ fn test_gemm_isolation() {
     let conv_weight = (2048 * 6144 + 2048 * 2048) / 32 * 18;
     let attn_weight = (2048 * 2048 * 3 + 2048 * 512 * 2 + 2048 * 2048) / 32 * 18;
     let ffn_weight = (2048 * 8192 * 2 + 8192 * 2048) / 32 * 18;
-    total_weight_bytes = (10 * conv_weight + 6 * attn_weight + 16 * ffn_weight) as u64;
+    let total_weight_bytes = (10 * conv_weight + 6 * attn_weight + 16 * ffn_weight) as u64;
     let weight_mb = total_weight_bytes as f64 / 1_048_576.0;
 
     // Effective bandwidth = weight_bytes / time (weights read once for all n tokens)
@@ -787,7 +775,7 @@ fn test_q8_0_gemm_standalone() {
     let m = 64u32;
     let k = 32u32;
     let n = 4u32; // 4 input vectors
-    let nb = k / 32; // 1 block per row
+    let _nb = k / 32; // 1 block per row
 
     // Build Q8_0 weight data: scale=1.0, quants=[1,2,3,...,32] for each row.
     let mut weight_data = Vec::new();
@@ -952,6 +940,83 @@ fn test_450m_prefill_phase_profile() {
             total,
             count,
             total / total_us * 100.0
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_cpu_gemv_microbench() {
+    use wick::backend::cpu;
+
+    fn quantize_q4_0(weights_f32: &[f32], m: usize, k: usize) -> Vec<u8> {
+        assert_eq!(k % 32, 0);
+        let nb = k / 32;
+        let mut out = Vec::with_capacity(m * nb * 18);
+        for row in 0..m {
+            for b in 0..nb {
+                let start = row * k + b * 32;
+                let block = &weights_f32[start..start + 32];
+                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let d = amax / 7.0;
+                let d_f16 = half::f16::from_f32(d);
+                out.extend_from_slice(&d_f16.to_bits().to_le_bytes());
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                for qi in 0..16 {
+                    let lo = ((block[qi] * id + 8.5) as u8).min(15);
+                    let hi = ((block[16 + qi] * id + 8.5) as u8).min(15);
+                    out.push(lo | (hi << 4));
+                }
+            }
+        }
+        out
+    }
+
+    let shapes = [
+        (1024, 1024, "attn-q"),
+        (4096, 1024, "mid-4096"),
+        (1024, 2048, "ffn-down"),
+    ];
+
+    println!("\n=== CPU Microbenchmarks (GEMV) ===");
+    for (m, k, label) in shapes {
+        let weights_f32: Vec<f32> = (0..m * k).map(|i| (i as f32).sin()).collect();
+        let q4_bytes = quantize_q4_0(&weights_f32, m, k);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32).cos()).collect();
+        let mut y = vec![0.0f32; m];
+
+        // f32 gemv
+        let t0 = Instant::now();
+        let iters = 100;
+        for _ in 0..iters {
+            cpu::gemv_f32(bytemuck::cast_slice(&weights_f32), &x, &mut y, m, k);
+        }
+        let elapsed_f32 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        // Q4_0 gemv
+        let mut q8_scales = vec![0.0f32; k / 32];
+        let mut q8_quants = vec![0i8; k];
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            cpu::gemv_q4_0_f32(&q4_bytes, &x, &mut y, m, k, &mut q8_scales, &mut q8_quants);
+        }
+        let elapsed_q4 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        // Q4_0 with Q8 pre-quantized x
+        let (q8_scales_pre, q8_qs_pre) = cpu::quantize_f32_to_q8_0(&x);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            cpu::gemv_q4_0_with_q8(&q4_bytes, &q8_scales_pre, &q8_qs_pre, &mut y, m, k);
+        }
+        let elapsed_q4_q8 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        println!(
+            "Shape {:<12}: f32={:7.1}µs, q4_0={:7.1}µs, q4_0+q8={:7.1}µs (x{:.1} vs f32)",
+            label,
+            elapsed_f32 * 1e6,
+            elapsed_q4 * 1e6,
+            elapsed_q4_q8 * 1e6,
+            elapsed_f32 / elapsed_q4_q8
         );
     }
 }

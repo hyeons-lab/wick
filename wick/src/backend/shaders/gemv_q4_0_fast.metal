@@ -595,3 +595,122 @@ kernel void gemv_q4_0_fast_accum(
         }
     }
 }
+
+struct SplitKParams {
+    uint m;
+    uint k;
+    uint n_splits;
+};
+
+// Phase A: Split-K partial GEMV
+kernel void gemv_q4_0_fast_splitk(
+    const device uchar* a [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    device float* y_partial [[buffer(2)]], // [n_splits, m]
+    constant SplitKParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    uint m = params.m;
+    uint k = params.k;
+    uint n_splits = params.n_splits;
+    uint nb = k / 32;
+    uint row_bytes = nb * BLOCK_BYTES;
+
+    uint rows_per_split = (m + 7) / 8;
+    uint split_id = tg_id / rows_per_split;
+    uint row_group = tg_id % rows_per_split;
+    uint row_base = row_group * 8;
+
+    uint chunk = (nb + n_splits - 1) / n_splits;
+    uint ib_start = split_id * chunk;
+    uint ib_end = min(ib_start + chunk, nb);
+
+    if (row_base >= m || ib_start >= nb) return;
+
+    uint r0 = row_base + sgitg * ROWS_PER_SIMD;
+
+    device const block_q4_0* ax[ROWS_PER_SIMD];
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+        ax[r] = (device const block_q4_0*) (a + (r0 + r) * row_bytes);
+    }
+
+    uint ix = tiisg / 2;
+    uint il = (tiisg & 1u) * 8;
+
+    float sumf[ROWS_PER_SIMD] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float yl[16];
+    
+    // Adjust yb for split start
+    device const float* yb = x + ib_start * 32 + ix * 32 + il;
+
+    for (uint ib = ib_start + ix; ib < ib_end; ib += NQ) {
+        float sumy[2] = {0.0f, 0.0f};
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i += 2) {
+            sumy[0]   += yb[i + 0] + yb[i + 1];
+            yl[i + 0]  = yb[i + 0];
+            yl[i + 1]  = yb[i + 1] / 256.0f;
+            sumy[1]   += yb[i + 16] + yb[i + 17];
+            yl[i + 8]  = yb[i + 16] / 16.0f;
+            yl[i + 9]  = yb[i + 17] / 4096.0f;
+        }
+
+        float sumy_total = sumy[0] + sumy[1];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+            sumf[r] += half_block_dot(ax[r] + ib, sumy_total, yl, il);
+        }
+
+        yb += 32 * NQ;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < ROWS_PER_SIMD; r++) {
+        float tot = simd_sum(sumf[r]);
+        if (tiisg == 0 && r0 + r < m) {
+            y_partial[split_id * m + r0 + r] = tot;
+        }
+    }
+}
+
+// Phase B: Merge Split-K partials
+kernel void gemv_q4_0_splitk_merge(
+    const device float* y_partial [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    constant SplitKParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    uint m = params.m;
+    uint n_splits = params.n_splits;
+    if (row >= m) return;
+
+    float acc = 0.0f;
+    for (uint s = 0; s < n_splits; s++) {
+        acc += y_partial[s * m + row];
+    }
+    y[row] = acc;
+}
+
+// Phase B: Merge Split-K partials with accumulate (y += sum partials)
+kernel void gemv_q4_0_splitk_merge_accum(
+    const device float* y_partial [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    constant SplitKParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    uint m = params.m;
+    uint n_splits = params.n_splits;
+    if (row >= m) return;
+
+    float acc = 0.0f;
+    for (uint s = 0; s < n_splits; s++) {
+        acc += y_partial[s * m + row];
+    }
+    y[row] += acc;
+}
