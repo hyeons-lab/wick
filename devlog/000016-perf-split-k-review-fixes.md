@@ -60,4 +60,5 @@ The previous broken-Split-K numbers in the PR body (283 tok/s) were measured wit
 
 ## Commits
 
-- HEAD — fix(metal): address PR #17 review — Split-K dispatch + merge race, test compile errors
+- 51cd656 — fix(metal): Split-K GEMV dispatch bug and Phase B data race
+- HEAD — devlog: record commit hash
