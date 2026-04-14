@@ -3,24 +3,14 @@ import subprocess
 import re
 import csv
 import sys
+import argparse
 from pathlib import Path
 
-# Paths
-HOME = Path.home()
-MODELS_DIR = HOME / ".leap" / "models"
-WICK_BIN = Path.cwd() / "target" / "release" / "wick"
-LLAMA_BENCH = Path("/Users/dberrios/development/llama.cpp/worktrees/dberrios-updateLlama/build/bin/llama-bench")
-
-# Matrix
-PROMPT_LENGTHS = [128, 1024, 4096]
-GEN_LENGTHS = [64, 256, 1024]
-RUNS = 5
-
-def find_models():
+def find_models(models_dir):
     models = []
-    if not MODELS_DIR.exists():
+    if not models_dir.exists():
         return models
-    for root, dirs, files in os.walk(MODELS_DIR):
+    for root, dirs, files in os.walk(models_dir):
         for file in files:
             # Filter for LLM/VL models (wick only supports LFM2 architecture currently)
             if file.endswith(".gguf") and "LFM2" in file and "vocoder" not in file and "Audio" not in file:
@@ -38,15 +28,15 @@ def parse_time_output(stderr):
             footprint = int(line.strip().split()[0])
     return rss, footprint
 
-def run_wick(model_path, prompt_len, gen_len):
+def run_wick(wick_bin, model_path, prompt_len, gen_len, runs):
     print(f"  [wick] p={prompt_len} n={gen_len}...")
     cmd = [
         "/usr/bin/time", "-l",
-        str(WICK_BIN), "bench",
+        str(wick_bin), "bench",
         "--model", str(model_path),
         "--prompt-tokens", str(prompt_len),
         "--max-tokens", str(gen_len),
-        "--runs", str(RUNS),
+        "--runs", str(runs),
         "--device", "metal",
         "--context-size", "16384",
         "--no-cache"
@@ -66,24 +56,22 @@ def run_wick(model_path, prompt_len, gen_len):
         print(f"    Error running wick: {e}")
         return 0.0, 0.0, 0, 0
 
-def run_llama(model_path, prompt_len, gen_len):
+def run_llama(llama_bench, model_path, prompt_len, gen_len, runs):
     print(f"  [llama] p={prompt_len} n={gen_len}...")
     # llama-bench: -p prompt, -n gen
     cmd = [
         "/usr/bin/time", "-l",
-        str(LLAMA_BENCH),
+        str(llama_bench),
         "-m", str(model_path),
         "-p", str(prompt_len),
         "-n", str(gen_len),
         "-ngl", "99",
-        "-r", str(RUNS),
-        "--no-warmup" # wick bench has its own warmup, llama-bench warmup can be slow
+        "-r", str(runs),
+        "--no-warmup"
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         # llama-bench outputs a markdown table to stdout.
-        # | model | size | params | backend | threads | test | t/s |
-        # test is 'pp<prompt>' for prefill, 'tg<gen>' for generation
         
         prefill_tps = 0.0
         decode_tps = 0.0
@@ -103,15 +91,26 @@ def run_llama(model_path, prompt_len, gen_len):
         return 0.0, 0.0, 0, 0
 
 def main():
-    models = find_models()
+    parser = argparse.ArgumentParser(description="Wick vs llama.cpp benchmark matrix")
+    parser.add_argument("--models-dir", type=Path, default=Path.home() / ".leap" / "models", help="Directory containing GGUF models")
+    parser.add_argument("--wick-bin", type=Path, default=Path.cwd() / "target" / "release" / "wick", help="Path to wick binary")
+    parser.add_argument("--llama-bench", type=Path, required=True, help="Path to llama-bench binary")
+    parser.add_argument("--output", type=Path, default=Path("benchmark_results.csv"), help="Output CSV file")
+    parser.add_argument("--runs", type=int, default=5, help="Number of runs per configuration")
+    
+    args = parser.parse_args()
+
+    PROMPT_LENGTHS = [128, 1024, 4096]
+    GEN_LENGTHS = [64, 256, 1024]
+
+    models = find_models(args.models_dir)
     if not models:
-        print("No models found in ~/.leap/models")
+        print(f"No compatible models found in {args.models_dir}")
         return
 
-    output_file = "benchmark_results.csv"
     fields = ["model", "prompt_len", "gen_len", "engine", "prefill_tps", "decode_tps", "rss_mb", "footprint_mb"]
     
-    with open(output_file, "w", newline="") as f:
+    with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         
@@ -121,7 +120,7 @@ def main():
             for p_len in PROMPT_LENGTHS:
                 for g_len in GEN_LENGTHS:
                     # Run Wick
-                    p_tps, d_tps, rss, foot = run_wick(model, p_len, g_len)
+                    p_tps, d_tps, rss, foot = run_wick(args.wick_bin, model, p_len, g_len, args.runs)
                     writer.writerow({
                         "model": model_name, "prompt_len": p_len, "gen_len": g_len,
                         "engine": "wick", "prefill_tps": p_tps, "decode_tps": d_tps,
@@ -129,7 +128,7 @@ def main():
                     })
                     
                     # Run Llama.cpp
-                    p_tps, d_tps, rss, foot = run_llama(model, p_len, g_len)
+                    p_tps, d_tps, rss, foot = run_llama(args.llama_bench, model, p_len, g_len, args.runs)
                     writer.writerow({
                         "model": model_name, "prompt_len": p_len, "gen_len": g_len,
                         "engine": "llama.cpp", "prefill_tps": p_tps, "decode_tps": d_tps,
@@ -137,7 +136,7 @@ def main():
                     })
                     f.flush()
 
-    print(f"\nDone! Results saved to {output_file}")
+    print(f"\nDone! Results saved to {args.output}")
 
 if __name__ == "__main__":
     main()

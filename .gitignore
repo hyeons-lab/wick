@@ -16,3 +16,9 @@ Cargo.lock
 
 # Environment
 .env
+
+# Benchmark artifacts
+benchmark_results.csv
+benchmark_output.log
+wick_time.txt
+llama_time.txt

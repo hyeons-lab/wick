@@ -601,8 +601,18 @@ fn main() -> Result<()> {
 
             let mut tokens = Vec::new();
             if let Some(n) = prompt_tokens {
-                // Generate N unique tokens (avoiding 0/EOS/BOS range).
-                tokens = (0..n as u32).map(|i| (i % 1000) + 100).collect();
+                // Generate N tokens by sampling from the vocabulary, skipping special tokens.
+                let vocab_size = tokenizer.vocab_size() as u32;
+                let mut tid = 100; // Start after typical special token range
+                while tokens.len() < n {
+                    if !tokenizer.is_special_token(tid % vocab_size) {
+                        tokens.push(tid % vocab_size);
+                    }
+                    tid += 1;
+                    if tid > vocab_size * 2 + n as u32 {
+                        break; // Safety break
+                    }
+                }
             } else {
                 if add_bos {
                     if let Some(bos) = tokenizer.bos_token() {
