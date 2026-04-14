@@ -1048,11 +1048,13 @@ impl MetalLfm2Model {
         accumulate: bool,
         n_splits: u32,
     ) {
-        let grid = MTLSize::new(
-            (w.m as u64 + 7) / 8, // ROWS_PER_TG = 8
-            n_splits as u64,
-            1,
-        );
+        // Phase A dispatches a 1D grid of `rows_per_split * n_splits` TGs; the
+        // shader reads `tg_id` as a scalar and splits it back into
+        // `(split_id, row_group)` via integer division. A 2D dispatch won't
+        // work here — `tg_id` is bound as `uint`, so it only gets the X
+        // component and every TG would compute `split_id == 0`.
+        let rows_per_split = (w.m as u64 + 7) / 8; // ROWS_PER_TG = 8
+        let grid = MTLSize::new(rows_per_split * n_splits as u64, 1, 1);
         let split_params = [w.m, w.k, n_splits];
 
         // Phase A: Partial GEMV
@@ -1063,7 +1065,10 @@ impl MetalLfm2Model {
         enc.set_bytes(3, 12, split_params.as_ptr() as *const _);
         enc.dispatch_thread_groups(grid, sz1d(64));
 
-        // Phase B: Merge
+        // Phase B: Merge. One threadgroup per row and one *thread* per
+        // threadgroup, so the reduction + write happens exactly once per row.
+        // The previous 32-thread dispatch raced: every thread in the TG ran
+        // the same reduction loop and wrote `y[row]` concurrently.
         let merge_pipeline = if accumulate {
             &self.pipelines.gemv_q4_0_splitk_merge_accum
         } else {
@@ -1073,7 +1078,7 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.gemv_splitk_partials), 0);
         enc.set_buffer(1, Some(output), output_off_bytes);
         enc.set_bytes(2, 12, split_params.as_ptr() as *const _);
-        enc.dispatch_thread_groups(MTLSize::new(w.m as u64, 1, 1), sz1d(32));
+        enc.dispatch_thread_groups(MTLSize::new(w.m as u64, 1, 1), sz1d(1));
     }
 
     fn encode_gemv_impl(

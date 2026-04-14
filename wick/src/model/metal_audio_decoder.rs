@@ -23,7 +23,6 @@ fn sz1d(x: u64) -> metal::MTLSize {
     metal::MTLSize::new(x, 1, 1)
 }
 
-
 // ── GPU weight ──────────────────────────────────────────────────────────────
 
 /// F32 weight matrix on GPU. Dequantized from Q4_0 at load time to match
