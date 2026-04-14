@@ -1065,10 +1065,8 @@ impl MetalLfm2Model {
         enc.set_bytes(3, 12, split_params.as_ptr() as *const _);
         enc.dispatch_thread_groups(grid, sz1d(64));
 
-        // Phase B: Merge. One threadgroup per row and one *thread* per
-        // threadgroup, so the reduction + write happens exactly once per row.
-        // The previous 32-thread dispatch raced: every thread in the TG ran
-        // the same reduction loop and wrote `y[row]` concurrently.
+        // Phase B: Merge. One thread per row. Dispatching total threads
+        // and letting Metal group them up to 256 per threadgroup.
         let merge_pipeline = if accumulate {
             &self.pipelines.gemv_q4_0_splitk_merge_accum
         } else {
@@ -1078,7 +1076,7 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.gemv_splitk_partials), 0);
         enc.set_buffer(1, Some(output), output_off_bytes);
         enc.set_bytes(2, 12, split_params.as_ptr() as *const _);
-        enc.dispatch_thread_groups(MTLSize::new(w.m as u64, 1, 1), sz1d(1));
+        enc.dispatch_threads(sz1d(w.m as u64), sz1d(256));
     }
 
     fn encode_gemv_impl(

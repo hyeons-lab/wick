@@ -26,8 +26,8 @@ fn single_token_attention() {
 
     let q_dim = cfg.n_head * cfg.n_embd_head;
     let k_dim = cfg.n_head_kv * cfg.n_embd_head;
-    let q = &qkv[..q_dim];
-    let k = &qkv[q_dim..q_dim + k_dim];
+    let _q = &qkv[..q_dim];
+    let _k = &qkv[q_dim..q_dim + k_dim];
     let v = &qkv[q_dim + k_dim..];
     eprintln!("q_dim={q_dim}, k_dim={k_dim}, v_dim={}", v.len());
 

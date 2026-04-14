@@ -682,8 +682,7 @@ kernel void gemv_q4_0_splitk_merge(
     const device float* y_partial [[buffer(0)]],
     device float* y [[buffer(1)]],
     constant SplitKParams& params [[buffer(2)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
+    uint row [[thread_position_in_grid]]
 ) {
     uint m = params.m;
     uint n_splits = params.n_splits;
@@ -701,8 +700,7 @@ kernel void gemv_q4_0_splitk_merge_accum(
     const device float* y_partial [[buffer(0)]],
     device float* y [[buffer(1)]],
     constant SplitKParams& params [[buffer(2)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
+    uint row [[thread_position_in_grid]]
 ) {
     uint m = params.m;
     uint n_splits = params.n_splits;
