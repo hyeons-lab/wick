@@ -183,7 +183,7 @@ fn bench_wgpu(
 
     // Timed batch — submit all iters, then a single readback to drain.
     let start = std::time::Instant::now();
-    for _i in 0..iters {
+    for _ in 0..iters {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());

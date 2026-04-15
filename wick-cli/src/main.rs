@@ -613,6 +613,13 @@ fn main() -> Result<()> {
                         break; // Safety break
                     }
                 }
+                if tokens.len() != n {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer only provides {} usable prompt token(s), but {} were requested",
+                        tokens.len(),
+                        n
+                    ));
+                }
             } else {
                 if add_bos {
                     if let Some(bos) = tokenizer.bos_token() {

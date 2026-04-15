@@ -116,7 +116,7 @@ pub struct MetalAudioDecoder {
 }
 
 impl MetalAudioDecoder {
-    pub fn from_gguf(gguf: &GgufFile, __vocoder_path: &Path) -> Result<Self> {
+    pub fn from_gguf(gguf: &GgufFile, _vocoder_path: &Path) -> Result<Self> {
         // Also load the CPU decoder weights for depthformer config
         let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
         let ctx = MetalContext::new()?;
@@ -319,7 +319,7 @@ impl MetalAudioDecoder {
         // Build Metal depthformer
         let depthformer = match MetalDepthformer::from_gguf(
             gguf,
-            __vocoder_path,
+            _vocoder_path,
             &cpu_dec.depthformer_config,
             &cpu_dec.decoder_config,
         ) {
@@ -906,7 +906,7 @@ pub struct MetalDepthformer {
 impl MetalDepthformer {
     pub fn from_gguf(
         gguf: &GgufFile,
-        __vocoder_path: &Path,
+        _vocoder_path: &Path,
         df_cfg: &crate::model::audio_decoder::DepthformerConfig,
         dec_cfg: &crate::model::audio_decoder::DecoderConfig,
     ) -> Result<Self> {

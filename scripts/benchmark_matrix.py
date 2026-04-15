@@ -90,11 +90,23 @@ def run_llama(llama_bench, model_path, prompt_len, gen_len, runs):
         print(f"    Error running llama: {e}")
         return 0.0, 0.0, 0, 0
 
+def resolve_llama_bench():
+    import shutil
+    env_value = os.environ.get("LLAMA_BENCH")
+    if env_value:
+        return Path(env_value).expanduser()
+
+    resolved = shutil.which("llama-bench")
+    if resolved:
+        return Path(resolved)
+
+    return Path("llama-bench")
+
 def main():
     parser = argparse.ArgumentParser(description="Wick vs llama.cpp benchmark matrix")
     parser.add_argument("--models-dir", type=Path, default=Path.home() / ".leap" / "models", help="Directory containing GGUF models")
     parser.add_argument("--wick-bin", type=Path, default=Path.cwd() / "target" / "release" / "wick", help="Path to wick binary")
-    parser.add_argument("--llama-bench", type=Path, required=True, help="Path to llama-bench binary")
+    parser.add_argument("--llama-bench", type=Path, default=resolve_llama_bench(), help="Path to llama-bench binary")
     parser.add_argument("--output", type=Path, default=Path("benchmark_results.csv"), help="Output CSV file")
     parser.add_argument("--runs", type=int, default=5, help="Number of runs per configuration")
     
