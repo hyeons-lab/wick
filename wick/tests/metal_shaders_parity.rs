@@ -470,7 +470,7 @@ fn test_gemv_q6_k() {
     raw.extend_from_slice(&[0u8; 16]); // safety pad
 
     // x vector.
-    let x: Vec<f32> = (0..k).map(|i| ((i as f32 * 0.013).sin())).collect();
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
 
     // CPU reference: y[r] = Σ weight_f32[r][i] × x[i].
     let mut y_ref = vec![0.0f32; m as usize];
