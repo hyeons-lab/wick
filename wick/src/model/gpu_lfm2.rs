@@ -521,6 +521,7 @@ impl GpuLfm2Model {
     // ── Encode helpers (add passes to an existing encoder) ────────────
 
     /// Encode GEMV dispatch — uses cached bind group if available, else creates one.
+    #[allow(dead_code)]
     fn encode_gemv_weight(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -563,7 +564,7 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         m: u32,
-        k: u32,
+        _k: u32,
     ) {
         // Use pre-allocated params (m=vocab_size, k=hs are constant).
         let params_buf = &self.embedding_params;
@@ -607,7 +608,7 @@ impl GpuLfm2Model {
         enc: &mut wgpu::CommandEncoder,
         x: &wgpu::Buffer,
         weight: &wgpu::Buffer,
-        n: u32,
+        _n: u32,
         _eps: f32,
     ) {
         // Use pre-allocated params buffer (n and eps are always hs and config.rms_norm_eps).
@@ -758,7 +759,7 @@ impl Model for GpuLfm2Model {
 
             if cfg.block_types[i] == BlockType::GatedConv {
                 let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
-                let d_conv = kernel_size - 1;
+                let _d_conv = kernel_size - 1;
                 let conv_buf = self.gpu_state.conv_buffers[i].as_ref().unwrap();
 
                 // Pre-create BGs for conv block (using pre-allocated params).
