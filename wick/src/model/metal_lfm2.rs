@@ -2201,6 +2201,10 @@ impl MetalLfm2Model {
             }
         }
 
+        // Cache once — the per-layer attention dispatch below reads this in
+        // a hot loop, and `std::env::var` is a syscall.
+        let skip_attn = std::env::var("WICK_PROFILE").as_deref() == Ok("noattn");
+
         // Op-first batching: within each layer, batch each operation across
         // all N tokens before moving to the next operation. GEMV dispatches
         // against the same weight matrix execute consecutively, keeping
@@ -2461,7 +2465,10 @@ impl MetalLfm2Model {
                 );
 
                 // Phase C: batched causal attention (1 dispatch for all N queries).
-                {
+                // WICK_PROFILE=noattn: skip to measure prefill cost without attention.
+                // prefill_normed_buf keeps stale RMSNormed Q data — downstream reads
+                // garbage, as with the decode path's noattn guard.
+                if !skip_attn {
                     let scale = 1.0f32 / (head_dim as f32).sqrt();
                     let params: [u32; 9] = [
                         n_heads,
@@ -2671,9 +2678,13 @@ impl MetalLfm2Model {
 }
 
 impl MetalLfm2Model {
-    /// Profiled prefill: same as forward_prefill but commits/waits after each
-    /// phase category to measure wall-clock GPU time per phase. Much slower
-    /// due to per-phase serialization — for analysis only, not production.
+    /// Profiled prefill: per-phase timings for one forward pass.
+    ///
+    /// `WICK_PROFILE=gpu` selects the GPU-timestamp variant (single command
+    /// buffer, `sample_counters_in_buffer` attachments per phase) —
+    /// dispatch-overhead-free attribution. Otherwise uses the CPU wall-clock
+    /// variant which commits + waits between phases; correct but inflates
+    /// absolute shares because of per-phase serialization.
     ///
     /// Chunks inputs larger than MAX_PREFILL_TOKENS (matching
     /// `forward_prefill_inner`) so the caller doesn't overflow
@@ -2696,6 +2707,7 @@ impl MetalLfm2Model {
             tokens.len(),
             self.state.max_seq_len
         );
+        let use_gpu_ts = std::env::var("WICK_PROFILE").as_deref() == Ok("gpu");
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if tokens.len() > max_chunk {
             let mut all_timings = Vec::new();
@@ -2704,14 +2716,22 @@ impl MetalLfm2Model {
             while !remaining.is_empty() {
                 let chunk_len = remaining.len().min(max_chunk);
                 let chunk = &remaining[..chunk_len];
-                let timings = self.forward_prefill_profiled_inner(chunk, pos, state);
+                let timings = if use_gpu_ts {
+                    self.forward_prefill_profiled_gpu_inner(chunk, pos, state)
+                } else {
+                    self.forward_prefill_profiled_inner(chunk, pos, state)
+                };
                 all_timings.extend(timings);
                 pos += chunk_len;
                 remaining = &remaining[chunk_len..];
             }
             return all_timings;
         }
-        self.forward_prefill_profiled_inner(tokens, start_pos, state)
+        if use_gpu_ts {
+            self.forward_prefill_profiled_gpu_inner(tokens, start_pos, state)
+        } else {
+            self.forward_prefill_profiled_inner(tokens, start_pos, state)
+        }
     }
 
     fn forward_prefill_profiled_inner(
@@ -3072,6 +3092,401 @@ impl MetalLfm2Model {
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
             self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
         });
+
+        self.state.seq_len.set(start_pos + n);
+        state.seq_len = start_pos + n;
+        let _ = self.ctx.read_f32(&self.logits_buf, cfg.vocab_size);
+
+        timings
+    }
+
+    /// GPU-timestamp variant of `forward_prefill_profiled_inner`:
+    /// one command buffer with per-phase compute encoders carrying
+    /// `sample_counters_in_buffer` attachments. Avoids the per-phase
+    /// `commit + wait_until_completed` overhead of the CPU-wall-clock
+    /// variant, so per-category shares reflect actual GPU busy time.
+    ///
+    /// Returns the same `(label, µs)` shape as the CPU variant so
+    /// `aggregate_prefill_phases` in bench_perf.rs works unchanged.
+    fn forward_prefill_profiled_gpu_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<(String, f64)> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        let is = cfg.intermediate_size;
+        let batch_buf = &self.prefill_batch_buf;
+
+        // 16 layers × 9 phases + 1 output ≈ 145 passes × 2 indices/pass.
+        // 512 gives headroom; fallback to CPU-timing variant on alloc failure.
+        let capacity: usize = (cfg.n_layers * 10 + 2) * 2;
+        let Some(gpu) = build_gpu_timer(&self.ctx, capacity.max(64)) else {
+            eprintln!("[wick-metal] GPU timestamp unsupported — falling back to CPU timing");
+            return self.forward_prefill_profiled_inner(tokens, start_pos, state);
+        };
+
+        // Stage all N embedding rows directly into batch_buf's mapped memory.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
+            }
+        }
+
+        let cb = self.ctx.queue.new_command_buffer();
+        let mut labels: Vec<String> = Vec::with_capacity(capacity / 2);
+        let mut next_idx: usize = 0;
+
+        let mut run_phase = |name: String, f: &dyn Fn(&metal::ComputeCommandEncoderRef)| {
+            let idx = next_idx;
+            if idx + 2 > gpu.capacity {
+                let enc = cb.new_compute_command_encoder();
+                f(enc);
+                enc.end_encoding();
+                return;
+            }
+            let desc = metal::ComputePassDescriptor::new();
+            let attachments = desc.sample_buffer_attachments();
+            let attachment = metal::ComputePassSampleBufferAttachmentDescriptor::new();
+            attachment.set_sample_buffer(&gpu.sample_buf);
+            attachment.set_start_of_encoder_sample_index(idx as metal::NSUInteger);
+            attachment.set_end_of_encoder_sample_index((idx + 1) as metal::NSUInteger);
+            attachments.set_object_at(0, Some(&attachment));
+            let enc = cb.compute_command_encoder_with_descriptor(desc);
+            f(enc);
+            enc.end_encoding();
+            labels.push(name);
+            next_idx = idx + 2;
+        };
+
+        for layer in 0..cfg.n_layers {
+            let lw = &self.layers[layer];
+            let lt = if cfg.block_types[layer] == BlockType::GatedConv {
+                "conv"
+            } else {
+                "attn"
+            };
+
+            run_phase(format!("L{layer}_{lt}_norm"), &|enc| {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.attn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            });
+
+            if cfg.block_types[layer] == BlockType::GatedConv {
+                let conv_buf = self.state.conv_buffers[layer].as_ref().unwrap();
+                let w_in = lw.conv_in_proj.as_ref().unwrap();
+                let w_out = lw.conv_out_proj.as_ref().unwrap();
+
+                run_phase(format!("L{layer}_conv_inproj"), &|enc| {
+                    self.encode_gemm(
+                        enc,
+                        w_in,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        (3 * hs) as u32,
+                        false,
+                    );
+                });
+
+                run_phase(format!("L{layer}_conv1d"), &|enc| {
+                    let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
+                    let params: [u32; 6] = [
+                        hs as u32,
+                        (d_conv + 1) as u32,
+                        d_conv as u32,
+                        n as u32,
+                        (3 * hs) as u32,
+                        hs as u32,
+                    ];
+                    let grid = sz1d((hs as u32).div_ceil(256) as u64);
+                    enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(conv_buf), 0);
+                    enc.set_buffer(2, Some(lw.conv_weight.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    enc.dispatch_thread_groups(grid, sz1d(256));
+                });
+
+                run_phase(format!("L{layer}_conv_outproj"), &|enc| {
+                    self.encode_gemm_add(
+                        enc,
+                        w_out,
+                        &self.prefill_normed_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                });
+            } else {
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let kv_dim = (n_kv_heads * head_dim) as usize;
+                let n_heads = cfg.n_heads as u32;
+                let (k_cache, v_cache) = self.state.kv_caches[layer].as_ref().unwrap();
+
+                run_phase(format!("L{layer}_attn_qkv"), &|enc| {
+                    let w_q = lw.attn_q.as_ref().unwrap();
+                    let w_k = lw.attn_k.as_ref().unwrap();
+                    let w_v = lw.attn_v.as_ref().unwrap();
+                    self.encode_gemm(
+                        enc,
+                        w_q,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_proj_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                        false,
+                    );
+                    self.encode_gemm(
+                        enc,
+                        w_k,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                    self.encode_gemm(
+                        enc,
+                        w_v,
+                        &self.prefill_normed_buf,
+                        0,
+                        &self.prefill_up_buf,
+                        0,
+                        n as u32,
+                        hs as u32,
+                        kv_dim as u32,
+                        false,
+                    );
+                });
+
+                run_phase(format!("L{layer}_attn_rope_cast"), &|enc| {
+                    let params: [u32; 10] = [
+                        start_pos as u32,
+                        n as u32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        self.config.rms_norm_eps.to_bits(),
+                        self.config.rope_theta.to_bits(),
+                        0,
+                        hs as u32,
+                        kv_dim as u32,
+                    ];
+                    enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope_batch);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(&self.prefill_gate_buf), 0);
+                    enc.set_buffer(2, Some(lw.attn_q_norm.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(lw.attn_k_norm.as_ref().unwrap()), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    let tg_count = n as u32 * (n_heads + n_kv_heads);
+                    enc.dispatch_thread_groups(sz1d(tg_count as u64), sz1d(256));
+
+                    let kv_cache_off = (start_pos * kv_dim * 2) as u64;
+                    self.encode_cast_f32_to_f16_offsets(
+                        enc,
+                        &self.prefill_gate_buf,
+                        0,
+                        k_cache,
+                        kv_cache_off,
+                        (n * kv_dim) as u32,
+                    );
+                    self.encode_cast_f32_to_f16_offsets(
+                        enc,
+                        &self.prefill_up_buf,
+                        0,
+                        v_cache,
+                        kv_cache_off,
+                        (n * kv_dim) as u32,
+                    );
+                });
+
+                run_phase(format!("L{layer}_attn_kernel"), &|enc| {
+                    let scale = 1.0f32 / (head_dim as f32).sqrt();
+                    let params: [u32; 9] = [
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim as u32,
+                        start_pos as u32,
+                        n as u32,
+                        scale.to_bits(),
+                        hs as u32,
+                        hs as u32,
+                    ];
+                    enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
+                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
+                    enc.set_buffer(1, Some(k_cache), 0);
+                    enc.set_buffer(2, Some(v_cache), 0);
+                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of_val(&params) as u64,
+                        params.as_ptr() as *const _,
+                    );
+                    let hd_val = head_dim as usize;
+                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+                    let q_per_tg = 8u32;
+                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
+                });
+
+                run_phase(format!("L{layer}_attn_outproj"), &|enc| {
+                    let w_o = lw.attn_output.as_ref().unwrap();
+                    self.encode_gemm_add(
+                        enc,
+                        w_o,
+                        &self.prefill_normed_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.prefill_gate_buf,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                });
+            }
+
+            run_phase(format!("L{layer}_{lt}_ffn_norm"), &|enc| {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    0,
+                    &lw.ffn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            });
+
+            run_phase(format!("L{layer}_{lt}_ffn_gemm"), &|enc| {
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_gate,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_gate_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    &lw.ffn_up,
+                    &self.prefill_normed_buf,
+                    0,
+                    &self.prefill_up_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+            });
+
+            run_phase(format!("L{layer}_{lt}_ffn_silu"), &|enc| {
+                let total = (n * is) as u32;
+                let grid = sz1d(total.div_ceil(256) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+                enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
+                enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
+                let params: [u32; 2] = [total, 0];
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&params) as u64,
+                    params.as_ptr() as *const _,
+                );
+                enc.dispatch_thread_groups(grid, sz1d(256));
+            });
+
+            run_phase(format!("L{layer}_{lt}_ffn_down"), &|enc| {
+                self.encode_gemm_add(
+                    enc,
+                    &lw.ffn_down,
+                    &self.prefill_gate_buf,
+                    0,
+                    batch_buf,
+                    0,
+                    &self.prefill_normed_buf,
+                    n as u32,
+                    is as u32,
+                    hs as u32,
+                );
+            });
+        }
+
+        run_phase("output".to_string(), &|enc| {
+            let last_off = ((n - 1) * hs * 4) as u64;
+            self.copy_compute(
+                enc,
+                batch_buf,
+                last_off,
+                &self.hidden_buf,
+                0,
+                &self.params.elementwise_hs,
+                hs as u64,
+            );
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+        });
+
+        cb.commit();
+        cb.wait_until_completed();
+
+        let range = metal::NSRange {
+            location: 0,
+            length: next_idx as u64,
+        };
+        let samples = gpu.sample_buf.resolve_counter_range(range);
+        let mut timings: Vec<(String, f64)> = Vec::with_capacity(labels.len());
+        for (i, label) in labels.into_iter().enumerate() {
+            let a = samples[i * 2];
+            let b = samples[i * 2 + 1];
+            let delta_ticks = b.saturating_sub(a) as f64;
+            let us = delta_ticks * gpu.ns_per_tick / 1000.0;
+            timings.push((label, us));
+        }
 
         self.state.seq_len.set(start_pos + n);
         state.seq_len = start_pos + n;
