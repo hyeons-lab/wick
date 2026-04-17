@@ -89,4 +89,4 @@ report so future readers don't chase the p=128 delta.
 
 ## Commits
 
-_will fill in after first commit_
+HEAD — perf(profile): batched-prefill noattn + GPU-timestamp attribution
