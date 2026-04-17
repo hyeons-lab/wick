@@ -14,6 +14,9 @@ Cargo.lock
 # Claude Code local state (memory, skills, scheduled tasks, per-project settings)
 .claude/
 
+# Local-only development logs (per-branch session notes, plans)
+devlog/
+
 # Models
 *.gguf
 
