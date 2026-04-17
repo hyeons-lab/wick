@@ -24,10 +24,13 @@ struct SplitParams {
 // Phase A: per-split partial computation.
 // Dispatch: (n_heads × n_splits) threadgroups, 256 threads each.
 // Writes: partials_out[head, split, d], partials_max[head, split], partials_sum[head, split].
+// K/V caches are stored as f16 (see `encode_cast_f32_to_f16_offsets` in
+// metal_lfm2.rs and the `// f16 bytes` comment). Binding as `float*`
+// would reinterpret two adjacent halves as one f32 and produce garbage.
 kernel void attention_split_compute(
     const device float* q [[buffer(0)]],
-    const device float* k_cache [[buffer(1)]],
-    const device float* v_cache [[buffer(2)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
     device float* partials_out [[buffer(3)]],    // [n_heads × n_splits × head_dim]
     device float* partials_max [[buffer(4)]],    // [n_heads × n_splits]
     device float* partials_sum [[buffer(5)]],    // [n_heads × n_splits]
@@ -91,7 +94,7 @@ kernel void attention_split_compute(
         float dot = 0.0f;
         uint k_base = t * kv_dim + kv_h_offset;
         for (uint d = 0u; d < head_dim; d++) {
-            dot += q_shared[d] * k_cache[k_base + d];
+            dot += q_shared[d] * float(k_cache[k_base + d]);
         }
         scores[i] = dot * scale;
     }
@@ -138,7 +141,7 @@ kernel void attention_split_compute(
     if (d < head_dim) {
         float val = 0.0f;
         for (uint ii = s_group; ii < t_len; ii += par) {
-            val += scores[ii] * v_cache[(t_start + ii) * kv_dim + kv_h_offset + d];
+            val += scores[ii] * float(v_cache[(t_start + ii) * kv_dim + kv_h_offset + d]);
         }
         for (uint offset = par >> 1; offset > 0u; offset >>= 1) {
             val += simd_shuffle_down(val, offset);
