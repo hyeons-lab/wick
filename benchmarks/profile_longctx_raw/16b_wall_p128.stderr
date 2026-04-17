@@ -1,0 +1,10 @@
+Using native Metal backend
+Model: lfm2 | 16 layers | hidden=2048
+Prompt tokens: 128 | max_tokens: 1 | warmup: 1 | runs: 3
+warmup 1/1
+run 1/3: prefill=3004 decode=2060.1 tok/s
+run 2/3: prefill=2997 decode=1861.9 tok/s
+run 3/3: prefill=3002 decode=1473.4 tok/s
+
+decode tok/s: p50=1861.9 p10=1473.4 p90=2060.1 mean=1798.5 stddev=243.7 (n=3)
+prefill tok/s: p50=3002 p10=2997 p90=3004 mean=3001 stddev=3 (n=3)

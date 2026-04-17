@@ -2674,7 +2674,47 @@ impl MetalLfm2Model {
     /// Profiled prefill: same as forward_prefill but commits/waits after each
     /// phase category to measure wall-clock GPU time per phase. Much slower
     /// due to per-phase serialization — for analysis only, not production.
+    ///
+    /// Chunks inputs larger than MAX_PREFILL_TOKENS (matching
+    /// `forward_prefill_inner`) so the caller doesn't overflow
+    /// `prefill_batch_buf`. Per-layer category names repeat across chunks;
+    /// aggregate by category to combine.
     pub fn forward_prefill_profiled(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<(String, f64)> {
+        // Upfront bounds check so failures are atomic — otherwise a call
+        // exceeding the context window could partially advance seq_len /
+        // KV / conv buffers across successful chunks and then panic on a
+        // later chunk. Matches the assertion in `forward_prefill_inner`.
+        assert!(
+            start_pos + tokens.len() <= self.state.max_seq_len,
+            "prefill seq_len {} + {} exceeds max {}",
+            start_pos,
+            tokens.len(),
+            self.state.max_seq_len
+        );
+        let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        if tokens.len() > max_chunk {
+            let mut all_timings = Vec::new();
+            let mut pos = start_pos;
+            let mut remaining = tokens;
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(max_chunk);
+                let chunk = &remaining[..chunk_len];
+                let timings = self.forward_prefill_profiled_inner(chunk, pos, state);
+                all_timings.extend(timings);
+                pos += chunk_len;
+                remaining = &remaining[chunk_len..];
+            }
+            return all_timings;
+        }
+        self.forward_prefill_profiled_inner(tokens, start_pos, state)
+    }
+
+    fn forward_prefill_profiled_inner(
         &self,
         tokens: &[u32],
         start_pos: usize,

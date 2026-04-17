@@ -11,6 +11,9 @@ Cargo.lock
 *~
 .DS_Store
 
+# Claude Code local state (memory, skills, scheduled tasks, per-project settings)
+.claude/
+
 # Models
 *.gguf
 

@@ -1,0 +1,11 @@
+warning: WICK_PROFILE is set — bench numbers will be inflated by profile overhead
+Using native Metal backend
+Model: lfm2 | 16 layers | hidden=1024
+Prompt tokens: 128 | max_tokens: 1 | warmup: 1 | runs: 3
+warmup 1/1
+run 1/3: prefill=7796 decode=2431.6 tok/s
+run 2/3: prefill=7839 decode=2260.1 tok/s
+run 3/3: prefill=7963 decode=2252.7 tok/s
+
+decode tok/s: p50=2260.1 p10=2252.7 p90=2431.6 mean=2314.8 stddev=82.7 (n=3)
+prefill tok/s: p50=7839 p10=7796 p90=7963 mean=7866 stddev=71 (n=3)
