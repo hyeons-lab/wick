@@ -1799,6 +1799,75 @@ impl MetalLfm2Model {
         enc.set_buffer(6, Some(&self.params.conv1d), 0);
         enc.dispatch_thread_groups(grid, sz1d(256));
     }
+
+    /// Dispatch one `attention_prefill` kernel call against (q_buf, k_cache,
+    /// v_cache) writing to `out_buf`. Kernel layout constants (Q_PER_TG=8,
+    /// C=32, N_THREADS=256) are defined in `attention_prefill.metal`; this
+    /// helper is the single authoritative Rust side for them, so both the
+    /// production prefill path and the per-phase profiled path stay in sync
+    /// when the kernel is tuned.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_attention_prefill_batch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q_buf: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        out_buf: &Buffer,
+        n: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        start_pos: u32,
+        q_stride: u32,
+        out_stride: u32,
+    ) {
+        // Kernel invariants (attention_prefill.metal):
+        // - hd <= 256 (po[8] × 32 lanes in V accumulation)
+        // - hd % 4 == 0 (float4 scoring loop)
+        assert!(
+            head_dim <= 256 && head_dim % 4 == 0,
+            "attention_prefill requires head_dim <= 256 and divisible by 4, got {}",
+            head_dim,
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 9] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            start_pos,
+            n,
+            scale.to_bits(),
+            q_stride,
+            out_stride,
+        ];
+        enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
+        enc.set_buffer(0, Some(q_buf), 0);
+        enc.set_buffer(1, Some(k_cache), 0);
+        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(3, Some(out_buf), 0);
+        enc.set_bytes(
+            4,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        // Dynamic threadgroup memory — must match attention_prefill.metal's
+        // layout exactly (Q_PER_TG=8, C=32). Fields: q_tg + kv_tile + scores +
+        // out_tg + state.
+        let hd_val = head_dim as usize;
+        let smem_bytes = (8 * hd_val        // q_tg
+            + 32 * hd_val                    // kv_tile (C=32)
+            + 8 * 32                         // scores (Q_PER_TG×C)
+            + 8 * hd_val                     // out_tg
+            + 8 * 2)                         // state
+            * 4;
+        enc.set_threadgroup_memory_length(0, smem_bytes as u64);
+        let q_per_tg = 8u32;
+        let n_tgs = ((n + q_per_tg - 1) / q_per_tg) * n_heads;
+        enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
+    }
 }
 
 impl Model for MetalLfm2Model {
@@ -2471,35 +2540,20 @@ impl MetalLfm2Model {
                 // from Phase 1. Downstream consumers read it and produce garbage,
                 // as with the decode path's noattn guard.
                 if !self.skip_attn {
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-                    let params: [u32; 9] = [
+                    self.encode_attention_prefill_batch(
+                        enc,
+                        &self.prefill_proj_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_normed_buf,
+                        n as u32,
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        kv_dim as u32,
                         start_pos as u32,
-                        n as u32,
-                        scale.to_bits(),
                         hs as u32, // q_stride
                         hs as u32, // out_stride
-                    ];
-                    enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
-                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
-                    enc.set_buffer(1, Some(k_cache), 0);
-                    enc.set_buffer(2, Some(v_cache), 0);
-                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
-                    enc.set_bytes(
-                        4,
-                        std::mem::size_of_val(&params) as u64,
-                        params.as_ptr() as *const _,
                     );
-                    // Dynamic threadgroup memory for multi-query tiled attention.
-                    let hd_val = head_dim as usize;
-                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
-                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
-                    let q_per_tg = 8u32;
-                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
-                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
                 }
 
                 // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
@@ -2974,35 +3028,20 @@ impl MetalLfm2Model {
                 });
 
                 run_phase(format!("L{layer}_attn_kernel"), &|enc| {
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-                    let params: [u32; 9] = [
+                    self.encode_attention_prefill_batch(
+                        enc,
+                        &self.prefill_proj_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_normed_buf,
+                        n as u32,
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        kv_dim as u32,
                         start_pos as u32,
-                        n as u32,
-                        scale.to_bits(),
                         hs as u32,
                         hs as u32,
-                    ];
-                    enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
-                    enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
-                    enc.set_buffer(1, Some(k_cache), 0);
-                    enc.set_buffer(2, Some(v_cache), 0);
-                    enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
-                    enc.set_bytes(
-                        4,
-                        std::mem::size_of_val(&params) as u64,
-                        params.as_ptr() as *const _,
                     );
-                    // Dynamic threadgroup memory for multi-query tiled attention.
-                    let hd_val = head_dim as usize;
-                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
-                    enc.set_threadgroup_memory_length(0, smem_bytes as u64);
-                    let q_per_tg = 8u32;
-                    let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
-                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
                 });
 
                 run_phase(format!("L{layer}_attn_outproj"), &|enc| {
