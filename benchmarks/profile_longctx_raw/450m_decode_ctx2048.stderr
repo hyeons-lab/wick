@@ -1,0 +1,41 @@
+warning: WICK_PROFILE is set — bench numbers will be inflated by profile overhead
+Using native Metal backend
+Model: lfm2 | 16 layers | hidden=1024
+Prompt tokens: 2048 | max_tokens: 128 | warmup: 0 | runs: 1
+[wick-metal] per-category ms/token breakdown (32 tokens):
+  conv_pre         2.616 (11.8%)
+  conv1d           2.487 (11.2%)
+  ffn_norm_gemv    4.546 (20.5%)
+  ffn_silu_down    4.243 (19.1%)
+  attn_norm_qkv    1.663 ( 7.5%)
+  attn_qk_rope     1.431 ( 6.4%)
+  attn_kernel      3.212 (14.5%)
+  attn_out         1.367 ( 6.2%)
+  out              0.660 ( 3.0%)
+  TOTAL           22.226
+[wick-metal] per-category ms/token breakdown (64 tokens):
+  conv_pre         2.653 (11.7%)
+  conv1d           2.497 (11.0%)
+  ffn_norm_gemv    4.622 (20.3%)
+  ffn_silu_down    4.317 (19.0%)
+  attn_norm_qkv    1.651 ( 7.3%)
+  attn_qk_rope     1.433 ( 6.3%)
+  attn_kernel      3.444 (15.2%)
+  attn_out         1.384 ( 6.1%)
+  out              0.719 ( 3.2%)
+  TOTAL           22.718
+[wick-metal] per-category ms/token breakdown (96 tokens):
+  conv_pre         2.652 (11.6%)
+  conv1d           2.490 (10.9%)
+  ffn_norm_gemv    4.645 (20.3%)
+  ffn_silu_down    4.334 (19.0%)
+  attn_norm_qkv    1.641 ( 7.2%)
+  attn_qk_rope     1.430 ( 6.3%)
+  attn_kernel      3.526 (15.4%)
+  attn_out         1.385 ( 6.1%)
+  out              0.737 ( 3.2%)
+  TOTAL           22.842
+run 1/1: prefill=3421 decode=42.2 tok/s
+
+decode tok/s: p50=42.2 p10=42.2 p90=42.2 mean=42.2 stddev=0.0 (n=1)
+prefill tok/s: p50=3421 p10=3421 p90=3421 mean=3421 stddev=0 (n=1)
