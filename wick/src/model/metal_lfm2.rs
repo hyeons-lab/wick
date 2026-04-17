@@ -2493,9 +2493,24 @@ impl MetalLfm2Model {
                         std::mem::size_of_val(&params) as u64,
                         params.as_ptr() as *const _,
                     );
-                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    // Kernel invariants (attention_prefill.metal):
+                    // - hd <= 256 (po[8] × 32 lanes)
+                    // - hd % 4 == 0 (float4 scoring loop)
+                    assert!(
+                        head_dim <= 256 && head_dim % 4 == 0,
+                        "attention_prefill requires head_dim <= 256 and divisible by 4, got {}",
+                        head_dim,
+                    );
+                    // Dynamic threadgroup memory — must match attention_prefill.metal's
+                    // layout (Q_PER_TG=8, C=32). Fields: q_tg + kv_tile + scores +
+                    // out_tg + state.
                     let hd_val = head_dim as usize;
-                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    let smem_bytes = (8 * hd_val        // q_tg
+                        + 32 * hd_val                    // kv_tile (C=32)
+                        + 8 * 32                         // scores (Q_PER_TG×C)
+                        + 8 * hd_val                     // out_tg
+                        + 8 * 2)                         // state
+                        * 4;
                     enc.set_threadgroup_memory_length(0, smem_bytes as u64);
                     let q_per_tg = 8u32;
                     let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
@@ -2996,9 +3011,24 @@ impl MetalLfm2Model {
                         std::mem::size_of_val(&params) as u64,
                         params.as_ptr() as *const _,
                     );
-                    // Dynamic threadgroup memory for multi-query tiled attention.
+                    // Kernel invariants (attention_prefill.metal):
+                    // - hd <= 256 (po[8] × 32 lanes)
+                    // - hd % 4 == 0 (float4 scoring loop)
+                    assert!(
+                        head_dim <= 256 && head_dim % 4 == 0,
+                        "attention_prefill requires head_dim <= 256 and divisible by 4, got {}",
+                        head_dim,
+                    );
+                    // Dynamic threadgroup memory — must match attention_prefill.metal's
+                    // layout (Q_PER_TG=8, C=32). Fields: q_tg + kv_tile + scores +
+                    // out_tg + state.
                     let hd_val = head_dim as usize;
-                    let smem_bytes = (8 * hd_val + 32 * hd_val + 8 * 32 + 8 * hd_val + 16 + 8) * 4;
+                    let smem_bytes = (8 * hd_val        // q_tg
+                        + 32 * hd_val                    // kv_tile (C=32)
+                        + 8 * 32                         // scores (Q_PER_TG×C)
+                        + 8 * hd_val                     // out_tg
+                        + 8 * 2)                         // state
+                        * 4;
                     enc.set_threadgroup_memory_length(0, smem_bytes as u64);
                     let q_per_tg = 8u32;
                     let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;

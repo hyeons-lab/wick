@@ -80,10 +80,12 @@ kernel void attention_prefill(
     const uint simd_id = tid >> 5u;
     const uint hd4 = hd / 4u;
 
-    // Lane owns a contiguous slice of head_dim.
-    uint dims_per_lane = hd / NW;
-    if (dims_per_lane < 1u) dims_per_lane = 1u;
-    if (dims_per_lane > 8u) dims_per_lane = 8u;
+    // Lane owns a contiguous slice of head_dim. Ceil-div so a trailing
+    // partial slice (hd not a multiple of NW) is still covered — the
+    // `if (d < hd)` guards inside the V loops prevent out-of-bounds
+    // reads/writes. Host code asserts `hd <= NW * 8` and `hd % 4 == 0`
+    // so `po[8]` and the float4 scoring loop are safe.
+    const uint dims_per_lane = (hd + NW - 1u) / NW;
 
     // Load Q vectors (cooperative, all threads).
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
@@ -157,26 +159,32 @@ kernel void attention_prefill(
         // until the next iteration's barriers.
         const uint q = simd_id;
         if (q < n_q) {
-            // Softmax max: one lane per timestep (since C == simd_width).
-            float local_max = (simd_lane < c_len)
+            // Softmax max: lane L holds score[q][L] (since C == simd_width).
+            float score_lane = (simd_lane < c_len)
                 ? scores[q * C + simd_lane]
                 : -INFINITY;
-            float chunk_max = simd_max(local_max);
+            float chunk_max = simd_max(score_lane);
 
             float prev_max = state[q * 2 + 0];
             float new_max = max(prev_max, chunk_max);
             float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
 
-            // Exponentiate in place; reduce chunk_sum.
+            // Exponentiate — store back into the per-SG row of `scores` so
+            // the V loop can read timestep tt's value on every lane.
+            // `simdgroup_barrier` provides the threadgroup-memory visibility
+            // between the write (this lane's slot) and the read (all lanes'
+            // slots) that a bare `simd_sum` wouldn't.
             float e = 0.0f;
             if (simd_lane < c_len) {
-                e = exp(scores[q * C + simd_lane] - new_max);
+                e = exp(score_lane - new_max);
                 scores[q * C + simd_lane] = e;
             }
             float chunk_sum = simd_sum(e);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
 
             // V accumulation: each lane owns dims_per_lane dims, iterates
-            // all c_len timesteps. Reads V from kv_tile (threadgroup memory).
+            // all c_len timesteps. scores are in threadgroup memory, made
+            // visible by the simdgroup_barrier above.
             float po[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             for (uint tt = 0u; tt < c_len; tt++) {
                 float s = scores[q * C + tt];

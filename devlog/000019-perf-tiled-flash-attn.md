@@ -143,4 +143,69 @@ gate.
 
 ## Commits
 
-HEAD — perf(metal): one-simdgroup-per-query prefill attention
+3730d0d — perf(metal): one-simdgroup-per-query prefill attention
+HEAD — review: simdgroup_barrier + ceil-div dims_per_lane + host assert
+
+## PR review round 1 addressed (2026-04-16T23:11-0700)
+
+Three PR-review items landed from the same reviewer pass (plus I flagged
+the same simdgroup-barrier concern in a self-review before the comments
+posted):
+
+- **Missing simdgroup-level memory barrier.** The write at the old line
+  174 (`scores[q*C+simd_lane] = e`) and the read at line 182
+  (`scores[q*C+tt]`) cross lanes within one simdgroup. Per the Metal
+  Shading Language spec, threadgroup-memory visibility between lanes of
+  the same simdgroup requires either a `simdgroup_barrier` or a
+  `threadgroup_barrier` — even though it happens to work on M1 Max, it's
+  undefined behavior. Fixed by adding
+  `simdgroup_barrier(mem_flags::mem_threadgroup)` between the exp+write
+  and the V loop. Cheap (within-SG sync only) and keeps the threadgroup
+  round-trip to preserve perf. Tried a `simd_shuffle`-based rewrite that
+  avoids the threadgroup round-trip entirely; it was slightly slower on
+  M1 Max (-26.6% attn vs barrier path's -28.5%), so landed the barrier
+  version instead.
+
+- **`dims_per_lane` floor-div silently dropped dims** when `head_dim`
+  isn't a multiple of NW=32. Changed to ceil-div `(hd + NW - 1) / NW`;
+  the inner `if (d < hd)` guards were already in place to prevent OOB
+  reads/writes when the last lane covers fewer dims.
+
+- **`head_dim` upper bound and divisibility were implicit.** `po[8]` +
+  32 lanes caps the kernel at `head_dim ≤ 256`, and the float4 scoring
+  loop requires `head_dim % 4 == 0`. Added a host-side `assert!` in the
+  two Rust dispatch sites so unsupported models fail fast instead of
+  silently producing wrong attention output.
+
+- **Stale smem slot in Rust.** The old `sg_val` scratch (8 floats) was
+  no longer allocated in the kernel but still reserved in the Rust smem
+  formula. Tightened the formula to match the new TG-memory layout
+  exactly (q_tg + kv_tile + scores + out_tg + state).
+
+**Perf after review fixes** (LFM2.5-VL-450M-Q4_0, M1 Max):
+
+| Metric                    | Baseline   | Pre-review | Post-review | vs baseline |
+|---------------------------|-----------:|-----------:|------------:|------------:|
+| Prefill tok/s @ p=4096    | 2227       | 2802       | **2784**    | **+25.0%**  |
+| Prefill tok/s @ p=1024    | 5602       | 6362       | 6359        | +13.5%      |
+| Prefill tok/s @ p=128     | 8086       | 8346       | 8280        | +2.4%       |
+| `attn_kernel` GPU µs      | 1,413,205  | 979,123    | **1,010,592** | **-28.5%** |
+
+Barrier addition added ~3.2% to `attn_kernel` GPU time (979 → 1011 µs)
+vs the buggy-but-measured pre-review version. Wall-time delta is ~0.6%.
+Still clearly material over baseline.
+
+**What I did not address:**
+
+- **Junie's "hd > 256 limitation" beyond the hard assert.** Supporting
+  `hd > 256` would require restructuring `po[8]` to be dynamically sized
+  (multi-SG per dim) — out of scope here. The assert makes the
+  limitation explicit rather than silent. LFM2 uses hd=64.
+
+- **Synthetic CI test for `attention_prefill`.** Noted in my
+  critical-review list but deferred to a follow-up — the end-to-end
+  `test_batched_prefill_logits_match_sequential` plus the three
+  `attention_metal_parity` tests give good coverage already, and
+  building a faithful CPU reference for multi-query flash attention is
+  a larger piece of work than the 10-line synthetic tests for the
+  single-query kernels.
