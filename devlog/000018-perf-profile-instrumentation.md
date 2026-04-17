@@ -89,4 +89,29 @@ report so future readers don't chase the p=128 delta.
 
 ## Commits
 
-HEAD — perf(profile): batched-prefill noattn + GPU-timestamp attribution
+f020eae — perf(profile): batched-prefill noattn + GPU-timestamp attribution
+HEAD — review: share GpuTimer across chunks, warn on noattn+profiled, fix buffer-role comment
+
+## PR review addressed (2026-04-16T22:12-0700)
+
+- **Copilot 3129**: `build_gpu_timer` fired per-chunk (5 ms calibration ×
+  N chunks on prompts > 512 tokens). Fixed: `forward_prefill_profiled`
+  builds the `GpuTimer` once and passes it as a parameter into
+  `forward_prefill_profiled_gpu_inner`, which now resets `next_idx` /
+  `labels` per chunk but reuses the calibrated sample buffer.
+  Verified: p=4096 run now logs 3 calibrations (1 at load + 1 warmup + 1
+  measured), vs ~16 before (8 chunks × 2 calls).
+- **Copilot 2734**: `WICK_PROFILE=noattn` silently ignored on the profiled
+  paths. Fixed: `forward_prefill_profiled` now logs an eprintln warning
+  when it detects `noattn` so the user knows attention still ran. Also
+  documented in the function's doc comment.
+- **Copilot 2470**: comment in `forward_prefill_inner` mis-described
+  `prefill_normed_buf` as holding Q. Rewrote to explain correctly that Q
+  lives in `prefill_proj_buf` and `prefill_normed_buf` is the attention
+  kernel's output slot (pre-attention it holds the RMSNorm'd hidden
+  state from Phase 1, which is what downstream reads when we skip).
+- **Plan §39 (same wording fix)**: updated for consistency.
+- **Junie / Copilot 2206**: "cache `skip_attn` in the model struct" — not
+  applied. The env var is already cached once per forward call; moving
+  it to the struct would save a single syscall per forward (negligible)
+  at the cost of making the flag non-dynamic (can't flip mid-process).

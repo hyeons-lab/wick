@@ -2466,8 +2466,10 @@ impl MetalLfm2Model {
 
                 // Phase C: batched causal attention (1 dispatch for all N queries).
                 // WICK_PROFILE=noattn: skip to measure prefill cost without attention.
-                // prefill_normed_buf keeps stale RMSNormed Q data — downstream reads
-                // garbage, as with the decode path's noattn guard.
+                // Q lives in `prefill_proj_buf`; `prefill_normed_buf` is the attention
+                // kernel's output and is left holding stale RMSNorm'd hidden-state
+                // from Phase 1. Downstream consumers read it and produce garbage,
+                // as with the decode path's noattn guard.
                 if !skip_attn {
                     let scale = 1.0f32 / (head_dim as f32).sqrt();
                     let params: [u32; 9] = [
@@ -2686,6 +2688,11 @@ impl MetalLfm2Model {
     /// variant which commits + waits between phases; correct but inflates
     /// absolute shares because of per-phase serialization.
     ///
+    /// `WICK_PROFILE=noattn` only affects the production (non-profiled)
+    /// prefill path — the profiled variants always run the attention
+    /// phase so every phase has a measurable time. Combining `noattn`
+    /// with either profiled variant is meaningless and will log a warning.
+    ///
     /// Chunks inputs larger than MAX_PREFILL_TOKENS (matching
     /// `forward_prefill_inner`) so the caller doesn't overflow
     /// `prefill_batch_buf`. Per-layer category names repeat across chunks;
@@ -2707,7 +2714,39 @@ impl MetalLfm2Model {
             tokens.len(),
             self.state.max_seq_len
         );
-        let use_gpu_ts = std::env::var("WICK_PROFILE").as_deref() == Ok("gpu");
+        let profile = std::env::var("WICK_PROFILE").ok();
+        let use_gpu_ts = profile.as_deref() == Some("gpu");
+        if profile.as_deref() == Some("noattn") {
+            eprintln!(
+                "[wick-metal] warning: WICK_PROFILE=noattn has no effect on the \
+                 profiled prefill path — attention phase will still run. Set \
+                 WICK_PROFILE=timing or =gpu to profile, or leave unset and use \
+                 noattn via `wick bench`."
+            );
+        }
+
+        // Allocate the GpuTimer once (shared across chunks) to avoid the
+        // ~5 ms calibration sleep in `build_gpu_timer` firing per-chunk on
+        // prompts > MAX_PREFILL_TOKENS. `next_idx` / `labels` are reset at
+        // the start of each chunk.
+        let gpu_timer = if use_gpu_ts {
+            // Capacity for the worst-case chunk: MAX_PREFILL_TOKENS of phases.
+            // Per-chunk: n_layers × ~10 phases + 1 output, × 2 indices.
+            let per_chunk = (self.config.n_layers * 10 + 2) * 2;
+            match build_gpu_timer(&self.ctx, per_chunk.max(64)) {
+                Some(t) => Some(t),
+                None => {
+                    eprintln!(
+                        "[wick-metal] GPU timestamp unsupported — falling back to \
+                         CPU timing"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if tokens.len() > max_chunk {
             let mut all_timings = Vec::new();
@@ -2716,8 +2755,8 @@ impl MetalLfm2Model {
             while !remaining.is_empty() {
                 let chunk_len = remaining.len().min(max_chunk);
                 let chunk = &remaining[..chunk_len];
-                let timings = if use_gpu_ts {
-                    self.forward_prefill_profiled_gpu_inner(chunk, pos, state)
+                let timings = if let Some(ref t) = gpu_timer {
+                    self.forward_prefill_profiled_gpu_inner(chunk, pos, state, t)
                 } else {
                     self.forward_prefill_profiled_inner(chunk, pos, state)
                 };
@@ -2727,8 +2766,8 @@ impl MetalLfm2Model {
             }
             return all_timings;
         }
-        if use_gpu_ts {
-            self.forward_prefill_profiled_gpu_inner(tokens, start_pos, state)
+        if let Some(ref t) = gpu_timer {
+            self.forward_prefill_profiled_gpu_inner(tokens, start_pos, state, t)
         } else {
             self.forward_prefill_profiled_inner(tokens, start_pos, state)
         }
@@ -3106,6 +3145,9 @@ impl MetalLfm2Model {
     /// `commit + wait_until_completed` overhead of the CPU-wall-clock
     /// variant, so per-category shares reflect actual GPU busy time.
     ///
+    /// `gpu` is provided by the caller so calibration fires once per
+    /// `forward_prefill_profiled` call, not per chunk.
+    ///
     /// Returns the same `(label, µs)` shape as the CPU variant so
     /// `aggregate_prefill_phases` in bench_perf.rs works unchanged.
     fn forward_prefill_profiled_gpu_inner(
@@ -3113,20 +3155,13 @@ impl MetalLfm2Model {
         tokens: &[u32],
         start_pos: usize,
         state: &mut InferenceState,
+        gpu: &GpuTimer,
     ) -> Vec<(String, f64)> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let n = tokens.len();
         let is = cfg.intermediate_size;
         let batch_buf = &self.prefill_batch_buf;
-
-        // 16 layers × 9 phases + 1 output ≈ 145 passes × 2 indices/pass.
-        // 512 gives headroom; fallback to CPU-timing variant on alloc failure.
-        let capacity: usize = (cfg.n_layers * 10 + 2) * 2;
-        let Some(gpu) = build_gpu_timer(&self.ctx, capacity.max(64)) else {
-            eprintln!("[wick-metal] GPU timestamp unsupported — falling back to CPU timing");
-            return self.forward_prefill_profiled_inner(tokens, start_pos, state);
-        };
 
         // Stage all N embedding rows directly into batch_buf's mapped memory.
         unsafe {
@@ -3137,7 +3172,7 @@ impl MetalLfm2Model {
         }
 
         let cb = self.ctx.queue.new_command_buffer();
-        let mut labels: Vec<String> = Vec::with_capacity(capacity / 2);
+        let mut labels: Vec<String> = Vec::with_capacity(gpu.capacity / 2);
         let mut next_idx: usize = 0;
 
         let mut run_phase = |name: String, f: &dyn Fn(&metal::ComputeCommandEncoderRef)| {

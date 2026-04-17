@@ -35,9 +35,11 @@ The attention dispatch lives in `forward_prefill_inner` (around lines
 - set threadgroup memory
 - dispatch
 
-Skipping all of that when `WICK_PROFILE=noattn` leaves `prefill_normed_buf`
-holding the previous layer's RMSNormed Q input — downstream consumers
-(attn output projection, FFN) read garbage, but that's already the
+Skipping all of that when `WICK_PROFILE=noattn` leaves `prefill_proj_buf`
+holding the projected/RoPE'd Q input, while `prefill_normed_buf`
+(the attention kernel's output slot) keeps the stale RMSNorm'd hidden
+state from Phase 1. Downstream consumers (attn output projection, FFN)
+read that stale data and produce garbage, but that's already the
 contract of `noattn` on the decode path: the output logits are
 meaningless, the timing is what we want.
 
