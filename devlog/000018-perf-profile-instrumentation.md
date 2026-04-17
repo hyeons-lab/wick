@@ -90,7 +90,33 @@ report so future readers don't chase the p=128 delta.
 ## Commits
 
 f020eae — perf(profile): batched-prefill noattn + GPU-timestamp attribution
-HEAD — review: share GpuTimer across chunks, warn on noattn+profiled, fix buffer-role comment
+511729b — review: share GpuTimer across chunks, warn on noattn+profiled, fix buffer-role comment
+HEAD — review: cache skip_attn on model + dedupe profiled prefill layer loop
+
+## PR review round 2 addressed (2026-04-16T22:30-0700)
+
+- **Copilot/Junie 2206 (repeat)**: finally cached `skip_attn` as a field
+  on `MetalLfm2Model`, populated from `WICK_PROFILE=noattn` at load time
+  alongside the existing `force_flash` / `attn_mode`. Three call sites
+  (`encode_attention`, `encode_attention_q_offset`, `forward_prefill_inner`)
+  now read `self.skip_attn` instead of hitting `std::env::var` per
+  layer / per forward call. Verified: noattn bench at p=4096 still
+  produces 11483 tok/s vs 2246 baseline (~80% attn share).
+- **Copilot/Junie 3153**: deduped `forward_prefill_profiled_inner` and
+  `forward_prefill_profiled_gpu_inner` by extracting
+  `encode_prefill_phases<F>` — a single shared method that owns the
+  embedding stage + layer loop + `output` epilogue and calls
+  `run_phase(name, encode_fn)` once per logical phase. The two wrappers
+  become thin adapters: CPU variant commits per phase and times with
+  `Instant`, GPU variant accumulates encoders with sample attachments
+  into one command buffer and resolves timestamps after wait. Net
+  -317 lines, identical output shape. Verified: both variants still
+  produce the same `L{layer}_{phase}` label shape and agree on
+  `attn_kernel` absolute time (CPU=1,430,595 µs, GPU=1,416,216 µs,
+  within 1%).
+- **Copilot/Junie 3329 (granularity)**: resolved automatically — both
+  variants now go through the same phase list by construction. No code
+  change needed beyond the dedupe above.
 
 ## PR review addressed (2026-04-16T22:12-0700)
 
