@@ -67,22 +67,70 @@ Default builds — `cargo build --release` with no features — use the pure-NEO
 
 Two GPU backends with runtime selection via `--device`:
 
-**Native Metal** (`--device metal`, macOS/iOS) — hand-written MSL shaders, single-encoder dispatch, GPU argmax. Beats llama.cpp across all tested models and context lengths.
+**Native Metal** (`--device metal`, macOS/iOS) — hand-written MSL shaders, single-encoder dispatch, GPU argmax. Decodes ~2× faster than llama.cpp on all tested Q4_0 models; prefill is competitive at short prompts and trails at long prompts (tracked in `benchmarks/profile_longctx.md`).
 
 **wgpu** (`--device gpu`, cross-platform) — WGSL shaders targeting Metal/Vulkan/DX12/WebGPU. Portable but slower due to API translation overhead.
 
-#### Decode throughput vs llama.cpp (greedy, M1 Max)
+#### Decode throughput vs llama.cpp (greedy, M1 Max, Q4_0)
 
-| Model | Context | llama.cpp | wick Metal | wick wgpu | wick CPU |
-|-------|---------|----------:|-----------:|----------:|---------:|
-| LFM2-450M | tg128 | 301 | **379** (+26%) | 75 | 120 |
-| LFM2-450M | tg512 | 325 | **345** (+6%) | 70 | — |
-| LFM2.5-VL-1.6B | tg128 | 262 | **278** (+6%) | — | — |
-| LFM2.5-VL-1.6B | tg512 | 200 | **242** (+21%) | — | — |
-| LFM2.5-Audio-1.5B | tg128 | 267 | **278** (+4%) | — | — |
-| LFM2.5-Audio-1.5B | tg512 | 201 | **253** (+26%) | — | — |
+| Model             | Test  | llama.cpp | wick Metal       |
+|-------------------|-------|----------:|-----------------:|
+| LFM2.5-VL-450M    | tg128 | 142       | **351** (+147%)  |
+| LFM2.5-VL-450M    | tg512 | 139       | **321** (+131%)  |
+| LFM2.5-VL-1.6B    | tg128 | 128       | **261** (+104%)  |
+| LFM2.5-VL-1.6B    | tg512 | 122       | **223** (+83%)   |
+| LFM2.5-Audio-1.5B | tg128 | 107*      | **226** (+111%)  |
+| LFM2.5-Audio-1.5B | tg512 | 115       | **222** (+93%)   |
 
-Measured with `wick bench --runs 20 --warmup 3` (sustained in-process, p50 reported). llama.cpp numbers from `llama-bench -r 10` on the Liquid4All fork (9438fcb27).
+\* Audio tg128 is llama-bench noisy at r=10 (σ ≈ ±45). Steady-state Audio
+decode sits near the tg512 number.
+
+Both engines are primed with a 128-token prefill, then decode tok/s is
+timed over the next 128 or 512 tokens (no timing includes the prefill).
+Reproduction commands:
+
+```
+# wick (per row, swap --max-tokens)
+wick bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 128 --runs 20 --warmup 3
+wick bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 512 --runs 20 --warmup 3
+
+# llama.cpp (Liquid4All fork fb38d6f27; per row, swap -n)
+llama-bench -m model.gguf -p 128 -n 128 -ngl 99 -r 10
+llama-bench -m model.gguf -p 128 -n 512 -ngl 99 -r 10
+```
+
+#### Prefill throughput vs llama.cpp (Q4_0, Metal, M1 Max)
+
+| Model          | Prompt | llama.cpp | wick Metal      | Ratio |
+|----------------|-------:|----------:|----------------:|------:|
+| LFM2.5-VL-450M | 128    | 7619      | **8315** (+9%)  | 1.09× |
+| LFM2.5-VL-450M | 1024   | 8213      | 6411            | 0.78× |
+| LFM2.5-VL-450M | 4096   | 7008      | 2817            | 0.40× |
+| LFM2.5-VL-1.6B | 128    | 2750      | 2567            | 0.93× |
+| LFM2.5-VL-1.6B | 1024   | 2481      | 1864            | 0.75× |
+| LFM2.5-VL-1.6B | 4096   | 2178      | 1135            | 0.52× |
+
+Wick leads on 450M at p=128 and is competitive on 1.6B at p=128;
+llama.cpp's BLAS-backed GEMM still wins at p=1024 and p=4096 on both
+models. PR [#20](https://github.com/hyeons-lab/wick/pull/20) landed a
+**+26% improvement** to Metal prefill at p=4096 (2227 → 2817 tok/s on
+LFM2.5-VL-450M) via a one-simdgroup-per-query rewrite of
+`attention_prefill.metal`. Further work on the long-prompt gap is
+tracked in `benchmarks/profile_longctx.md`.
+
+Reproduction commands:
+
+```
+# wick (per row, swap --prompt-tokens)
+wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 128  --max-tokens 0 --runs 20 --warmup 3
+wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 1024 --max-tokens 0 --runs 20 --warmup 3
+wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 4096 --max-tokens 0 --runs 20 --warmup 3
+
+# llama.cpp (Liquid4All fork fb38d6f27; per row, swap -p)
+llama-bench -m model.gguf -p 128  -n 0 -ngl 99 -r 20
+llama-bench -m model.gguf -p 1024 -n 0 -ngl 99 -r 20
+llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
+```
 
 #### Key Metal optimizations
 
