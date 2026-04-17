@@ -294,3 +294,83 @@ Scope for the follow-up plan:
    - If improvement is <10% despite a correct implementation: the
      attribution was wrong, back out the change and revisit via the proper
      instrumentation from step (1).
+
+---
+
+## 8. Post-instrumentation attribution (2026-04-16, PR #19)
+
+Step (1) from §7 now lands: the `WICK_PROFILE=noattn` guard fires in
+batched prefill (`forward_prefill_inner`), and a GPU-timestamp variant of
+`forward_prefill_profiled` sidesteps the per-phase `commit + wait`
+overhead that inflated small phases in the CPU-wall-clock run.
+
+### 8.1 noattn on batched prefill (the table §6 warned about)
+
+`wick bench --device metal --no-cache --context-size 8192 --prompt-tokens N
+--runs 3 --warmup 1 --max-tokens 0` on LFM2.5-VL-450M-Q4_0, M1 Max:
+
+| Prompt | regular (tok/s) | noattn (tok/s) | attn share (1 - regular/noattn) |
+|--------|----------------:|---------------:|--------------------------------:|
+| 128    | 8086            | 7563           | negative (noise — 7 ms total)   |
+| 1024   | 5602            | 11498          | **51%**                         |
+| 4096   | 2226            | 11162          | **80%**                         |
+
+Compare to §6's pre-fix table: p=1024 and p=4096 both read ~0% attn share
+because the guard lived only on the decode-path dispatches. The fix lands
+right in the range the report predicted (40–70% at p=4096) and confirms
+attention is the overwhelming scaler on prefill.
+
+p=128 noise: noattn's absolute time is ~7 ms and the warmup run settles
+Metal shader cache / GPU clock unevenly; the variance swamps the 6% of
+total time attention costs at that scale. Ignore the sign.
+
+### 8.2 GPU timestamps vs CPU wall clock (sanity)
+
+`WICK_PROFILE=gpu cargo test ... test_profile_longctx_2_5_450m_n4096`
+vs the default `WICK_PROFILE` path, 450M @ p=4096:
+
+| Category       | CPU-wall µs | GPU-ticks µs | Δ         | GPU share |
+|----------------|------------:|-------------:|----------:|----------:|
+| attn_kernel    | 1,428,248   | 1,427,326    | -0.06%    | **80.1%** |
+| conv_ffn_gemm  | 118,287     | 99,688       | -16%      | 5.6%      |
+| attn_ffn_gemm  | 71,242      | 59,405       | -17%      | 3.3%      |
+| conv_ffn_down  | 76,333      | 55,693       | -27%      | 3.1%      |
+| conv_inproj    | 51,538      | 33,781       | -34%      | 1.9%      |
+| attn_ffn_down  | 45,396      | 33,137       | -27%      | 1.9%      |
+| conv1d         | 35,167      | 17,544       | -50%      | 1.0%      |
+| attn_qkv       | 26,646      | 15,593       | -41%      | 0.9%      |
+| conv_outproj   | 34,066      | 13,398       | -61%      | 0.8%      |
+| attn_outproj   | 25,707      | 8,530        | -67%      | 0.5%      |
+| small phases   | 100k+       | 15k          | -85%+     | ~1.0%     |
+| Total          | 2,042 ms    | 1,782 ms     | -13%      | 100%      |
+
+`attn_kernel` absolute time agrees within 0.1% — the one phase large
+enough that per-phase dispatch overhead is negligible. All other phases
+shrink substantially under GPU timestamps, which is exactly the expected
+shape: CPU wall clock over-counts dispatch latency on short kernels.
+
+Consequence for attribution: attention's real share on p=4096 prefill is
+**80%**, not the 70% the CPU wall-clock path reported in §5. That matches
+the §8.1 noattn cross-check (80%) to the point. Both independent methods
+now agree.
+
+### 8.3 Updated guidance for the flash-attention rewrite
+
+The rewrite's opportunity is larger than the original report implied:
+
+- **Decode @ ctx=4096:** 54% attn share (unchanged from §3) — room for
+  ~2× decode at long context if the kernel is faster.
+- **Prefill @ p=4096:** **80% attn share** (was reported as "directional
+  evidence for 70%") — if the rewrite matches llama.cpp's per-token
+  prefill attention cost (flat ~10k tok/s across prompt sizes vs our
+  4× regression at p=4096), the upside is closer to **3–4× prefill**,
+  not 2×.
+
+The §7 validation targets still stand as lower bounds:
+- Prefill @ p=4096 ≥ 4500 tok/s (2.0× current).
+- Decode @ ctx=4096 ≥ 44 tok/s (2.0× current).
+
+New lower bound for the rewrite to be worth the complexity: **if attn_kernel
+GPU time at p=4096 doesn't drop by ≥40%, abandon the rewrite** — 80% of
+an un-improved kernel leaves nothing for other phases to make up, and
+the residual gap is then in GEMM batching / conv1d, not attention.
