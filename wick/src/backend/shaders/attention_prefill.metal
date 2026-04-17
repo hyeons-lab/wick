@@ -3,18 +3,26 @@ using namespace metal;
 
 // Multi-query tiled flash attention for prefill.
 //
-// Processes Q_PER_TG=8 queries per threadgroup with KV tiling (chunk C).
-// Each TG loads KV tiles into threadgroup memory once, shared across 8 queries.
-// Online softmax with rescaling enables unbounded sequence length.
+// Layout: one simdgroup per query within a threadgroup. NSG=8 matches
+// Q_PER_TG=8 so each SG owns a query's softmax + V accumulation
+// independently — all reductions inside the per-query block use
+// simdgroup collectives (simd_max / simd_sum), with NO threadgroup
+// barriers between them. Barriers remain only between the cooperative
+// K-load, score, V-load phases (3 per chunk) — vs the previous design's
+// ~5 per query × n_q per chunk.
 //
-// Dispatch: ceil(n_queries/Q_PER_TG) × n_heads TGs × 128 threads (4 SGs).
+// C=32 matches simd_width so each chunk's softmax reduction fits in a
+// single simd_max / simd_sum call per SG. Growing C beyond simd_width
+// would require per-SG loops with partial sums and defeat the point.
+//
+// Dispatch: ceil(n_queries/Q_PER_TG) × n_heads TGs × 256 threads.
 // Threadgroup memory: dynamically allocated via set_threadgroup_memory_length.
 
 constant constexpr uint Q_PER_TG = 8;   // queries per threadgroup
-constant constexpr uint C = 32;          // KV chunk size
-constant constexpr uint NW = 32;         // SIMD width
-constant constexpr uint NSG = 4;         // simdgroups per TG
-constant constexpr uint N_THREADS = NSG * NW; // 128
+constant constexpr uint C = 32;         // KV chunk size (must equal NW)
+constant constexpr uint NW = 32;        // SIMD width
+constant constexpr uint NSG = 8;        // simdgroups per TG (must equal Q_PER_TG)
+constant constexpr uint N_THREADS = NSG * NW; // 256
 
 struct PrefillAttnParams {
     uint n_heads;
@@ -25,13 +33,13 @@ struct PrefillAttnParams {
     uint n_queries;
     uint scale_bits;
     uint q_stride;   // floats between query vectors
-    uint out_stride;  // floats between output vectors
+    uint out_stride; // floats between output vectors
 };
 
 kernel void attention_prefill(
     const device float* q_batch [[buffer(0)]],
-    const device half* k_cache [[buffer(1)]],
-    const device half* v_cache [[buffer(2)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
     device float* out_batch [[buffer(3)]],
     constant PrefillAttnParams& params [[buffer(4)]],
     threadgroup char* shmem [[threadgroup(0)]],
@@ -53,28 +61,29 @@ kernel void attention_prefill(
     const uint kv_head = head / group_size;
     const uint kv_h_off = kv_head * hd;
 
-    // How many valid queries in this TG (last group may be partial).
     const uint n_q = min(Q_PER_TG, n_queries - q_base);
-    // Max seq_len across all queries in this group.
     const uint max_seq = start_pos + q_base + n_q;
 
     // Dynamic threadgroup memory layout (all floats):
     //   q_tg:    Q_PER_TG × hd       (query vectors)
-    //   kv_tile: C × hd               (K or V tile, shared between K/V phases)
-    //   scores:  Q_PER_TG × C         (QK scores for current chunk)
-    //   out_tg:  Q_PER_TG × hd        (output accumulators)
-    //   state:   Q_PER_TG × 2         (running softmax max + sum per query)
-    //   sg_val:  8                     (simdgroup reduction scratch)
+    //   kv_tile: C × hd               (K or V tile, reused)
+    //   scores:  Q_PER_TG × C         (per-chunk scores)
+    //   out_tg:  Q_PER_TG × hd        (running output accumulators)
+    //   state:   Q_PER_TG × 2         (running max + sum per query)
     threadgroup float* q_tg    = (threadgroup float*)(shmem);
     threadgroup float* kv_tile = q_tg + Q_PER_TG * hd;
     threadgroup float* scores  = kv_tile + C * hd;
     threadgroup float* out_tg  = scores + Q_PER_TG * C;
     threadgroup float* state   = out_tg + Q_PER_TG * hd;
-    threadgroup float* sg_val  = state + Q_PER_TG * 2;
 
     const uint simd_lane = tid & 31u;
     const uint simd_id = tid >> 5u;
     const uint hd4 = hd / 4u;
+
+    // Lane owns a contiguous slice of head_dim.
+    uint dims_per_lane = hd / NW;
+    if (dims_per_lane < 1u) dims_per_lane = 1u;
+    if (dims_per_lane > 8u) dims_per_lane = 8u;
 
     // Load Q vectors (cooperative, all threads).
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
@@ -82,17 +91,17 @@ kernel void attention_prefill(
         uint d = idx % hd;
         q_tg[q * hd + d] = q_batch[(q_base + q) * params.q_stride + head * hd + d];
     }
-    // Init output accumulators to 0 and softmax state.
+    // Init output accumulators + softmax state.
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
         out_tg[idx] = 0.0f;
     }
     if (tid < Q_PER_TG) {
-        state[tid * 2 + 0] = -INFINITY; // max
-        state[tid * 2 + 1] = 0.0f;       // sum
+        state[tid * 2 + 0] = -INFINITY;
+        state[tid * 2 + 1] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Process KV cache in chunks of C.
+    // Iterate KV chunks.
     for (uint c0 = 0; c0 < max_seq; c0 += C) {
         const uint c_end = min(c0 + C, max_seq);
         const uint c_len = c_end - c0;
@@ -113,9 +122,8 @@ kernel void attention_prefill(
 
             float s;
             if (c0 + t >= seq_len_q) {
-                s = -INFINITY; // causal mask
+                s = -INFINITY;
             } else {
-                // Dot product Q[q] · K[t] using float4 vectorization.
                 float acc = 0.0f;
                 for (uint d4 = 0; d4 < hd4; d4++) {
                     float4 qq = float4(
@@ -136,8 +144,7 @@ kernel void attention_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Per-query online softmax + V accumulation ----
-        // Load V tile (reuse kv_tile memory — K is no longer needed).
+        // ---- Overwrite kv_tile with V values for this chunk ----
         for (uint idx = tid; idx < c_len * hd; idx += N_THREADS) {
             uint t = idx / hd;
             uint d = idx % hd;
@@ -145,62 +152,61 @@ kernel void attention_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Process each query's softmax and V accumulation.
-        // Parallelize: 128 threads work on the C positions and hd dimensions.
-        for (uint q = 0; q < n_q; q++) {
-            // Find chunk max (all threads cooperate).
-            float local_max = -INFINITY;
-            for (uint t = tid; t < c_len; t += N_THREADS) {
-                local_max = max(local_max, scores[q * C + t]);
-            }
-            float sg_max_v = simd_max(local_max);
-            if (simd_lane == 0u) sg_val[simd_id] = sg_max_v;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_id == 0u) {
-                float v = simd_lane < NSG ? sg_val[simd_lane] : -INFINITY;
-                if (simd_lane == 0u) sg_val[0] = simd_max(v);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float chunk_max = sg_val[0];
+        // ---- Per-query softmax + V accumulation ----
+        // Each SG handles its own query. No inter-SG coordination in here
+        // until the next iteration's barriers.
+        const uint q = simd_id;
+        if (q < n_q) {
+            // Softmax max: one lane per timestep (since C == simd_width).
+            float local_max = (simd_lane < c_len)
+                ? scores[q * C + simd_lane]
+                : -INFINITY;
+            float chunk_max = simd_max(local_max);
 
             float prev_max = state[q * 2 + 0];
             float new_max = max(prev_max, chunk_max);
             float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
 
-            // Compute exp(score - new_max) and chunk sum.
-            float local_sum = 0.0f;
-            for (uint t = tid; t < c_len; t += N_THREADS) {
-                float e = exp(scores[q * C + t] - new_max);
-                scores[q * C + t] = e;
-                local_sum += e;
+            // Exponentiate in place; reduce chunk_sum.
+            float e = 0.0f;
+            if (simd_lane < c_len) {
+                e = exp(scores[q * C + simd_lane] - new_max);
+                scores[q * C + simd_lane] = e;
             }
-            float sg_sum_v = simd_sum(local_sum);
-            if (simd_lane == 0u) sg_val[simd_id] = sg_sum_v;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_id == 0u) {
-                float v = simd_lane < NSG ? sg_val[simd_lane] : 0.0f;
-                if (simd_lane == 0u) sg_val[0] = simd_sum(v);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float chunk_sum = sg_val[0];
+            float chunk_sum = simd_sum(e);
 
-            // Rescale previous output + accumulate weighted V.
-            for (uint d = tid; d < hd; d += N_THREADS) {
-                float prev = out_tg[q * hd + d] * rescale;
-                float v_sum = 0.0f;
-                for (uint t = 0; t < c_len; t++) {
-                    v_sum += scores[q * C + t] * kv_tile[t * hd + d];
+            // V accumulation: each lane owns dims_per_lane dims, iterates
+            // all c_len timesteps. Reads V from kv_tile (threadgroup memory).
+            float po[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (uint tt = 0u; tt < c_len; tt++) {
+                float s = scores[q * C + tt];
+                uint v_base = tt * hd + simd_lane * dims_per_lane;
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 8u; i++) {
+                    if (i < dims_per_lane) {
+                        uint d = simd_lane * dims_per_lane + i;
+                        if (d < hd) {
+                            po[i] += s * kv_tile[v_base + i];
+                        }
+                    }
                 }
-                out_tg[q * hd + d] = prev + v_sum;
             }
 
-            // Update softmax state.
-            if (tid == 0u) {
+            // Rescale running output + write chunk contribution.
+            for (uint i = 0u; i < dims_per_lane; i++) {
+                uint d = simd_lane * dims_per_lane + i;
+                if (d < hd) {
+                    out_tg[q * hd + d] = out_tg[q * hd + d] * rescale + po[i];
+                }
+            }
+
+            // Update softmax state (single lane).
+            if (simd_lane == 0u) {
                 state[q * 2 + 0] = new_max;
                 state[q * 2 + 1] = state[q * 2 + 1] * rescale + chunk_sum;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Final: divide by softmax sum and write output.

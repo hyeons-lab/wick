@@ -2499,7 +2499,7 @@ impl MetalLfm2Model {
                     enc.set_threadgroup_memory_length(0, smem_bytes as u64);
                     let q_per_tg = 8u32;
                     let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
-                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
                 }
 
                 // Attn output proj GEMM → gate_buf scratch (fused into FFN norm below).
@@ -3002,7 +3002,7 @@ impl MetalLfm2Model {
                     enc.set_threadgroup_memory_length(0, smem_bytes as u64);
                     let q_per_tg = 8u32;
                     let n_tgs = ((n as u32 + q_per_tg - 1) / q_per_tg) * n_heads;
-                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(128));
+                    enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
                 });
 
                 run_phase(format!("L{layer}_attn_outproj"), &|enc| {
