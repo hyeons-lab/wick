@@ -144,7 +144,23 @@ gate.
 ## Commits
 
 3730d0d — perf(metal): one-simdgroup-per-query prefill attention
-HEAD — review: simdgroup_barrier + ceil-div dims_per_lane + host assert
+e2872e5 — review: simdgroup_barrier + ceil-div dims_per_lane + host assert
+HEAD — review: extract encode_attention_prefill_batch helper
+
+## PR review round 2 addressed (2026-04-17T07:48-0700)
+
+- **Copilot (duplication):** the head_dim invariants + smem_bytes
+  formula + dispatch logic were duplicated across the two
+  `attention_prefill` call sites (production prefill and
+  `encode_prefill_phases`). Factored into a single
+  `encode_attention_prefill_batch` method on `MetalLfm2Model`, placed
+  next to the other `encode_attention*` helpers. Both call sites now
+  reduce to a 12-line method call, and future kernel tweaks only need
+  to update one place.
+- **Pure refactor** — no behavior change. Correctness preserved
+  (cosine=1.0, all three attention_metal_parity tests pass). Perf
+  within noise: 2795 tok/s (was 2784 in prior commit, baseline 2227 →
+  still +25.5%).
 
 ## PR review round 1 addressed (2026-04-16T23:11-0700)
 
