@@ -24,13 +24,19 @@ struct Params {
 
 kernel void flash_attention(
     const device float* q [[buffer(0)]],
-    const device float* k_cache [[buffer(1)]],
-    const device float* v_cache [[buffer(2)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
+    // K/V caches are stored as f16 on the Rust side (see
+    // `encode_cast_f32_to_f16_offsets` in metal_lfm2.rs and the
+    // `// f16 bytes` comment at the kv_cache_off calculation). The
+    // classic `attention.metal` also binds them as `half*`; binding as
+    // `float*` here reinterprets two consecutive f16 values as one f32
+    // and produces garbage attention outputs.
     uint n_heads = params.n_heads;
     uint n_kv_heads = params.n_kv_heads;
     uint head_dim = params.head_dim;
@@ -74,7 +80,7 @@ kernel void flash_attention(
             float sc = 0.0f;
             uint k_base = (tile_start + tid) * kv_dim + kv_h_offset;
             for (uint dd = 0u; dd < head_dim; dd++) {
-                sc += q_shared[dd] * k_cache[k_base + dd];
+                sc += q_shared[dd] * float(k_cache[k_base + dd]);
             }
             tile_scores[tid] = sc * scale;
         }
@@ -119,7 +125,7 @@ kernel void flash_attention(
             partial_out *= correction;
             for (uint b = s_group; b < tile_len; b += par) {
                 partial_out += tile_scores[b]
-                             * v_cache[(tile_start + b) * kv_dim + kv_h_offset + d];
+                             * float(v_cache[(tile_start + b) * kv_dim + kv_h_offset + d]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

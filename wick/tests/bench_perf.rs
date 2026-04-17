@@ -465,7 +465,6 @@ fn test_gemm_isolation() {
 #[test]
 #[ignore]
 fn test_prefill_phase_profile() {
-    use std::collections::HashMap;
     use wick::model::Model;
     use wick::model::metal_lfm2::MetalLfm2Model;
 
@@ -487,17 +486,7 @@ fn test_prefill_phase_profile() {
     let mut state = wick::kv_cache::InferenceState::from_config(cfg);
     let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
-    // Aggregate by category (strip layer number).
-    let mut by_cat: HashMap<String, (f64, usize)> = HashMap::new();
-    for (name, us) in &timings {
-        // "L0_conv_inproj" → "conv_inproj"
-        let cat = name.split('_').skip(1).collect::<Vec<_>>().join("_");
-        let entry = by_cat.entry(cat).or_insert((0.0, 0));
-        entry.0 += us;
-        entry.1 += 1;
-    }
-
-    let total_us: f64 = timings.iter().map(|(_, us)| us).sum();
+    let (total_us, cats) = aggregate_prefill_phases(&timings);
     eprintln!("=== Prefill Phase Profile (n={n}) ===");
     eprintln!(
         "  Total: {:.1} ms ({:.0} tok/s)",
@@ -505,11 +494,6 @@ fn test_prefill_phase_profile() {
         n as f64 / (total_us / 1e6)
     );
     eprintln!();
-
-    // Sort by total time descending.
-    let mut cats: Vec<_> = by_cat.into_iter().collect();
-    cats.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-
     eprintln!(
         "  {:30} {:>8} {:>6} {:>6}",
         "Phase", "Total µs", "Count", "%"
@@ -518,10 +502,38 @@ fn test_prefill_phase_profile() {
         "  {:30} {:>8} {:>6} {:>6}",
         "-----", "--------", "-----", "--"
     );
-    for (cat, (total, count)) in &cats {
+    for (cat, total, count) in &cats {
         let pct = total / total_us * 100.0;
         eprintln!("  {:30} {:>8.0} {:>6} {:>5.1}%", cat, total, count, pct);
     }
+}
+
+/// Group per-layer-per-phase timings from `forward_prefill_profiled` into
+/// per-category totals, stripping the `L{layer}_` prefix. Returns
+/// `(total_us, Vec<(category, total_us, count)>)` sorted by total
+/// descending.
+///
+/// Phase names without a `_` (e.g. the whole-model `"out"` epilogue)
+/// are preserved as-is rather than collapsing to an empty string.
+fn aggregate_prefill_phases(timings: &[(String, f64)]) -> (f64, Vec<(String, f64, usize)>) {
+    use std::collections::HashMap;
+    let mut by_cat: HashMap<String, (f64, usize)> = HashMap::new();
+    for (name, us) in timings {
+        let cat = match name.split_once('_') {
+            Some((_prefix, rest)) => rest.to_string(),
+            None => name.to_string(),
+        };
+        let entry = by_cat.entry(cat).or_insert((0.0, 0));
+        entry.0 += us;
+        entry.1 += 1;
+    }
+    let total_us: f64 = timings.iter().map(|(_, us)| us).sum();
+    let mut cats: Vec<_> = by_cat
+        .into_iter()
+        .map(|(cat, (total, count))| (cat, total, count))
+        .collect();
+    cats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    (total_us, cats)
 }
 
 /// Verify that KV prefix cache produces identical results on cache hit.
@@ -888,7 +900,6 @@ fn test_q8_0_gemm_standalone() {
 #[test]
 #[ignore]
 fn test_450m_prefill_phase_profile() {
-    use std::collections::HashMap;
     use wick::model::Model;
     use wick::model::metal_lfm2::MetalLfm2Model;
 
@@ -913,27 +924,18 @@ fn test_450m_prefill_phase_profile() {
     let mut state = wick::kv_cache::InferenceState::from_config(cfg);
     let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
-    let mut by_cat: HashMap<String, (f64, usize)> = HashMap::new();
-    for (name, us) in &timings {
-        let cat = name.split('_').skip(1).collect::<Vec<_>>().join("_");
-        let entry = by_cat.entry(cat).or_insert((0.0, 0));
-        entry.0 += us;
-        entry.1 += 1;
-    }
-    let total_us: f64 = timings.iter().map(|(_, us)| us).sum();
+    let (total_us, cats) = aggregate_prefill_phases(&timings);
     eprintln!("=== 450M Prefill Phase Profile (n={n}) ===");
     eprintln!(
         "  Total: {:.1} ms ({:.0} tok/s)",
         total_us / 1000.0,
         n as f64 / (total_us / 1e6)
     );
-    let mut cats: Vec<_> = by_cat.into_iter().collect();
-    cats.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
     eprintln!(
         "  {:30} {:>8} {:>6} {:>6}",
         "Phase", "Total µs", "Count", "%"
     );
-    for (cat, (total, count)) in &cats {
+    for (cat, total, count) in &cats {
         eprintln!(
             "  {:30} {:>8.0} {:>6} {:>5.1}%",
             cat,
@@ -1019,4 +1021,84 @@ fn test_cpu_gemv_microbench() {
             elapsed_f32 / elapsed_q4_q8
         );
     }
+}
+
+/// Long-context profiling: run `forward_prefill_profiled` for a (model, n)
+/// cell and emit a structured, grep-able block to stderr.
+///
+/// Output format (one block per invocation):
+///   === PROFILE_LONGCTX BEGIN ===
+///   model=<name>
+///   n=<tokens>
+///   total_ms=<f>
+///   tok_per_sec=<f>
+///   category<TAB>total_us<TAB>count<TAB>pct
+///   <cat><TAB><us><TAB><count><TAB><pct>
+///   ...
+///   === PROFILE_LONGCTX END ===
+fn profile_longctx_run(model_name: &str, n: usize) {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model(model_name) else {
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let ctx = 8192usize.max(2 * n);
+    let model = MetalLfm2Model::from_gguf(gguf, &path, ctx).unwrap();
+    let cfg = model.config();
+
+    let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
+
+    // Warmup.
+    let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+    let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    // Measured.
+    let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+    let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    let (total_us, cats) = aggregate_prefill_phases(&timings);
+
+    eprintln!("=== PROFILE_LONGCTX BEGIN ===");
+    eprintln!("model={model_name}");
+    eprintln!("n={n}");
+    eprintln!("total_ms={:.3}", total_us / 1000.0);
+    eprintln!("tok_per_sec={:.1}", n as f64 / (total_us / 1e6));
+    eprintln!("category\ttotal_us\tcount\tpct");
+    for (cat, total, count) in &cats {
+        let pct = total / total_us * 100.0;
+        eprintln!("{cat}\t{total:.0}\t{count}\t{pct:.2}");
+    }
+    eprintln!("=== PROFILE_LONGCTX END ===");
+}
+
+#[test]
+#[ignore]
+fn test_profile_longctx_2_5_450m_n128() {
+    profile_longctx_run("LFM2.5-VL-450M-Q4_0", 128);
+}
+
+#[test]
+#[ignore]
+fn test_profile_longctx_2_5_450m_n1024() {
+    profile_longctx_run("LFM2.5-VL-450M-Q4_0", 1024);
+}
+
+#[test]
+#[ignore]
+fn test_profile_longctx_2_5_450m_n4096() {
+    profile_longctx_run("LFM2.5-VL-450M-Q4_0", 4096);
+}
+
+#[test]
+#[ignore]
+fn test_profile_longctx_1_6b_n128() {
+    profile_longctx_run("LFM2.5-VL-1.6B-Q4_0", 128);
+}
+
+#[test]
+#[ignore]
+fn test_profile_longctx_1_6b_n4096() {
+    profile_longctx_run("LFM2.5-VL-1.6B-Q4_0", 4096);
 }

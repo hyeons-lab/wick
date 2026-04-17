@@ -24,10 +24,13 @@ struct Params {
     uint _pad1;
 };
 
+// K/V caches are stored as f16 (see `encode_cast_f32_to_f16_offsets` in
+// metal_lfm2.rs and the `// f16 bytes` comment). Binding as `float*`
+// would reinterpret two adjacent halves as one f32 and produce garbage.
 kernel void attention_gqa(
     const device float* q [[buffer(0)]],
-    const device float* k_cache [[buffer(1)]],
-    const device float* v_cache [[buffer(2)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
     device float* out [[buffer(3)]],
     constant Params& params [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]],
@@ -70,7 +73,7 @@ kernel void attention_gqa(
         float dots[MAX_GROUP];
         for (uint g = 0; g < group_size; g++) dots[g] = 0.0f;
         for (uint d = 0u; d < head_dim; d++) {
-            float k_val = k_cache[k_base + d];  // loaded once
+            float k_val = float(k_cache[k_base + d]);  // loaded once
             for (uint g = 0; g < group_size; g++) {
                 dots[g] += q_shared[g * head_dim + d] * k_val;
             }
@@ -137,7 +140,7 @@ kernel void attention_gqa(
             float val = 0.0f;
             uint s_off = g * seq_len;
             for (uint tt = s_group; tt < seq_len; tt += par) {
-                val += scores[s_off + tt] * v_cache[tt * kv_dim + kv_h_offset + d];
+                val += scores[s_off + tt] * float(v_cache[tt * kv_dim + kv_h_offset + d]);
             }
             for (uint offset = par >> 1; offset > 0u; offset >>= 1) {
                 val += simd_shuffle_down(val, offset);

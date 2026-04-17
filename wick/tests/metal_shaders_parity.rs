@@ -750,3 +750,258 @@ fn test_conv1d() {
     let got = ctx.read_f32(&output_buf, hs as usize);
     assert_close("conv1d", &expected, &got, 1e-5);
 }
+
+// ── Attention kernel parity (synthetic inputs, no model file needed) ────────
+//
+// All four single-token attention variants must produce identical outputs on
+// the same Q/K/V. Before the f16 fix, flash/gqa/splitk bound K/V as `float*`
+// while classic binds as `half*` — reading f16 as f32 silently produced
+// garbage. These tests catch that class of bug without needing a model file,
+// so they run under `cargo test` in CI (unlike the end-to-end parity tests
+// in `attention_metal_parity.rs`, which are `#[ignore]`).
+
+/// Upload an f32 slice as an f16 Metal buffer (matches how the model code
+/// stores K/V caches: f32 compute → `encode_cast_f32_to_f16_offsets` → f16
+/// device buffer).
+fn upload_f16_from_f32(ctx: &MetalContext, data: &[f32]) -> metal::Buffer {
+    let half_bits: Vec<u16> = data
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_bits())
+        .collect();
+    ctx.upload_bytes(bytemuck::cast_slice(&half_bits))
+}
+
+#[test]
+fn test_classic_vs_flash_attention_synthetic() {
+    let Some(ctx) = setup() else { return };
+
+    let n_heads: u32 = 4;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 64;
+    let kv_dim: u32 = n_kv_heads * head_dim;
+    let seq_len: u32 = 17;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..(n_heads * head_dim))
+        .map(|i| (i as f32 * 0.01).sin())
+        .collect();
+    let k_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.007).cos() * 0.5)
+        .collect();
+    let v_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.005).sin() * 0.3)
+        .collect();
+
+    let q_buf = ctx.upload_f32(&q);
+    let k_buf = upload_f16_from_f32(&ctx, &k_f32);
+    let v_buf = upload_f16_from_f32(&ctx, &v_f32);
+    let params = [
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_dim,
+        seq_len,
+        scale.to_bits(),
+        0,
+        0,
+    ];
+    let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+    let out_bytes = (n_heads * head_dim) as u64 * 4;
+
+    let run_attn = |src: &str, entry: &str| -> Vec<f32> {
+        let pipe = ctx.create_pipeline(src, entry).expect("compile");
+        let out_buf = ctx.create_buffer(out_bytes);
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&out_buf), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.dispatch_thread_groups(tg_size(n_heads as u64), tg_size(256));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        ctx.read_f32(&out_buf, (n_heads * head_dim) as usize)
+    };
+
+    let classic = run_attn(shaders::ATTENTION, "attention");
+    let flash = run_attn(shaders::FLASH_ATTENTION, "flash_attention");
+    // Tolerance accounts for f16 rounding + slightly different reduction
+    // orders between classic (monolithic softmax) and flash (online tiled).
+    assert_close("classic vs flash", &classic, &flash, 1e-3);
+}
+
+#[test]
+fn test_classic_vs_gqa_attention_synthetic() {
+    let Some(ctx) = setup() else { return };
+
+    // GQA kernel requires group_size ∈ {1, 2, 4}. Use 2.
+    let n_heads: u32 = 4;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 64;
+    let kv_dim: u32 = n_kv_heads * head_dim;
+    // GQA MAX_SEQ_LEN = 1024 (tighter than classic's 4096); stay well under.
+    let seq_len: u32 = 17;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..(n_heads * head_dim))
+        .map(|i| (i as f32 * 0.01).sin())
+        .collect();
+    let k_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.007).cos() * 0.5)
+        .collect();
+    let v_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.005).sin() * 0.3)
+        .collect();
+
+    let q_buf = ctx.upload_f32(&q);
+    let k_buf = upload_f16_from_f32(&ctx, &k_f32);
+    let v_buf = upload_f16_from_f32(&ctx, &v_f32);
+    let params = [
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_dim,
+        seq_len,
+        scale.to_bits(),
+        0,
+        0,
+    ];
+    let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+    let out_bytes = (n_heads * head_dim) as u64 * 4;
+
+    let run_attn = |src: &str, entry: &str, tg_count: u64| -> Vec<f32> {
+        let pipe = ctx.create_pipeline(src, entry).expect("compile");
+        let out_buf = ctx.create_buffer(out_bytes);
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&out_buf), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+        enc.dispatch_thread_groups(tg_size(tg_count), tg_size(256));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        ctx.read_f32(&out_buf, (n_heads * head_dim) as usize)
+    };
+
+    let classic = run_attn(shaders::ATTENTION, "attention", n_heads as u64);
+    // GQA dispatches one TG per KV head.
+    let gqa = run_attn(shaders::ATTENTION_GQA, "attention_gqa", n_kv_heads as u64);
+    assert_close("classic vs gqa", &classic, &gqa, 1e-3);
+}
+
+#[test]
+fn test_classic_vs_splitk_attention_synthetic() {
+    let Some(ctx) = setup() else { return };
+
+    let n_heads: u32 = 4;
+    let n_kv_heads: u32 = 2;
+    let head_dim: u32 = 64;
+    let kv_dim: u32 = n_kv_heads * head_dim;
+    let seq_len: u32 = 17;
+    let n_splits: u32 = 4;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..(n_heads * head_dim))
+        .map(|i| (i as f32 * 0.01).sin())
+        .collect();
+    let k_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.007).cos() * 0.5)
+        .collect();
+    let v_f32: Vec<f32> = (0..(seq_len * kv_dim))
+        .map(|i| (i as f32 * 0.005).sin() * 0.3)
+        .collect();
+
+    let q_buf = ctx.upload_f32(&q);
+    let k_buf = upload_f16_from_f32(&ctx, &k_f32);
+    let v_buf = upload_f16_from_f32(&ctx, &v_f32);
+
+    // Classic reference with 8-u32 params.
+    let classic_params = [
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_dim,
+        seq_len,
+        scale.to_bits(),
+        0,
+        0,
+    ];
+    let classic_params_buf = ctx.upload_bytes(bytemuck::cast_slice(&classic_params));
+    let out_bytes = (n_heads * head_dim) as u64 * 4;
+    let classic_pipe = ctx
+        .create_pipeline(shaders::ATTENTION, "attention")
+        .expect("compile");
+    let classic_out_buf = ctx.create_buffer(out_bytes);
+    {
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&classic_pipe);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&classic_out_buf), 0);
+        enc.set_buffer(4, Some(&classic_params_buf), 0);
+        enc.dispatch_thread_groups(tg_size(n_heads as u64), tg_size(256));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    let classic = ctx.read_f32(&classic_out_buf, (n_heads * head_dim) as usize);
+
+    // Split-K: 2-phase. split_params carries n_splits at index 6.
+    let split_params = [
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        kv_dim,
+        seq_len,
+        scale.to_bits(),
+        n_splits,
+        0,
+    ];
+    let split_params_buf = ctx.upload_bytes(bytemuck::cast_slice(&split_params));
+    let partials_out_buf = ctx.create_buffer((n_heads * n_splits * head_dim) as u64 * 4);
+    let partials_max_buf = ctx.create_buffer((n_heads * n_splits) as u64 * 4);
+    let partials_sum_buf = ctx.create_buffer((n_heads * n_splits) as u64 * 4);
+    let splitk_out_buf = ctx.create_buffer(out_bytes);
+
+    let compute_pipe = ctx
+        .create_pipeline(shaders::ATTENTION_SPLITK, "attention_split_compute")
+        .expect("compile compute");
+    let merge_pipe = ctx
+        .create_pipeline(shaders::ATTENTION_SPLITK, "attention_split_merge")
+        .expect("compile merge");
+    {
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&compute_pipe);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&partials_out_buf), 0);
+        enc.set_buffer(4, Some(&partials_max_buf), 0);
+        enc.set_buffer(5, Some(&partials_sum_buf), 0);
+        enc.set_buffer(6, Some(&split_params_buf), 0);
+        enc.dispatch_thread_groups(tg_size((n_heads * n_splits) as u64), tg_size(256));
+
+        enc.set_compute_pipeline_state(&merge_pipe);
+        enc.set_buffer(0, Some(&partials_out_buf), 0);
+        enc.set_buffer(1, Some(&partials_max_buf), 0);
+        enc.set_buffer(2, Some(&partials_sum_buf), 0);
+        enc.set_buffer(3, Some(&splitk_out_buf), 0);
+        enc.set_buffer(4, Some(&split_params_buf), 0);
+        enc.dispatch_thread_groups(tg_size(n_heads as u64), tg_size(head_dim.max(32) as u64));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    let splitk = ctx.read_f32(&splitk_out_buf, (n_heads * head_dim) as usize);
+    assert_close("classic vs splitk", &classic, &splitk, 1e-3);
+}
