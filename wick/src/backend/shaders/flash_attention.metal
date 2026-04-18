@@ -94,6 +94,9 @@ kernel void flash_attention(
     }
 
     // Load Q once into shared memory.
+    // head_dim ≤ MAX_HEAD_DIM=128 is asserted on the host side in
+    // encode_attention(), so this q_shared write and the partials_tg
+    // indexing in the epilogue are always within the static bounds.
     if (tid < head_dim) {
         q_shared[tid] = q[q_offset + tid];
     }
@@ -244,6 +247,10 @@ kernel void flash_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0u) {
+        // running_sum > 0 is guaranteed here: seq_len == 0 is handled by
+        // the early return near the kernel entry, and for seq_len >= 1
+        // each tile contributes at least one exp() > 0 to running_sum.
+        // So `1.0 / running_sum` is well-defined.
         float inv_sum = 1.0f / running_sum;
         for (uint i = 0u; i < dims_per_lane; i++) {
             uint d = simd_lane * dims_per_lane + i;
