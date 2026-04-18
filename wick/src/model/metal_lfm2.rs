@@ -71,6 +71,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_q4_0_gate_up: ComputePipelineState,
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
+    gemv_q4_0_fast_slim_qkv: ComputePipelineState,
     #[allow(dead_code)]
     gemv_q4_0_fast_slim2_gate_up: ComputePipelineState,
     #[allow(dead_code)]
@@ -252,6 +253,8 @@ impl MetalLfm2Model {
             gemv_q4_0_gate_up: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_gate_up")?,
             gemv_q4_0_fast_slim_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
+            gemv_q4_0_fast_slim_qkv: ctx
+                .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_qkv")?,
             gemv_q4_0_fast_slim2_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim2_gate_up")?,
             gemv_q4_0_fast_gate_up: ctx
@@ -972,6 +975,57 @@ impl MetalLfm2Model {
         enc.set_buffer(3, Some(y_gate), 0);
         enc.set_buffer(4, Some(y_up), 0);
         enc.set_buffer(5, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(32));
+    }
+
+    /// Fused Q/K/V GEMV: y_q = W_q × x, y_k = W_k × x, y_v = W_v × x in
+    /// one dispatch. Unlike gate_up, Q has m_q rows while K/V each have
+    /// m_kv (≤ m_q under GQA). Replaces three `encode_gemv_weight` calls
+    /// with one — saves 2 dispatches per attention layer.
+    ///
+    /// Falls back to three separate `encode_gemv_weight` calls if any of
+    /// the three weights isn't Q4_0 (the fused kernel is Q4_0-only; a
+    /// Q8_0 fused variant could be a follow-up).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_qkv(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_q: &MetalWeight,
+        w_k: &MetalWeight,
+        w_v: &MetalWeight,
+        x: &Buffer,
+        y_q: &Buffer,
+        y_k: &Buffer,
+        y_v: &Buffer,
+    ) {
+        if w_q.dtype != DType::Q4_0 || w_k.dtype != DType::Q4_0 || w_v.dtype != DType::Q4_0 {
+            // Fallback for Q8_0 (and any other quantization).
+            self.encode_gemv_weight(enc, w_q, x, y_q);
+            self.encode_gemv_weight(enc, w_k, x, y_k);
+            self.encode_gemv_weight(enc, w_v, x, y_v);
+            return;
+        }
+        debug_assert_eq!(w_q.k, w_k.k);
+        debug_assert_eq!(w_q.k, w_v.k);
+        debug_assert_eq!(w_k.m, w_v.m);
+        let m_q = w_q.m;
+        let m_kv = w_k.m;
+        let total_tgs = (m_q + 2 * m_kv) as u64;
+        let grid = sz2d(total_tgs.min(65535), total_tgs.div_ceil(65535));
+        let params: [u32; 4] = [m_q, m_kv, w_q.k, 0];
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_slim_qkv);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_q.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_k.mmap_offset);
+        enc.set_buffer(2, Some(&self.mmap_buf), w_v.mmap_offset);
+        enc.set_buffer(3, Some(x), 0);
+        enc.set_buffer(4, Some(y_q), 0);
+        enc.set_buffer(5, Some(y_k), 0);
+        enc.set_buffer(6, Some(y_v), 0);
+        enc.set_bytes(
+            7,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
@@ -3572,22 +3626,14 @@ impl MetalLfm2Model {
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
                 let kv_offset = (pos * kv_dim as usize * 2) as u64;
 
-                self.encode_gemv_weight(
+                self.encode_gemv_qkv(
                     enc,
                     lw.attn_q.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.q_buf,
-                );
-                self.encode_gemv_weight(
-                    enc,
                     lw.attn_k.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.k_buf,
-                );
-                self.encode_gemv_weight(
-                    enc,
                     lw.attn_v.as_ref().unwrap(),
                     &self.normed_buf,
+                    &self.q_buf,
+                    &self.k_buf,
                     &self.v_buf,
                 );
 
@@ -3732,23 +3778,15 @@ impl MetalLfm2Model {
                 // f16 KV cache: byte offset is 2 bytes per element.
                 let kv_offset = (pos * kv_dim as usize * 2) as u64;
 
-                // Q/K/V → f32 scratch buffers.
-                self.encode_gemv_weight(
+                // Q/K/V → f32 scratch buffers (fused triple GEMV).
+                self.encode_gemv_qkv(
                     enc,
                     lw.attn_q.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.q_buf,
-                );
-                self.encode_gemv_weight(
-                    enc,
                     lw.attn_k.as_ref().unwrap(),
-                    &self.normed_buf,
-                    &self.k_buf,
-                );
-                self.encode_gemv_weight(
-                    enc,
                     lw.attn_v.as_ref().unwrap(),
                     &self.normed_buf,
+                    &self.q_buf,
+                    &self.k_buf,
                     &self.v_buf,
                 );
 
@@ -3891,22 +3929,14 @@ impl MetalLfm2Model {
 
                 self.gpu_sampled_pass(timer, cb, "attn_norm_qkv", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
-                    self.encode_gemv_weight(
+                    self.encode_gemv_qkv(
                         enc,
                         lw.attn_q.as_ref().unwrap(),
-                        &self.normed_buf,
-                        &self.q_buf,
-                    );
-                    self.encode_gemv_weight(
-                        enc,
                         lw.attn_k.as_ref().unwrap(),
-                        &self.normed_buf,
-                        &self.k_buf,
-                    );
-                    self.encode_gemv_weight(
-                        enc,
                         lw.attn_v.as_ref().unwrap(),
                         &self.normed_buf,
+                        &self.q_buf,
+                        &self.k_buf,
                         &self.v_buf,
                     );
                 });
@@ -4056,25 +4086,18 @@ impl MetalLfm2Model {
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
                 let kv_offset = (pos * kv_dim as usize * 2) as u64; // f16 = 2 bytes
 
-                // attn rmsnorm + Q/K/V projection GEMVs → f32 scratch.
+                // attn rmsnorm + Q/K/V projection GEMVs → f32 scratch
+                // (Q/K/V are fused into a single triple-GEMV dispatch).
                 self.profile_segment(timer, "attn_norm_qkv", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
-                    self.encode_gemv_weight(
+                    self.encode_gemv_qkv(
                         enc,
                         lw.attn_q.as_ref().unwrap(),
-                        &self.normed_buf,
-                        &self.q_buf,
-                    );
-                    self.encode_gemv_weight(
-                        enc,
                         lw.attn_k.as_ref().unwrap(),
-                        &self.normed_buf,
-                        &self.k_buf,
-                    );
-                    self.encode_gemv_weight(
-                        enc,
                         lw.attn_v.as_ref().unwrap(),
                         &self.normed_buf,
+                        &self.q_buf,
+                        &self.k_buf,
                         &self.v_buf,
                     );
                 });
