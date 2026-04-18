@@ -88,11 +88,12 @@ kernel void flash_attention(
     // (encode_attention / encode_attention_q_offset), so these branches are
     // belt-and-suspenders — but the cost is one compare+branch per thread.
     //
-    // head_dim > MAX_HEAD_DIM would overflow the static q_shared and
-    // partials_tg arrays below. Must bail before touching them.
+    // head_dim > MAX_HEAD_DIM would overflow both the static q_shared
+    // array (written at line ~100) and the partials_tg array (indexed
+    // later with a `simd_id * head_dim` stride in the epilogue). Bail
+    // before touching either. Output size is unknown in this degenerate
+    // case; leave `out` untouched rather than guessing a write range.
     if (head_dim > MAX_HEAD_DIM) {
-        // Output size is unknown in this degenerate case; leave `out`
-        // untouched rather than guessing a write range.
         return;
     }
     // seq_len=0 leaves running_sum=0 → inv_sum=inf → NaN in the epilogue.
