@@ -276,10 +276,20 @@ kernel void gemv_q4_0_fast_slim_qkv(
     device float* y_k [[buffer(5)]],
     device float* y_v [[buffer(6)]],
     constant ParamsQKV& params [[buffer(7)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]],
+    uint3 tid_v [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]]
 ) {
+    // MSL requires matching scalar/vector shapes for position attributes:
+    // if `threadgroup_position_in_grid` is uint3, `thread_position_in_threadgroup`
+    // must also be uint3. We use only the X components in scalar form.
+    //
+    // Rust dispatches a 2D grid when total_tgs > 65535 (the per-dimension
+    // Metal limit). A scalar tg_id only sees the X component, so Y > 0 TGs
+    // would alias. Linearize via (x + y*65535) to match the gemv_f32.metal
+    // pattern.
+    uint tid = tid_v.x;
+    uint tg_id = tg_pos.x + tg_pos.y * 65535u;
     uint m_q = params.m_q;
     uint m_kv = params.m_kv;
     uint k = params.k;
