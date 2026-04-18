@@ -253,6 +253,92 @@ kernel void gemv_q4_0_fast_slim_gate_up(
     }
 }
 
+// Fused Q/K/V GEMV. Unlike gate_up (which has identical output sizes for
+// both weights), Q and K/V differ under GQA: Q has m_q rows, K and V each
+// have m_kv rows (with m_kv ≤ m_q). One TG per output row across all
+// three matrices; routing by tg_id. Saves 2 of 3 dispatches per attention
+// layer.
+//
+// Dispatch: m_q + 2*m_kv threadgroups × 32 threads each.
+struct ParamsQKV {
+    uint m_q;
+    uint m_kv;
+    uint k;
+    uint _pad;
+};
+
+kernel void gemv_q4_0_fast_slim_qkv(
+    const device uchar* a_q [[buffer(0)]],
+    const device uchar* a_k [[buffer(1)]],
+    const device uchar* a_v [[buffer(2)]],
+    const device float* x [[buffer(3)]],
+    device float* y_q [[buffer(4)]],
+    device float* y_k [[buffer(5)]],
+    device float* y_v [[buffer(6)]],
+    constant ParamsQKV& params [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {
+    uint m_q = params.m_q;
+    uint m_kv = params.m_kv;
+    uint k = params.k;
+    uint nb = k / 32;
+    uint row_bytes = nb * BLOCK_BYTES;
+
+    // Route to Q / K / V based on tg_id. Branch is uniform across all
+    // threads of a TG (same tg_id), so no warp divergence.
+    const device uchar* a;
+    device float* y;
+    uint row;
+    if (tg_id < m_q) {
+        a = a_q;
+        y = y_q;
+        row = tg_id;
+    } else if (tg_id < m_q + m_kv) {
+        a = a_k;
+        y = y_k;
+        row = tg_id - m_q;
+    } else if (tg_id < m_q + 2u * m_kv) {
+        a = a_v;
+        y = y_v;
+        row = tg_id - m_q - m_kv;
+    } else {
+        return;
+    }
+
+    device const block_q4_0* a_ptr =
+        (device const block_q4_0*) (a + row * row_bytes);
+
+    uint ix = tiisg / 2;
+    uint il = (tiisg & 1u) * 8;
+
+    float sum = 0.0f;
+    float yl[16];
+    device const float* yb = x + ix * 32 + il;
+
+    for (uint ib = ix; ib < nb; ib += NQ) {
+        float sumy[2] = {0.0f, 0.0f};
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i += 2) {
+            sumy[0]   += yb[i + 0] + yb[i + 1];
+            yl[i + 0]  = yb[i + 0];
+            yl[i + 1]  = yb[i + 1] / 256.0f;
+            sumy[1]   += yb[i + 16] + yb[i + 17];
+            yl[i + 8]  = yb[i + 16] / 16.0f;
+            yl[i + 9]  = yb[i + 17] / 4096.0f;
+        }
+        float sumy_total = sumy[0] + sumy[1];
+        sum += half_block_dot(a_ptr + ib, sumy_total, yl, il);
+        yb += 32 * NQ;
+    }
+
+    float total = simd_sum(sum);
+    if (tiisg == 0) {
+        y[row] = total;
+    }
+}
+
 // Fused gate+up, 2 rows/TG. Same dispatch as fast_slim_gate_up in thread
 // count (32 threads) but halves TG count, amortizing x across 2 rows × 2
 // weights = 4 dot products per x load.
