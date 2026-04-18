@@ -1599,6 +1599,15 @@ impl MetalLfm2Model {
         n_kv_heads: u32,
         head_dim: u32,
     ) {
+        // All attention shader variants (classic, flash, splitk, gqa)
+        // size q_shared and similar threadgroup buffers for MAX_HEAD_DIM=128.
+        // Out-of-bounds threadgroup writes would corrupt adjacent slots.
+        // Also head_dim % 4 == 0 is required by the float4-from-half4 Q·K path.
+        assert!(
+            head_dim <= 128 && head_dim % 4 == 0,
+            "encode_attention requires head_dim ≤ 128 and divisible by 4, got {}",
+            head_dim,
+        );
         let kv_dim = n_kv_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let params: [u32; 8] = [
@@ -1715,6 +1724,14 @@ impl MetalLfm2Model {
         n_kv_heads: u32,
         head_dim: u32,
     ) {
+        // Same invariants as encode_attention — shader variants assume
+        // head_dim ≤ MAX_HEAD_DIM=128 and head_dim % 4 == 0 for the
+        // float4-from-half4 Q·K path.
+        assert!(
+            head_dim <= 128 && head_dim % 4 == 0,
+            "encode_attention_q_offset requires head_dim ≤ 128 and divisible by 4, got {}",
+            head_dim,
+        );
         let kv_dim = n_kv_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let params: [u32; 8] = [

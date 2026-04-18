@@ -24,9 +24,18 @@ using namespace metal;
 //   - Online softmax with running_max / running_sum / correction keeps
 //     the O(1)-shmem-in-seq_len invariant.
 //
-// Constraint: head_dim ≤ MAX_HEAD_DIM=128. No alignment beyond
-// head_dim % 4 == 0 for the float4 QK path; generic path handles
-// anything divisible.
+// Constraints:
+//   - head_dim ≤ MAX_HEAD_DIM = 128 (bounds q_shared and partials_tg).
+//     Host caller asserts this in the Rust dispatch site.
+//   - head_dim % 4 == 0 (Phase 1 uses float4-from-half4 loads with no
+//     scalar tail; matches classic attention.metal which has the same
+//     unstated requirement). All current LFM2 models satisfy this
+//     (hd ∈ {64, 128}).
+//
+// Fast paths for V accumulation are gated on the exact head_dim value
+// (not on dims_per_lane) so they never read past head_dim into the
+// next kv-head's slot in v_cache. head_dim ∈ {64, 128} hit fast paths;
+// everything else falls into the bounds-checked generic loop.
 //
 // One threadgroup per head, 256 threads. Binding layout matches
 // attention.metal so the Rust dispatch is identical (drop-in).
@@ -74,6 +83,16 @@ kernel void flash_attention(
     threadgroup float sg_val[8];                     // cross-SG reduction buffer
     threadgroup float partials_tg[8 * MAX_HEAD_DIM]; // cross-SG po reduction
 
+    // seq_len=0 would leave running_sum=0 and produce inv_sum=inf → NaN
+    // output. Write zeros and bail defensively. (Not expected at runtime —
+    // decode always has at least one KV slot — but cheap insurance.)
+    if (seq_len == 0u) {
+        if (tid < head_dim) {
+            out[q_offset + tid] = 0.0f;
+        }
+        return;
+    }
+
     // Load Q once into shared memory.
     if (tid < head_dim) {
         q_shared[tid] = q[q_offset + tid];
@@ -85,8 +104,12 @@ kernel void flash_attention(
     float running_sum = 0.0f;
     float po[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint dims_per_lane = head_dim / 32u;
-    if (dims_per_lane < 1u) dims_per_lane = 1u;
+    // Ceil-div so head_dim not a multiple of 32 is still fully covered
+    // by the generic V-accum path (the `if (d < head_dim)` bounds check
+    // masks the tail lanes). Classic attention.metal uses floor-div, which
+    // silently drops dims 32..hd-1 for hd like 48 or 80 — not triggered by
+    // any current LFM2 model but worth fixing here.
+    uint dims_per_lane = (head_dim + 31u) / 32u;
     if (dims_per_lane > 8u) dims_per_lane = 8u;
     uint hd4 = head_dim / 4u;
 
@@ -169,8 +192,12 @@ kernel void flash_attention(
         uint tt_start = simd_id * chunk;
         uint tt_end   = min(tt_start + chunk, tile_len);
 
-        if (dims_per_lane == 2u) {
-            // hd=64 fast path: half2 load per timestep.
+        // Gate fast paths on exact head_dim so they never read past the
+        // head boundary into the next kv-head's slot in v_cache.
+        // Matching `dims_per_lane == 2/4` alone would let hd=48 or hd=80
+        // (with the new ceil-div) take the half2 path and read invalid V.
+        if (head_dim == 64u) {
+            // hd=64 fast path: half2 load per timestep. 32 lanes × 2 dims = 64.
             for (uint tt = tt_start; tt < tt_end; tt++) {
                 float s = tile_scores[tt];
                 uint v_base = (tile_start + tt) * kv_dim + kv_h_offset + simd_lane * 2u;
@@ -178,8 +205,8 @@ kernel void flash_attention(
                 po[0] += s * v2.x;
                 po[1] += s * v2.y;
             }
-        } else if (dims_per_lane == 4u) {
-            // hd=128 fast path: half4 load per timestep.
+        } else if (head_dim == 128u) {
+            // hd=128 fast path: half4 load per timestep. 32 lanes × 4 dims = 128.
             for (uint tt = tt_start; tt < tt_end; tt++) {
                 float s = tile_scores[tt];
                 uint v_base = (tile_start + tt) * kv_dim + kv_h_offset + simd_lane * 4u;
