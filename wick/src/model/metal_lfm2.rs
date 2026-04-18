@@ -1822,12 +1822,12 @@ impl MetalLfm2Model {
         q_stride: u32,
         out_stride: u32,
     ) {
-        // Kernel invariants (attention_prefill.metal):
-        // - hd <= 256 (po[8] × 32 lanes in V accumulation)
-        // - hd % 4 == 0 (float4 scoring loop)
+        // Kernel invariants (attention_prefill.metal, MMA variant):
+        //   - hd <= 256 (8 output tiles × 8 dims each, max ~64 lanes wide)
+        //   - hd % 8 == 0 (simdgroup_matrix 8×8 tile alignment on head_dim)
         assert!(
-            head_dim <= 256 && head_dim % 4 == 0,
-            "attention_prefill requires head_dim <= 256 and divisible by 4, got {}",
+            head_dim <= 256 && head_dim % 8 == 0,
+            "attention_prefill requires head_dim <= 256 and divisible by 8, got {}",
             head_dim,
         );
         let kv_dim = n_kv_heads * head_dim;
@@ -1854,14 +1854,15 @@ impl MetalLfm2Model {
             params.as_ptr() as *const _,
         );
         // Dynamic threadgroup memory — must match attention_prefill.metal's
-        // layout exactly (Q_PER_TG=8, C=32). Fields: q_tg + kv_tile + scores +
-        // out_tg + state.
+        // layout exactly (Q_PER_TG=8, C=32).
+        // Fields: q_tg + kv_tile + scores + out_tg + state + rescales.
         let hd_val = head_dim as usize;
         let smem_bytes = (8 * hd_val        // q_tg
             + 32 * hd_val                    // kv_tile (C=32)
             + 8 * 32                         // scores (Q_PER_TG×C)
             + 8 * hd_val                     // out_tg
-            + 8 * 2)                         // state
+            + 8 * 2                          // state
+            + 8)                             // rescales (per-query)
             * 4;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
         let q_per_tg = 8u32;
