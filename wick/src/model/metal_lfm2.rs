@@ -1854,16 +1854,26 @@ impl MetalLfm2Model {
             params.as_ptr() as *const _,
         );
         // Dynamic threadgroup memory — must match attention_prefill.metal's
-        // layout exactly (Q_PER_TG=8, C=32).
-        // Fields: q_tg + kv_tile + scores + out_tg + state + rescales.
+        // layout exactly (Q_PER_TG=8, C=64).
+        //
+        // Iter 4 layout mixes precisions: q_tg and kv_tile are `half`
+        // (2 bytes/elem), everything else is `float` (4 bytes/elem).
+        //   q_tg    : half  [Q_PER_TG × hd]     = 16·hd  bytes
+        //   kv_tile : half  [C × hd]            = 128·hd bytes
+        //   scores  : float [Q_PER_TG × C]      = 2048   bytes
+        //   out_tg  : float [Q_PER_TG × hd]     = 32·hd  bytes
+        //   state   : float [Q_PER_TG × 2]      = 64     bytes
+        //   rescales: float [Q_PER_TG]          = 32     bytes
+        // Totals: ~13.1 KB at hd=64 (2 TGs/SM), ~24.1 KB at hd=128
+        // (1 TG/SM) on M1 Max — same occupancy tier as Iter 3.
         let hd_val = head_dim as usize;
-        let smem_bytes = (8 * hd_val        // q_tg
-            + 32 * hd_val                    // kv_tile (C=32)
-            + 8 * 32                         // scores (Q_PER_TG×C)
-            + 8 * hd_val                     // out_tg
-            + 8 * 2                          // state
-            + 8)                             // rescales (per-query)
-            * 4;
+        let half_bytes = 2 * 8 * hd_val        // q_tg (fp16)
+            + 2 * 64 * hd_val; // kv_tile (fp16, C=64)
+        let float_bytes = 4 * 8 * 64            // scores
+            + 4 * 8 * hd_val                    // out_tg
+            + 4 * 8 * 2                         // state
+            + 4 * 8; // rescales
+        let smem_bytes = half_bytes + float_bytes;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
         let q_per_tg = 8u32;
         let n_tgs = ((n + q_per_tg - 1) / q_per_tg) * n_heads;

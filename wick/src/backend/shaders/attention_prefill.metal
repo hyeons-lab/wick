@@ -1,37 +1,41 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Iter 3 — MMA-based prefill attention.
+// Iter 4 — MMA prefill attention with C=64 + fp16 Q/K/V.
 //
-// Forked from `attention_prefill.metal` (#20 Iter 2). Both inner
-// multiplies — QK^T scoring (Step A) and softmax×V accumulation
-// (Step B) — now use `simdgroup_matrix_float8x8` +
-// `simdgroup_multiply_accumulate`. The outer online-softmax loop and
-// per-query softmax reduction retain Iter 2's one-SG-per-query pattern.
+// Builds on Iter 3 (#22). Two coordinated changes vs Iter 3:
 //
-// Tile layout:
-//   - Score matrix [Q_PER_TG × C] = [8 × 32] = 1 row-tile × 4 col-tiles.
-//     SGs 0..3 each own one 8×8 output tile during QK^T; SGs 4..7 idle
-//     during scoring. A follow-up could split each score tile across
-//     two SGs (inner-dim partition + reduce) to engage the idle half,
-//     but the MMA is already compute-bound enough that the scoring
-//     phase isn't the dominant cost after this rewrite.
-//   - Per-chunk V-output matrix [Q_PER_TG × hd] = [8 × hd].
-//     hd/8 output tiles, distributed round-robin across all 8 SGs.
-//     For hd=64: exactly one dim-tile per SG. For hd=128: two per SG.
+// 1. `C` bumped 32 → 64. Score matrix becomes [Q_PER_TG × C] = [8 × 64]
+//    = 8 tiles of 8×8, one per simdgroup — all 8 SGs are busy during
+//    QK^T scoring (Iter 3 had only 4 SGs active).
 //
-// Constraint: hd must be a multiple of 8 (MMA requires 8x8 tile
-// alignment on the head_dim axis). Host asserts this.
+// 2. Q, K, V staged in threadgroup memory as `half` instead of `float`
+//    and loaded into `simdgroup_half8x8` matrices. Scores matrix and
+//    output accumulator remain fp32 (standard flash-attention precision
+//    shape). This halves TG memory for q_tg and kv_tile, keeping total
+//    shmem at ~13.1 KB for hd=64 (unchanged from Iter 3 despite C
+//    doubling) and ~24.1 KB for hd=128.
 //
-// TG memory occupancy on M1 Max (~32 KB per SM):
-//   - hd=64:  ~13.1 KB + 32 B for rescales → 2 TGs/SM
-//   - hd=128: ~25.1 KB + 32 B for rescales → 1 TG/SM
-// The hd=128 regime was already 1 TG/SM in Iter 2; this PR's 32-byte
-// `rescales` slot does not change the occupancy tier for either
-// head_dim we ship (64 or 128).
+// Empirical results vs Iter 3 at p=4096 on M1 Max (5-run median):
+//   450M-Q4_0 (hd=64):  prefill 5663 → 6184 tok/s (+9.2%)
+//                       attn_kernel 338k → 281k µs (−17%)
+//   1.6B-Q4_0 (hd=128): attn_kernel 640k → 549k µs (−14%)
+// The end-to-end gain on 1.6B is within measurement noise because
+// non-attention phases dominate its total wall time.
+//
+// Mixed-precision MMA overloads in use (confirmed supported on M1+):
+//   - QK^T:  simdgroup_multiply_accumulate(float8x8, half8x8, half8x8, float8x8)
+//   - AV:    simdgroup_multiply_accumulate(float8x8, float8x8, half8x8, float8x8)
+//
+// Softmax reduces over 64 cells per query but the simdgroup is only 32
+// lanes wide, so each lane owns two cells (lane l handles cells l and
+// l+32) and we take `max`/`simd_max` / `simd_sum` on the lane-local pair
+// before the cross-lane reduction.
+//
+// Constraint (unchanged): head_dim % 8 == 0, head_dim <= 256.
 
 constant constexpr uint Q_PER_TG = 8;
-constant constexpr uint C = 32;
+constant constexpr uint C = 64;
 constant constexpr uint NW = 32;
 constant constexpr uint NSG = 8;
 constant constexpr uint N_THREADS = NSG * NW; // 256
@@ -76,14 +80,22 @@ kernel void attention_prefill(
     const uint n_q = min(Q_PER_TG, n_queries - q_base);
     const uint max_seq = start_pos + q_base + n_q;
 
-    // TG memory layout (floats). Adds `rescales[Q_PER_TG]` after `state`
-    // so Step B's V-MMA can pick up per-query rescale values written by
-    // the softmax pass.
-    threadgroup float* q_tg    = (threadgroup float*)(shmem);
-    threadgroup float* kv_tile = q_tg + Q_PER_TG * hd;
-    threadgroup float* scores  = kv_tile + C * hd;
-    threadgroup float* out_tg  = scores + Q_PER_TG * C;
-    threadgroup float* state   = out_tg + Q_PER_TG * hd;
+    // TG memory layout:
+    //   q_tg    : half  [Q_PER_TG × hd]
+    //   kv_tile : half  [C × hd]            (K first, overwritten by V)
+    //   scores  : float [Q_PER_TG × C]
+    //   out_tg  : float [Q_PER_TG × hd]     (running softmax-weighted V sum)
+    //   state   : float [Q_PER_TG × 2]      (per-query max, sum)
+    //   rescales: float [Q_PER_TG]
+    // The `half*` → `float*` pointer cast is safe because
+    // `(Q_PER_TG + C) * hd * 2` bytes is always a multiple of 4
+    // (Q_PER_TG + C = 72, times hd ≥ 8 = minimum 1152 bytes, and hd is
+    // guaranteed divisible by 8 by the host-side assertion).
+    threadgroup half*  q_tg     = (threadgroup half*)(shmem);
+    threadgroup half*  kv_tile  = q_tg + Q_PER_TG * hd;
+    threadgroup float* scores   = (threadgroup float*)(kv_tile + C * hd);
+    threadgroup float* out_tg   = scores + Q_PER_TG * C;
+    threadgroup float* state    = out_tg + Q_PER_TG * hd;
     threadgroup float* rescales = state + Q_PER_TG * 2;
 
     const uint simd_lane = tid & 31u;
@@ -91,23 +103,23 @@ kernel void attention_prefill(
 
     // --- Load Q + init output accumulators (cooperative) ---
     //
-    // `out_tg` is zeroed for the full Q_PER_TG × hd (not just n_q × hd).
-    // The Step B pre-rescale step reads all Q_PER_TG rows, and threadgroup
-    // memory contents are not guaranteed to be zero on entry. Even though
-    // rescales[q >= n_q] = 0 (set in the softmax else branch) would
-    // logically zero those rows, NaN × 0 = NaN would still leave unused
-    // rows as NaN. The per-row-independent MMA semantics mean that NaN in
-    // unused rows doesn't leak into valid rows, but we avoid the hazard
-    // entirely by initializing the full tile.
+    // out_tg is zeroed for the full Q_PER_TG × hd (not just n_q × hd) —
+    // Step B's pre-rescale step reads all Q_PER_TG rows and threadgroup
+    // memory is not guaranteed zero on entry. Even though
+    // rescales[q >= n_q] = 0 (set in the softmax else branch below) would
+    // logically zero those rows, NaN × 0 = NaN leaves unused rows as NaN.
+    // Per-row-independent MMA semantics mean NaN in unused rows doesn't
+    // leak into valid rows, but we avoid the hazard entirely by
+    // initializing the full tile.
     //
-    // `q_tg` for q >= n_q remains uninitialized; any NaN produced by the
-    // scoring MMA on those rows is scrubbed by the softmax else branch
-    // (which writes 0 to every lane of rows q >= n_q) before the V MMA
-    // reads `scores`.
+    // q_tg for q >= n_q remains uninitialized; any garbage produced by
+    // the scoring MMA on those rows is scrubbed by the softmax else
+    // branch (which writes 0 to every lane of rows q >= n_q) before the
+    // V MMA reads `scores`.
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
         uint q = idx / hd;
         uint d = idx % hd;
-        q_tg[q * hd + d] = q_batch[(q_base + q) * params.q_stride + head * hd + d];
+        q_tg[q * hd + d] = half(q_batch[(q_base + q) * params.q_stride + head * hd + d]);
     }
     for (uint idx = tid; idx < Q_PER_TG * hd; idx += N_THREADS) {
         out_tg[idx] = 0.0f;
@@ -123,56 +135,41 @@ kernel void attention_prefill(
         const uint c_end = min(c0 + C, max_seq);
         const uint c_len = c_end - c0;
 
-        // --- Load K tile into TG memory (cooperative) ---
+        // --- Load K tile into TG memory (cooperative, half-precision) ---
         //
-        // MMA reads the full C×hd tile regardless of c_len, so the tail
-        // rows (t >= c_len, only on the last chunk) must be zeroed —
-        // otherwise 0 × uninitialized = NaN propagates through MMA.
-        // The scalar kernel was safe because its inner loop stopped at c_len.
+        // MMA reads the full C×hd tile regardless of c_len, so tail rows
+        // (t >= c_len on the last chunk) must be zeroed to avoid
+        // 0 × uninitialized = NaN propagation.
         for (uint idx = tid; idx < c_len * hd; idx += N_THREADS) {
             uint t = idx / hd;
             uint d = idx % hd;
-            kv_tile[t * hd + d] = float(k_cache[(c0 + t) * kv_dim + kv_h_off + d]);
+            kv_tile[t * hd + d] = k_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
         for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
-            kv_tile[idx] = 0.0f;
+            kv_tile[idx] = half(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- MMA QK scoring (Step A) ---
+        // --- MMA QK scoring (all 8 SGs) ---
         //
-        // Score matrix is 8×32 = 1 row-tile × 4 col-tiles.
-        // Simdgroups 0..3 each own one 8×8 output tile (simd_id == t_tile).
-        // Inner dim is head_dim; we accumulate via hd/8 MMAs per tile.
-        //
-        // simd_id 4..7 skip the scoring MMAs — they participate in V
-        // accumulation later, and for scoring there's only 4 output tiles.
-        if (simd_id < 4u) {
-            const uint t_tile = simd_id;          // which 8-wide col of the score matrix
-            const uint hd_tiles = hd / 8u;         // must divide cleanly
+        // Score matrix [Q_PER_TG × C] = [8 × 64] = 1 row-tile × 8 col-tiles.
+        // SG `simd_id` owns col-tile `simd_id`.
+        {
+            const uint t_tile = simd_id;
+            const uint hd_tiles = hd / 8u;
 
             simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
-            simdgroup_float8x8 q_mat;
-            simdgroup_float8x8 k_mat;
+            simdgroup_half8x8  q_mat;
+            simdgroup_half8x8  k_mat;
 
-            // Accumulate over head_dim.
-            // Q is q_tg[query][d], K is kv_tile[t][d]. Score[q][t] = sum_d Q[q][d] * K[t][d].
-            // MMA computes C = A * B where A is [8×8], B is [8×8]. We want S[q][t] = Q[q][d] * K[t][d]^T
-            // so A = Q (rows: q, cols: d-slice), B = K^T (rows: d-slice, cols: t).
-            // K^T is produced by loading K with transpose=true.
             for (uint d_tile = 0u; d_tile < hd_tiles; d_tile++) {
-                // Load Q[0..8, d_tile*8..d_tile*8+8] — stride hd, no transpose.
-                // (Only 8 queries exist per TG, and we always have 8 here if n_q==Q_PER_TG.
-                //  When n_q < Q_PER_TG, the extra q_tg rows are garbage but their score
-                //  outputs are masked by the causal-mask step below and by the per-query
-                //  `q < n_q` guard downstream.)
+                // Q[0..8, d_tile*8..+8], stride = hd, no transpose.
                 simdgroup_load(q_mat, q_tg + d_tile * 8u, hd);
 
-                // Load K^T[d_tile*8..+8, t_tile*8..+8] — i.e. K with transpose=true
-                // starting at row t_tile*8, col d_tile*8.
-                // `origin` is `ulong2` per the MSL simdgroup_load signature
-                // shipped with this Metal toolchain — not `uint2` as a PR
-                // review tool suggested. Using uint2 fails compilation.
+                // K with transpose=true loads K^T[d_tile*8..+8, t_tile*8..+8].
+                // `origin` is `ulong2` per MSL's simdgroup_load signature on
+                // this toolchain (not uint2 as a review tool once suggested
+                // — using uint2 fails compilation).
                 simdgroup_load(k_mat,
                                kv_tile + t_tile * 8u * hd + d_tile * 8u,
                                hd,
@@ -182,17 +179,14 @@ kernel void attention_prefill(
                 simdgroup_multiply_accumulate(acc, q_mat, k_mat, acc);
             }
 
-            // Store the 8×8 score tile to TG memory. `scores` is Q_PER_TG × C row-major,
-            // so we write rows [0..8), cols [t_tile*8 .. t_tile*8+8) at stride C.
             simdgroup_store(acc, scores + t_tile * 8u, C);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- Scale + causal mask (per-lane fix-up of the score matrix) ---
         //
-        // The MMA produced raw QK. We still need `* scale` and the
-        // triangular mask. Parallelize over all n_q × c_len entries like
-        // Iter 2 did — cheap relative to MMA.
+        // The MMA produced raw QK. Apply `* scale` and the triangular mask
+        // in one cooperative pass over n_q × c_len entries.
         for (uint idx = tid; idx < n_q * c_len; idx += N_THREADS) {
             uint q = idx / c_len;
             uint t = idx % c_len;
@@ -207,45 +201,52 @@ kernel void attention_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Overwrite kv_tile with V values ---
-        // Same tail-zero fix as the K load: MMA reads the full C×hd tile.
+        // --- Overwrite kv_tile with V values (half-precision) ---
         for (uint idx = tid; idx < c_len * hd; idx += N_THREADS) {
             uint t = idx / hd;
             uint d = idx % hd;
-            kv_tile[t * hd + d] = float(v_cache[(c0 + t) * kv_dim + kv_h_off + d]);
+            kv_tile[t * hd + d] = v_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
         for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
-            kv_tile[idx] = 0.0f;
+            kv_tile[idx] = half(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Per-query softmax (Iter 2's one-SG-per-query pattern) ---
+        // --- Per-query softmax (one SG per query, two cells per lane) ---
         //
-        // Each SG owns one query. Writes: exp-scored row of `scores`,
-        // state[q], rescales[q]. For Step B's MMA below, scores lanes
-        // beyond c_len and rows beyond n_q must be zero (MMA reads the
-        // full 8×32 tile). Zero-out the tail explicitly.
+        // Simdgroup has 32 lanes but C=64 cells per query. Lane `l` owns
+        // cells `l` and `l + 32`. Lane-local max/sum folds both cells
+        // before the cross-lane simd_max / simd_sum.
         {
             const uint q = simd_id;
             if (q < n_q) {
-                float score_lane = (simd_lane < c_len)
-                    ? scores[q * C + simd_lane]
-                    : -INFINITY;
-                float chunk_max = simd_max(score_lane);
+                const uint idx0 = simd_lane;
+                const uint idx1 = simd_lane + NW;
+
+                float s0 = (idx0 < c_len) ? scores[q * C + idx0] : -INFINITY;
+                float s1 = (idx1 < c_len) ? scores[q * C + idx1] : -INFINITY;
+
+                float chunk_max = simd_max(max(s0, s1));
 
                 float prev_max = state[q * 2 + 0];
                 float new_max = max(prev_max, chunk_max);
                 float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
 
-                float e = 0.0f;
-                if (simd_lane < c_len) {
-                    e = exp(score_lane - new_max);
-                    scores[q * C + simd_lane] = e;
+                float e0 = 0.0f;
+                float e1 = 0.0f;
+                if (idx0 < c_len) {
+                    e0 = exp(s0 - new_max);
+                    scores[q * C + idx0] = e0;
                 } else {
-                    // Zero out inactive lanes so MMA sees clean inputs.
-                    scores[q * C + simd_lane] = 0.0f;
+                    scores[q * C + idx0] = 0.0f;
                 }
-                float chunk_sum = simd_sum(e);
+                if (idx1 < c_len) {
+                    e1 = exp(s1 - new_max);
+                    scores[q * C + idx1] = e1;
+                } else {
+                    scores[q * C + idx1] = 0.0f;
+                }
+                float chunk_sum = simd_sum(e0 + e1);
 
                 if (simd_lane == 0u) {
                     state[q * 2 + 0] = new_max;
@@ -253,20 +254,13 @@ kernel void attention_prefill(
                     rescales[q] = rescale;
                 }
             } else {
-                // Unused query row (q >= n_q): we need its contribution to
-                // the V-MMA to be exactly zero so it doesn't corrupt adjacent
-                // valid rows via shared reads. Two independent guards achieve
-                // this jointly:
-                //   1. Zero this row of `scores`. Then `scores × V` for this
-                //      row is 0 regardless of what V contains.
-                //   2. Zero `rescales[q]`. The pre-MMA rescale multiplies
-                //      out_tg by this, zeroing any garbage out_tg row left
-                //      over from prior chunk iterations (a subtle issue since
-                //      out_tg rows for q >= n_q are never initialized).
-                // Together these make the full out_new[q] = 0 × V + 0 × out_tg
-                // = 0 for unused rows, which is harmless since they're never
-                // read back (final write-out loops only over q < n_q).
-                scores[q * C + simd_lane] = 0.0f;
+                // Unused query row (q >= n_q): zero both cells per lane so
+                // the scores row is fully zero (MMA then produces 0 × V = 0),
+                // and zero rescales[q] so the pre-MMA rescale of out_tg is
+                // also 0. Two independent guards — see Iter 3 commentary
+                // for the full argument.
+                scores[q * C + simd_lane]        = 0.0f;
+                scores[q * C + simd_lane + NW]   = 0.0f;
                 if (simd_lane == 0u) {
                     rescales[q] = 0.0f;
                 }
@@ -274,36 +268,30 @@ kernel void attention_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Step B: MMA V accumulation ---
+        // --- MMA V accumulation ---
         //
-        // Pre-rescale out_tg by per-query `rescales[q]` (cooperative),
-        // then for each 8-wide dim tile:
-        //   po (loaded from out_tg) += scores × V_tile
-        // The `simdgroup_multiply_accumulate(po, A, B, po)` call computes
-        // po = A*B + po, so loading `po` with the rescaled out_tg before
-        // the MMA yields the correct fused update in a single operation.
+        // Pre-rescale out_tg by per-query rescales[q] (cooperative), then
+        // fuse V MMA with the add via po pre-loaded with rescaled out_tg:
+        //   po_new = scores × V + po   where po = rescales[q] · out_tg
         for (uint idx = tid; idx < Q_PER_TG * hd; idx += N_THREADS) {
             uint q = idx / hd;
             out_tg[idx] = out_tg[idx] * rescales[q];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Each SG owns a dim-tile (8 output columns); round-robin across
-        // the hd/8 tiles. For hd=64 → 8 tiles → 1 per SG.
-        // For hd=128 → 16 tiles → 2 per SG (d_off advances by NSG=8).
+        // Each SG owns a dim-tile (8 output cols); round-robin across the
+        // hd/8 tiles. For hd=64 → 8 tiles → 1 per SG.
+        // For hd=128 → 16 tiles → 2 per SG.
         const uint dim_tiles = hd / 8u;
-        const uint inner_tiles = C / 8u;  // C=32 → 4 MMA inner iterations
+        const uint inner_tiles = C / 8u;  // C=64 → 8 MMA inner iterations
         for (uint d_off = simd_id; d_off < dim_tiles; d_off += NSG) {
             simdgroup_float8x8 po;
             simdgroup_load(po, out_tg + d_off * 8u, hd);
 
             simdgroup_float8x8 s_mat;
-            simdgroup_float8x8 v_mat;
+            simdgroup_half8x8  v_mat;
             for (uint t_in = 0u; t_in < inner_tiles; t_in++) {
-                // scores is [Q_PER_TG × C] row-major, stride=C.
                 simdgroup_load(s_mat, scores + t_in * 8u, C);
-                // kv_tile is [C × hd] row-major. Load an 8×8 tile at
-                // rows [t_in*8..+8], cols [d_off*8..+8].
                 simdgroup_load(v_mat,
                                kv_tile + t_in * 8u * hd + d_off * 8u,
                                hd);
