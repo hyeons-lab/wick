@@ -146,7 +146,7 @@ kernel void attention_prefill(
             kv_tile[t * hd + d] = k_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
         for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
-            kv_tile[idx] = half(0.0h);
+            kv_tile[idx] = 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -208,7 +208,7 @@ kernel void attention_prefill(
             kv_tile[t * hd + d] = v_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
         for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
-            kv_tile[idx] = half(0.0h);
+            kv_tile[idx] = 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

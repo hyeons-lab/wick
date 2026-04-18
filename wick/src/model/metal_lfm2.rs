@@ -1822,8 +1822,8 @@ impl MetalLfm2Model {
         q_stride: u32,
         out_stride: u32,
     ) {
-        // Kernel invariants (attention_prefill.metal, MMA variant):
-        //   - hd <= 256 (8 output tiles × 8 dims each, max ~64 lanes wide)
+        // Kernel invariants (attention_prefill.metal, Iter 4 MMA):
+        //   - hd <= 256 (final-normalize + write-out loops bound by hd)
         //   - hd % 8 == 0 (simdgroup_matrix 8×8 tile alignment on head_dim)
         assert!(
             head_dim <= 256 && head_dim % 8 == 0,
