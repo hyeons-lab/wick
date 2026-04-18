@@ -306,6 +306,74 @@ fn test_batched_prefill_logits_match_sequential() {
     );
 }
 
+/// Prefill parity for partial-chunk token counts.
+///
+/// The MMA prefill kernel (attention_prefill.metal) reads the full C×hd
+/// K/V tile regardless of the actual number of valid timesteps in the
+/// last chunk. Tail rows (t >= c_len) must be zeroed — otherwise
+/// `0 × uninitialized = NaN` propagates through the V MMA. This test
+/// exercises n_tokens values that land a partial chunk anywhere in the
+/// [1..C) range: just before the boundary (31, 63), just after (33, 65),
+/// mid-range (7, 17), and a cross-chunk case (127).
+///
+/// The n_tokens = 32 case (exact chunk boundary) is already covered by
+/// test_batched_prefill_logits_match_sequential; this test is
+/// specifically for the partial-chunk paths the full-chunk test misses.
+#[test]
+#[ignore]
+fn test_batched_prefill_partial_last_chunk() {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") else {
+        return;
+    };
+
+    for &n_tokens in &[7usize, 17, 31, 33, 63, 65, 127] {
+        let tokens: Vec<u32> = (0..n_tokens as u32).map(|i| i % 1000 + 1).collect();
+
+        let gguf_seq = wick::gguf::GgufFile::open(&path).unwrap();
+        let model_seq = MetalLfm2Model::from_gguf(gguf_seq, &path, 8192).unwrap();
+        let cfg = model_seq.config();
+        let mut state_seq = wick::kv_cache::InferenceState::from_config(cfg);
+        let mut logits_seq = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            logits_seq = model_seq.forward(&[tok], i, &mut state_seq);
+        }
+
+        let gguf_pf = wick::gguf::GgufFile::open(&path).unwrap();
+        let model_pf = MetalLfm2Model::from_gguf(gguf_pf, &path, 8192).unwrap();
+        let mut state_pf = wick::kv_cache::InferenceState::from_config(cfg);
+        let logits_pf = model_pf.forward_prefill(&tokens, 0, &mut state_pf);
+
+        assert_eq!(
+            logits_seq.len(),
+            logits_pf.len(),
+            "n={n_tokens}: logit length mismatch"
+        );
+
+        let nan_count_pf = logits_pf.iter().filter(|x| x.is_nan()).count();
+        assert_eq!(nan_count_pf, 0, "n={n_tokens}: prefill logits contain NaN");
+
+        let mut dot = 0.0f64;
+        let mut norm_a = 0.0f64;
+        let mut norm_b = 0.0f64;
+        for i in 0..logits_seq.len() {
+            let a = logits_seq[i] as f64;
+            let b = logits_pf[i] as f64;
+            dot += a * b;
+            norm_a += a * a;
+            norm_b += b * b;
+        }
+        let cosine = dot / (norm_a.sqrt() * norm_b.sqrt());
+        eprintln!("  n={n_tokens}: cosine={cosine:.6}");
+        assert!(
+            cosine > 0.999,
+            "n={n_tokens}: prefill vs sequential cosine {cosine:.6} < 0.999"
+        );
+    }
+}
+
 /// Compare GEMM vs batch GEMV crossover point.
 #[test]
 #[ignore]

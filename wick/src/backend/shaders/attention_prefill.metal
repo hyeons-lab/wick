@@ -12,13 +12,23 @@ using namespace metal;
 // Tile layout:
 //   - Score matrix [Q_PER_TG × C] = [8 × 32] = 1 row-tile × 4 col-tiles.
 //     SGs 0..3 each own one 8×8 output tile during QK^T; SGs 4..7 idle
-//     during scoring.
+//     during scoring. A follow-up could split each score tile across
+//     two SGs (inner-dim partition + reduce) to engage the idle half,
+//     but the MMA is already compute-bound enough that the scoring
+//     phase isn't the dominant cost after this rewrite.
 //   - Per-chunk V-output matrix [Q_PER_TG × hd] = [8 × hd].
 //     hd/8 output tiles, distributed round-robin across all 8 SGs.
 //     For hd=64: exactly one dim-tile per SG. For hd=128: two per SG.
 //
 // Constraint: hd must be a multiple of 8 (MMA requires 8x8 tile
 // alignment on the head_dim axis). Host asserts this.
+//
+// TG memory occupancy on M1 Max (~32 KB per SM):
+//   - hd=64:  ~13.1 KB + 32 B for rescales → 2 TGs/SM
+//   - hd=128: ~25.1 KB + 32 B for rescales → 1 TG/SM
+// The hd=128 regime was already 1 TG/SM in Iter 2; this PR's 32-byte
+// `rescales` slot does not change the occupancy tier for either
+// head_dim we ship (64 or 128).
 
 constant constexpr uint Q_PER_TG = 8;
 constant constexpr uint C = 32;
@@ -78,8 +88,6 @@ kernel void attention_prefill(
 
     const uint simd_lane = tid & 31u;
     const uint simd_id = tid >> 5u;
-    const uint hd4 = hd / 4u;
-    const uint dims_per_lane = (hd + NW - 1u) / NW;
 
     // --- Load Q + init output accumulators (cooperative) ---
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
@@ -228,10 +236,19 @@ kernel void attention_prefill(
                     rescales[q] = rescale;
                 }
             } else {
-                // Unused query row: zero its score row so MMA doesn't
-                // pollute adjacent valid rows via ordinary load. Set
-                // rescale to 0 so its out_tg row (garbage) is zeroed
-                // in the pre-MMA rescale step.
+                // Unused query row (q >= n_q): we need its contribution to
+                // the V-MMA to be exactly zero so it doesn't corrupt adjacent
+                // valid rows via shared reads. Two independent guards achieve
+                // this jointly:
+                //   1. Zero this row of `scores`. Then `scores × V` for this
+                //      row is 0 regardless of what V contains.
+                //   2. Zero `rescales[q]`. The pre-MMA rescale multiplies
+                //      out_tg by this, zeroing any garbage out_tg row left
+                //      over from prior chunk iterations (a subtle issue since
+                //      out_tg rows for q >= n_q are never initialized).
+                // Together these make the full out_new[q] = 0 × V + 0 × out_tg
+                // = 0 for unused rows, which is harmless since they're never
+                // read back (final write-out loops only over q < n_q).
                 scores[q * C + simd_lane] = 0.0f;
                 if (simd_lane == 0u) {
                     rescales[q] = 0.0f;
