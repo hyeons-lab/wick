@@ -53,6 +53,26 @@ kernel void attention(
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5u;
 
+    // Defensive early returns. These preconditions are already asserted on
+    // the host side (encode_attention / encode_attention_q_offset), so
+    // these branches are belt-and-suspenders.
+    //
+    // head_dim > MAX_HEAD_DIM would overflow the static q_shared array.
+    // Output write range is unknown in this case — leave `out` untouched.
+    if (head_dim > MAX_HEAD_DIM) {
+        return;
+    }
+    // seq_len > MAX_SEQ_LEN would overflow `scores[MAX_SEQ_LEN]` (classic
+    // kernel's cap — dispatch routes to flash above this threshold).
+    // head_dim is valid here, so zero this head's output slice so callers
+    // don't observe stale values from a prior kernel.
+    if (seq_len > MAX_SEQ_LEN) {
+        if (tid < head_dim) {
+            out[q_offset + tid] = 0.0f;
+        }
+        return;
+    }
+
     // Load Q once into threadgroup memory — all 256 threads reuse it in phase 1.
     if (tid < head_dim) {
         q_shared[tid] = q[q_offset + tid];

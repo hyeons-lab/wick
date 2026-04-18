@@ -83,9 +83,21 @@ kernel void flash_attention(
     threadgroup float sg_val[8];                     // cross-SG reduction buffer
     threadgroup float partials_tg[8 * MAX_HEAD_DIM]; // cross-SG po reduction
 
-    // seq_len=0 would leave running_sum=0 and produce inv_sum=inf → NaN
-    // output. Write zeros and bail defensively. (Not expected at runtime —
-    // decode always has at least one KV slot — but cheap insurance.)
+    // Defensive early returns for dispatches that would corrupt TG memory
+    // or produce NaN. The Rust side asserts these preconditions at dispatch
+    // (encode_attention / encode_attention_q_offset), so these branches are
+    // belt-and-suspenders — but the cost is one compare+branch per thread.
+    //
+    // head_dim > MAX_HEAD_DIM would overflow both the static q_shared
+    // array (written at line ~100) and the partials_tg array (indexed
+    // later with a `simd_id * head_dim` stride in the epilogue). Bail
+    // before touching either. Output size is unknown in this degenerate
+    // case; leave `out` untouched rather than guessing a write range.
+    if (head_dim > MAX_HEAD_DIM) {
+        return;
+    }
+    // seq_len=0 leaves running_sum=0 → inv_sum=inf → NaN in the epilogue.
+    // Write zeros and bail.
     if (seq_len == 0u) {
         if (tid < head_dim) {
             out[q_offset + tid] = 0.0f;
@@ -93,10 +105,10 @@ kernel void flash_attention(
         return;
     }
 
-    // Load Q once into shared memory.
-    // head_dim ≤ MAX_HEAD_DIM=128 is asserted on the host side in
-    // encode_attention(), so this q_shared write and the partials_tg
-    // indexing in the epilogue are always within the static bounds.
+    // Load Q once into shared memory. head_dim ≤ MAX_HEAD_DIM=128 is
+    // guaranteed by both the host-side assertion in encode_attention() and
+    // the in-kernel early return above, so this q_shared write and the
+    // partials_tg indexing in the epilogue are always within static bounds.
     if (tid < head_dim) {
         q_shared[tid] = q[q_offset + tid];
     }
