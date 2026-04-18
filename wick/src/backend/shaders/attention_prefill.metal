@@ -90,12 +90,26 @@ kernel void attention_prefill(
     const uint simd_id = tid >> 5u;
 
     // --- Load Q + init output accumulators (cooperative) ---
+    //
+    // `out_tg` is zeroed for the full Q_PER_TG × hd (not just n_q × hd).
+    // The Step B pre-rescale step reads all Q_PER_TG rows, and threadgroup
+    // memory contents are not guaranteed to be zero on entry. Even though
+    // rescales[q >= n_q] = 0 (set in the softmax else branch) would
+    // logically zero those rows, NaN × 0 = NaN would still leave unused
+    // rows as NaN. The per-row-independent MMA semantics mean that NaN in
+    // unused rows doesn't leak into valid rows, but we avoid the hazard
+    // entirely by initializing the full tile.
+    //
+    // `q_tg` for q >= n_q remains uninitialized; any NaN produced by the
+    // scoring MMA on those rows is scrubbed by the softmax else branch
+    // (which writes 0 to every lane of rows q >= n_q) before the V MMA
+    // reads `scores`.
     for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
         uint q = idx / hd;
         uint d = idx % hd;
         q_tg[q * hd + d] = q_batch[(q_base + q) * params.q_stride + head * hd + d];
     }
-    for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
+    for (uint idx = tid; idx < Q_PER_TG * hd; idx += N_THREADS) {
         out_tg[idx] = 0.0f;
     }
     if (tid < Q_PER_TG) {
@@ -156,6 +170,9 @@ kernel void attention_prefill(
 
                 // Load K^T[d_tile*8..+8, t_tile*8..+8] — i.e. K with transpose=true
                 // starting at row t_tile*8, col d_tile*8.
+                // `origin` is `ulong2` per the MSL simdgroup_load signature
+                // shipped with this Metal toolchain — not `uint2` as a PR
+                // review tool suggested. Using uint2 fails compilation.
                 simdgroup_load(k_mat,
                                kv_tile + t_tile * 8u * hd + d_tile * 8u,
                                hd,
