@@ -178,10 +178,35 @@ impl WickEngine {
             Self::from_manifest_file(&manifest_path, cfg)
         } else if has_extension(path, "json") {
             Self::from_manifest_file(path, cfg)
-        } else if has_extension(path, "gguf") || path.is_file() {
-            // Bare file (with or without .gguf suffix) → synthesize a text manifest.
-            let manifest = Manifest::synthetic_text(path);
-            Self::from_manifest(manifest, cfg)
+        } else if has_extension(path, "gguf") {
+            // Bare `.gguf` → peek at `general.architecture` and fail
+            // early for known non-text arches (VL, audio) so the caller
+            // gets the `UnsupportedInferenceType` error they'd see with
+            // a manifest, not a mid-load "unsupported architecture"
+            // failure from the text loader. Unknown arches fall back
+            // to text (auto-detect's existing policy).
+            let detected = auto_detect_inference_type(path)?;
+            match detected {
+                InferenceType::LlamaCppTextToText => {
+                    let manifest = Manifest::synthetic_text(path);
+                    Self::from_manifest(manifest, cfg)
+                }
+                InferenceType::LlamaCppLfm2AudioV1 => {
+                    // Audio loads the same text LLM under the hood today
+                    // (aux files are manifest-driven). Proceed with the
+                    // synthetic text manifest; audio consumers who need
+                    // the aux files must load via manifest or `from_files`.
+                    let manifest = Manifest::synthetic_text(path);
+                    Self::from_manifest(manifest, cfg)
+                }
+                InferenceType::LlamaCppImageToText => Err(WickError::UnsupportedInferenceType(
+                    detected.as_str().to_string(),
+                )),
+                // `auto_detect_inference_type` defaults unknown arches to
+                // Text, so this arm is unreachable today — matched for
+                // exhaustiveness if the policy changes.
+                InferenceType::Unknown(s) => Err(WickError::UnsupportedInferenceType(s)),
+            }
         } else {
             Err(WickError::Backend(format!(
                 "don't know how to load `{}` — expected a .gguf file, a .json manifest, or a directory containing one",
@@ -208,7 +233,7 @@ impl WickEngine {
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(false);
         let model = load_text_model(gguf, None, &cfg)?;
-        let metadata = build_metadata(model.as_ref(), &manifest, add_bos_token);
+        let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
         Ok(Self {
             manifest,
             model,
@@ -276,7 +301,7 @@ impl WickEngine {
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(false);
         let model = load_text_model(gguf, Some(primary), &cfg)?;
-        let metadata = build_metadata(model.as_ref(), &manifest, add_bos_token);
+        let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
 
         Ok(Self {
             manifest,
@@ -399,6 +424,15 @@ fn resolve_url_or_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf, 
              Pass a local file path or pre-download the bundle."
         )));
     }
+    if let Some(rest) = strip_file_scheme(value) {
+        // `file://…` isn't portable via `Path::new` (Windows especially),
+        // so reject until we take a real URI dependency. Users with a
+        // `file://` URI in hand can drop the scheme before calling.
+        return Err(WickError::Backend(format!(
+            "manifest references `file://` URI `{value}` — wick doesn't parse file URIs yet; \
+             pass the local path directly (e.g. `{rest}`)."
+        )));
+    }
     let p = Path::new(value);
     if p.is_absolute() {
         Ok(p.to_path_buf())
@@ -412,6 +446,22 @@ fn resolve_url_or_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf, 
 fn is_remote_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Return the path-like tail of a `file://` URI, or `None` if the input
+/// isn't a file URI. Case-insensitive on the scheme. Does NOT decode
+/// percent-encoding or handle Windows drive letters; the caller errors
+/// out rather than trying to interpret it.
+fn strip_file_scheme(s: &str) -> Option<&str> {
+    let lower = s.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("file://") {
+        // Slice from the same byte offset in the original string so we
+        // preserve case.
+        let offset = s.len() - rest.len();
+        Some(&s[offset..])
+    } else {
+        None
+    }
 }
 
 /// Build a minimal `Manifest` from an explicit `ModelFiles`.
@@ -479,6 +529,7 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, WickEr
         serde_json::Value::Object(load_params),
     );
 
+    let defaults_shape = inference_type_defaults_shape(&inference_type);
     Ok(Manifest {
         inference_type,
         schema_version: "1.0.0".into(),
@@ -494,7 +545,11 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, WickEr
         // surface a zero-info `Text` variant for text/VL models and an
         // empty `Audio` variant for audio models. Consumers who need
         // defaults should go through a real manifest.
-        generation_defaults: match inference_type_kind_default(&files.inference_type) {
+        //
+        // Key on the *resolved* `inference_type` — using `files.inference_type`
+        // (pre-resolution) would hand the `Text` defaults shape to an
+        // auto-detected audio model.
+        generation_defaults: match defaults_shape {
             DefaultsShape::Text => crate::manifest::GenerationDefaults::Text {
                 temperature: None,
                 min_p: None,
@@ -519,16 +574,13 @@ enum DefaultsShape {
     Other,
 }
 
-fn inference_type_kind_default(it: &Option<InferenceType>) -> DefaultsShape {
+fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
     match it {
-        Some(InferenceType::LlamaCppLfm2AudioV1) => DefaultsShape::Audio,
-        Some(InferenceType::LlamaCppTextToText) | Some(InferenceType::LlamaCppImageToText) => {
+        InferenceType::LlamaCppLfm2AudioV1 => DefaultsShape::Audio,
+        InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText => {
             DefaultsShape::Text
         }
-        Some(InferenceType::Unknown(_)) => DefaultsShape::Other,
-        // Auto-detect will have resolved to a concrete variant; if it
-        // somehow reaches here with `None`, prefer the text shape.
-        None => DefaultsShape::Text,
+        InferenceType::Unknown(_) => DefaultsShape::Other,
     }
 }
 
@@ -593,6 +645,18 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, WickError> {
+    // Without a path (today: `from_bytes` only), Metal is unreachable
+    // (it requires a file) and wgpu-then-CPU fallback can't re-open the
+    // source. Short-circuit to CPU so `from_bytes` stays robust — this
+    // matches the documented "testing / <50 MB" intent of that
+    // constructor. Callers who want GPU with in-memory bytes must
+    // opt in explicitly via `BackendPreference::Gpu`.
+    if path.is_none() {
+        tracing::debug!("wick::engine: no path available (from_bytes); using CPU backend (auto)");
+        return model::load_model(gguf, context_size)
+            .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")));
+    }
+
     // Metal → wgpu → CPU. Mirrors the CLI's previous `load_model_auto`.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if let Some(p) = path {
@@ -609,12 +673,9 @@ fn load_text_model_auto(
 
     #[cfg(feature = "gpu")]
     {
-        let gguf_for_gpu = if let Some(p) = path {
-            clone_gguf_like(&gguf, p)?
-        } else {
-            // Without a path we can't re-open; consume `gguf` for wgpu.
-            gguf
-        };
+        // Path guaranteed present (short-circuited above otherwise).
+        let p = path.expect("path guaranteed by early return");
+        let gguf_for_gpu = clone_gguf_like(&gguf, p)?;
         match model::load_model_gpu(gguf_for_gpu, context_size) {
             Ok(m) => {
                 tracing::debug!("wick::engine: using wgpu GPU backend (auto)");
@@ -624,27 +685,17 @@ fn load_text_model_auto(
                 tracing::debug!("wick::engine: wgpu unavailable ({e}); falling back to CPU");
             }
         }
-        // If we took this branch and fell through, we've already consumed
-        // `gguf` — need to re-open from path for CPU.
-        let gguf_for_cpu = if let Some(p) = path {
-            GgufFile::open(p).map_err(|e| {
-                WickError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
-            })?
-        } else {
-            return Err(WickError::Backend(
-                "wgpu failed and no path available to re-open for CPU fallback".into(),
-            ));
-        };
+        // Re-open the file for CPU — original `gguf` may have been
+        // consumed by the Metal attempt above.
+        let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
+            WickError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
+        })?;
         return model::load_model(gguf_for_cpu, context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")));
     }
 
     #[cfg(not(feature = "gpu"))]
     {
-        // `path` is threaded so `metal` / `gpu` builds can re-open the
-        // file after a fallback; the CPU-only build consumes `gguf`
-        // directly.
-        let _ = path;
         tracing::debug!("wick::engine: using CPU backend (auto)");
         model::load_model(gguf, context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")))
@@ -660,9 +711,18 @@ fn clone_gguf_like(_: &GgufFile, path: &Path) -> Result<GgufFile, WickError> {
         .map_err(|e| WickError::Backend(format!("reopening `{}`: {e}", path.display())))
 }
 
-fn build_metadata(model: &dyn Model, manifest: &Manifest, add_bos_token: bool) -> ModelMetadata {
+fn build_metadata(
+    model: &dyn Model,
+    tokenizer: &BpeTokenizer,
+    manifest: &Manifest,
+    add_bos_token: bool,
+) -> ModelMetadata {
     let cfg = model.config();
-    let has_chat_template = manifest.chat_template.is_some();
+    // Reflect the effective template availability: a manifest override
+    // OR a GGUF-embedded template (the common case for bare `.gguf`
+    // loads). Consumers asking `metadata().has_chat_template` expect a
+    // truthful answer, not just "does the manifest have one".
+    let has_chat_template = manifest.chat_template.is_some() || tokenizer.chat_template().is_some();
     ModelMetadata {
         architecture: cfg.architecture.clone(),
         max_seq_len: cfg.max_seq_len as u32,
@@ -752,6 +812,28 @@ mod tests {
             msg.contains("remote URL") && msg.contains("Phase 1.6"),
             "error should point at the downloader follow-up; got `{msg}`"
         );
+    }
+
+    #[test]
+    fn resolve_url_or_path_rejects_file_scheme() {
+        let e = resolve_url_or_path("file:///models/x.gguf", None)
+            .expect_err("file:// URIs aren't supported yet");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("file://") && msg.contains("wick doesn't parse file URIs"),
+            "error should point at the file:// limitation; got `{msg}`"
+        );
+    }
+
+    #[test]
+    fn strip_file_scheme_preserves_case() {
+        assert_eq!(
+            strip_file_scheme("FILE:///Models/Foo.gguf"),
+            Some("/Models/Foo.gguf")
+        );
+        assert_eq!(strip_file_scheme("file://./rel"), Some("./rel"));
+        assert_eq!(strip_file_scheme("https://x/y"), None);
+        assert_eq!(strip_file_scheme("/abs/path"), None);
     }
 
     #[test]

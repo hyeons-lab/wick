@@ -187,15 +187,12 @@ fn from_path_directory_dispatches_single_manifest() {
 #[test]
 fn from_path_rejects_arbitrary_extension() {
     let dir = tempfile::tempdir().unwrap();
+    // File exists and has an extension that's neither .gguf nor .json;
+    // must error rather than being silently fed to the GGUF parser.
     let odd = dir.path().join("model.weirdext");
-    // The path exists, but `path.is_file()` would still route it through
-    // the bare-file branch — so use a path that *doesn't* exist so the
-    // "don't know how to load" arm fires first (is_dir false; is_file
-    // false; extension neither gguf nor json).
-    let ghost = dir.path().join("nope.txt");
-    assert!(!ghost.exists());
+    std::fs::write(&odd, b"not a gguf").unwrap();
     let err = expect_err(
-        WickEngine::from_path(&ghost, cpu_cfg()),
+        WickEngine::from_path(&odd, cpu_cfg()),
         "unknown extension must error",
     );
     let msg = format!("{err}");
@@ -204,6 +201,15 @@ fn from_path_rejects_arbitrary_extension() {
         "got `{msg}` from {odd:?}"
     );
 }
+
+// Note on bare-`.gguf` VL detection: `auto_detect_inference_type`
+// dispatches on `general.architecture`. Current LFM2 VL bundles ship the
+// primary GGUF with `architecture = "lfm2"` (the VL-ness lives in the
+// mmproj aux + manifest), so bare-loading that file yields a text
+// session — which is the correct text-only subset. The
+// `LlamaCppImageToText` arm in `from_path(.gguf)` is defense-in-depth
+// for any future GGUF that does declare a VL-specific arch (`lfm2vl`
+// etc.); no current fixture exercises it.
 
 // ---------------------------------------------------------------------------
 // Smoke tests that need a real model on disk. Gated.
