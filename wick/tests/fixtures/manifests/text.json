@@ -1,0 +1,15 @@
+{
+  "inference_type": "llama.cpp/text-to-text",
+  "schema_version": "1.0.0",
+  "load_time_parameters": {
+    "model": "https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_0.gguf",
+    "chat_template": "{{- bos_token -}}\n{%- for message in messages -%}\n  {{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" + message[\"content\"] + \"<|im_end|>\\n\" -}}\n{%- endfor -%}\n"
+  },
+  "generation_time_parameters": {
+    "sampling_parameters": {
+      "temperature": 0.3,
+      "min_p": 0.15,
+      "repetition_penalty": 1.05
+    }
+  }
+}

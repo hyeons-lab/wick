@@ -13,6 +13,7 @@ mod generated {
 }
 pub mod gguf;
 pub mod kv_cache;
+pub mod manifest;
 pub mod model;
 pub mod quant;
 pub mod sampler;
