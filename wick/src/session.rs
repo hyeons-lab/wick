@@ -105,6 +105,9 @@ pub enum FinishReason {
     Stop,
     /// External `cancel()` flipped the atomic.
     Cancelled,
+    /// Reached the session's `max_seq_len`; no room to decode further
+    /// without a context shift (landing in Phase 1.5 via `n_keep`).
+    ContextFull,
     /// Other error; the outer `Result` is the authoritative channel.
     Error(String),
 }
@@ -147,8 +150,9 @@ pub enum ImageFormat {
     RawRgb { width: u32, height: u32 },
 }
 
-/// Error type for session operations. `anyhow::Error` upstream consumers
-/// can continue to use `?` — we impl `Into<anyhow::Error>` via `thiserror`.
+/// Error type for session operations. Upstream consumers using
+/// `anyhow::Error` can continue to use `?` because `thiserror` derives
+/// `std::error::Error` for this type, making it compatible with `anyhow`.
 #[derive(Error, Debug)]
 pub enum WickError {
     #[error("modality not supported by this model")]
@@ -187,8 +191,9 @@ pub struct Session<'a> {
     last_logits: Option<Vec<f32>>,
     /// Copied from config — enforced on `append_tokens`.
     max_seq_len: usize,
-    /// Copied from config — retained for introspection.
-    _config: SessionConfig,
+    /// Retained for `reset()` (rebuild state + sampler) and
+    /// `sync_sampler_from_opts` (read back the seed).
+    config: SessionConfig,
 }
 
 impl<'a> Session<'a> {
@@ -219,7 +224,7 @@ impl<'a> Session<'a> {
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
             max_seq_len,
-            _config: config,
+            config,
         }
     }
 
@@ -235,6 +240,13 @@ impl<'a> Session<'a> {
         self.position_atomic.load(Ordering::Relaxed)
     }
 
+    /// Shared handle to the position counter. Clone into another thread to
+    /// watch an in-flight generate's progress without holding `&self` (which
+    /// would block on `generate`'s `&mut self` borrow).
+    pub fn position_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.position_atomic)
+    }
+
     /// Shared handle to the cancel flag. Clone it into another thread
     /// and call `.store(true, Relaxed)` to interrupt an in-flight generate.
     /// The convenience `cancel()` method does the same for the owning thread.
@@ -247,16 +259,24 @@ impl<'a> Session<'a> {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Clear KV state and reset position to 0. Does NOT touch the engine-level
-    /// disk prefix cache (which lives on `WickEngine`, not `Session`).
+    /// Clear KV state and reset position to 0. Rebuilds the sampler from
+    /// `SessionConfig::seed` so a seeded session is fully reproducible after
+    /// reset. Does NOT touch the engine-level disk prefix cache (which lives
+    /// on `WickEngine`, not `Session`).
     pub fn reset(&mut self) {
         let model_cfg = self.model.config();
         self.state =
-            InferenceState::from_config_with_compression(model_cfg, &self._config.kv_compression);
+            InferenceState::from_config_with_compression(model_cfg, &self.config.kv_compression);
         self.current_pos = 0;
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
         self.cancel.store(false, Ordering::Relaxed);
+        // Re-seed the sampler so deterministic runs stay deterministic after reset().
+        let sampler_cfg = SamplerConfig {
+            seed: self.config.seed,
+            ..SamplerConfig::default()
+        };
+        self.sampler = Sampler::new(sampler_cfg);
     }
 
     /// Tokenize text and append. Convenience over `append_tokens`.
@@ -327,23 +347,18 @@ impl<'a> Session<'a> {
         // We don't re-time it here. (Real per-chunk timing arrives with 1.4.)
         let prompt_eval_ms: u32 = 0;
 
-        let mut logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
-
         let decode_start = Instant::now();
         let mut finish = FinishReason::MaxTokens;
         let mut generated: u32 = 0;
         let mut pos = self.current_pos;
-        // Token batch buffer — flushed to `on_text_tokens` per opts.
         let mut pending: Vec<u32> = Vec::with_capacity(opts.flush_every_tokens.max(1) as usize);
         let mut last_flush = Instant::now();
 
-        let greedy = opts.temperature <= 0.0 || opts.top_k == 1;
         let flush_n = opts.flush_every_tokens.max(1) as usize;
         let flush_ms = opts.flush_every_ms;
 
-        // Seed with the first token sampled from the prefill logits.
+        // max_tokens=0: emit nothing, leave KV + logits unchanged.
         if opts.max_tokens == 0 {
-            // Nothing to do — still flush the (empty) sink.
             sink.on_done(FinishReason::MaxTokens);
             let decode_ms = decode_start.elapsed().as_millis() as u32;
             return Ok(GenerateSummary {
@@ -355,24 +370,46 @@ impl<'a> Session<'a> {
             });
         }
 
-        self.sync_sampler_from_opts(opts);
-        let mut next_token = self.sampler.sample(&mut logits);
+        // Take the prefill logits; seed the first generated token from them.
+        // `logits` is the pristine "what comes next" distribution for the
+        // current position — we keep it unmutated across the whole loop so
+        // we can store it back into `self.last_logits` for the NEXT
+        // `generate()` to continue from (multi-call chaining).
+        //
+        // The sampler mutates its input in place (temperature scaling,
+        // top-k filter, softmax), so we copy pristine `logits` into
+        // `sample_scratch` on each call. One reused allocation, one memcpy
+        // per token — ~20 μs per 32 K-vocab model, deep in the noise
+        // vs. the forward() that follows.
+        let logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
+        let mut logits = logits;
+        let mut sample_scratch: Vec<f32> = Vec::with_capacity(logits.len());
 
+        self.sync_sampler_from_opts(opts);
+        sample_scratch.clear();
+        sample_scratch.extend_from_slice(&logits);
+        let mut next_token = self.sampler.sample(&mut sample_scratch);
+
+        // Decode loop. Each iteration emits `next_token`, then calls full
+        // `forward()` to advance KV state + produce logits for the NEXT
+        // token. The emit/forward/advance happen together so
+        // `current_pos == state.seq_len` always holds on exit — no KV gap
+        // on any break path (cancel, EOS, max_tokens, context overflow).
+        //
+        // We deliberately use `forward()` rather than `forward_greedy()`
+        // even in greedy mode: the free logits readback lets us save
+        // `last_logits` for the next `generate()`. A greedy-optimized path
+        // is a perf follow-up (call `forward_greedy` in the loop, then one
+        // extra `forward()` at the end for the continuation seed).
         loop {
+            // Stop conditions — each must leave `pos == state.seq_len`.
+
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
                 break;
             }
-            if generated >= opts.max_tokens {
-                break;
-            }
-            if pos >= self.max_seq_len {
-                break;
-            }
 
-            // EOS / stop-token check happens BEFORE emitting the token.
-            // Matches llama.cpp/OpenAI semantics: the terminator is not
-            // part of the output stream.
+            // EOS / stop-token: don't emit the terminator.
             if self.tokenizer.eos_token() == Some(next_token)
                 || opts.stop_tokens.contains(&next_token)
             {
@@ -380,12 +417,18 @@ impl<'a> Session<'a> {
                 break;
             }
 
+            if generated >= opts.max_tokens {
+                break;
+            }
+            if pos >= self.max_seq_len {
+                finish = FinishReason::ContextFull;
+                break;
+            }
+
+            // Emit the token.
             pending.push(next_token);
             generated += 1;
-            pos += 1;
 
-            // Flush the pending batch when N tokens accumulated or
-            // flush_every_ms elapsed.
             let should_flush_n = pending.len() >= flush_n;
             let should_flush_t =
                 flush_ms > 0 && last_flush.elapsed().as_millis() >= flush_ms as u128;
@@ -395,21 +438,20 @@ impl<'a> Session<'a> {
                 last_flush = Instant::now();
             }
 
-            // If we're at the limit, skip the final (wasted) forward pass.
-            if generated >= opts.max_tokens || pos >= self.max_seq_len {
-                break;
-            }
+            // Forward + advance pos, bound together so state.seq_len stays
+            // aligned with current_pos on every loop iteration.
+            logits = self.model.forward(&[next_token], pos, &mut self.state);
+            pos += 1;
+            // External watchers (another thread holding a `position_handle`)
+            // observe progress per-token, not just at call boundaries.
+            self.position_atomic.store(pos as u32, Ordering::Relaxed);
 
-            next_token = if greedy {
-                self.model
-                    .forward_greedy(&[next_token], pos - 1, &mut self.state)
-            } else {
-                logits = self.model.forward(&[next_token], pos - 1, &mut self.state);
-                self.sampler.sample(&mut logits)
-            };
+            // Sample from a copy — `logits` stays pristine.
+            sample_scratch.clear();
+            sample_scratch.extend_from_slice(&logits);
+            next_token = self.sampler.sample(&mut sample_scratch);
         }
 
-        // Flush any tail tokens.
         if !pending.is_empty() {
             sink.on_text_tokens(&pending);
         }
@@ -417,6 +459,11 @@ impl<'a> Session<'a> {
         self.current_pos = pos;
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
+
+        // Preserve pristine logits for the NEXT generate() call. This lets
+        // consumers chain multiple generate() calls on one session without
+        // needing an intervening append_tokens.
+        self.last_logits = Some(logits);
 
         sink.on_done(finish.clone());
 
@@ -437,7 +484,7 @@ impl<'a> Session<'a> {
             temperature: opts.temperature,
             top_k: opts.top_k as usize,
             top_p: opts.top_p,
-            seed: self._config.seed,
+            seed: self.config.seed,
         };
         self.sampler.set_config(cfg);
     }
@@ -503,7 +550,8 @@ mod tests {
         assert!(matches!(s.done, Some(FinishReason::MaxTokens)));
     }
 
-    // Integration tests that need a real model run under
-    // `tests/session_integration.rs` (gated on models being present
-    // locally); unit tests here stay dep-free.
+    // Integration tests that need a real model live under
+    // `wick/tests/session_chain.rs` (gated behind `#[ignore]` and a
+    // `find_model()` helper so they skip silently when no GGUF is
+    // available locally). Unit tests here stay dep-free.
 }
