@@ -944,10 +944,7 @@ mod tests {
         // `GgufFile: !Debug`, so `.unwrap_err()` won't compile — match instead.
         match GgufFile::from_bytes(bytes) {
             Ok(_) => panic!("expected error for tiny buffer"),
-            Err(e) => assert!(
-                e.to_string().contains("too small"),
-                "unexpected error: {e}"
-            ),
+            Err(e) => assert!(e.to_string().contains("too small"), "unexpected error: {e}"),
         }
     }
 
