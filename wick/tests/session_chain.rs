@@ -147,9 +147,10 @@ fn greedy_chain_requires_append_tokens() {
         "expected EmptyInput on chained greedy generate without append, got: {err:?}"
     );
 
-    // After appending the last emitted token, greedy can continue normally.
-    let last = *sink_a.0.last().unwrap();
-    session.append_tokens(&[last]).unwrap();
+    // After appending a FRESH user-side token suffix (the real chat loop —
+    // new user turn appended between generates), greedy can continue.
+    let follow_up = tokenizer.encode(" and the currency is");
+    session.append_tokens(&follow_up).unwrap();
     let mut sink_b = CollectSink(Vec::new());
     let summary = session.generate(&greedy_opts(4), &mut sink_b).unwrap();
     assert_eq!(summary.tokens_generated, 4);
@@ -195,16 +196,18 @@ fn no_kv_gap_after_bounded_generate_greedy() {
     let pos_after_gen = session.position() as usize;
     assert_eq!(pos_after_gen, prompt_toks.len() + 4);
 
-    // A further append_tokens must land without error. If `state.seq_len`
-    // lagged `current_pos` (the pre-fix bug), this would write to a stale
-    // KV slot; no panic would fire but subsequent generate output would
-    // be garbage. Here we just check the happy path completes.
-    let last = *sink.0.last().unwrap();
-    session.append_tokens(&[last]).unwrap();
+    // A further append_tokens must land without error and advance the
+    // position cleanly. If `state.seq_len` lagged `current_pos` (the
+    // pre-fix bug), this would write to a stale KV slot — no panic would
+    // fire but subsequent generate output would be garbage. We use a
+    // fresh user-side token suffix (mirrors the real chat loop) rather
+    // than re-feeding an already-emitted token.
+    let follow_up = tokenizer.encode(" and the language is");
+    session.append_tokens(&follow_up).unwrap();
     assert_eq!(
         session.position() as usize,
-        pos_after_gen + 1,
-        "append_tokens after bounded generate should advance position by 1"
+        pos_after_gen + follow_up.len(),
+        "append_tokens after bounded generate should advance position by the appended length"
     );
 
     // And a further greedy generate succeeds.

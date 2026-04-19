@@ -392,14 +392,20 @@ impl<'a> Session<'a> {
         // and returns the argmax token directly — a real win on Metal
         // (~hundreds of μs per token saved at 64 K vocab).
         let mut logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
-        let mut sample_scratch: Vec<f32> = Vec::with_capacity(logits.len());
-
-        self.sync_sampler_from_opts(opts);
 
         // Greedy mode is decided once per generate call: deterministic
         // argmax + `forward_greedy`. Stochastic mode samples with RNG +
         // `forward` (keeps logits, supports chaining).
         let greedy = opts.temperature <= 0.0 || opts.top_k == 1;
+
+        // Stochastic-only state. Allocating the scratch buffer and syncing
+        // the sampler are skipped in greedy mode where neither is touched.
+        let mut sample_scratch: Vec<f32> = if greedy {
+            Vec::new()
+        } else {
+            self.sync_sampler_from_opts(opts);
+            Vec::with_capacity(logits.len())
+        };
 
         // Greedy-mode token state: the first token comes from `cpu_argmax`
         // on the prefill logits; each subsequent iteration's token comes
@@ -493,16 +499,25 @@ impl<'a> Session<'a> {
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
 
-        // Chain support: stochastic preserves logits so the next
-        // `generate()` can continue without an intervening `append_tokens`.
-        // Greedy clears them — `forward_greedy()` never produced a readable
-        // vocab distribution, so there's nothing honest to save. The next
-        // greedy `generate()` on this session requires an intermediate
-        // `append_tokens`, and will otherwise return
-        // `WickError::EmptyInput`. This is the standard chat loop anyway
-        // (append user message → generate assistant → append next user
-        // message → generate), so it's rarely noticed in practice.
-        if greedy {
+        // Chain support:
+        //
+        // - Stochastic: `logits` holds the most recent `forward()` output
+        //   (pristine). Save so the next `generate()` can continue
+        //   without an intervening `append_tokens`.
+        //
+        // - Greedy, `generated > 0`: at least one `forward_greedy()` ran,
+        //   advancing state and leaving `logits` stale (never read after
+        //   the initial argmax). Clear — honest "nothing to save."
+        //   Subsequent greedy `generate()` needs an `append_tokens` first,
+        //   matching the standard chat loop (append user → generate →
+        //   append next user → generate).
+        //
+        // - Greedy, `generated == 0`: we broke before any `forward_greedy`
+        //   (e.g., cancel-before-first-iter, or the first predicted token
+        //   was already EOS). `logits` still holds the untouched prefill
+        //   distribution; restoring it keeps the session usable for a
+        //   retry without the caller having to re-prefill.
+        if greedy && generated > 0 {
             self.last_logits = None;
         } else {
             self.last_logits = Some(logits);
