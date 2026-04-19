@@ -13,13 +13,13 @@ tracing.workspace = true
 bytemuck.workspace = true
 byteorder.workspace = true
 half.workspace = true
-memmap2.workspace = true
+memmap2 = { workspace = true, optional = true }
 minijinja.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true
 regex.workspace = true
-rayon.workspace = true
+rayon = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
@@ -41,11 +41,25 @@ openblas-src = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
-# Opt-in like `metal` and `gpu`. Enable with `--features blas` to route prefill
-# GEMM through Apple Accelerate (macOS, AMX) or OpenBLAS (Linux). Default builds
-# stay on the pure-NEON integer GEMM path so CI and Linux users don't pull in
-# a system OpenBLAS dependency.
-default = []
-gpu = ["dep:wgpu", "dep:pollster"]
-metal = ["dep:metal", "dep:objc"]
+# Portability feature set (Phase 1.3).
+#
+# `parallel`, `mmap`, `std-fs`, `disk-cache` are default-on so desktop + CLI
+# builds are unchanged. Turn them off to shrink the crate for targets like
+# wasm32-unknown-unknown or embedded environments:
+#
+#   cargo check -p wick --no-default-features
+#   cargo check -p wick --no-default-features --features parallel
+#
+# Feature deps:
+#   mmap        ⇒ std-fs  (memory-mapping a file needs a filesystem path)
+#   disk-cache  ⇒ std-fs  (writing the cold KV tier needs std::fs)
+#   gpu / metal ⇒ mmap    (both backends open the GGUF via mmap today)
+#   blas        — unchanged; opt-in GEMM accelerator
+default = ["parallel", "mmap", "std-fs", "disk-cache"]
+parallel = ["dep:rayon"]
+std-fs = []
+mmap = ["dep:memmap2", "std-fs"]
+disk-cache = ["std-fs"]
+gpu = ["dep:wgpu", "dep:pollster", "mmap"]
+metal = ["dep:metal", "dep:objc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]

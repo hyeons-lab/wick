@@ -34,12 +34,15 @@
 //!   [`BundleRepo`] as the follow-up. Callers who already have the
 //!   bundle on disk should point the manifest at the on-disk file.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::gguf::GgufFile;
 use crate::kv_cache::KvCacheConfig;
-use crate::manifest::{InferenceType, Manifest, ManifestFiles};
+#[cfg(feature = "mmap")]
+use crate::manifest::ManifestFiles;
+use crate::manifest::{InferenceType, Manifest};
 use crate::model::{self, Model};
 use crate::session::{Session, SessionConfig, WickError};
 use crate::tokenizer::BpeTokenizer;
@@ -171,6 +174,12 @@ impl WickEngine {
     /// - a bare `.gguf` file → internally synthesizes a text manifest,
     /// - a `.json` LeapBundles manifest → parsed + dispatched on `inference_type`,
     /// - a directory → scanned for exactly one `.json` manifest.
+    ///
+    /// Requires both `std-fs` (for directory + manifest I/O) and `mmap`
+    /// (to mmap-open the GGUF). Both are default-on. Builds without
+    /// them (e.g. wasm32) should use [`Self::from_reader`] or
+    /// [`Self::from_bytes`] with externally-sourced bytes.
+    #[cfg(feature = "mmap")]
     pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, WickError> {
         let path = path.as_ref();
         if path.is_dir() {
@@ -187,11 +196,7 @@ impl WickEngine {
             // to text (auto-detect's existing policy).
             let detected = auto_detect_inference_type(path)?;
             match detected {
-                InferenceType::LlamaCppTextToText => {
-                    let manifest = Manifest::synthetic_text(path);
-                    Self::from_manifest(manifest, cfg)
-                }
-                InferenceType::LlamaCppLfm2AudioV1 => {
+                InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => {
                     // Audio loads the same text LLM under the hood today
                     // (aux files are manifest-driven). Proceed with the
                     // synthetic text manifest; audio consumers who need
@@ -219,33 +224,41 @@ impl WickEngine {
     /// (VL / audio) use [`Self::from_path`] with a manifest or
     /// [`Self::from_files`]. Documented as `<50 MB or testing only` —
     /// production paths should stream from disk.
+    ///
+    /// Unconditional — works in every feature configuration, including
+    /// `--no-default-features`. Phase 3's `wick-wasm` crate uses this
+    /// (plus [`Self::from_reader`]) to back its OPFS-loaded paths.
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>, cfg: EngineConfig) -> Result<Self, WickError> {
         let arc_bytes: Arc<[u8]> = bytes.into();
         let gguf = GgufFile::from_bytes(arc_bytes)
             .map_err(|e| WickError::Backend(format!("parsing GGUF bytes: {e}")))?;
-        // Synthesize a minimal text manifest; model path is a placeholder
-        // since we don't have one. Consumers who care about the manifest
-        // should use `from_path`.
         let manifest = Manifest::synthetic_text(Path::new("<bytes>"));
-        let tokenizer = BpeTokenizer::from_gguf(&gguf)
-            .map_err(|e| WickError::Backend(format!("loading tokenizer: {e}")))?;
-        let add_bos_token = gguf
-            .get_bool("tokenizer.ggml.add_bos_token")
-            .unwrap_or(false);
-        let model = load_text_model(gguf, None, &cfg)?;
-        let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
-        Ok(Self {
-            manifest,
-            model,
-            tokenizer,
-            metadata,
-            config: cfg,
-        })
+        Self::from_gguf(gguf, manifest, cfg, None)
+    }
+
+    /// Load from any `std::io::Read`. Streams the full GGUF into an
+    /// owned buffer before parsing. Unconditional — works in every
+    /// feature configuration.
+    ///
+    /// Intended backend for Phase 3's `wick-wasm` (an OPFS-backed
+    /// `Read + Seek` shim) and for any consumer that has the bytes
+    /// coming from a source other than a filesystem path (decrypted
+    /// blob, network stream, archive entry).
+    pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, WickError> {
+        let gguf = GgufFile::from_reader(reader)
+            .map_err(|e| WickError::Backend(format!("reading GGUF stream: {e}")))?;
+        let manifest = Manifest::synthetic_text(Path::new("<reader>"));
+        Self::from_gguf(gguf, manifest, cfg, None)
     }
 
     /// Load from explicit file paths — skips manifest JSON parsing.
     /// `files.inference_type` decides the loader; `None` auto-detects
     /// from the GGUF header.
+    ///
+    /// Requires the `mmap` feature (default-on) because it mmap-opens
+    /// the primary file. Callers without `mmap` should read the file
+    /// manually and use [`Self::from_reader`].
+    #[cfg(feature = "mmap")]
     pub fn from_files(files: ModelFiles, cfg: EngineConfig) -> Result<Self, WickError> {
         let manifest = synthesize_manifest_from_files(&files)?;
         // If the caller overrode the chat template, apply it by threading
@@ -257,52 +270,37 @@ impl WickEngine {
 
     // --- internal constructors ---
 
-    fn from_manifest_file(path: &Path, cfg: EngineConfig) -> Result<Self, WickError> {
-        let manifest = Manifest::from_file(path).map_err(|e| {
-            WickError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
-        })?;
-        let manifest_dir = path.parent().map(Path::to_path_buf);
-        let primary = resolve_primary_model_path(&manifest, manifest_dir.as_deref())?;
-        Self::from_manifest_with_primary(manifest, &primary, cfg)
-    }
-
-    /// Dispatch helper that assumes the primary model path has already
-    /// been resolved to a local file. Called by `from_manifest_file` and
-    /// `from_files`; `from_path(.gguf)` goes through [`Self::from_manifest`]
-    /// which re-resolves the primary from the synthetic manifest.
-    fn from_manifest_with_primary(
+    /// Core assembly: take a pre-constructed `GgufFile` + parsed
+    /// manifest, build the tokenizer, load the model, wrap in
+    /// `WickEngine`. All three public constructors funnel through here:
+    ///
+    /// - `from_bytes` / `from_reader` pass `path = None` — no on-disk
+    ///   file to hand to backends.
+    /// - `from_manifest_with_primary` (via `from_path` / `from_files`)
+    ///   passes `Some(primary)` — Metal and wgpu's auto-dispatch may
+    ///   reopen the file by path for their own mmap, so they need the
+    ///   original filesystem path even though we also hand them the
+    ///   already-parsed `GgufFile`.
+    fn from_gguf(
+        gguf: GgufFile,
         manifest: Manifest,
-        primary: &Path,
         cfg: EngineConfig,
+        path: Option<&Path>,
     ) -> Result<Self, WickError> {
-        match &manifest.inference_type {
-            InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => {
-                // Text LLMs AND LFM2-audio models both load the primary
-                // GGUF through the same path. Audio aux files (decoder,
-                // mmproj, safetensors tokenizer) stay on the manifest
-                // for the audio pipeline to pick up separately.
-            }
-            InferenceType::LlamaCppImageToText => {
-                return Err(WickError::UnsupportedInferenceType(
-                    manifest.inference_type.as_str().to_string(),
-                ));
-            }
-            InferenceType::Unknown(s) => {
-                return Err(WickError::UnsupportedInferenceType(s.clone()));
-            }
-        }
+        // Covers `from_bytes` / `from_reader`, which skip the pre-filter
+        // in `from_manifest_with_primary`. Text LLMs AND LFM2-audio
+        // models both load the primary GGUF through the same path;
+        // audio aux files (decoder, mmproj, safetensors tokenizer) stay
+        // on the manifest for the audio pipeline to pick up separately.
+        check_inference_type_supported(&manifest.inference_type)?;
 
-        let gguf = GgufFile::open(primary)
-            .map_err(|e| WickError::Backend(format!("opening `{}`: {e}", primary.display())))?;
         let tokenizer = BpeTokenizer::from_gguf(&gguf)
             .map_err(|e| WickError::Backend(format!("loading tokenizer: {e}")))?;
-        // Peek at add_bos before `gguf` is moved into the loader.
         let add_bos_token = gguf
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(false);
-        let model = load_text_model(gguf, Some(primary), &cfg)?;
+        let model = load_text_model(gguf, path, &cfg)?;
         let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
-
         Ok(Self {
             manifest,
             model,
@@ -312,10 +310,40 @@ impl WickEngine {
         })
     }
 
-    /// Convergence point for `from_path(.gguf)` and `from_bytes` (after
-    /// their respective synthetic manifests). Re-resolves the primary
-    /// from the manifest and dispatches through
+    #[cfg(feature = "mmap")]
+    fn from_manifest_file(path: &Path, cfg: EngineConfig) -> Result<Self, WickError> {
+        let manifest = Manifest::from_file(path).map_err(|e| {
+            WickError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
+        })?;
+        let manifest_dir = path.parent().map(Path::to_path_buf);
+        let primary = resolve_primary_model_path(&manifest, manifest_dir.as_deref())?;
+        Self::from_manifest_with_primary(manifest, &primary, cfg)
+    }
+
+    /// Opens the primary GGUF at `primary` and delegates assembly to
+    /// [`Self::from_gguf`] with `Some(primary)` so Metal/GPU backends
+    /// can reach the on-disk file.
+    ///
+    /// Requires `mmap` because it opens the primary via `GgufFile::open`.
+    #[cfg(feature = "mmap")]
+    fn from_manifest_with_primary(
+        manifest: Manifest,
+        primary: &Path,
+        cfg: EngineConfig,
+    ) -> Result<Self, WickError> {
+        // Pre-filter on inference_type so VL / Unknown manifests fail
+        // fast without paying for the GGUF mmap + header parse. `from_gguf`
+        // checks again for the in-memory constructors that skip this path.
+        check_inference_type_supported(&manifest.inference_type)?;
+        let gguf = GgufFile::open(primary)
+            .map_err(|e| WickError::Backend(format!("opening `{}`: {e}", primary.display())))?;
+        Self::from_gguf(gguf, manifest, cfg, Some(primary))
+    }
+
+    /// Convergence point for `from_path(.gguf)`. Re-resolves the primary
+    /// from the synthetic manifest and dispatches through
     /// [`Self::from_manifest_with_primary`].
+    #[cfg(feature = "mmap")]
     fn from_manifest(manifest: Manifest, cfg: EngineConfig) -> Result<Self, WickError> {
         let primary = resolve_primary_model_path(&manifest, None)?;
         Self::from_manifest_with_primary(manifest, &primary, cfg)
@@ -367,12 +395,15 @@ impl WickEngine {
 // Internals
 // ---------------------------------------------------------------------------
 
+// Only used on `mmap` builds (by `from_path` + `find_single_manifest`).
+#[cfg(feature = "mmap")]
 fn has_extension(p: &Path, ext: &str) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
+#[cfg(feature = "mmap")]
 fn find_single_manifest(dir: &Path) -> Result<PathBuf, WickError> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| WickError::Backend(format!("reading directory `{}`: {e}", dir.display())))?;
@@ -410,6 +441,11 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, WickError> {
 /// path. HTTP(S) URLs are rejected with a pointer at Phase 1.6's
 /// downloader; relative paths resolve against `manifest_dir` when
 /// provided (for on-disk manifests loaded via `from_manifest_file`).
+///
+/// Gated on `mmap` — the only callers are `from_manifest_with_primary`
+/// and `from_manifest` (both `mmap`-only). `from_bytes` / `from_reader`
+/// skip path resolution entirely.
+#[cfg(feature = "mmap")]
 fn resolve_primary_model_path(
     manifest: &Manifest,
     manifest_dir: Option<&Path>,
@@ -417,6 +453,7 @@ fn resolve_primary_model_path(
     resolve_url_or_path(&manifest.files.model, manifest_dir)
 }
 
+#[cfg(feature = "mmap")]
 fn resolve_url_or_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf, WickError> {
     if is_remote_url(value) {
         return Err(WickError::Backend(format!(
@@ -443,6 +480,7 @@ fn resolve_url_or_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf, 
     }
 }
 
+#[cfg(feature = "mmap")]
 fn is_remote_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
@@ -452,6 +490,7 @@ fn is_remote_url(s: &str) -> bool {
 /// isn't a file URI. Case-insensitive on the scheme. Does NOT decode
 /// percent-encoding or handle Windows drive letters; the caller errors
 /// out rather than trying to interpret it.
+#[cfg(feature = "mmap")]
 fn strip_file_scheme(s: &str) -> Option<&str> {
     let lower = s.to_ascii_lowercase();
     if let Some(rest) = lower.strip_prefix("file://") {
@@ -465,6 +504,7 @@ fn strip_file_scheme(s: &str) -> Option<&str> {
 }
 
 /// Build a minimal `Manifest` from an explicit `ModelFiles`.
+#[cfg(feature = "mmap")]
 fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, WickError> {
     let inference_type = match files.inference_type.clone() {
         Some(it) => it,
@@ -568,12 +608,15 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, WickEr
     })
 }
 
+// Only used by `synthesize_manifest_from_files` (mmap-gated).
+#[cfg(feature = "mmap")]
 enum DefaultsShape {
     Text,
     Audio,
     Other,
 }
 
+#[cfg(feature = "mmap")]
 fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
     match it {
         InferenceType::LlamaCppLfm2AudioV1 => DefaultsShape::Audio,
@@ -588,6 +631,22 @@ fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
 /// for v1 — only `lfm2` is actually loadable today; the other arches
 /// are listed so auto-detect doesn't silently confuse a future non-text
 /// model for text.
+/// Shared gate for the set of `InferenceType`s the engine can actually
+/// load today. Returns `Ok(())` for text + LFM2-audio; returns
+/// `WickError::UnsupportedInferenceType` for VL and anything unknown.
+/// Unconditional so both the mmap-backed path (pre-file-open) and the
+/// in-memory paths (`from_bytes` / `from_reader`) use the same rule.
+fn check_inference_type_supported(it: &InferenceType) -> Result<(), WickError> {
+    match it {
+        InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => Ok(()),
+        InferenceType::LlamaCppImageToText => {
+            Err(WickError::UnsupportedInferenceType(it.as_str().to_string()))
+        }
+        InferenceType::Unknown(s) => Err(WickError::UnsupportedInferenceType(s.clone())),
+    }
+}
+
+#[cfg(feature = "mmap")]
 fn auto_detect_inference_type(model_path: &Path) -> Result<InferenceType, WickError> {
     let gguf = GgufFile::open(model_path).map_err(|e| {
         WickError::Backend(format!(

@@ -1,5 +1,7 @@
 use half::f16;
-use rayon::prelude::*;
+
+#[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 
 // ── Block layouts ────────────────────────────────────────────────────────────
 

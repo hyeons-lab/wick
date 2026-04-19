@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "disk-cache")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::model::{BlockType, ModelConfig};
@@ -435,6 +437,7 @@ struct CacheEntry {
 }
 
 /// Two-tier KV prefix cache: warm (memory) + cold (disk via FlatBuffers).
+#[cfg_attr(not(feature = "disk-cache"), allow(dead_code))]
 pub struct KvPrefixCache {
     warm: HashMap<u64, CacheEntry>,
     pub config: KvCacheConfig,
@@ -466,6 +469,8 @@ impl KvPrefixCache {
             });
 
         // Check cold tier too — it may have a longer prefix than the warm hit.
+        // `disk-cache` off → cold tier compiles out; only warm hits matter.
+        #[cfg(feature = "disk-cache")]
         let cold_hit = self
             .config
             .cache_dir
@@ -475,6 +480,8 @@ impl KvPrefixCache {
                 let len = snapshot.seq_len;
                 (snapshot, len)
             });
+        #[cfg(not(feature = "disk-cache"))]
+        let cold_hit: Option<(StateSnapshot, usize)> = None;
 
         let best = match (warm_hit, cold_hit) {
             (Some(w), Some(c)) if c.1 > w.1 => Some(c),
@@ -521,7 +528,8 @@ impl KvPrefixCache {
         // Evict from warm if needed.
         self.evict_warm_if_needed(snap_bytes);
 
-        // Save to cold tier.
+        // Save to cold tier (if `disk-cache` feature on; otherwise no-op).
+        #[cfg(feature = "disk-cache")]
         if let Some(dir) = &self.config.cache_dir {
             self.save_cold(dir, tokens, &snapshot);
         }
@@ -568,7 +576,13 @@ impl KvPrefixCache {
     }
 
     // ── Cold tier (FlatBuffers) ─────────────────────────────────────
+    //
+    // All cold-tier helpers live behind `disk-cache` (default-on).
+    // Builds without `disk-cache` compile only the warm (memory) tier;
+    // `cache_dir` on `KvCacheConfig` is retained so consumers don't
+    // need to conditionally construct the config, but it's ignored.
 
+    #[cfg(feature = "disk-cache")]
     fn cold_filename(&self, token_hash: u64) -> String {
         format!(
             "{:016x}_{:016x}.kvcache",
@@ -576,6 +590,7 @@ impl KvPrefixCache {
         )
     }
 
+    #[cfg(feature = "disk-cache")]
     fn save_cold(&self, dir: &Path, tokens: &[u32], snapshot: &StateSnapshot) {
         if std::fs::create_dir_all(dir).is_err() {
             return;
@@ -631,6 +646,7 @@ impl KvPrefixCache {
         self.evict_cold_if_needed(dir);
     }
 
+    #[cfg(feature = "disk-cache")]
     fn find_cold_prefix(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
         // Check specific filenames by pre-computing hashes for all prefixes,
         // longest first. This avoids reading the entire directory.
@@ -651,6 +667,7 @@ impl KvPrefixCache {
         best
     }
 
+    #[cfg(feature = "disk-cache")]
     fn load_cold_file(&self, path: &Path, expected_prefix: &[u32]) -> Option<StateSnapshot> {
         let data = std::fs::read(path).ok()?;
         let entry = flatbuffers::root::<crate::generated::wick::cache::KvCacheEntry>(&data).ok()?;
@@ -701,6 +718,7 @@ impl KvPrefixCache {
         Some(StateSnapshot { layers, seq_len })
     }
 
+    #[cfg(feature = "disk-cache")]
     fn evict_cold_if_needed(&self, dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;

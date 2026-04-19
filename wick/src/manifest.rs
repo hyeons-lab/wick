@@ -130,6 +130,11 @@ pub enum GenerationDefaults {
 impl Manifest {
     /// Parse a manifest from a file on disk. Thin convenience over
     /// `from_str` that also captures a nicer error context.
+    ///
+    /// Requires the `std-fs` feature (default-on). WASM / embedded
+    /// consumers without filesystem access should read the manifest
+    /// bytes externally and call [`Self::from_bytes`].
+    #[cfg(feature = "std-fs")]
     pub fn from_file(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading manifest file: {}", path.display()))?;

@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+#[cfg(feature = "mmap")]
 use std::fs::File;
 use std::io::{Cursor, Read};
+#[cfg(feature = "mmap")]
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
 use crate::tensor::{DType, Tensor};
@@ -85,6 +88,7 @@ pub struct TensorInfo {
 /// (WASM builds, in-memory buffers, tests). Kept private — callers
 /// go through `GgufFile::mmap_data()` / `get_tensor()` / `tensor_data()`.
 enum Backing {
+    #[cfg(feature = "mmap")]
     Mmap(Mmap),
     Owned(Arc<[u8]>),
 }
@@ -321,6 +325,10 @@ fn tensor_data_size(shape: &[usize], dtype: DType) -> Result<usize> {
 impl GgufFile {
     /// Open and parse a GGUF file via mmap. Zero-copy — tensor data is
     /// referenced directly from the kernel mapping.
+    ///
+    /// Requires the `mmap` feature (default-on). Builds without `mmap`
+    /// (e.g. wasm32) should use [`Self::from_bytes`] or [`Self::from_reader`].
+    #[cfg(feature = "mmap")]
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: Mmap::map is `unsafe` because concurrent truncation of
@@ -392,6 +400,7 @@ impl GgufFile {
         // buffer we bail early with a nicer error than the "magic
         // mismatch" below would produce.
         let data_slice: &[u8] = match &backing {
+            #[cfg(feature = "mmap")]
             Backing::Mmap(m) => m,
             Backing::Owned(a) => a,
         };
