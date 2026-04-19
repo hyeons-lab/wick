@@ -53,6 +53,13 @@ impl Sampler {
         Self { config, rng }
     }
 
+    /// Replace the sampler's config mid-session. Preserves the existing RNG
+    /// so intra-session determinism survives per-call opts changes (e.g.,
+    /// adjusting temperature between turns of a chat).
+    pub fn set_config(&mut self, config: SamplerConfig) {
+        self.config = config;
+    }
+
     /// Sample a token ID from logits. Panics if logits is empty.
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         assert!(!logits.is_empty(), "cannot sample from empty logits");
