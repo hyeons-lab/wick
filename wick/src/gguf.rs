@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{Cursor, Read};
 use std::path::Path;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
@@ -78,12 +80,60 @@ pub struct TensorInfo {
     pub ggml_type_id: u32,
 }
 
-/// A parsed GGUF file with memory-mapped tensor data.
+/// How a `GgufFile` owns its underlying bytes. `Mmap` is the zero-copy
+/// default for `open(path)`; `Owned` backs `from_bytes` / `from_reader`
+/// (WASM builds, in-memory buffers, tests). Kept private — callers
+/// go through `GgufFile::mmap_data()` / `get_tensor()` / `tensor_data()`.
+enum Backing {
+    Mmap(Mmap),
+    Owned(Arc<[u8]>),
+}
+
+/// Raw pointer + length to the immutable bytes of a `Backing`, cached at
+/// construction so every tensor access avoids the enum match. See SAFETY
+/// below.
+struct SafeDataPtr {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the `ptr` is derived from either a `memmap2::Mmap` (kernel-
+// managed mapping whose base address is stable once mapped) or an
+// `Arc<[u8]>` (heap buffer — refcounted handle; moving the `Arc` doesn't
+// relocate the data). The owning `Backing` sits alongside on `GgufFile`
+// and is dropped with it, so the pointer never outlives its storage.
+// The data is never mutated after construction — all accessors return
+// immutable slices. NonNull<u8> + usize are trivially Send + Sync apart
+// from the raw-pointer Send/Sync bound, which we assert here.
+unsafe impl Send for SafeDataPtr {}
+unsafe impl Sync for SafeDataPtr {}
+
+impl SafeDataPtr {
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: see type-level SAFETY note — ptr+len valid for
+        // `GgufFile` lifetime; data is immutable.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// A parsed GGUF file with zero-copy tensor data access. Construct via
+/// [`GgufFile::open`] (mmap), [`GgufFile::from_bytes`] (owned buffer),
+/// or [`GgufFile::from_reader`] (any `std::io::Read`; reads fully).
 pub struct GgufFile {
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: HashMap<String, TensorInfo>,
-    mmap: Mmap,
-    /// Offset in the file where tensor data begins (after header + metadata + tensor infos).
+    /// Raw data pointer resolved at construction; preferred access path.
+    data: SafeDataPtr,
+    /// Retained so its `Drop` frees the bytes `data` points into. Never
+    /// read after construction — `data.as_slice()` is the canonical
+    /// accessor regardless of variant.
+    _backing: Backing,
+    /// Offset in the buffer where tensor data begins (after header +
+    /// metadata + tensor infos).
     data_offset: usize,
 }
 
@@ -269,16 +319,95 @@ fn tensor_data_size(shape: &[usize], dtype: DType) -> Result<usize> {
 }
 
 impl GgufFile {
-    /// Open and parse a GGUF file.
+    /// Open and parse a GGUF file via mmap. Zero-copy — tensor data is
+    /// referenced directly from the kernel mapping.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let file_size = file.metadata()?.len() as usize;
-
-        // Memory-map the entire file
+        // SAFETY: Mmap::map is `unsafe` because concurrent truncation of
+        // the file on disk would invalidate the mapping. We treat this
+        // as an acceptable risk for the duration of the `GgufFile` —
+        // callers are expected not to mutate model files in-flight.
         let mmap = unsafe { Mmap::map(&file)? };
+        Self::from_backing(Backing::Mmap(mmap))
+    }
 
-        // Parse header and metadata using a buffered reader
-        let mut reader = GgufReader::new(BufReader::new(&file));
+    /// Parse a GGUF file from an owned byte buffer. Use for WASM
+    /// (no filesystem mmap), in-memory test fixtures, or when the caller
+    /// wants to keep the bytes around without re-reading. `Arc<[u8]>` so
+    /// multiple `GgufFile` instances can share one copy.
+    ///
+    /// Cost: no copy beyond what the caller has already done to produce
+    /// the `Arc<[u8]>`. Prefer [`GgufFile::open`] for file-path loads.
+    pub fn from_bytes(bytes: Arc<[u8]>) -> Result<Self> {
+        Self::from_backing(Backing::Owned(bytes))
+    }
+
+    /// Parse a GGUF file from any `std::io::Read`. Reads fully into a
+    /// heap buffer first (delegates to [`Self::from_bytes`]). Useful when
+    /// the source is a stream (network, decrypted blob) without a file
+    /// descriptor to mmap.
+    ///
+    /// Applies a hard sanity cap of [`Self::DEFAULT_READER_MAX_BYTES`]
+    /// (64 GiB) — reading past it fails fast rather than OOM-ing the
+    /// process. For untrusted inputs use
+    /// [`Self::from_reader_with_limit`] with a tighter bound, or wrap
+    /// the reader in [`std::io::Read::take`] before calling.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
+        Self::from_reader_with_limit(reader, Self::DEFAULT_READER_MAX_BYTES)
+    }
+
+    /// Default ceiling for [`Self::from_reader`]. 64 GiB — bigger than any
+    /// GGUF we expect to ship but small enough to fail before consuming
+    /// an unbounded hostile stream.
+    pub const DEFAULT_READER_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+    /// Like [`Self::from_reader`] but with a caller-specified byte
+    /// ceiling. Streams up to and including `max_bytes` are accepted;
+    /// anything past that errors out cleanly. The reader is wrapped in
+    /// `Read::take(max_bytes + 1)` so we can distinguish "exactly at the
+    /// limit" from "more than the limit, truncated": if we read one byte
+    /// past the ceiling, the underlying source was over-size.
+    pub fn from_reader_with_limit<R: Read>(reader: R, max_bytes: u64) -> Result<Self> {
+        let mut buf: Vec<u8> = Vec::new();
+        // +1 so we can tell "filled exactly up to max_bytes" apart from
+        // "truncated at max_bytes because the source is larger".
+        let probe_limit = max_bytes.saturating_add(1);
+        let mut bounded = reader.take(probe_limit);
+        let read = bounded
+            .read_to_end(&mut buf)
+            .context("reading GGUF stream")?;
+        ensure!(
+            (read as u64) <= max_bytes,
+            "GGUF stream exceeded {max_bytes} byte limit — pass a larger ceiling to `from_reader_with_limit` if legitimate"
+        );
+        Self::from_bytes(Arc::from(buf.into_boxed_slice()))
+    }
+
+    /// Core parse: take a backing, walk the header + tensor infos, and
+    /// build the final `GgufFile`. All three public constructors funnel
+    /// through here so there's one source of truth for format parsing.
+    fn from_backing(backing: Backing) -> Result<Self> {
+        // Derive a stable byte view of the backing. NonNull from a slice
+        // of at least one byte is guaranteed non-null; for a zero-byte
+        // buffer we bail early with a nicer error than the "magic
+        // mismatch" below would produce.
+        let data_slice: &[u8] = match &backing {
+            Backing::Mmap(m) => m,
+            Backing::Owned(a) => a,
+        };
+        ensure!(
+            data_slice.len() >= 24,
+            "GGUF buffer too small ({} bytes; need at least 24 for the header)",
+            data_slice.len()
+        );
+        let file_size = data_slice.len();
+
+        let ptr = NonNull::new(data_slice.as_ptr() as *mut u8)
+            .expect("non-empty slice always yields non-null pointer");
+
+        // Parse header + metadata from the slice via a Cursor. Shares
+        // one implementation across mmap and owned-buffer backings.
+        let mut reader = GgufReader::new(Cursor::new(data_slice));
 
         // ── Header ──────────────────────────────────────────────────────
         let magic = reader.read_u32()?;
@@ -398,7 +527,11 @@ impl GgufFile {
         Ok(GgufFile {
             metadata,
             tensors,
-            mmap,
+            data: SafeDataPtr {
+                ptr,
+                len: file_size,
+            },
+            _backing: backing,
             data_offset,
         })
     }
@@ -506,17 +639,21 @@ impl GgufFile {
         }
     }
 
-    /// Raw access to the memory-mapped data region.
+    /// Raw access to the full backing data region (mmap or owned).
+    /// Name retained for backward compat with existing callers; despite
+    /// the name, the buffer may be heap-owned (via `from_bytes` /
+    /// `from_reader`) rather than mmapped.
     pub fn mmap_data(&self) -> &[u8] {
-        &self.mmap
+        self.data.as_slice()
     }
 
-    /// Get the offset where tensor data begins in the mmap.
+    /// Get the offset where tensor data begins in the backing buffer
+    /// (mmap or owned bytes — same semantics either way).
     pub fn data_offset(&self) -> usize {
         self.data_offset
     }
 
-    /// Validate a tensor and return its byte range within the mmap.
+    /// Validate a tensor and return its byte range within the backing buffer.
     fn tensor_range(&self, name: &str) -> Result<(&TensorInfo, std::ops::Range<usize>)> {
         let info = self
             .tensors
@@ -536,28 +673,31 @@ impl GgufFile {
             .checked_add(info.size_bytes)
             .with_context(|| format!("tensor {name} end offset overflow"))?;
         ensure!(
-            end <= self.mmap.len(),
-            "tensor {name} data extends beyond mmap"
+            end <= self.data.len(),
+            "tensor {name} data extends beyond GGUF buffer"
         );
 
         Ok((info, start..end))
     }
 
-    /// Load a tensor by name, returning an owned Tensor.
-    /// The data is copied from the memory-mapped file.
+    /// Load a tensor by name, returning an owned Tensor. Copies from the
+    /// backing buffer (mmap or owned).
     pub fn get_tensor(&self, name: &str) -> Result<Tensor> {
         let (info, range) = self.tensor_range(name)?;
-        let data = self.mmap[range].to_vec();
+        let data = self.data.as_slice()[range].to_vec();
         Ok(Tensor::new(data, info.shape.clone(), info.dtype))
     }
 
-    /// Get a reference to a tensor's raw data in the mmap without copying.
+    /// Get a reference to a tensor's raw data without copying. Valid for
+    /// the `GgufFile`'s lifetime.
     pub fn tensor_data(&self, name: &str) -> Result<&[u8]> {
         let (_info, range) = self.tensor_range(name)?;
-        Ok(&self.mmap[range])
+        Ok(&self.data.as_slice()[range])
     }
 
-    /// Get tensor metadata: (byte_offset_in_mmap, rows, cols, dtype).
+    /// Get tensor metadata: (byte_offset_in_backing, rows, cols, dtype).
+    /// The offset is relative to the underlying GGUF backing buffer
+    /// (mmap or owned bytes — same semantics either way).
     /// For GGUF [ne0, ne1] tensors: rows = ne1 (output dim), cols = ne0 (input dim).
     pub fn tensor_meta(&self, name: &str) -> Result<(usize, usize, usize, DType)> {
         let (info, range) = self.tensor_range(name)?;
@@ -698,10 +838,9 @@ mod tests {
     #[test]
     fn test_tensor_range_unsupported_type() {
         // Build a GgufFile with a tensor that has size_bytes=0 (unsupported type)
-        let mmap = memmap2::MmapMut::map_anon(256)
-            .unwrap()
-            .make_read_only()
-            .unwrap();
+        let bytes: Arc<[u8]> = Arc::from(vec![0u8; 256].into_boxed_slice());
+        let ptr = NonNull::new(bytes.as_ptr() as *mut u8).unwrap();
+        let len = bytes.len();
 
         let mut tensors = HashMap::new();
         tensors.insert(
@@ -730,7 +869,8 @@ mod tests {
         let gguf = GgufFile {
             metadata: HashMap::new(),
             tensors,
-            mmap,
+            data: SafeDataPtr { ptr, len },
+            _backing: Backing::Owned(bytes),
             data_offset: 0,
         };
 
@@ -788,5 +928,94 @@ mod tests {
         data.extend_from_slice(b"hello");
         let mut reader = GgufReader::new(std::io::Cursor::new(data));
         assert_eq!(reader.read_string().unwrap(), "hello");
+    }
+
+    /// Build a minimal valid GGUF byte buffer: magic + version + zero
+    /// tensors + zero metadata. Enough to exercise `from_bytes` /
+    /// `from_reader` header parsing without needing a real model file.
+    fn minimal_gguf_bytes() -> Vec<u8> {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes()); // magic
+        data.extend_from_slice(&3u32.to_le_bytes()); // version
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&0u64.to_le_bytes()); // kv_count
+        data
+    }
+
+    #[test]
+    fn from_bytes_parses_minimal_header() {
+        let bytes: Arc<[u8]> = Arc::from(minimal_gguf_bytes().into_boxed_slice());
+        let gguf = match GgufFile::from_bytes(bytes) {
+            Ok(g) => g,
+            Err(e) => panic!("parse minimal GGUF: {e}"),
+        };
+        assert!(gguf.metadata.is_empty());
+        assert!(gguf.tensors.is_empty());
+        assert_eq!(gguf.mmap_data().len(), 24);
+    }
+
+    #[test]
+    fn from_reader_matches_from_bytes() {
+        let bytes = minimal_gguf_bytes();
+        let a = match GgufFile::from_bytes(Arc::from(bytes.clone().into_boxed_slice())) {
+            Ok(g) => g,
+            Err(e) => panic!("from_bytes: {e}"),
+        };
+        let b = match GgufFile::from_reader(std::io::Cursor::new(bytes)) {
+            Ok(g) => g,
+            Err(e) => panic!("from_reader: {e}"),
+        };
+        assert_eq!(a.metadata.len(), b.metadata.len());
+        assert_eq!(a.tensors.len(), b.tensors.len());
+        assert_eq!(a.mmap_data().len(), b.mmap_data().len());
+    }
+
+    #[test]
+    fn from_bytes_rejects_too_small_buffer() {
+        let bytes: Arc<[u8]> = Arc::from(vec![0u8; 10].into_boxed_slice());
+        // `GgufFile: !Debug`, so `.unwrap_err()` won't compile — match instead.
+        match GgufFile::from_bytes(bytes) {
+            Ok(_) => panic!("expected error for tiny buffer"),
+            Err(e) => assert!(e.to_string().contains("too small"), "unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn from_reader_with_limit_rejects_oversize_stream() {
+        // Caller-supplied limit of 16 bytes; minimal header is 24, so we
+        // should see the limit error rather than a partial-parse garbage.
+        let bytes = minimal_gguf_bytes(); // 24 bytes, exceeds limit
+        match GgufFile::from_reader_with_limit(std::io::Cursor::new(bytes), 16) {
+            Ok(_) => panic!("expected error when stream exceeds limit"),
+            Err(e) => assert!(
+                e.to_string().contains("exceeded") || e.to_string().contains("too small"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn from_reader_with_limit_accepts_stream_exactly_at_limit() {
+        // Stream size equals `max_bytes` — must succeed, not trip the
+        // "exceeded limit" check (regression: off-by-one caught by review).
+        let bytes = minimal_gguf_bytes();
+        let exact = bytes.len() as u64;
+        match GgufFile::from_reader_with_limit(std::io::Cursor::new(bytes), exact) {
+            Ok(g) => assert_eq!(g.mmap_data().len() as u64, exact),
+            Err(e) => panic!("stream exactly at limit should succeed, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_bad_magic() {
+        let mut bytes = minimal_gguf_bytes();
+        bytes[0..4].copy_from_slice(b"ABCD"); // wrong magic
+        match GgufFile::from_bytes(Arc::from(bytes.into_boxed_slice())) {
+            Ok(_) => panic!("expected error for bad magic"),
+            Err(e) => assert!(
+                e.to_string().contains("not a GGUF file"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 }

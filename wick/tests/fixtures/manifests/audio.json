@@ -1,0 +1,13 @@
+{
+  "inference_type": "llama.cpp/lfm2-audio-v1",
+  "schema_version": "1.0.0",
+  "load_time_parameters": {
+    "model": "https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF/resolve/main/LFM2-Audio-1.5B-F16.gguf",
+    "multimodal_projector": "https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF/resolve/main/mmproj-audioencoder-LFM2-Audio-1.5B-F16.gguf",
+    "audio_decoder": "https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF/resolve/main/audiodecoder-LFM2-Audio-1.5B-F16.gguf",
+    "audio_tokenizer": "https://huggingface.co/LiquidAI/LFM2-Audio-1.5B/resolve/main/tokenizer-e351c8d8-checkpoint125.safetensors"
+  },
+  "generation_time_parameters": {
+    "number_of_decoding_threads": 4
+  }
+}

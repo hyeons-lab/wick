@@ -1,0 +1,15 @@
+{
+  "inference_type": "llama.cpp/image-to-text",
+  "schema_version": "1.0.0",
+  "load_time_parameters": {
+    "model": "https://huggingface.co/LiquidAI/LFM2-VL-1.6B-GGUF/resolve/main/LFM2-VL-1.6B-F16.gguf",
+    "multimodal_projector": "https://huggingface.co/LiquidAI/LFM2-VL-1.6B-GGUF/resolve/main/mmproj-LFM2-VL-1.6B-F16.gguf"
+  },
+  "generation_time_parameters": {
+    "sampling_parameters": {
+      "temperature": 0.1,
+      "min_p": 0.15,
+      "repetition_penalty": 1.05
+    }
+  }
+}

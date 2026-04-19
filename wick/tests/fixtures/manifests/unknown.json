@@ -1,0 +1,11 @@
+{
+  "inference_type": "llama.cpp/some-future-modality",
+  "schema_version": "1.0.0",
+  "load_time_parameters": {
+    "model": "https://example.com/future-model.gguf",
+    "novel_aux_component": "https://example.com/novel-aux.gguf"
+  },
+  "generation_time_parameters": {
+    "mystery_knob": 42
+  }
+}

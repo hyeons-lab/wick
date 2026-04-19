@@ -721,7 +721,12 @@ mod tests {
     #[test]
     fn test_encode_empty() {
         let tok = make_test_tokenizer();
-        assert_eq!(tok.encode(""), vec![]);
+        // Explicit type on the RHS: once `serde_json` is in the lib-test
+        // dep graph (pulled in by `wick::manifest`) the compiler sees an
+        // `impl PartialEq<serde_json::Value> for u32` alongside the
+        // reflexive `impl PartialEq for u32`, which makes `vec![]`'s
+        // element type ambiguous here.
+        assert_eq!(tok.encode(""), Vec::<u32>::new());
     }
 
     #[test]
