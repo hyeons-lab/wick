@@ -136,6 +136,19 @@ enum Command {
         /// 256 lose ≥5% prefill throughput. 0 disables chunking (monolithic).
         #[arg(long, default_value_t = 512)]
         ubatch_size: u32,
+
+        /// Tokens to pin at the front when the KV window fills up. 0
+        /// disables shifting — overflow returns ContextOverflow. A
+        /// positive value lets the session drop a middle range to make
+        /// room, but ONLY if (a) the pinned prefix plus incoming tokens
+        /// leave real space in the context window (so setting
+        /// `--n-keep` >= `--context-size` is a no-op) and (b) the prompt
+        /// itself fits (overflow still occurs if the raw prompt is
+        /// larger than the window). Not supported with any TurboQuant
+        /// KV-cache mode (`tq3`, `tq3-keys`, `tq3-values`) — shifting
+        /// compressed caches lands in a follow-up.
+        #[arg(long, default_value_t = 0)]
+        n_keep: u32,
     },
 
     /// Inspect a GGUF model file.
@@ -358,6 +371,7 @@ fn main() -> Result<()> {
             no_cache,
             kv_cache_keys,
             ubatch_size,
+            n_keep,
         } => {
             let engine = load_engine(Path::new(&model), &device, context_size)?;
             let tokenizer = engine.tokenizer();
@@ -550,6 +564,7 @@ fn main() -> Result<()> {
                     kv_compression,
                     seed: None,
                     ubatch_size,
+                    n_keep,
                     ..Default::default()
                 });
 

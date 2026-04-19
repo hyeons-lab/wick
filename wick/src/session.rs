@@ -208,6 +208,36 @@ impl<'a> Session<'a> {
             .unwrap_or(model_cfg.max_seq_len)
             .min(model_cfg.max_seq_len);
 
+        // A `n_keep >= max_seq_len` config can never actually shift —
+        // `current_pos` tops out at `max_seq_len` and the shift arm
+        // requires `current_pos >= n_keep + shift_needed`. Warn once
+        // at construction so users see why their `--n-keep` isn't
+        // kicking in instead of discovering it via `ContextOverflow`.
+        if config.n_keep > 0 && (config.n_keep as usize) >= max_seq_len {
+            tracing::warn!(
+                target: "wick::session",
+                n_keep = config.n_keep,
+                max_seq_len,
+                "n_keep >= max_seq_len; context shift will never fire \
+                 because there's no room left for shifted cells. Lower \
+                 n_keep to enable shifting."
+            );
+        }
+        // Likewise, `n_keep > 0` + TurboQuant is a no-op because the
+        // overflow arm gates on `!is_compressed()`. Warn once so the
+        // user knows their n_keep value is being silently ignored on
+        // overflow.
+        if config.n_keep > 0 && !matches!(config.kv_compression, KvCompression::None) {
+            tracing::warn!(
+                target: "wick::session",
+                n_keep = config.n_keep,
+                "n_keep configured alongside TurboQuant KV compression; \
+                 shift not yet supported for compressed caches, so \
+                 overflow will still return ContextOverflow. Disable \
+                 compression to enable n_keep."
+            );
+        }
+
         let state = InferenceState::from_config_with_compression(model_cfg, &config.kv_compression);
 
         let sampler_cfg = SamplerConfig {
@@ -328,10 +358,39 @@ impl<'a> Session<'a> {
             .checked_add(tokens.len())
             .ok_or(WickError::Backend("position overflow".into()))?;
         if new_end > self.max_seq_len {
-            return Err(WickError::ContextOverflow {
-                max_seq_len: self.max_seq_len as u32,
-                by: (new_end - self.max_seq_len) as u32,
-            });
+            // `n_keep` context shift (Phase 1.5): if the session was
+            // configured with `n_keep > 0` and the state isn't
+            // TurboQuant-compressed, drop the middle range to make room.
+            // Otherwise fall through to the typed ContextOverflow.
+            let n_keep = self.config.n_keep as usize;
+            let shift_needed = new_end - self.max_seq_len;
+            let can_shift = n_keep > 0
+                && !self.state.is_compressed()
+                && self.current_pos >= n_keep + shift_needed;
+            if !can_shift {
+                return Err(WickError::ContextOverflow {
+                    max_seq_len: self.max_seq_len as u32,
+                    by: (new_end - self.max_seq_len) as u32,
+                });
+            }
+            self.state.shift_attention_kv(n_keep, shift_needed);
+            let before = self.current_pos;
+            self.current_pos -= shift_needed;
+            self.position_atomic
+                .store(self.current_pos as u32, Ordering::Relaxed);
+            // Pre-shift `last_logits` corresponded to position `before - 1`;
+            // the positions they encode don't exist anymore. Clear so a
+            // subsequent `generate()` that bypasses the upcoming prefill
+            // doesn't silently emit from the wrong context.
+            self.last_logits = None;
+            tracing::info!(
+                target: "wick::kv_shift",
+                n_keep = n_keep,
+                shift = shift_needed,
+                seq_len_before = before,
+                seq_len_after = self.current_pos,
+                "kv context shift"
+            );
         }
         // Pass `ubatch_size` straight through — the trait method treats
         // 0 as "no chunking" (single chunk = whole input), matching the
