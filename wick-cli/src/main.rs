@@ -1,7 +1,37 @@
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use wick::tokenizer::BpeTokenizer;
+use wick::{FinishReason, ModalitySink};
+
+/// Decode tokens to stdout as they stream. Used by the `run` command.
+struct StdoutSink<'a> {
+    tokenizer: &'a BpeTokenizer,
+}
+
+impl<'a> StdoutSink<'a> {
+    fn new(tokenizer: &'a BpeTokenizer) -> Self {
+        Self { tokenizer }
+    }
+}
+
+impl ModalitySink for StdoutSink<'_> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        let piece = self.tokenizer.decode(tokens);
+        print!("{piece}");
+        let _ = std::io::stdout().flush();
+    }
+    fn on_done(&mut self, _reason: FinishReason) {}
+}
+
+/// Swallows every event. Used by `bench` to avoid stdout inside the timed loop.
+struct NoopSink;
+
+impl ModalitySink for NoopSink {
+    fn on_done(&mut self, _reason: FinishReason) {}
+}
 
 #[derive(Parser)]
 #[command(name = "wick", version, about = "Rust-native LLM inference engine")]
@@ -527,26 +557,47 @@ fn main() -> Result<()> {
                     eprintln!("Wrote {default_path}");
                 }
             } else {
-                // Text-only generation.
-                let config = wick::engine::GenerateConfig {
-                    max_tokens,
-                    sampler: wick::sampler::SamplerConfig {
-                        temperature,
+                // Text-only generation via Session + StdoutSink.
+                let mut session = wick::Session::new(
+                    loaded_model.as_ref(),
+                    &tokenizer,
+                    wick::SessionConfig {
+                        kv_compression,
+                        seed: None,
                         ..Default::default()
                     },
-                    silent: false,
-                    kv_compression,
+                );
+
+                let prefill_start = std::time::Instant::now();
+                session.append_tokens(&tokens)?;
+                let prefill_elapsed = prefill_start.elapsed();
+
+                let opts = wick::GenerateOpts {
+                    max_tokens: max_tokens as u32,
+                    temperature,
+                    ..Default::default()
                 };
 
-                let result =
-                    wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
+                let mut sink = StdoutSink::new(&tokenizer);
+                let summary = session.generate(&opts, &mut sink)?;
+
+                let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
+                    tokens.len() as f64 / prefill_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let decode_tps = if summary.decode_ms > 0 {
+                    summary.tokens_generated as f64 / (summary.decode_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
 
                 eprintln!();
                 eprintln!("---");
-                eprintln!("Prompt tokens: {}", result.prompt_tokens);
-                eprintln!("Generated tokens: {}", result.generated_tokens);
-                eprintln!("Prefill: {:.1} tok/s", result.prefill_tok_per_sec);
-                eprintln!("Decode: {:.1} tok/s", result.decode_tok_per_sec);
+                eprintln!("Prompt tokens: {}", tokens.len());
+                eprintln!("Generated tokens: {}", summary.tokens_generated);
+                eprintln!("Prefill: {:.1} tok/s", prefill_tps);
+                eprintln!("Decode: {:.1} tok/s", decode_tps);
             }
         }
         Command::Inspect { model } => {
@@ -643,21 +694,40 @@ fn main() -> Result<()> {
                 runs
             );
 
-            // Greedy (temp=0): deterministic, bench-friendly.
-            let config = wick::engine::GenerateConfig {
-                max_tokens,
-                sampler: wick::sampler::SamplerConfig {
+            // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
+            let run_once = || -> Result<(f64, f64)> {
+                let mut session = wick::Session::new(
+                    loaded_model.as_ref(),
+                    &tokenizer,
+                    wick::SessionConfig {
+                        kv_compression: kv_compression.clone(),
+                        seed: None,
+                        ..Default::default()
+                    },
+                );
+                let prefill_start = std::time::Instant::now();
+                session.append_tokens(&tokens)?;
+                let prefill_elapsed = prefill_start.elapsed();
+
+                let opts = wick::GenerateOpts {
+                    max_tokens: max_tokens as u32,
                     temperature: 0.0,
                     ..Default::default()
-                },
-                silent: true,
-                kv_compression,
-            };
+                };
+                let mut sink = NoopSink;
+                let summary = session.generate(&opts, &mut sink)?;
 
-            let run_once = || -> Result<(f64, f64)> {
-                let r =
-                    wick::engine::generate(loaded_model.as_ref(), &tokenizer, &tokens, &config)?;
-                Ok((r.prefill_tok_per_sec, r.decode_tok_per_sec))
+                let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
+                    tokens.len() as f64 / prefill_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let decode_tps = if summary.decode_ms > 0 {
+                    summary.tokens_generated as f64 / (summary.decode_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                Ok((prefill_tps, decode_tps))
             };
 
             for i in 0..warmup {

@@ -34,27 +34,42 @@ fn find_model(name: &str) -> Option<PathBuf> {
 /// generated-token slice. Constructs a fresh model so the `WICK_FLASH` env
 /// var is picked up at load time (`metal_lfm2.rs:509`).
 fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u32> {
-    use wick::engine::{GenerateConfig, generate};
     use wick::kv_cache::KvCompression;
     use wick::model::metal_lfm2::MetalLfm2Model;
-    use wick::sampler::SamplerConfig;
+    use wick::{FinishReason, GenerateOpts, ModalitySink, Session, SessionConfig};
 
     let gguf = wick::gguf::GgufFile::open(model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
     let model = MetalLfm2Model::from_gguf(gguf, model_path, 4096).unwrap();
     let prompt_toks = tokenizer.encode(prompt);
 
-    let config = GenerateConfig {
-        max_tokens,
-        sampler: SamplerConfig {
-            temperature: 0.0,
+    struct CollectSink(Vec<u32>);
+    impl ModalitySink for CollectSink {
+        fn on_text_tokens(&mut self, tokens: &[u32]) {
+            self.0.extend_from_slice(tokens);
+        }
+        fn on_done(&mut self, _: FinishReason) {}
+    }
+
+    let mut session = Session::new(
+        &model,
+        &tokenizer,
+        SessionConfig {
+            kv_compression: KvCompression::None,
+            seed: None,
             ..Default::default()
         },
-        silent: true,
-        kv_compression: KvCompression::None,
+    );
+    session.append_tokens(&prompt_toks).unwrap();
+
+    let opts = GenerateOpts {
+        max_tokens: max_tokens as u32,
+        temperature: 0.0,
+        ..Default::default()
     };
-    let result = generate(&model, &tokenizer, &prompt_toks, &config).unwrap();
-    result.tokens[prompt_toks.len()..].to_vec()
+    let mut sink = CollectSink(Vec::new());
+    session.generate(&opts, &mut sink).unwrap();
+    sink.0
 }
 
 const PROMPT: &str = "The capital of France is";

@@ -5,7 +5,6 @@
 
 pub mod audio_engine;
 pub mod backend;
-pub mod engine;
 /// Auto-generated FlatBuffers code for KV cache serialization.
 /// Regenerate with: `flatc --rust -o src/generated schema/kv_cache.fbs`
 #[allow(warnings)]
@@ -17,6 +16,15 @@ pub mod kv_cache;
 pub mod model;
 pub mod quant;
 pub mod sampler;
+pub mod session;
 pub mod tensor;
 pub mod tokenizer;
 pub mod turboquant;
+
+// Canonical public re-exports for the stateful API. Consumers should
+// `use wick::{Session, ModalitySink, ...}` rather than reaching into
+// `wick::session::*`.
+pub use session::{
+    FinishReason, GenerateOpts, GenerateSummary, ImageFormat, ModalityCapabilities, ModalitySink,
+    Session, SessionConfig, WickError,
+};
