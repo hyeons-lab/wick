@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use wick::tokenizer::BpeTokenizer;
-use wick::{FinishReason, ModalitySink};
+use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine};
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
 ///
@@ -59,7 +59,8 @@ struct Cli {
 enum Command {
     /// Run inference on a prompt.
     Run {
-        /// Path to the GGUF model file.
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles manifest,
+        /// or a directory containing exactly one `.json` manifest.
         #[arg(short, long)]
         model: String,
 
@@ -166,7 +167,7 @@ enum Command {
     /// (WICK_PROFILE must be unset) — profile-mode timings are diagnostic and
     /// don't predict real decode throughput.
     Bench {
-        /// Path to the GGUF model file.
+        /// Path to the model (`.gguf`, `.json` manifest, or manifest dir).
         #[arg(short, long)]
         model: String,
 
@@ -208,69 +209,31 @@ enum Command {
     },
 }
 
-fn load_model_for_device(
-    path: &Path,
-    device: &str,
-    context_size: usize,
-) -> Result<Box<dyn wick::model::Model>> {
-    let open = || wick::gguf::GgufFile::open(path);
-
-    match device {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        "metal" => {
-            eprintln!("Using native Metal backend");
-            wick::model::load_model_metal(open()?, path, context_size)
-        }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
-        "metal" => {
-            anyhow::bail!("Metal backend not available (compile with --features metal on macOS)")
-        }
-        #[cfg(feature = "gpu")]
-        "gpu" | "wgpu" => {
-            eprintln!("Using wgpu GPU backend");
-            wick::model::load_model_gpu(open()?, context_size)
-        }
-        #[cfg(not(feature = "gpu"))]
-        "gpu" | "wgpu" => anyhow::bail!("GPU backend not available (compile with --features gpu)"),
-        "cpu" => {
-            eprintln!("Using CPU backend");
-            wick::model::load_model(open()?, context_size)
-        }
-        _ => load_model_auto(path, context_size),
-    }
-}
-
-/// Auto device selection: metal > wgpu > cpu, with runtime fallback.
-fn load_model_auto(path: &Path, context_size: usize) -> Result<Box<dyn wick::model::Model>> {
-    let open = || wick::gguf::GgufFile::open(path);
-
-    // Try Metal first (macOS/iOS only).
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    match wick::model::load_model_metal(open()?, path, context_size) {
-        Ok(m) => {
-            eprintln!("Using native Metal backend (auto)");
-            return Ok(m);
-        }
-        Err(e) => {
-            eprintln!("Metal unavailable ({e}), trying next backend");
-        }
-    }
-
-    // Try wgpu (any platform with Vulkan/Metal/DX12).
-    #[cfg(feature = "gpu")]
-    match open().and_then(|g| wick::model::load_model_gpu(g, context_size)) {
-        Ok(m) => {
-            eprintln!("Using wgpu GPU backend (auto)");
-            return Ok(m);
-        }
-        Err(e) => {
-            eprintln!("wgpu GPU unavailable ({e}), falling back to CPU");
-        }
-    }
-
-    // CPU fallback — always available.
-    eprintln!("Using CPU backend (auto)");
-    wick::model::load_model(open()?, context_size)
+/// Load a `WickEngine` from a path that may be a bare `.gguf`, a `.json`
+/// manifest, or a directory containing one `.json` manifest. The engine
+/// owns the model + tokenizer for the CLI's lifetime; callers get
+/// `engine.new_session(...)` for text and `engine.model()` / `engine.tokenizer()`
+/// handles for the audio pipeline.
+fn load_engine(path: &Path, device: &str, context_size: usize) -> Result<WickEngine> {
+    let backend = BackendPreference::parse_str(device).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let engine = WickEngine::from_path(
+        path,
+        EngineConfig {
+            context_size,
+            backend,
+        },
+    )?;
+    eprintln!(
+        "Using {} backend ({})",
+        match backend {
+            BackendPreference::Auto => "auto-selected",
+            BackendPreference::Cpu => "CPU",
+            BackendPreference::Gpu => "wgpu",
+            BackendPreference::Metal => "native Metal",
+        },
+        engine.metadata().architecture,
+    );
+    Ok(engine)
 }
 
 /// (p10, p50, p90, mean, stddev)
@@ -383,18 +346,15 @@ fn main() -> Result<()> {
             no_cache,
             kv_cache_keys,
         } => {
-            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
-            let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-            let add_bos = gguf
-                .get_bool("tokenizer.ggml.add_bos_token")
-                .unwrap_or(false);
+            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            let tokenizer = engine.tokenizer();
+            let add_bos = engine.metadata().add_bos_token;
 
-            let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
-            let kv_compression = setup_kv_compression(loaded_model.as_ref(), &kv_cache_keys)?;
+            let kv_compression = setup_kv_compression(engine.model(), &kv_cache_keys)?;
 
             // Configure KV prefix cache.
             if no_cache {
-                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                engine.configure_cache(wick::kv_cache::KvCacheConfig {
                     cache_dir: None,
                     max_warm_entries: 0,
                     max_warm_bytes: 0,
@@ -406,7 +366,7 @@ fn main() -> Result<()> {
                         .ok()
                         .map(|h| std::path::PathBuf::from(h).join(".cache/wick/kv"))
                 });
-                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                engine.configure_cache(wick::kv_cache::KvCacheConfig {
                     cache_dir: dir,
                     max_warm_entries: 32,
                     max_warm_bytes: cache_warm_mb * 1024 * 1024,
@@ -436,7 +396,7 @@ fn main() -> Result<()> {
                         content: prompt.clone(),
                     },
                 ];
-                let formatted = wick::tokenizer::apply_chat_template(&tokenizer, &messages, true)?;
+                let formatted = wick::tokenizer::apply_chat_template(tokenizer, &messages, true)?;
                 eprintln!("Chat template applied ({} chars)", formatted.len());
                 tokens = tokenizer.encode(&formatted);
             } else if let Some(ids) = &token_ids {
@@ -455,9 +415,9 @@ fn main() -> Result<()> {
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",
-                loaded_model.config().architecture,
-                loaded_model.config().n_layers,
-                loaded_model.config().hidden_size
+                engine.model().config().architecture,
+                engine.model().config().n_layers,
+                engine.model().config().hidden_size
             );
             eprintln!("Prompt tokens: {}", tokens.len());
 
@@ -515,10 +475,10 @@ fn main() -> Result<()> {
                 let gpu_ref: Option<&dyn wick::model::audio_decoder::AudioGpu> = None;
 
                 let result = wick::audio_engine::generate_audio(
-                    loaded_model.as_ref(),
+                    engine.model(),
                     &decoder_weights,
                     &detok_weights,
-                    &tokenizer,
+                    tokenizer,
                     &tokens,
                     &audio_config,
                     gpu_ref,
@@ -573,15 +533,11 @@ fn main() -> Result<()> {
                 }
             } else {
                 // Text-only generation via Session + StdoutSink.
-                let mut session = wick::Session::new(
-                    loaded_model.as_ref(),
-                    &tokenizer,
-                    wick::SessionConfig {
-                        kv_compression,
-                        seed: None,
-                        ..Default::default()
-                    },
-                );
+                let mut session = engine.new_session(wick::SessionConfig {
+                    kv_compression,
+                    seed: None,
+                    ..Default::default()
+                });
 
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
@@ -593,7 +549,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
 
-                let mut sink = StdoutSink::new(&tokenizer, session.cancel_handle());
+                let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
@@ -648,16 +604,13 @@ fn main() -> Result<()> {
                 );
             }
 
-            let gguf = wick::gguf::GgufFile::open(Path::new(&model))?;
-            let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-            let add_bos = gguf
-                .get_bool("tokenizer.ggml.add_bos_token")
-                .unwrap_or(false);
-            let loaded_model = load_model_for_device(Path::new(&model), &device, context_size)?;
-            let kv_compression = setup_kv_compression(loaded_model.as_ref(), &kv_cache_keys)?;
+            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            let tokenizer = engine.tokenizer();
+            let add_bos = engine.metadata().add_bos_token;
+            let kv_compression = setup_kv_compression(engine.model(), &kv_cache_keys)?;
 
             if no_cache {
-                loaded_model.configure_cache(wick::kv_cache::KvCacheConfig {
+                engine.configure_cache(wick::kv_cache::KvCacheConfig {
                     cache_dir: None,
                     max_warm_entries: 0,
                     max_warm_bytes: 0,
@@ -697,9 +650,9 @@ fn main() -> Result<()> {
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",
-                loaded_model.config().architecture,
-                loaded_model.config().n_layers,
-                loaded_model.config().hidden_size
+                engine.model().config().architecture,
+                engine.model().config().n_layers,
+                engine.model().config().hidden_size
             );
             eprintln!(
                 "Prompt tokens: {} | max_tokens: {} | warmup: {} | runs: {}",
@@ -711,15 +664,11 @@ fn main() -> Result<()> {
 
             // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
             let run_once = || -> Result<(f64, f64)> {
-                let mut session = wick::Session::new(
-                    loaded_model.as_ref(),
-                    &tokenizer,
-                    wick::SessionConfig {
-                        kv_compression: kv_compression.clone(),
-                        seed: None,
-                        ..Default::default()
-                    },
-                );
+                let mut session = engine.new_session(wick::SessionConfig {
+                    kv_compression: kv_compression.clone(),
+                    seed: None,
+                    ..Default::default()
+                });
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();
