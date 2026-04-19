@@ -1,5 +1,6 @@
 use half::f16;
 
+#[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
 use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 
 // ── Block layouts ────────────────────────────────────────────────────────────

@@ -1682,6 +1682,7 @@ impl Model for Lfm2Model {
                             let flash_buf = &mut flash_out[..flash_len];
                             let q_ref = &q_mat[..];
 
+                            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
                             use crate::par::{
                                 IndexedParallelIterator, ParallelIterator, ParallelSliceMut,
                             };

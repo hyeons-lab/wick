@@ -81,6 +81,16 @@ mod seq {
 #[cfg(not(feature = "parallel"))]
 pub use seq::{ParallelSlice, ParallelSliceMut};
 
+// Alias rayon's iterator traits to std's `Iterator` when `parallel` is
+// off, so call-site `use crate::par::{IndexedParallelIterator, ParallelIterator}`
+// keeps resolving. Method calls like `.enumerate()` / `.zip()` /
+// `.for_each()` already exist on `Iterator`, so the sequential paths
+// Just Work.
+#[cfg(not(feature = "parallel"))]
+pub use core::iter::Iterator as IndexedParallelIterator;
+#[cfg(not(feature = "parallel"))]
+pub use core::iter::Iterator as ParallelIterator;
+
 #[cfg(test)]
 mod tests {
     use super::*;

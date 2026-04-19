@@ -57,7 +57,7 @@ pub fn configure_thread_pool() -> usize {
 
 /// Returns the number of performance cores on macOS (Apple Silicon).
 /// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` directly — no subprocess.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "parallel"))]
 fn performance_core_count() -> Option<usize> {
     unsafe extern "C" {
         fn sysctlbyname(
@@ -87,7 +87,7 @@ fn performance_core_count() -> Option<usize> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "parallel"))]
 fn performance_core_count() -> Option<usize> {
     None
 }
@@ -210,6 +210,7 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 /// Parallel for_each with chunking to prevent over-splitting.
 /// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
+    #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
     use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
     let chunk_size = (y.len() / crate::par::current_num_threads()).max(min_rows);
     y.par_chunks_mut(chunk_size)
@@ -234,6 +235,7 @@ pub fn par_rows_n(
     if n == 0 || y.is_empty() {
         return;
     }
+    #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
     use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
     let m = y.len() / n;
     let rows_per_chunk = (m / crate::par::current_num_threads()).max(min_rows);
