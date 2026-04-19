@@ -377,6 +377,114 @@ impl InferenceState {
             None
         }
     }
+
+    /// Is any attention layer's KV currently backed by a compressed
+    /// (TurboQuant) cache? Used by `Session::append_tokens` to decide
+    /// whether `n_keep` shift is supported for this state — v1 gates
+    /// shift on uncompressed caches only.
+    pub fn is_compressed(&self) -> bool {
+        self.layers.iter().any(|l| {
+            matches!(
+                l,
+                LayerState::Attention {
+                    compressed_keys: Some(_),
+                    ..
+                } | LayerState::Attention {
+                    compressed_values: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
+    /// layer and slide the tail down, implementing the core of
+    /// `n_keep` context shift (Phase 1.5). Attention cache layout is
+    /// time-major `[seq_len × kv_dim]`, so the drop maps to
+    /// `Vec::drain` of a contiguous range — one memmove per layer.
+    ///
+    /// `seq_len` is decremented by `shift`. Compressed (TurboQuant)
+    /// layers are **not** shifted — callers must check
+    /// [`Self::is_compressed`] first and avoid calling shift on a
+    /// compressed state; this method panics in debug builds if it
+    /// encounters a compressed layer.
+    ///
+    /// Conv layers (LFM2's `GatedConv`) are intentionally left
+    /// untouched: their buffer holds only the last `d_conv`
+    /// activations, which are post-shift-valid as soon as the next
+    /// forward pass runs. The quality transient this introduces
+    /// decays to zero within `d_conv` forward passes (typically 3
+    /// tokens for LFM2). See devlog `000034-feat-n-keep-shift.md` for
+    /// the full analysis.
+    ///
+    /// Preconditions (enforced in all builds — violating them silently
+    /// corrupts state, so we use `assert!` rather than `debug_assert!`):
+    /// - `shift > 0`
+    /// - `n_keep + shift <= seq_len`
+    /// - `!self.is_compressed()`
+    pub fn shift_attention_kv(&mut self, n_keep: usize, shift: usize) {
+        // Hard preconditions — keep them in release builds. Silently
+        // decrementing `seq_len` without actually shifting the
+        // compressed caches would hand the next forward pass a KV that
+        // disagrees with `seq_len`, producing garbage output, and the
+        // bounds asserts catch config errors that would otherwise
+        // panic deep inside `Vec::drain`.
+        assert!(shift > 0, "shift must be > 0");
+        assert!(
+            n_keep + shift <= self.seq_len,
+            "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={}",
+            self.seq_len
+        );
+        assert!(
+            !self.is_compressed(),
+            "shift_attention_kv called on a TurboQuant-compressed state; \
+             shifting compressed caches is not yet supported"
+        );
+
+        for layer in self.layers.iter_mut() {
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } = layer
+            {
+                // Layer has no KV yet — nothing to shift. Reaches here
+                // for models whose first `n_layers - 1` layers were
+                // populated but the last one wasn't; guard defensively.
+                if key_cache.is_empty() && value_cache.is_empty() {
+                    continue;
+                }
+                // Invariants we rely on: both caches the same length,
+                // that length a clean multiple of `seq_len`. Asserting
+                // here catches cache-corruption bugs with a clear
+                // message instead of an opaque `Vec::drain` panic.
+                assert_eq!(
+                    key_cache.len(),
+                    value_cache.len(),
+                    "KV cache length mismatch: key={} value={}",
+                    key_cache.len(),
+                    value_cache.len()
+                );
+                assert!(self.seq_len > 0, "attention layer has KV but seq_len is 0");
+                assert_eq!(
+                    key_cache.len() % self.seq_len,
+                    0,
+                    "KV cache length {} not a multiple of seq_len {}",
+                    key_cache.len(),
+                    self.seq_len
+                );
+                let kv_dim = key_cache.len() / self.seq_len;
+                let drop_start = n_keep * kv_dim;
+                let drop_end = (n_keep + shift) * kv_dim;
+                // `Vec::drain` on a contiguous range is a memmove of
+                // the tail — no reallocation, one pass.
+                key_cache.drain(drop_start..drop_end);
+                value_cache.drain(drop_start..drop_end);
+            }
+        }
+
+        self.seq_len -= shift;
+    }
 }
 
 // ── KV Prefix Cache ─────────────────────────────────────────────────────
