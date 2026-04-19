@@ -148,6 +148,9 @@ pub struct ModelMetadata {
     pub vocab_size: u32,
     pub has_chat_template: bool,
     pub quantization: String,
+    /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
+    /// want to insert a BOS at the head of a raw prompt should honor it.
+    pub add_bos_token: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,8 +204,11 @@ impl WickEngine {
         let manifest = Manifest::synthetic_text(Path::new("<bytes>"));
         let tokenizer = BpeTokenizer::from_gguf(&gguf)
             .map_err(|e| WickError::Backend(format!("loading tokenizer: {e}")))?;
+        let add_bos_token = gguf
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(false);
         let model = load_text_model(gguf, None, &cfg)?;
-        let metadata = build_metadata(model.as_ref(), &manifest);
+        let metadata = build_metadata(model.as_ref(), &manifest, add_bos_token);
         Ok(Self {
             manifest,
             model,
@@ -265,8 +271,12 @@ impl WickEngine {
             .map_err(|e| WickError::Backend(format!("opening `{}`: {e}", primary.display())))?;
         let tokenizer = BpeTokenizer::from_gguf(&gguf)
             .map_err(|e| WickError::Backend(format!("loading tokenizer: {e}")))?;
+        // Peek at add_bos before `gguf` is moved into the loader.
+        let add_bos_token = gguf
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(false);
         let model = load_text_model(gguf, Some(primary), &cfg)?;
-        let metadata = build_metadata(model.as_ref(), &manifest);
+        let metadata = build_metadata(model.as_ref(), &manifest, add_bos_token);
 
         Ok(Self {
             manifest,
@@ -650,7 +660,7 @@ fn clone_gguf_like(_: &GgufFile, path: &Path) -> Result<GgufFile, WickError> {
         .map_err(|e| WickError::Backend(format!("reopening `{}`: {e}", path.display())))
 }
 
-fn build_metadata(model: &dyn Model, manifest: &Manifest) -> ModelMetadata {
+fn build_metadata(model: &dyn Model, manifest: &Manifest, add_bos_token: bool) -> ModelMetadata {
     let cfg = model.config();
     let has_chat_template = manifest.chat_template.is_some();
     ModelMetadata {
@@ -662,6 +672,7 @@ fn build_metadata(model: &dyn Model, manifest: &Manifest) -> ModelMetadata {
         // encodes this but it's not wired through today. Leave
         // "unknown" for v1; UniFFI bindings don't gate on it.
         quantization: "unknown".into(),
+        add_bos_token,
     }
 }
 
