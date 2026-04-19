@@ -244,6 +244,78 @@ fn position_handle_observes_progress() {
     assert!(after_gen > after_append);
 }
 
+/// Regression test for PR #28 review comment (github-actions @ session.rs:453):
+/// Stochastic split-generation reproducibility. A single `generate(8)` with
+/// a fixed seed must produce the same token stream as two back-to-back
+/// `generate(4)` calls with the same seed, because the decode loop must
+/// advance the RNG exactly once per emitted token. The pre-restructure
+/// implementation leaked an extra RNG step at the end of each `generate()`
+/// call (the unused "seed for next iter" sample), which meant split calls
+/// diverged from a single call starting with the same seed.
+#[test]
+#[ignore]
+fn stochastic_split_matches_single_call_under_seed() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let prompt_toks = tokenizer.encode("Tell me a story about");
+
+    let stochastic_opts = |n: u32| GenerateOpts {
+        max_tokens: n,
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.9,
+        ..Default::default()
+    };
+
+    let baseline = {
+        let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+        let model = wick::model::load_model(gguf, 4096).unwrap();
+        let mut session = Session::new(
+            model.as_ref(),
+            &tokenizer,
+            SessionConfig {
+                seed: Some(999),
+                ..Default::default()
+            },
+        );
+        session.append_tokens(&prompt_toks).unwrap();
+        let mut sink = CollectSink(Vec::new());
+        session.generate(&stochastic_opts(8), &mut sink).unwrap();
+        sink.0
+    };
+
+    let split = {
+        let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+        let model = wick::model::load_model(gguf, 4096).unwrap();
+        let mut session = Session::new(
+            model.as_ref(),
+            &tokenizer,
+            SessionConfig {
+                seed: Some(999),
+                ..Default::default()
+            },
+        );
+        session.append_tokens(&prompt_toks).unwrap();
+        let mut sink1 = CollectSink(Vec::new());
+        session.generate(&stochastic_opts(4), &mut sink1).unwrap();
+        let mut sink2 = CollectSink(Vec::new());
+        session.generate(&stochastic_opts(4), &mut sink2).unwrap();
+        let mut all = sink1.0;
+        all.extend(sink2.0);
+        all
+    };
+
+    assert_eq!(
+        baseline, split,
+        "split stochastic generation must match single call with the same seed.\nbaseline: {baseline:?}\nsplit:    {split:?}"
+    );
+}
+
 /// Regression test for new PR #27 review comment (Copilot @ session.rs:385):
 /// `position_atomic` must update DURING decode (per-token), not just at
 /// call boundaries, so an external watcher thread observes progress in real

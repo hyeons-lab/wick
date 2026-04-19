@@ -357,7 +357,10 @@ impl<'a> Session<'a> {
         let flush_n = opts.flush_every_tokens.max(1) as usize;
         let flush_ms = opts.flush_every_ms;
 
-        // max_tokens=0: emit nothing, leave KV + logits unchanged.
+        // Early exit before consuming logits or touching the RNG. A no-op
+        // `generate()` at full context or with max_tokens=0 has zero
+        // side effects — important for stochastic split-generation
+        // reproducibility and for callers polling capacity.
         if opts.max_tokens == 0 {
             sink.on_done(FinishReason::MaxTokens);
             let decode_ms = decode_start.elapsed().as_millis() as u32;
@@ -369,54 +372,56 @@ impl<'a> Session<'a> {
                 finish_reason: FinishReason::MaxTokens,
             });
         }
+        if self.current_pos >= self.max_seq_len {
+            sink.on_done(FinishReason::ContextFull);
+            let decode_ms = decode_start.elapsed().as_millis() as u32;
+            return Ok(GenerateSummary {
+                tokens_generated: 0,
+                prompt_eval_tokens,
+                prompt_eval_ms,
+                decode_ms,
+                finish_reason: FinishReason::ContextFull,
+            });
+        }
 
-        // Take the prefill logits; seed the first generated token from them.
-        // `logits` is the pristine "what comes next" distribution for the
-        // current position — we keep it unmutated across the whole loop so
-        // we can store it back into `self.last_logits` for the NEXT
-        // `generate()` to continue from (multi-call chaining).
+        // Take the prefill logits — `logits` is the pristine "what comes
+        // next" distribution for the current position. Kept unmutated
+        // across the whole loop so we can store it back into
+        // `self.last_logits` for the NEXT `generate()` to continue from.
         //
         // The sampler mutates its input in place (temperature scaling,
         // top-k filter, softmax), so we copy pristine `logits` into
-        // `sample_scratch` on each call. One reused allocation, one memcpy
-        // per token — ~20 μs per 32 K-vocab model, deep in the noise
-        // vs. the forward() that follows.
-        let logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
-        let mut logits = logits;
+        // `sample_scratch` before each `sample()`. One reused allocation,
+        // one memcpy per token — ~20 μs per 32 K-vocab model, deep in the
+        // noise vs. the forward() that follows.
+        let mut logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
         let mut sample_scratch: Vec<f32> = Vec::with_capacity(logits.len());
 
         self.sync_sampler_from_opts(opts);
-        sample_scratch.clear();
-        sample_scratch.extend_from_slice(&logits);
-        let mut next_token = self.sampler.sample(&mut sample_scratch);
 
-        // Decode loop. Each iteration emits `next_token`, then calls full
-        // `forward()` to advance KV state + produce logits for the NEXT
-        // token. The emit/forward/advance happen together so
-        // `current_pos == state.seq_len` always holds on exit — no KV gap
-        // on any break path (cancel, EOS, max_tokens, context overflow).
+        // Decode loop. Each iteration: stop checks → sample → EOS check →
+        // emit → forward + advance. Sampling lives INSIDE the loop body so
+        // the RNG advances exactly once per emitted token (plus once more
+        // if we break on EOS, matching natural "sampled the terminator"
+        // semantics). A pre-loop seed sample would leak an extra RNG step
+        // on every `generate()` call, breaking stochastic reproducibility
+        // across split generations (a single generate(N) must produce the
+        // same token stream as two generate(N/2) calls with the same seed).
         //
         // We deliberately use `forward()` rather than `forward_greedy()`
-        // even in greedy mode: the free logits readback lets us save
-        // `last_logits` for the next `generate()`. A greedy-optimized path
-        // is a perf follow-up (call `forward_greedy` in the loop, then one
-        // extra `forward()` at the end for the continuation seed).
+        // even in greedy mode: the free logits readback lets us keep
+        // `last_logits` populated for chainable multi-call `generate()`.
+        // A greedy-optimized path is a deferred perf follow-up (call
+        // `forward_greedy` in the loop, then one extra `forward()` at
+        // exit for the continuation seed).
         loop {
-            // Stop conditions — each must leave `pos == state.seq_len`.
-
+            // Stop checks at the top — each must leave `pos ==
+            // state.seq_len` and must NOT have sampled yet (to avoid
+            // wasted RNG advancement).
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
                 break;
             }
-
-            // EOS / stop-token: don't emit the terminator.
-            if self.tokenizer.eos_token() == Some(next_token)
-                || opts.stop_tokens.contains(&next_token)
-            {
-                finish = FinishReason::Stop;
-                break;
-            }
-
             if generated >= opts.max_tokens {
                 break;
             }
@@ -425,8 +430,21 @@ impl<'a> Session<'a> {
                 break;
             }
 
-            // Emit the token.
-            pending.push(next_token);
+            // Sample the next token from pristine `logits` via the scratch
+            // copy. This is the ONE RNG advance per loop iteration.
+            sample_scratch.clear();
+            sample_scratch.extend_from_slice(&logits);
+            let token = self.sampler.sample(&mut sample_scratch);
+
+            // EOS / stop-token: don't emit the terminator. The RNG step
+            // above is intentional — it represents "sampling the EOS."
+            if self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token) {
+                finish = FinishReason::Stop;
+                break;
+            }
+
+            // Emit.
+            pending.push(token);
             generated += 1;
 
             let should_flush_n = pending.len() >= flush_n;
@@ -438,18 +456,23 @@ impl<'a> Session<'a> {
                 last_flush = Instant::now();
             }
 
-            // Forward + advance pos, bound together so state.seq_len stays
-            // aligned with current_pos on every loop iteration.
-            logits = self.model.forward(&[next_token], pos, &mut self.state);
+            // Forward + advance pos, bound together so state.seq_len
+            // stays aligned with current_pos on every iteration.
+            logits = self.model.forward(&[token], pos, &mut self.state);
             pos += 1;
-            // External watchers (another thread holding a `position_handle`)
-            // observe progress per-token, not just at call boundaries.
+            // External watchers (another thread holding a
+            // `position_handle`) observe progress per-token, not just at
+            // call boundaries.
             self.position_atomic.store(pos as u32, Ordering::Relaxed);
 
-            // Sample from a copy — `logits` stays pristine.
-            sample_scratch.clear();
-            sample_scratch.extend_from_slice(&logits);
-            next_token = self.sampler.sample(&mut sample_scratch);
+            // Second cancel check: if another thread / sink flipped the
+            // flag during `forward()` or the preceding `on_text_tokens`
+            // callback, exit BEFORE the next iteration's sample to avoid
+            // an unnecessary RNG step.
+            if self.cancel.load(Ordering::Relaxed) {
+                finish = FinishReason::Cancelled;
+                break;
+            }
         }
 
         if !pending.is_empty() {
