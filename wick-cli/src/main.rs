@@ -129,6 +129,13 @@ enum Command {
         /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
         #[arg(long, default_value = "f32")]
         kv_cache_keys: String,
+
+        /// Prefill chunk size (ubatch). Long prompts split into chunks of
+        /// this many tokens so `cancel()` can interrupt within one chunk.
+        /// Default 512 matches the Phase 1.4 sweep on LFM2; values under
+        /// 256 lose ≥5% prefill throughput. 0 disables chunking (monolithic).
+        #[arg(long, default_value_t = 512)]
+        ubatch_size: u32,
     },
 
     /// Inspect a GGUF model file.
@@ -206,6 +213,11 @@ enum Command {
         /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
         #[arg(long, default_value = "f32")]
         kv_cache_keys: String,
+
+        /// Prefill chunk size (ubatch). Lower = more cancel-responsive
+        /// but slower prefill. 0 disables chunking (monolithic).
+        #[arg(long, default_value_t = 512)]
+        ubatch_size: u32,
     },
 }
 
@@ -345,6 +357,7 @@ fn main() -> Result<()> {
             cache_disk_gb,
             no_cache,
             kv_cache_keys,
+            ubatch_size,
         } => {
             let engine = load_engine(Path::new(&model), &device, context_size)?;
             let tokenizer = engine.tokenizer();
@@ -536,6 +549,7 @@ fn main() -> Result<()> {
                 let mut session = engine.new_session(wick::SessionConfig {
                     kv_compression,
                     seed: None,
+                    ubatch_size,
                     ..Default::default()
                 });
 
@@ -596,6 +610,7 @@ fn main() -> Result<()> {
             context_size,
             no_cache,
             kv_cache_keys,
+            ubatch_size,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("WICK_PROFILE").is_ok() {
@@ -667,6 +682,7 @@ fn main() -> Result<()> {
                 let mut session = engine.new_session(wick::SessionConfig {
                     kv_compression: kv_compression.clone(),
                     seed: None,
+                    ubatch_size,
                     ..Default::default()
                 });
                 let prefill_start = std::time::Instant::now();

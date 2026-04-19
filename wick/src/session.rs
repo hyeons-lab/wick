@@ -291,9 +291,34 @@ impl<'a> Session<'a> {
     }
 
     /// Append raw token IDs, running a prefill pass from the current position
-    /// over just the new tail. In v1.1 the prefill is monolithic (no ubatch
-    /// chunking yet — that lands in Phase 1.4). Cancel granularity during
-    /// append is therefore "whole call"; document that limitation to callers.
+    /// over just the new tail.
+    ///
+    /// Prefill runs through [`Model::forward_prefill_chunked`] with
+    /// `SessionConfig::ubatch_size` so long prompts can be cancelled
+    /// mid-flight. Returns `WickError::Cancelled` when cancel fires
+    /// before the full slice is consumed.
+    ///
+    /// On cancellation:
+    /// - Tokens already fed through the kernel stay in KV; `position()`
+    ///   advances to reflect how many were actually consumed.
+    /// - `last_logits` is **cleared** (not set to the partial-prefill
+    ///   logits). This forces a subsequent `generate()` to return
+    ///   `EmptyInput` rather than silently producing tokens from
+    ///   mid-prompt state. The caller's contract is to clear the flag
+    ///   via [`Self::clear_cancel`] and resume by appending the
+    ///   unconsumed tail before generating. Sketch:
+    ///
+    ///   ```ignore
+    ///   let before = session.position() as usize;
+    ///   match session.append_tokens(&tokens) {
+    ///       Err(WickError::Cancelled) => {
+    ///           let consumed = session.position() as usize - before;
+    ///           session.clear_cancel();
+    ///           session.append_tokens(&tokens[consumed..])?;
+    ///       }
+    ///       other => other?,
+    ///   }
+    ///   ```
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), WickError> {
         if tokens.is_empty() {
             return Err(WickError::EmptyInput);
@@ -308,14 +333,39 @@ impl<'a> Session<'a> {
                 by: (new_end - self.max_seq_len) as u32,
             });
         }
-        let logits = self
-            .model
-            .forward_prefill(tokens, self.current_pos, &mut self.state);
-        self.current_pos = new_end;
+        // Pass `ubatch_size` straight through — the trait method treats
+        // 0 as "no chunking" (single chunk = whole input), matching the
+        // CLI `--ubatch-size 0` opt-out.
+        let (consumed, logits) = self.model.forward_prefill_chunked(
+            tokens,
+            self.current_pos,
+            &mut self.state,
+            self.config.ubatch_size as usize,
+            &self.cancel,
+        );
+        self.current_pos += consumed;
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
-        self.last_logits = Some(logits);
-        Ok(())
+        if consumed < tokens.len() {
+            // Don't stash the partial-prefill logits. They correspond to
+            // the chunk boundary, not the intended end of prompt — letting
+            // a subsequent `generate()` read them would silently produce
+            // text from mid-prompt state. Force the caller to re-append
+            // (or `reset`) before generating.
+            self.last_logits = None;
+            Err(WickError::Cancelled)
+        } else {
+            self.last_logits = logits;
+            Ok(())
+        }
+    }
+
+    /// Clear the cancel flag. Call this after handling a
+    /// [`WickError::Cancelled`] from `append_tokens` / `generate` when
+    /// you want to resume work on the same session (append more tokens,
+    /// generate again) without rebuilding it via [`Self::reset`].
+    pub fn clear_cancel(&self) {
+        self.cancel.store(false, Ordering::Relaxed);
     }
 
     /// Append an image input. Not supported in v1 for any currently-shipping

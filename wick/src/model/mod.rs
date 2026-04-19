@@ -10,6 +10,8 @@ pub mod metal_lfm2;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_audio_decoder;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Result, bail};
 
 use crate::gguf::GgufFile;
@@ -63,6 +65,55 @@ pub trait Model: Send {
             logits = self.forward(&[token], start_pos + i, state);
         }
         logits
+    }
+
+    /// Cancelable chunked prefill. Splits `tokens` into `ubatch`-sized slices,
+    /// calls [`Self::forward_prefill`] per chunk, and polls `cancel` between
+    /// chunks so long prompts can be interrupted without blocking the
+    /// caller for the full monolithic duration.
+    ///
+    /// Returns `(tokens_processed, last_logits)`:
+    /// - `tokens_processed <= tokens.len()`; when cancel fires, equals the
+    ///   number of tokens that made it into KV before the flag was
+    ///   observed (granularity: one ubatch).
+    /// - `last_logits` holds the logits from the final processed chunk —
+    ///   `Some` whenever any chunk ran. `None` only for the empty-input
+    ///   edge case (`tokens.is_empty()`).
+    ///
+    /// Default impl is correctness-preserving; backend-specific overrides
+    /// are free to batch across chunks (none do in v1 — Phase 1.4's
+    /// deliberate "probably not in v1" scope). `ubatch == 0` means "no
+    /// chunking" (one chunk covering the whole input); this matches the
+    /// CLI `--ubatch-size 0` convention for disabling chunking.
+    fn forward_prefill_chunked(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+        ubatch: usize,
+        cancel: &AtomicBool,
+    ) -> (usize, Option<Vec<f32>>) {
+        // `ubatch == 0` → one chunk covering everything (no chunking).
+        // Otherwise keep the caller-supplied size.
+        let ubatch = if ubatch == 0 {
+            tokens.len().max(1)
+        } else {
+            ubatch
+        };
+        let mut consumed = 0usize;
+        let mut last_logits: Option<Vec<f32>> = None;
+        for chunk in tokens.chunks(ubatch) {
+            let logits = self.forward_prefill(chunk, start_pos + consumed, state);
+            consumed += chunk.len();
+            last_logits = Some(logits);
+            // Check *after* each chunk so we always make progress on at
+            // least one ubatch — avoids the "cancel-before-start leaves
+            // the session wedged with no position advance" corner.
+            if cancel.load(Ordering::Relaxed) && consumed < tokens.len() {
+                break;
+            }
+        }
+        (consumed, last_logits)
     }
 
     /// Get the model configuration.
