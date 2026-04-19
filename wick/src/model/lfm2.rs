@@ -1682,7 +1682,9 @@ impl Model for Lfm2Model {
                             let flash_buf = &mut flash_out[..flash_len];
                             let q_ref = &q_mat[..];
 
-                            use rayon::prelude::*;
+                            use crate::par::{
+                                IndexedParallelIterator, ParallelIterator, ParallelSliceMut,
+                            };
                             flash_buf.par_chunks_mut(chunk_size).enumerate().for_each(
                                 |(kv_h, chunk)| {
                                     cpu::flash_attention_gqa_cpu(

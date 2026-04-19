@@ -19,6 +19,7 @@
 ///
 /// Must be called once before any rayon work (e.g., early in `main()`).
 /// Returns the number of threads configured.
+#[cfg(feature = "parallel")]
 pub fn configure_thread_pool() -> usize {
     // If the user explicitly set RAYON_NUM_THREADS, respect it.
     if std::env::var("RAYON_NUM_THREADS").is_ok() {
@@ -45,6 +46,13 @@ pub fn configure_thread_pool() -> usize {
             rayon::current_num_threads()
         }
     }
+}
+
+/// No-op stub for builds without the `parallel` feature. Returns `1`
+/// because single-threaded is the only choice.
+#[cfg(not(feature = "parallel"))]
+pub fn configure_thread_pool() -> usize {
+    1
 }
 
 /// Returns the number of performance cores on macOS (Apple Silicon).
@@ -202,9 +210,8 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 /// Parallel for_each with chunking to prevent over-splitting.
 /// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
-    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-    use rayon::slice::ParallelSliceMut;
-    let chunk_size = (y.len() / rayon::current_num_threads()).max(min_rows);
+    use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+    let chunk_size = (y.len() / crate::par::current_num_threads()).max(min_rows);
     y.par_chunks_mut(chunk_size)
         .enumerate()
         .for_each(|(ci, chunk)| {
@@ -227,10 +234,9 @@ pub fn par_rows_n(
     if n == 0 || y.is_empty() {
         return;
     }
-    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-    use rayon::slice::ParallelSliceMut;
+    use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
     let m = y.len() / n;
-    let rows_per_chunk = (m / rayon::current_num_threads()).max(min_rows);
+    let rows_per_chunk = (m / crate::par::current_num_threads()).max(min_rows);
     let elems_per_chunk = rows_per_chunk * n;
     y.par_chunks_mut(elems_per_chunk)
         .enumerate()
@@ -2084,7 +2090,7 @@ mod tests {
     ///
     /// Run with:
     /// `cargo test -p wick --release --lib backend::cpu::tests::microbench_gemv_q4_0 -- --ignored --nocapture`
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
     #[test]
     #[ignore]
     fn microbench_gemv_q4_0() {

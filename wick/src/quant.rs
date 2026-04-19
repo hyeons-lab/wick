@@ -1,5 +1,6 @@
 use half::f16;
-use rayon::prelude::*;
+
+use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 
 // ── Block layouts ────────────────────────────────────────────────────────────
 
