@@ -346,11 +346,40 @@ impl GgufFile {
     /// heap buffer first (delegates to [`Self::from_bytes`]). Useful when
     /// the source is a stream (network, decrypted blob) without a file
     /// descriptor to mmap.
-    pub fn from_reader<R: Read>(mut reader: R) -> Result<Self> {
+    ///
+    /// Applies a hard sanity cap of [`Self::DEFAULT_READER_MAX_BYTES`]
+    /// (64 GiB) — reading past it fails fast rather than OOM-ing the
+    /// process. For untrusted inputs use
+    /// [`Self::from_reader_with_limit`] with a tighter bound, or wrap
+    /// the reader in [`std::io::Read::take`] before calling.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
+        Self::from_reader_with_limit(reader, Self::DEFAULT_READER_MAX_BYTES)
+    }
+
+    /// Default ceiling for [`Self::from_reader`]. 64 GiB — bigger than any
+    /// GGUF we expect to ship but small enough to fail before consuming
+    /// an unbounded hostile stream.
+    pub const DEFAULT_READER_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+    /// Like [`Self::from_reader`] but with a caller-specified byte
+    /// ceiling. Streams up to and including `max_bytes` are accepted;
+    /// anything past that errors out cleanly. The reader is wrapped in
+    /// `Read::take(max_bytes + 1)` so we can distinguish "exactly at the
+    /// limit" from "more than the limit, truncated": if we read one byte
+    /// past the ceiling, the underlying source was over-size.
+    pub fn from_reader_with_limit<R: Read>(reader: R, max_bytes: u64) -> Result<Self> {
         let mut buf: Vec<u8> = Vec::new();
-        reader
+        // +1 so we can tell "filled exactly up to max_bytes" apart from
+        // "truncated at max_bytes because the source is larger".
+        let probe_limit = max_bytes.saturating_add(1);
+        let mut bounded = reader.take(probe_limit);
+        let read = bounded
             .read_to_end(&mut buf)
             .context("reading GGUF stream")?;
+        ensure!(
+            (read as u64) <= max_bytes,
+            "GGUF stream exceeded {max_bytes} byte limit — pass a larger ceiling to `from_reader_with_limit` if legitimate"
+        );
         Self::from_bytes(Arc::from(buf.into_boxed_slice()))
     }
 
@@ -618,12 +647,13 @@ impl GgufFile {
         self.data.as_slice()
     }
 
-    /// Get the offset where tensor data begins in the mmap.
+    /// Get the offset where tensor data begins in the backing buffer
+    /// (mmap or owned bytes — same semantics either way).
     pub fn data_offset(&self) -> usize {
         self.data_offset
     }
 
-    /// Validate a tensor and return its byte range within the mmap.
+    /// Validate a tensor and return its byte range within the backing buffer.
     fn tensor_range(&self, name: &str) -> Result<(&TensorInfo, std::ops::Range<usize>)> {
         let info = self
             .tensors
@@ -665,7 +695,9 @@ impl GgufFile {
         Ok(&self.data.as_slice()[range])
     }
 
-    /// Get tensor metadata: (byte_offset_in_mmap, rows, cols, dtype).
+    /// Get tensor metadata: (byte_offset_in_backing, rows, cols, dtype).
+    /// The offset is relative to the underlying GGUF backing buffer
+    /// (mmap or owned bytes — same semantics either way).
     /// For GGUF [ne0, ne1] tensors: rows = ne1 (output dim), cols = ne0 (input dim).
     pub fn tensor_meta(&self, name: &str) -> Result<(usize, usize, usize, DType)> {
         let (info, range) = self.tensor_range(name)?;
@@ -945,6 +977,32 @@ mod tests {
         match GgufFile::from_bytes(bytes) {
             Ok(_) => panic!("expected error for tiny buffer"),
             Err(e) => assert!(e.to_string().contains("too small"), "unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn from_reader_with_limit_rejects_oversize_stream() {
+        // Caller-supplied limit of 16 bytes; minimal header is 24, so we
+        // should see the limit error rather than a partial-parse garbage.
+        let bytes = minimal_gguf_bytes(); // 24 bytes, exceeds limit
+        match GgufFile::from_reader_with_limit(std::io::Cursor::new(bytes), 16) {
+            Ok(_) => panic!("expected error when stream exceeds limit"),
+            Err(e) => assert!(
+                e.to_string().contains("exceeded") || e.to_string().contains("too small"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn from_reader_with_limit_accepts_stream_exactly_at_limit() {
+        // Stream size equals `max_bytes` — must succeed, not trip the
+        // "exceeded limit" check (regression: off-by-one caught by review).
+        let bytes = minimal_gguf_bytes();
+        let exact = bytes.len() as u64;
+        match GgufFile::from_reader_with_limit(std::io::Cursor::new(bytes), exact) {
+            Ok(g) => assert_eq!(g.mmap_data().len() as u64, exact),
+            Err(e) => panic!("stream exactly at limit should succeed, got: {e}"),
         }
     }
 

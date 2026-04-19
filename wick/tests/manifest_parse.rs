@@ -165,3 +165,28 @@ fn synthetic_text_from_gguf_path() {
     assert_eq!(m.files.model, "/tmp/fake-model.gguf");
     assert!(m.is_loadable());
 }
+
+/// Regression test for PR #30 review: when `inference_type` is `Unknown`
+/// and `generation_time_parameters` is missing, the parser must return
+/// `GenerationDefaults::Other { raw: Value::Null }` rather than an empty
+/// `Text` variant (which would imply text-sampling defaults for a model
+/// whose inference type we can't identify).
+#[test]
+fn unknown_inference_type_without_gen_params_returns_other_not_text() {
+    let bytes = br#"{
+        "inference_type": "llama.cpp/some-future-modality",
+        "schema_version": "1.0.0",
+        "load_time_parameters": { "model": "future.gguf" }
+    }"#;
+    let m = wick::manifest::Manifest::from_bytes(bytes).unwrap();
+    assert!(matches!(
+        m.inference_type,
+        InferenceType::Unknown(ref s) if s == "llama.cpp/some-future-modality"
+    ));
+    match &m.generation_defaults {
+        GenerationDefaults::Other { raw } => assert!(raw.is_null()),
+        other => panic!(
+            "expected Other with null raw for unknown inference + missing params, got {other:?}"
+        ),
+    }
+}

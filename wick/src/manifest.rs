@@ -117,9 +117,13 @@ pub enum GenerationDefaults {
     Audio {
         number_of_decoding_threads: Option<u32>,
     },
-    /// No `generation_time_parameters` present, OR the section didn't
-    /// match either known shape. `raw` preserves the JSON so consumers
-    /// can inspect.
+    /// Fallback variant — used when the manifest's `inference_type` is
+    /// `Unknown(...)`, whether the `generation_time_parameters` block
+    /// is present or absent. When it's present, `raw` holds the verbatim
+    /// JSON; when it's missing, `raw` is `Value::Null`. Text and audio
+    /// manifests always land in the typed `Text`/`Audio` variants, even
+    /// when `generation_time_parameters` is absent (the fields just
+    /// default to `None`).
     Other { raw: serde_json::Value },
 }
 
@@ -232,7 +236,8 @@ impl Manifest {
     /// `from_files` callers that want to round-trip through manifest
     /// form.
     pub fn files_in_order(&self) -> Vec<(&str, &str)> {
-        let mut out: Vec<(&str, &str)> = Vec::new();
+        // Capacity: 1 (model) + up to 3 typed aux slots + extras.
+        let mut out: Vec<(&str, &str)> = Vec::with_capacity(1 + 3 + self.files.extras.len());
         out.push(("model", self.files.model.as_str()));
         if let Some(v) = &self.files.multimodal_projector {
             out.push(("multimodal_projector", v.as_str()));
@@ -279,9 +284,14 @@ impl ManifestFiles {
             "multimodal_projector",
             "audio_decoder",
             "audio_tokenizer",
-            "chat_template",
         ];
-        let mut extras = HashMap::new();
+        // `chat_template` is an explicit field on `RawLoadTimeParameters`,
+        // so serde places it there directly; `#[serde(flatten)]` only
+        // sends the remaining unrecognized keys into `other`. No need to
+        // filter for it here.
+        //
+        // `extras` is a subset of `other` — same upper bound on size.
+        let mut extras = HashMap::with_capacity(raw.other.len());
         for (k, v) in &raw.other {
             if KNOWN_KEYS.contains(&k.as_str()) {
                 continue;
@@ -313,7 +323,8 @@ impl ManifestFiles {
     where
         F: FnMut(&str) -> PathBuf,
     {
-        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        // Capacity: 1 (model) + up to 3 typed aux slots + extras.
+        let mut out: Vec<(String, PathBuf)> = Vec::with_capacity(1 + 3 + self.extras.len());
         out.push(("model".into(), local_root_for_url(&self.model)));
         if let Some(v) = &self.multimodal_projector {
             out.push(("multimodal_projector".into(), local_root_for_url(v)));
@@ -342,12 +353,19 @@ impl GenerationDefaults {
                 InferenceType::LlamaCppLfm2AudioV1 => Self::Audio {
                     number_of_decoding_threads: None,
                 },
-                _ => Self::Text {
-                    temperature: None,
-                    min_p: None,
-                    top_p: None,
-                    top_k: None,
-                    repetition_penalty: None,
+                InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText => {
+                    Self::Text {
+                        temperature: None,
+                        min_p: None,
+                        top_p: None,
+                        top_k: None,
+                        repetition_penalty: None,
+                    }
+                }
+                // Unknown inference type + missing params → Other with
+                // a Null raw. `Text` defaults would be misleading.
+                InferenceType::Unknown(_) => Self::Other {
+                    raw: serde_json::Value::Null,
                 },
             };
         };
