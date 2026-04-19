@@ -119,6 +119,33 @@ pub trait Model: Send {
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
 
+    /// Does this backend support `n_keep` context shift? Static
+    /// capability probe — callers MUST check this before invoking
+    /// [`Self::shift_kv`].
+    ///
+    /// The default is `false` so new backends opt in deliberately.
+    /// CPU LFM2 overrides to `true`; Metal keeps the default (its
+    /// GPU-side K cache needs a shader-based shift that lands as a
+    /// follow-up). Non-RoPE architectures also stay `false` — the
+    /// shift semantics differ per positional-encoding scheme.
+    fn supports_kv_shift(&self) -> bool {
+        false
+    }
+
+    /// Execute a `n_keep` context shift on this model's state. Drops
+    /// attention KV cells `[n_keep .. n_keep + shift)` and re-rotates
+    /// remaining K vectors so their RoPE-encoded position matches
+    /// their new index. Implemented by overriding; the default is a
+    /// no-op, consistent with the default `false` from
+    /// [`Self::supports_kv_shift`].
+    ///
+    /// Callers (today: `Session::append_tokens`) MUST verify
+    /// `supports_kv_shift()` is `true` before invoking this. Calling
+    /// the default no-op on an overflowed state would leave
+    /// `InferenceState` unchanged while the caller proceeds as if a
+    /// shift happened — a silent corruption bug.
+    fn shift_kv(&self, _state: &mut InferenceState, _n_keep: usize, _shift: usize) {}
+
     /// Run a forward pass and return the hidden state BEFORE logit projection.
     /// Used by the audio decoder to extract the LLM embedding for audio frame sampling.
     /// Default: panics (must be overridden by backends that support audio).

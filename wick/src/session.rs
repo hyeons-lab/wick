@@ -237,6 +237,22 @@ impl<'a> Session<'a> {
                  compression to enable n_keep."
             );
         }
+        // Backend must opt in to shift (CPU LFM2 today; Metal is a
+        // follow-up). If the user set `n_keep > 0` on a backend that
+        // doesn't implement shift, overflow still returns
+        // ContextOverflow — tell them why instead of letting them
+        // discover it the hard way.
+        if config.n_keep > 0 && !model.supports_kv_shift() {
+            tracing::warn!(
+                target: "wick::session",
+                n_keep = config.n_keep,
+                architecture = model_cfg.architecture.as_str(),
+                "n_keep configured but this backend doesn't support KV shift; \
+                 overflow will still return ContextOverflow. CPU backend \
+                 (BackendPreference::Cpu) supports shift today; Metal / GPU \
+                 paths land in a follow-up."
+            );
+        }
 
         let state = InferenceState::from_config_with_compression(model_cfg, &config.kv_compression);
 
@@ -358,13 +374,15 @@ impl<'a> Session<'a> {
             .checked_add(tokens.len())
             .ok_or(WickError::Backend("position overflow".into()))?;
         if new_end > self.max_seq_len {
-            // `n_keep` context shift (Phase 1.5): if the session was
-            // configured with `n_keep > 0` and the state isn't
-            // TurboQuant-compressed, drop the middle range to make room.
-            // Otherwise fall through to the typed ContextOverflow.
+            // `n_keep` context shift (Phase 1.5): if the backend
+            // supports shift, the session was configured with
+            // `n_keep > 0`, the state isn't TurboQuant-compressed, and
+            // the pinned prefix leaves room to drop — shift to make
+            // room. Otherwise fall through to the typed ContextOverflow.
             let n_keep = self.config.n_keep as usize;
             let shift_needed = new_end - self.max_seq_len;
-            let can_shift = n_keep > 0
+            let can_shift = self.model.supports_kv_shift()
+                && n_keep > 0
                 && !self.state.is_compressed()
                 && self.current_pos >= n_keep + shift_needed;
             if !can_shift {
@@ -373,7 +391,7 @@ impl<'a> Session<'a> {
                     by: (new_end - self.max_seq_len) as u32,
                 });
             }
-            self.state.shift_attention_kv(n_keep, shift_needed);
+            self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
             self.position_atomic

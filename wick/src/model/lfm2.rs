@@ -2192,4 +2192,22 @@ impl Model for Lfm2Model {
         let head_dim = self.config.hidden_size / self.config.n_heads;
         head_dim.is_power_of_two()
     }
+
+    fn supports_kv_shift(&self) -> bool {
+        // CPU LFM2 implements shift with RoPE re-rotation. Metal's
+        // override stays at the trait default (false) until its
+        // GPU-side shift shader lands.
+        true
+    }
+
+    fn shift_kv(&self, state: &mut crate::kv_cache::InferenceState, n_keep: usize, shift: usize) {
+        let head_dim = self.config.hidden_size / self.config.n_heads;
+        state.shift_kv_with_rope(
+            n_keep,
+            shift,
+            self.config.rope_theta,
+            head_dim,
+            &self.config.kv_heads_per_layer,
+        );
+    }
 }
