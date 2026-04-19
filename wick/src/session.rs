@@ -157,6 +157,8 @@ pub enum ImageFormat {
 pub enum WickError {
     #[error("modality not supported by this model")]
     UnsupportedModality,
+    #[error("inference_type `{0}` is not supported in this version of wick")]
+    UnsupportedInferenceType(String),
     #[error("session is busy with another operation")]
     Busy,
     #[error("cancelled")]
