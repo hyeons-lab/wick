@@ -177,6 +177,27 @@ pub enum WickError {
 // Session
 // ---------------------------------------------------------------------------
 
+/// Decide whether `append_tokens` may run a `n_keep` context shift
+/// instead of returning `ContextOverflow`. Pure 4-input predicate,
+/// extracted from the overflow arm so it can be unit-tested without
+/// spinning up a full `Session` (which needs a real `BpeTokenizer`).
+///
+/// All four must hold:
+/// - `supports_kv_shift`: backend opted in via [`Model::supports_kv_shift`]
+/// - `n_keep > 0`: user wants to preserve a prefix
+/// - `!is_compressed`: TurboQuant caches aren't shiftable yet
+/// - `current_pos >= n_keep + shift_needed`: the pinned prefix leaves
+///   at least `shift_needed` rotatable cells to drop
+pub fn can_shift(
+    supports_kv_shift: bool,
+    n_keep: usize,
+    is_compressed: bool,
+    current_pos: usize,
+    shift_needed: usize,
+) -> bool {
+    supports_kv_shift && n_keep > 0 && !is_compressed && current_pos >= n_keep + shift_needed
+}
+
 /// Stateful inference session. Borrows the model + tokenizer for its lifetime.
 pub struct Session<'a> {
     model: &'a dyn Model,
@@ -381,11 +402,13 @@ impl<'a> Session<'a> {
             // room. Otherwise fall through to the typed ContextOverflow.
             let n_keep = self.config.n_keep as usize;
             let shift_needed = new_end - self.max_seq_len;
-            let can_shift = self.model.supports_kv_shift()
-                && n_keep > 0
-                && !self.state.is_compressed()
-                && self.current_pos >= n_keep + shift_needed;
-            if !can_shift {
+            if !can_shift(
+                self.model.supports_kv_shift(),
+                n_keep,
+                self.state.is_compressed(),
+                self.current_pos,
+                shift_needed,
+            ) {
                 return Err(WickError::ContextOverflow {
                     max_seq_len: self.max_seq_len as u32,
                     by: (new_end - self.max_seq_len) as u32,

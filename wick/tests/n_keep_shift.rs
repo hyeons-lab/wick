@@ -121,9 +121,13 @@ fn build_state_with_rope_filled(
                     let mut rotated = raw.clone();
                     apply_rope_to_head(&mut rotated, t, head_dim, freq_base);
                     key_cache.extend_from_slice(&rotated);
-                    // V isn't RoPE'd; fill with same raw so we can also
-                    // check V's post-shift ordering without rotation.
-                    value_cache.extend_from_slice(&raw);
+                    // V isn't RoPE'd, but we still populate each row with a
+                    // position-dependent value so misindexed post-shift V
+                    // rows (wrong offset, off-by-one in drain math) get
+                    // caught — a position-invariant V fill would mask
+                    // row-swap bugs because every row would look the same.
+                    let v_row: Vec<f32> = raw.iter().map(|x| x + 0.001 * (t as f32)).collect();
+                    value_cache.extend_from_slice(&v_row);
                 }
             }
         }
@@ -211,14 +215,19 @@ fn shift_kv_with_rope_preserves_head_and_re_rotates_tail() {
                         "layer {layer_idx} head {h} t_new={t_new} t_old={t_old} max-err={err}"
                     );
 
-                    // V at this cell: unrotated raw, but shifted down by
-                    // `shift` rows. Original V for t_old was `raw`; the
-                    // drain moved it to row t_new.
+                    // V at this cell: unrotated but drained down. Original
+                    // V row for t_old was `raw + 0.001 * t_old`; the drain
+                    // moved it to row t_new, so the stored value at t_new
+                    // must still encode t_old — i.e., row identity was
+                    // preserved. If drain misindexed, the stored value
+                    // would encode a different t.
+                    let expected_v: Vec<f32> =
+                        raw.iter().map(|x| x + 0.001 * (t_old as f32)).collect();
                     let v_actual = &value_cache[start..end];
-                    let v_err = max_abs_diff(v_actual, &raw);
+                    let v_err = max_abs_diff(v_actual, &expected_v);
                     assert!(
                         v_err < 1e-6,
-                        "V at layer {layer_idx} h={h} t_new={t_new} changed unexpectedly (V is not RoPE'd): max-err={v_err}"
+                        "V at layer {layer_idx} h={h} t_new={t_new} t_old={t_old} row identity lost: max-err={v_err}"
                     );
                 }
             }
@@ -380,22 +389,56 @@ fn shift_frees_capacity_when_n_keep_set() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 6 — Session overflow gate is a pure predicate
+// ---------------------------------------------------------------------------
+//
+// `Session::append_tokens` uses a 4-input predicate to decide between
+// running a shift and returning `ContextOverflow`. Since the predicate
+// is extracted as a free function (`session::can_shift`) we test each
+// branch directly — this is the coverage the MockModel-based tests
+// couldn't provide without a real `BpeTokenizer`.
+
 #[test]
-fn unsupported_backend_leaves_shift_unused() {
-    // A MockModel that returns `supports_kv_shift = false` must never
-    // have `shift_kv` called by Session — the overflow arm gates on
-    // the probe. We don't invoke Session here (no tokenizer in tests),
-    // but we verify the probe answers correctly and the default trait
-    // `shift_kv` is a no-op that won't corrupt state if accidentally
-    // invoked.
-    let cfg = mock_attention_config(32);
-    let model = MockModel::new(cfg.clone(), /* supports_shift = */ false);
-    assert!(!model.supports_kv_shift());
-    // `shift_kv` on the unsupported model still runs (our impl chose
-    // to still call the kv_cache method for consistency), so don't
-    // assert on the side-effect here — the guarantee we're locking in
-    // is just that Session's probe gate returns false. Session-level
-    // behavior (probe false → ContextOverflow, never call shift_kv) is
-    // a code review / manual-trace property until BpeTokenizer gets a
-    // test constructor.
+fn can_shift_gate_all_branches() {
+    use wick::session::can_shift;
+
+    // Happy path — all conditions hold.
+    assert!(
+        can_shift(
+            /* supports */ true, /* n_keep */ 4, /* compressed */ false,
+            /* current_pos */ 28, /* shift */ 4,
+        ),
+        "all conditions hold → can_shift"
+    );
+
+    // Backend doesn't support shift (Metal today, non-RoPE archs).
+    assert!(
+        !can_shift(false, 4, false, 28, 4),
+        "supports_kv_shift=false → ContextOverflow"
+    );
+
+    // User didn't opt in to shift (default n_keep=0).
+    assert!(
+        !can_shift(true, 0, false, 28, 4),
+        "n_keep=0 → ContextOverflow"
+    );
+
+    // TurboQuant-compressed state — can't shift compressed blocks.
+    assert!(
+        !can_shift(true, 4, true, 28, 4),
+        "is_compressed=true → ContextOverflow"
+    );
+
+    // Pinned prefix leaves no room to drop (current_pos == n_keep).
+    assert!(
+        !can_shift(true, 4, false, 4, 4),
+        "current_pos < n_keep + shift → ContextOverflow"
+    );
+
+    // Boundary: current_pos exactly meets the minimum.
+    assert!(
+        can_shift(true, 4, false, 8, 4),
+        "current_pos == n_keep + shift is allowed (inclusive)"
+    );
 }
