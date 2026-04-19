@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -7,21 +9,34 @@ use wick::tokenizer::BpeTokenizer;
 use wick::{FinishReason, ModalitySink};
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
+///
+/// Holds a clone of the session's cancel flag so we can trigger a clean
+/// shutdown when stdout closes (e.g. `wick run ... | head` detaches). Using
+/// `print!` there would panic on `BrokenPipe`; we write manually and flip
+/// cancel on any write error, letting the decode loop exit gracefully.
 struct StdoutSink<'a> {
     tokenizer: &'a BpeTokenizer,
+    cancel: Arc<AtomicBool>,
 }
 
 impl<'a> StdoutSink<'a> {
-    fn new(tokenizer: &'a BpeTokenizer) -> Self {
-        Self { tokenizer }
+    fn new(tokenizer: &'a BpeTokenizer, cancel: Arc<AtomicBool>) -> Self {
+        Self { tokenizer, cancel }
     }
 }
 
 impl ModalitySink for StdoutSink<'_> {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
+        if self.cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let piece = self.tokenizer.decode(tokens);
-        print!("{piece}");
-        let _ = std::io::stdout().flush();
+        let mut out = std::io::stdout().lock();
+        if out.write_all(piece.as_bytes()).is_err() || out.flush().is_err() {
+            // Downstream closed (BrokenPipe). Signal the session to stop
+            // decoding on the next iteration.
+            self.cancel.store(true, Ordering::Relaxed);
+        }
     }
     fn on_done(&mut self, _reason: FinishReason) {}
 }
@@ -578,7 +593,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
 
-                let mut sink = StdoutSink::new(&tokenizer);
+                let mut sink = StdoutSink::new(&tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
