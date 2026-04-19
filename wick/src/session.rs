@@ -384,40 +384,56 @@ impl<'a> Session<'a> {
             });
         }
 
-        // Take the prefill logits — `logits` is the pristine "what comes
-        // next" distribution for the current position. Kept unmutated
-        // across the whole loop so we can store it back into
-        // `self.last_logits` for the NEXT `generate()` to continue from.
-        //
-        // The sampler mutates its input in place (temperature scaling,
-        // top-k filter, softmax), so we copy pristine `logits` into
-        // `sample_scratch` before each `sample()`. One reused allocation,
-        // one memcpy per token — ~20 μs per 32 K-vocab model, deep in the
-        // noise vs. the forward() that follows.
+        // Take the prefill logits. In stochastic mode we keep them pristine
+        // across the whole loop and store back at exit for chainable
+        // multi-call `generate()`. In greedy mode, logits are only used
+        // for the INITIAL argmax; subsequent tokens come from
+        // `forward_greedy()` which skips the vocab-sized GPU→CPU readback
+        // and returns the argmax token directly — a real win on Metal
+        // (~hundreds of μs per token saved at 64 K vocab).
         let mut logits = self.last_logits.take().ok_or(WickError::EmptyInput)?;
-        let mut sample_scratch: Vec<f32> = Vec::with_capacity(logits.len());
 
-        self.sync_sampler_from_opts(opts);
+        // Greedy mode is decided once per generate call: deterministic
+        // argmax + `forward_greedy`. Stochastic mode samples with RNG +
+        // `forward` (keeps logits, supports chaining).
+        let greedy = opts.temperature <= 0.0 || opts.top_k == 1;
 
-        // Decode loop. Each iteration: stop checks → sample → EOS check →
-        // emit → forward + advance. Sampling lives INSIDE the loop body so
-        // the RNG advances exactly once per emitted token (plus once more
-        // if we break on EOS, matching natural "sampled the terminator"
-        // semantics). A pre-loop seed sample would leak an extra RNG step
-        // on every `generate()` call, breaking stochastic reproducibility
-        // across split generations (a single generate(N) must produce the
-        // same token stream as two generate(N/2) calls with the same seed).
+        // Stochastic-only state. Allocating the scratch buffer and syncing
+        // the sampler are skipped in greedy mode where neither is touched.
+        let mut sample_scratch: Vec<f32> = if greedy {
+            Vec::new()
+        } else {
+            self.sync_sampler_from_opts(opts);
+            Vec::with_capacity(logits.len())
+        };
+
+        // Greedy-mode token state: the first token comes from `cpu_argmax`
+        // on the prefill logits; each subsequent iteration's token comes
+        // from the previous `forward_greedy()` return value. No RNG is
+        // touched in this path — argmax is deterministic.
+        let mut greedy_next: u32 = if greedy {
+            crate::sampler::cpu_argmax(&logits)
+        } else {
+            0
+        };
+
+        // Decode loop. One body handles both modes, branching on `greedy`:
         //
-        // We deliberately use `forward()` rather than `forward_greedy()`
-        // even in greedy mode: the free logits readback lets us keep
-        // `last_logits` populated for chainable multi-call `generate()`.
-        // A greedy-optimized path is a deferred perf follow-up (call
-        // `forward_greedy` in the loop, then one extra `forward()` at
-        // exit for the continuation seed).
+        //   Stop checks (no RNG, no forward)
+        //   ├─ greedy:     token = greedy_next
+        //   └─ stochastic: token = sampler.sample(scratch)  (one RNG advance)
+        //   EOS check
+        //   Emit + flush
+        //   ├─ greedy:     greedy_next = forward_greedy(&[token], pos)  (no vocab readback)
+        //   └─ stochastic: logits = forward(&[token], pos)              (keeps logits)
+        //   pos += 1, second cancel check
+        //
+        // Stochastic sampling happens INSIDE the loop body so the RNG
+        // advances exactly once per emitted token (plus once on EOS).
+        // That preserves seeded-split-generation reproducibility: a
+        // single `generate(N)` advances RNG the same number of steps as
+        // two `generate(N/2)` calls with the same seed.
         loop {
-            // Stop checks at the top — each must leave `pos ==
-            // state.seq_len` and must NOT have sampled yet (to avoid
-            // wasted RNG advancement).
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
                 break;
@@ -430,20 +446,19 @@ impl<'a> Session<'a> {
                 break;
             }
 
-            // Sample the next token from pristine `logits` via the scratch
-            // copy. This is the ONE RNG advance per loop iteration.
-            sample_scratch.clear();
-            sample_scratch.extend_from_slice(&logits);
-            let token = self.sampler.sample(&mut sample_scratch);
+            let token = if greedy {
+                greedy_next
+            } else {
+                sample_scratch.clear();
+                sample_scratch.extend_from_slice(&logits);
+                self.sampler.sample(&mut sample_scratch)
+            };
 
-            // EOS / stop-token: don't emit the terminator. The RNG step
-            // above is intentional — it represents "sampling the EOS."
             if self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token) {
                 finish = FinishReason::Stop;
                 break;
             }
 
-            // Emit.
             pending.push(token);
             generated += 1;
 
@@ -456,19 +471,20 @@ impl<'a> Session<'a> {
                 last_flush = Instant::now();
             }
 
-            // Forward + advance pos, bound together so state.seq_len
-            // stays aligned with current_pos on every iteration.
-            logits = self.model.forward(&[token], pos, &mut self.state);
+            if greedy {
+                // Fast path: argmax on GPU, returns the 4-byte next token.
+                // Skips the vocab-sized logits readback. `logits` goes stale
+                // — that's fine, greedy mode never reads it after the
+                // initial argmax.
+                greedy_next = self.model.forward_greedy(&[token], pos, &mut self.state);
+            } else {
+                // Stochastic: full forward. Logits stay pristine for the
+                // next iteration's sample and for chaining across calls.
+                logits = self.model.forward(&[token], pos, &mut self.state);
+            }
             pos += 1;
-            // External watchers (another thread holding a
-            // `position_handle`) observe progress per-token, not just at
-            // call boundaries.
             self.position_atomic.store(pos as u32, Ordering::Relaxed);
 
-            // Second cancel check: if another thread / sink flipped the
-            // flag during `forward()` or the preceding `on_text_tokens`
-            // callback, exit BEFORE the next iteration's sample to avoid
-            // an unnecessary RNG step.
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
                 break;
@@ -483,10 +499,29 @@ impl<'a> Session<'a> {
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
 
-        // Preserve pristine logits for the NEXT generate() call. This lets
-        // consumers chain multiple generate() calls on one session without
-        // needing an intervening append_tokens.
-        self.last_logits = Some(logits);
+        // Chain support:
+        //
+        // - Stochastic: `logits` holds the most recent `forward()` output
+        //   (pristine). Save so the next `generate()` can continue
+        //   without an intervening `append_tokens`.
+        //
+        // - Greedy, `generated > 0`: at least one `forward_greedy()` ran,
+        //   advancing state and leaving `logits` stale (never read after
+        //   the initial argmax). Clear — honest "nothing to save."
+        //   Subsequent greedy `generate()` needs an `append_tokens` first,
+        //   matching the standard chat loop (append user → generate →
+        //   append next user → generate).
+        //
+        // - Greedy, `generated == 0`: we broke before any `forward_greedy`
+        //   (e.g., cancel-before-first-iter, or the first predicted token
+        //   was already EOS). `logits` still holds the untouched prefill
+        //   distribution; restoring it keeps the session usable for a
+        //   retry without the caller having to re-prefill.
+        if greedy && generated > 0 {
+            self.last_logits = None;
+        } else {
+            self.last_logits = Some(logits);
+        }
 
         sink.on_done(finish.clone());
 
