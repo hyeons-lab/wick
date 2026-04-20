@@ -398,31 +398,49 @@ impl InferenceState {
     }
 
     /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
-    /// layer and slide the tail down, implementing the core of
-    /// `n_keep` context shift (Phase 1.5). Attention cache layout is
-    /// time-major `[seq_len × kv_dim]`, so the drop maps to
+    /// layer, slide the tail down, and re-apply RoPE so each shifted
+    /// cell's stored K encodes its new absolute position rather than
+    /// its old one. Implements the core of `n_keep` context shift
+    /// (Phase 1.5).
+    ///
+    /// Attention cache layout is time-major `[seq_len × kv_dim]`
+    /// where `kv_dim = n_kv_heads × head_dim`, so the drop maps to
     /// `Vec::drain` of a contiguous range — one memmove per layer.
+    /// After the drain, cells originally at old position `p_old`
+    /// (with `p_old >= n_keep + shift`) now sit at new position
+    /// `p_new = p_old - shift`, but their stored K was rotated via
+    /// RoPE for `p_old`. We fix this by applying `R(-shift)` (a
+    /// constant delta rotation across the whole shifted region) to
+    /// each cell's K via [`crate::backend::cpu::apply_rope_delta_to_head`].
+    /// Rotations compose additively in each dim-pair plane, so the
+    /// result is identical to freshly rotating the raw K for `p_new`.
+    /// V is NOT rotated by RoPE — only the two drain calls touch V.
     ///
     /// `seq_len` is decremented by `shift`. Compressed (TurboQuant)
     /// layers are **not** shifted — callers must check
-    /// [`Self::is_compressed`] first and avoid calling shift on a
-    /// compressed state; this method panics in debug builds if it
-    /// encounters a compressed layer.
+    /// [`Self::is_compressed`] first; this method panics otherwise.
     ///
     /// Conv layers (LFM2's `GatedConv`) are intentionally left
     /// untouched: their buffer holds only the last `d_conv`
     /// activations, which are post-shift-valid as soon as the next
-    /// forward pass runs. The quality transient this introduces
-    /// decays to zero within `d_conv` forward passes (typically 3
-    /// tokens for LFM2). See devlog `000034-feat-n-keep-shift.md` for
-    /// the full analysis.
+    /// forward pass runs. The quality transient decays to zero within
+    /// `d_conv` forward passes (typically 3 tokens for LFM2). See
+    /// `devlog/000034-feat-n-keep-shift.md` for the analysis.
     ///
     /// Preconditions (enforced in all builds — violating them silently
     /// corrupts state, so we use `assert!` rather than `debug_assert!`):
     /// - `shift > 0`
     /// - `n_keep + shift <= seq_len`
     /// - `!self.is_compressed()`
-    pub fn shift_attention_kv(&mut self, n_keep: usize, shift: usize) {
+    /// - `n_kv_heads_per_layer.len() == self.layers.len()`
+    pub fn shift_kv_with_rope(
+        &mut self,
+        n_keep: usize,
+        shift: usize,
+        rope_theta: f32,
+        head_dim: usize,
+        n_kv_heads_per_layer: &[usize],
+    ) {
         // Hard preconditions — keep them in release builds. Silently
         // decrementing `seq_len` without actually shifting the
         // compressed caches would hand the next forward pass a KV that
@@ -437,11 +455,20 @@ impl InferenceState {
         );
         assert!(
             !self.is_compressed(),
-            "shift_attention_kv called on a TurboQuant-compressed state; \
+            "shift_kv_with_rope called on a TurboQuant-compressed state; \
              shifting compressed caches is not yet supported"
         );
+        assert_eq!(
+            n_kv_heads_per_layer.len(),
+            self.layers.len(),
+            "n_kv_heads_per_layer length {} doesn't match layer count {}",
+            n_kv_heads_per_layer.len(),
+            self.layers.len(),
+        );
 
-        for layer in self.layers.iter_mut() {
+        let new_seq_len = self.seq_len - shift;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if let LayerState::Attention {
                 key_cache,
                 value_cache,
@@ -473,17 +500,47 @@ impl InferenceState {
                     key_cache.len(),
                     self.seq_len
                 );
+                let n_kv_heads = n_kv_heads_per_layer[layer_idx];
                 let kv_dim = key_cache.len() / self.seq_len;
+                // Sanity: declared kv_dim matches what's actually stored.
+                // An off-by-one here (wrong head count passed in) would
+                // silently corrupt the per-head RoPE application below,
+                // so assert eagerly.
+                assert_eq!(
+                    n_kv_heads * head_dim,
+                    kv_dim,
+                    "layer {layer_idx}: n_kv_heads*head_dim ({}) != cached kv_dim ({})",
+                    n_kv_heads * head_dim,
+                    kv_dim
+                );
                 let drop_start = n_keep * kv_dim;
                 let drop_end = (n_keep + shift) * kv_dim;
                 // `Vec::drain` on a contiguous range is a memmove of
                 // the tail — no reallocation, one pass.
                 key_cache.drain(drop_start..drop_end);
                 value_cache.drain(drop_start..drop_end);
+
+                // Re-rotate K cells now at positions [n_keep, new_seq_len).
+                // Their stored K was rotated for (new_pos + shift); apply
+                // R(-shift) to re-encode as new_pos. V is not RoPE'd.
+                let delta = -(shift as i32);
+                for t in n_keep..new_seq_len {
+                    let row_base = t * kv_dim;
+                    for h in 0..n_kv_heads {
+                        let head_start = row_base + h * head_dim;
+                        let head_end = head_start + head_dim;
+                        crate::backend::cpu::apply_rope_delta_to_head(
+                            &mut key_cache[head_start..head_end],
+                            delta,
+                            head_dim,
+                            rope_theta,
+                        );
+                    }
+                }
             }
         }
 
-        self.seq_len -= shift;
+        self.seq_len = new_seq_len;
     }
 }
 

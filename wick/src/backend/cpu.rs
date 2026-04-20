@@ -1497,10 +1497,44 @@ pub fn rope(
 
 /// Apply RoPE rotation to a single head vector.
 /// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
-fn apply_rope_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+///
+/// Exposed `pub` so integration tests can use it as the oracle when
+/// verifying [`apply_rope_delta_to_head`] — the two functions must
+/// produce equivalent results when composed per the additive-rotation
+/// identity `R(p + δ) = R(δ) · R(p)`.
+pub fn apply_rope_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
     let half_dim = head_dim / 2;
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta = pos as f32;
+    for i in 0..half_dim {
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        let x0 = head[i];
+        let x1 = head[i + half_dim];
+        head[i] = x0 * cos_t - x1 * sin_t;
+        head[i + half_dim] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
+    }
+}
+
+/// Compose an additional RoPE rotation onto an already-rotated head
+/// vector (Q or K). Given a head that was previously rotated for
+/// position `p_old` — so `head = R(p_old) · raw` — calling this with
+/// `delta_pos = p_new - p_old` leaves the head rotated for position
+/// `p_new`, since 2D rotations compose additively in each dim-pair
+/// plane: `R(p_new) = R(p_new - p_old) · R(p_old)`.
+///
+/// `delta_pos` is signed — negative values unwind the rotation
+/// (`sin_cos` handles negatives directly, no sign-flip bookkeeping
+/// needed). Used by the `n_keep` context shift (`InferenceState::shift_kv_with_rope`)
+/// to re-rotate K cells whose absolute position has moved after a
+/// middle-range drain. Same split-halves pair layout + iterative
+/// theta schedule as [`apply_rope_to_head`] so the two compose
+/// cleanly.
+pub fn apply_rope_delta_to_head(head: &mut [f32], delta_pos: i32, head_dim: usize, freq_base: f32) {
+    let half_dim = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = delta_pos as f32;
     for i in 0..half_dim {
         let (sin_t, cos_t) = theta.sin_cos();
 
