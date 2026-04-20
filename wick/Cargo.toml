@@ -39,6 +39,11 @@ openblas-src = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
+# Used only by gated integration tests (`shift_real_model.rs`). Kept as a
+# dev-dep with `default-features = false` + `rustls-tls` so we don't pull
+# OpenSSL, and so the core crate's dep tree is unaffected.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [features]
 # Portability feature set (Phase 1.3).
