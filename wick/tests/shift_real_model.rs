@@ -43,9 +43,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wick::engine::{BackendPreference, EngineConfig, WickEngine};
 use wick::session::SessionConfig;
 
-/// Smallest LFM2 that's already referenced elsewhere in the test fixtures.
-/// Q4_0 keeps the download small (~700 MB) and matches what the CI cache
-/// key expects.
+/// LFM2-1.2B-Q4_0: already referenced elsewhere in the test fixtures;
+/// keeps download ~700 MB. The URL uses `resolve/main/` (a mutable HF
+/// ref) deliberately — this test only asserts execution sanity +
+/// shift-fires, so any valid LFM2 GGUF at this path satisfies it. If
+/// upstream re-uploads the file, the cache's Content-Length check
+/// triggers a re-download on the next run and the test keeps passing.
+/// Phase 1.6's `BundleRepo` is where pinning to a revision hash
+/// belongs; for this test a mutable ref matches the cost/benefit.
 const MODEL_URL: &str =
     "https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_0.gguf";
 const MODEL_FILE: &str = "LFM2-1.2B-Q4_0.gguf";

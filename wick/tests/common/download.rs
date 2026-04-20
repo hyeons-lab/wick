@@ -60,7 +60,10 @@ fn head_content_length(url: &str) -> Option<u64> {
         .ok()
 }
 
-/// Stream `url` into `dest`. Overwrites any partial file.
+/// Stream `url` into `dest`. Writes to a sibling `<dest>.partial` file
+/// first and renames on success, so a failure mid-transfer leaves no
+/// half-written file that a later `ensure_cached` could mistake for a
+/// finished download when the HEAD probe is also unavailable.
 fn download_to(url: &str, dest: &Path) -> io::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -72,16 +75,27 @@ fn download_to(url: &str, dest: &Path) -> io::Result<()> {
         .map_err(io::Error::other)?
         .error_for_status()
         .map_err(io::Error::other)?;
-    let mut file = fs::File::create(dest)?;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = resp.read(&mut buf).map_err(io::Error::other)?;
-        if n == 0 {
-            break;
+
+    let mut partial = dest.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    // Best-effort remove of a leftover `.partial` from a prior crash.
+    let _ = fs::remove_file(&partial);
+
+    // Scope the file handle so it's closed before the rename.
+    {
+        let mut file = fs::File::create(&partial)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = resp.read(&mut buf).map_err(io::Error::other)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
         }
-        file.write_all(&buf[..n])?;
+        file.sync_all()?;
     }
-    file.sync_all()?;
+    fs::rename(&partial, dest)?;
     Ok(())
 }
 
