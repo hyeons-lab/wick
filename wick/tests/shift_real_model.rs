@@ -22,7 +22,7 @@
 //!   [`backend::cpu::apply_rope_delta_to_head`] would propagate NaNs /
 //!   out-of-bounds accesses during this prefill; the test passes only
 //!   if the full stack is numerically sound.
-//! - Exactly one `wick::kv_shift` tracing event fires.
+//! - At least one `wick::kv_shift` tracing event fires.
 //! - Final session position matches the invariant (== `max_seq_len`).
 //!
 //! Gating: `#[ignore]` + `WICK_TEST_DOWNLOAD=1` env var so `cargo test`
@@ -59,7 +59,8 @@ const MODEL_FILE: &str = "LFM2-1.2B-Q4_0.gguf";
 /// layer. We don't depend on an external subscriber because tests run
 /// in parallel and a global subscriber would race — we use an
 /// `Arc<AtomicUsize>` installed for the duration of this test only via
-/// `tracing::subscriber::with_default`.
+/// `tracing::subscriber::set_default` (scoped to the returned
+/// `DefaultGuard`).
 fn run_with_shift_counter<R>(f: impl FnOnce(Arc<AtomicUsize>) -> R) -> R {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::layer::SubscriberExt;

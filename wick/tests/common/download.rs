@@ -13,7 +13,7 @@
 //! default `cargo test` invocation.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -85,14 +85,7 @@ fn download_to(url: &str, dest: &Path) -> io::Result<()> {
     // Scope the file handle so it's closed before the rename.
     {
         let mut file = fs::File::create(&partial)?;
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = resp.read(&mut buf).map_err(io::Error::other)?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])?;
-        }
+        io::copy(&mut resp, &mut file)?;
         file.sync_all()?;
     }
     fs::rename(&partial, dest)?;
