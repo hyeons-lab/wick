@@ -132,12 +132,49 @@ pub struct ModalityCapabilities {
 }
 
 impl ModalityCapabilities {
-    /// Default text-only shape.
+    /// Text-in, text-out only. The baseline for LLaMA-family LLMs.
     pub fn text_only() -> Self {
         Self {
             text_in: true,
             text_out: true,
             ..Default::default()
+        }
+    }
+
+    /// Text + audio bidirectional — LFM2-Audio-class models: PCM audio
+    /// in via [`Session::append_audio`], text + audio frames out via
+    /// [`ModalitySink`].
+    pub fn text_and_audio() -> Self {
+        Self {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: true,
+            ..Default::default()
+        }
+    }
+
+    /// Text + image in, text out — VL-class models (LFM2-VL,
+    /// LLaVA-family). Image output is not an LFM2-family capability.
+    pub fn text_and_image_in() -> Self {
+        Self {
+            text_in: true,
+            text_out: true,
+            image_in: true,
+            ..Default::default()
+        }
+    }
+
+    /// Derive capabilities from a manifest's `inference_type`. Unknown
+    /// variants fall back to text-only so a bundle we don't understand
+    /// at least reports safe minimums.
+    pub fn from_inference_type(it: &crate::manifest::InferenceType) -> Self {
+        use crate::manifest::InferenceType::*;
+        match it {
+            LlamaCppTextToText => Self::text_only(),
+            LlamaCppImageToText => Self::text_and_image_in(),
+            LlamaCppLfm2AudioV1 => Self::text_and_audio(),
+            Unknown(_) => Self::text_only(),
         }
     }
 }
@@ -222,6 +259,10 @@ pub struct Session {
     last_logits: Option<Vec<f32>>,
     /// Copied from config — enforced on `append_tokens`.
     max_seq_len: usize,
+    /// What this session can accept / emit, derived from the model's
+    /// inference_type at construction. Immutable for the session's
+    /// lifetime.
+    capabilities: ModalityCapabilities,
     /// Retained for `reset()` (rebuild state + sampler) and
     /// `sync_sampler_from_opts` (read back the seed).
     config: SessionConfig,
@@ -232,7 +273,16 @@ impl Session {
     /// Both are taken by `Arc` — in-process callers typically clone from
     /// [`crate::WickEngine`] (see [`crate::WickEngine::new_session`]); FFI
     /// callers wrap owned handles.
-    pub fn new(model: Arc<dyn Model>, tokenizer: Arc<BpeTokenizer>, config: SessionConfig) -> Self {
+    ///
+    /// `capabilities` declares what the loaded model accepts / emits.
+    /// Direct callers (tests, standalone Model loaders) that don't have
+    /// a Manifest handy can pass [`ModalityCapabilities::text_only`].
+    pub fn new(
+        model: Arc<dyn Model>,
+        tokenizer: Arc<BpeTokenizer>,
+        capabilities: ModalityCapabilities,
+        config: SessionConfig,
+    ) -> Self {
         let model_cfg = model.config();
         let max_seq_len = config
             .max_seq_len
@@ -304,15 +354,16 @@ impl Session {
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
             max_seq_len,
+            capabilities,
             config,
         }
     }
 
-    /// Capabilities of the loaded model. v1 reports text-only for every
-    /// currently-supported model; multimodal reporting lands with the VL
-    /// and audio loaders.
+    /// What this session accepts as input / emits as output. Derived
+    /// from the model's `inference_type` at construction — see
+    /// [`ModalityCapabilities::from_inference_type`] for the mapping.
     pub fn capabilities(&self) -> ModalityCapabilities {
-        ModalityCapabilities::text_only()
+        self.capabilities
     }
 
     /// Borrow the tokenizer the session was constructed with. Useful
@@ -380,6 +431,31 @@ impl Session {
         }
         let tokens = self.tokenizer.encode(text);
         self.append_tokens(&tokens)
+    }
+
+    /// Append PCM audio input to the session's context. For audio-in
+    /// models the samples are run through the model's audio tokenizer
+    /// and the resulting tokens are prefilled into the KV cache.
+    ///
+    /// `sample_rate` is the PCM rate in Hz (LFM2-Audio expects 24_000).
+    ///
+    /// **Current status (Phase 1.x scaffold):** the API is locked in
+    /// for FFI surface-freeze reasons, but the actual audio-tokenizer
+    /// wiring lands in a follow-up PR. Today this always returns
+    /// [`WickError::UnsupportedModality`] regardless of the loaded
+    /// model; capability reporting via [`Session::capabilities`] still
+    /// reflects the model accurately so callers can gate on it.
+    pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), WickError> {
+        let _ = samples;
+        let _ = sample_rate;
+        if !self.capabilities.audio_in {
+            return Err(WickError::UnsupportedModality);
+        }
+        // Audio-in-capable model, but the tokenizer + prefill path
+        // isn't wired through Session yet. Callers that need audio
+        // input today should drive it through the existing
+        // `wick::audio_engine::generate_audio` free function.
+        Err(WickError::UnsupportedModality)
     }
 
     /// Append raw token IDs, running a prefill pass from the current position
@@ -497,12 +573,6 @@ impl Session {
     /// model; reserved API shape for the VL loader. Always returns
     /// `UnsupportedModality` until VL support lands.
     pub fn append_image(&mut self, _bytes: &[u8], _format: ImageFormat) -> Result<(), WickError> {
-        Err(WickError::UnsupportedModality)
-    }
-
-    /// Append an audio input. Reserved for the audio loader wiring; returns
-    /// `UnsupportedModality` until that follow-up commit lands.
-    pub fn append_audio(&mut self, _pcm: &[f32], _sample_rate: u32) -> Result<(), WickError> {
         Err(WickError::UnsupportedModality)
     }
 
@@ -732,6 +802,31 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::InferenceType;
+
+    #[test]
+    fn capabilities_from_inference_type_covers_every_variant() {
+        let text = ModalityCapabilities::from_inference_type(&InferenceType::LlamaCppTextToText);
+        assert!(text.text_in && text.text_out);
+        assert!(!text.audio_in && !text.audio_out && !text.image_in);
+
+        let audio = ModalityCapabilities::from_inference_type(&InferenceType::LlamaCppLfm2AudioV1);
+        assert!(audio.text_in && audio.text_out);
+        assert!(audio.audio_in && audio.audio_out);
+        assert!(!audio.image_in);
+
+        let vl = ModalityCapabilities::from_inference_type(&InferenceType::LlamaCppImageToText);
+        assert!(vl.text_in && vl.text_out && vl.image_in);
+        assert!(!vl.audio_in && !vl.audio_out);
+
+        // Unknown variants fall back to text-only so an unfamiliar bundle
+        // at least reports safe minimums rather than crashing.
+        let unknown = ModalityCapabilities::from_inference_type(&InferenceType::Unknown(
+            "llama.cpp/x".into(),
+        ));
+        assert!(unknown.text_in && unknown.text_out);
+        assert!(!unknown.audio_in && !unknown.audio_out && !unknown.image_in);
+    }
 
     /// A trivial sink that records text tokens + done calls in order, for
     /// asserting stream shape without needing a real model.
