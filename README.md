@@ -326,10 +326,11 @@ wick tokenize --model model.gguf "Hello world"
 
 ## Architecture
 
-Two-crate workspace:
+Three-crate workspace:
 
 - **`wick`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
 - **`wick-cli`** — CLI binary (clap, dispatches to `wick`)
+- **`wick-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`wick-ffi/README.md`](wick-ffi/README.md) for scope + roadmap.
 
 ### Module layout
 

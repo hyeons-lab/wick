@@ -15,11 +15,14 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 uniffi.workspace = true
-# wick: depend on default features for the core surface we expose. The
-# `remote` feature is opt-in at this layer — adding it when/if `wick-ffi`
-# exposes `BundleRepo` (PR 2+). Keeping it out now keeps the bootstrap
-# dep-tree small.
+# wick: default features for the core surface we expose. The `remote`
+# feature lights up when `BundleRepo` surfaces through FFI (a later
+# PR); keeps the bootstrap dep tree small for now.
 wick = { path = "../wick" }
 
-[build-dependencies]
-uniffi = { workspace = true, features = ["build"] }
+# No `[build-dependencies]` block: the proc-macro path doesn't need
+# UDL-scaffolding generation at build time, so `uniffi = { features =
+# ["build"] }` as a build-dep would compile UniFFI twice for no gain.
+# If/when we migrate to UDL, add `uniffi = { workspace = true,
+# features = ["build"] }` here and call `uniffi::generate_scaffolding`
+# from `build.rs`.

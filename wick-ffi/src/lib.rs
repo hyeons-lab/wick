@@ -47,14 +47,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_is_non_empty_semver_ish() {
+    fn version_is_non_empty() {
+        // Smoke test: proves the proc-macro expanded and the export is
+        // callable. No shape check on the string — SemVer allows
+        // pre-release + build-metadata suffixes (`0.1.0-alpha.1+deadbe`)
+        // that a strict `x.y.z` split would reject.
         let v = wick_ffi_version();
-        assert!(!v.is_empty());
-        // Loose shape check — three dot-separated chunks.
-        assert_eq!(
-            v.split('.').count(),
-            3,
-            "expected semver-shaped version: {v}"
-        );
+        assert!(!v.is_empty(), "version string must not be empty");
     }
 }
