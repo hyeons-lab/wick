@@ -6,16 +6,17 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Bootstrap.** The crate exists, the UniFFI build pipeline works, and
-one smoke-test function (`wick_ffi_version()`) is exported. The real
-surface grows in follow-up PRs per the Phase 2 roadmap:
+**Streaming.** `WickEngine` + `Session` + sync `generate` shipped in
+PRs 2–3; PR 4 adds `ModalitySink` as a UniFFI foreign-trait callback
+so foreign callers can receive tokens + audio frames as they're
+produced. Real surface grows in follow-up PRs per the Phase 2 roadmap:
 
 | PR | Scope |
 |---|---|
-| 1 *(this one)* | Crate shell + UniFFI scaffolding + smoke-test export |
+| 1 | Crate shell + UniFFI scaffolding + smoke-test export |
 | 2 | `WickEngine::from_path`, `EngineConfig`, `ModelMetadata`, `ModalityCapabilities` |
 | 3 | `Session`, `SessionConfig`, `GenerateOpts`, `GenerateSummary`, sync `generate` |
-| 4 | `ModalitySink` as UniFFI foreign-trait callback |
+| 4 *(this one)* | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
 | 5 | `async` `generate` via `#[uniffi::export(async_runtime = "tokio")]` |
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI |
 | 7+ | Error-type marshalling, parity harness, Android ABIs, iOS XCFramework |

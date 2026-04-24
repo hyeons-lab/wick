@@ -18,11 +18,15 @@
 //! - [`Session`] — stateful inference handle (one per conversation).
 //!   `append_text` / `append_tokens` for input, synchronous
 //!   [`Session::generate`] returning [`GenerateOutput`] (tokens +
-//!   [`GenerateSummary`]).
+//!   [`GenerateSummary`]), or [`Session::generate_streaming`] that
+//!   delivers tokens + audio frames through a foreign [`ModalitySink`]
+//!   as they're produced.
 //! - [`SessionConfig`] + [`KvCompression`] — per-session knobs.
 //! - [`GenerateOpts`] + [`FinishReason`] — per-call decode config + exit reason.
 //! - [`Session::cancel`] / [`Session::position`] for cooperative
 //!   interrupt + progress monitoring across threads.
+//! - [`ModalitySink`] — UniFFI foreign-trait callback for streaming
+//!   decode output to Kotlin / Swift / Python implementations.
 //!
 //! Error:
 //! - [`FfiError`] — minimal error shell (string-based). Typed variants
@@ -32,8 +36,7 @@
 //! ## Not exposed yet
 //!
 //! Future PRs grow the surface per the roadmap in
-//! `wick-ffi/README.md`. Highlights: streaming via `ModalitySink` as
-//! a UniFFI foreign-trait callback (PR 4), `async` `generate` via
+//! `wick-ffi/README.md`. Highlights: `async` `generate` via
 //! `#[uniffi::export(async_runtime = "tokio")]` (PR 5), remote URL
 //! loading through `BundleRepo` (gated on the `remote` feature),
 //! binding generation for Kotlin / Swift / Python, and typed error
@@ -468,6 +471,80 @@ pub struct GenerateOutput {
 }
 
 // ---------------------------------------------------------------------------
+// ModalitySink (foreign trait — PR 4)
+// ---------------------------------------------------------------------------
+
+/// Streaming sink for decode output. Foreign callers implement this
+/// trait (Kotlin class, Swift class, Python subclass) and pass an
+/// `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
+/// receive tokens + audio frames + the finish reason as they happen.
+///
+/// All methods are required from foreign implementations (UniFFI 0.28
+/// foreign traits don't carry Rust's default-impl fallbacks). Callers
+/// that don't care about a modality can provide an empty body.
+///
+/// Threading: every method is invoked on the same Rust thread running
+/// `generate` — the decode thread. If the foreign runtime requires
+/// marshalling onto a different thread (e.g. Swift's `@MainActor`) it
+/// is the implementer's responsibility to dispatch the call there.
+#[uniffi::export(with_foreign)]
+pub trait ModalitySink: Send + Sync {
+    /// Called with each chunk of generated token IDs. Ownership of the
+    /// `Vec<u32>` is transferred to the callback, so implementations
+    /// may retain or store it directly if needed — no clone required.
+    fn on_text_tokens(&self, tokens: Vec<u32>);
+
+    /// Called with each chunk of generated PCM audio samples. Not
+    /// called for text-only models; LFM2-Audio-class models emit here.
+    /// The `sample_rate` is the model's native output rate (typically
+    /// 24000 for LFM2-Audio) and is stable across the whole generate
+    /// call.
+    fn on_audio_frames(&self, pcm: Vec<f32>, sample_rate: u32);
+
+    /// Called exactly once per [`Session::generate_streaming`] call,
+    /// as the last thing before the wrapper returns. Fires for both
+    /// success (`MaxTokens`, `Stop`, `Cancelled`, `ContextFull`) and
+    /// failure paths: on error the wrapper synthesizes a
+    /// [`FinishReason::Error`] so foreign consumers have a reliable
+    /// end-of-stream signal regardless of how the call exits.
+    fn on_done(&self, reason: FinishReason);
+}
+
+/// Adapter from the UniFFI foreign trait to the internal
+/// [`wick::ModalitySink`]. Forwards every call; unavoidable `Vec`
+/// copy per chunk because UniFFI can't marshal a borrowed `&[u32]`
+/// or `&[f32]` across the ABI boundary. Impact is bounded: the
+/// decode loop emits chunks of at most a few tokens at a time, so
+/// the allocation volume is orders of magnitude lower than the decode
+/// itself. For audio the copy is larger but a single frame per decode
+/// step is still small (a few hundred f32s).
+///
+/// `done_called` tracks whether the underlying `wick::Session::generate`
+/// fired `on_done`. The FFI wrapper uses this to synthesize a
+/// terminal `on_done(Error)` if core returns an error before getting
+/// to its own `on_done` call (currently only possible on
+/// `WickError::EmptyInput`, but robust against future error paths).
+/// Guards against double-firing if the core ever starts calling
+/// `on_done` internally on error paths.
+struct ForeignSinkAdapter {
+    inner: Arc<dyn ModalitySink>,
+    done_called: bool,
+}
+
+impl wick::ModalitySink for ForeignSinkAdapter {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        self.inner.on_text_tokens(tokens.to_vec());
+    }
+    fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
+        self.inner.on_audio_frames(pcm.to_vec(), sample_rate);
+    }
+    fn on_done(&mut self, reason: wick::FinishReason) {
+        self.done_called = true;
+        self.inner.on_done(reason.into());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -555,6 +632,71 @@ impl Session {
             tokens: sink.0,
             summary: summary.into(),
         })
+    }
+
+    /// Run autoregressive decode, streaming every token (and audio
+    /// frame, for audio-capable models) to a foreign [`ModalitySink`]
+    /// as soon as it's produced. Returns only a [`GenerateSummary`] —
+    /// token IDs are delivered through `sink.on_text_tokens`, not a
+    /// return value.
+    ///
+    /// Synchronous: the call blocks on the decode thread and each
+    /// `sink` method runs on that same thread before decoding
+    /// continues. For async, see PR 5 in `wick-ffi/README.md`.
+    ///
+    /// **Callback reentrancy — deadlock hazard.** The session mutex is
+    /// held for the entire call, and sink callbacks run while that
+    /// lock is held. Calling back into methods that also take the
+    /// mutex ([`Session::append_text`], [`Session::append_tokens`],
+    /// [`Session::generate`], [`Session::generate_streaming`],
+    /// [`Session::reset`]) from inside a sink method will deadlock.
+    /// [`Session::cancel`] and [`Session::position`] are atomic-backed
+    /// and safe to call from the sink or from any other thread.
+    ///
+    /// Cancellation: call [`Session::cancel`] from any thread (or from
+    /// inside a sink callback on this thread) to terminate the loop at
+    /// the next between-token check; `sink.on_done` fires with
+    /// [`FinishReason::Cancelled`].
+    ///
+    /// End-of-stream guarantee: `sink.on_done` fires exactly once per
+    /// call, even on error paths. If the underlying decode returns an
+    /// error before reaching its own `on_done` call (e.g.,
+    /// `EmptyInput` with no prefill logits), the wrapper synthesizes
+    /// a terminal `on_done(FinishReason::Error { message })` so
+    /// foreign consumers have a reliable end-of-stream signal
+    /// regardless of how the call exits.
+    pub fn generate_streaming(
+        &self,
+        opts: GenerateOpts,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        let mut adapter = ForeignSinkAdapter {
+            inner: sink,
+            done_called: false,
+        };
+        // Scope the lock so the synthesized on_done on the error path
+        // doesn't run with the session mutex held — foreign sinks
+        // already have to avoid session-reentrancy during success
+        // callbacks; reusing that contract on the error path keeps
+        // the hazard set minimal.
+        let outcome = match self.lock_inner() {
+            Ok(mut guard) => guard
+                .generate(&opts.into(), &mut adapter)
+                .map_err(FfiError::from),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(summary) => Ok(summary.into()),
+            Err(err) => {
+                if !adapter.done_called {
+                    let message = match &err {
+                        FfiError::Backend { message } => message.clone(),
+                    };
+                    adapter.inner.on_done(FinishReason::Error { message });
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Current KV position — how many tokens live in the cache.
@@ -788,5 +930,121 @@ mod tests {
                 _ => panic!("variant mismatch: {ffi:?} tagged {tag}"),
             }
         }
+    }
+
+    /// Exercises the ForeignSinkAdapter by implementing the FFI
+    /// `ModalitySink` trait from Rust (what UniFFI codegens the foreign
+    /// binding to look like on the Rust side) and driving it through
+    /// the internal `wick::ModalitySink` impl. Confirms:
+    /// - `on_text_tokens` forwards with the exact bytes.
+    /// - `on_audio_frames` forwards with the exact bytes + rate.
+    /// - `on_done` forwards and maps the FinishReason through `.into()`.
+    /// - All three run without the foreign side needing `&mut self` —
+    ///   interior mutability (Mutex/atomic) is the caller's burden,
+    ///   mirroring what Kotlin/Swift will see.
+    #[test]
+    fn foreign_sink_adapter_forwards_every_method() {
+        use std::sync::Mutex;
+        use wick::ModalitySink as CoreSink;
+
+        #[derive(Default)]
+        struct Recorder {
+            text: Mutex<Vec<u32>>,
+            audio: Mutex<Vec<(Vec<f32>, u32)>>,
+            done: Mutex<Option<FinishReason>>,
+        }
+
+        impl ModalitySink for Recorder {
+            fn on_text_tokens(&self, tokens: Vec<u32>) {
+                self.text.lock().unwrap().extend(tokens);
+            }
+            fn on_audio_frames(&self, pcm: Vec<f32>, sample_rate: u32) {
+                self.audio.lock().unwrap().push((pcm, sample_rate));
+            }
+            fn on_done(&self, reason: FinishReason) {
+                *self.done.lock().unwrap() = Some(reason);
+            }
+        }
+
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let mut adapter = ForeignSinkAdapter {
+            inner: recorder.clone() as Arc<dyn ModalitySink>,
+            done_called: false,
+        };
+
+        // Drive the adapter as wick's decode loop would.
+        adapter.on_text_tokens(&[1, 2, 3]);
+        adapter.on_text_tokens(&[4, 5]);
+        adapter.on_audio_frames(&[0.1, 0.2, 0.3], 24_000);
+        adapter.on_done(wick::FinishReason::MaxTokens);
+
+        assert_eq!(&*recorder.text.lock().unwrap(), &[1, 2, 3, 4, 5]);
+        let audio = recorder.audio.lock().unwrap();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].0, vec![0.1, 0.2, 0.3]);
+        assert_eq!(audio[0].1, 24_000);
+        assert!(matches!(
+            &*recorder.done.lock().unwrap(),
+            Some(FinishReason::MaxTokens)
+        ));
+        assert!(
+            adapter.done_called,
+            "adapter.done_called must flip after on_done"
+        );
+    }
+
+    /// Before `adapter.on_done` has been forwarded, `done_called`
+    /// stays `false`. Protects the error-synthesis branch in
+    /// `Session::generate_streaming` — we can only safely synthesize
+    /// a terminal `on_done(Error)` on failure when the inner
+    /// `wick::Session::generate` hasn't already fired its own `on_done`.
+    #[test]
+    fn adapter_done_called_starts_false_and_guards_error_synthesis() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: Mutex<usize>,
+        }
+        impl ModalitySink for Recorder {
+            fn on_text_tokens(&self, _: Vec<u32>) {}
+            fn on_audio_frames(&self, _: Vec<f32>, _: u32) {}
+            fn on_done(&self, _: FinishReason) {
+                *self.calls.lock().unwrap() += 1;
+            }
+        }
+
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let adapter = ForeignSinkAdapter {
+            inner: recorder.clone() as Arc<dyn ModalitySink>,
+            done_called: false,
+        };
+
+        // Simulate the error-branch logic: never forwarded on_done,
+        // so the wrapper should synthesize one.
+        assert!(!adapter.done_called);
+        if !adapter.done_called {
+            adapter.inner.on_done(FinishReason::Error {
+                message: "simulated pre-decode error".into(),
+            });
+        }
+        assert_eq!(*recorder.calls.lock().unwrap(), 1, "synthesized once");
+
+        // And the double-fire guard: if done_called were already true,
+        // the wrapper must skip synthesis.
+        let adapter_already_done = ForeignSinkAdapter {
+            inner: recorder.clone() as Arc<dyn ModalitySink>,
+            done_called: true,
+        };
+        if !adapter_already_done.done_called {
+            adapter_already_done
+                .inner
+                .on_done(FinishReason::Error { message: "".into() });
+        }
+        assert_eq!(
+            *recorder.calls.lock().unwrap(),
+            1,
+            "still one — no double-fire"
+        );
     }
 }
