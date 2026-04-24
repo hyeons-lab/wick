@@ -27,6 +27,8 @@ objc = { workspace = true, optional = true }
 rustfft.workspace = true
 flatbuffers.workspace = true
 cblas-sys = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 # BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
 # Only the provider crate for the current target is pulled in, so cross-platform
@@ -40,10 +42,11 @@ openblas-src = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
-# Used only by gated integration tests (`shift_real_model.rs`). Kept as a
-# dev-dep with `default-features = false` + `rustls-tls` so we don't pull
-# OpenSSL, and so the core crate's dep tree is unaffected.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Gated integration tests (`shift_real_model.rs`, `bundle_download.rs`)
+# that perform HTTP downloads are `#[cfg(feature = "remote")]`'d at the
+# test level — run them with `cargo test -p wick --features remote -- ...`.
+# The downloader code itself lives in `src/bundle/download.rs` under the
+# same feature, so there is a single implementation.
 
 [features]
 # Portability feature set (Phase 1.3).
@@ -60,6 +63,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 #   disk-cache  ⇒ std-fs  (writing the cold KV tier needs std::fs)
 #   gpu / metal ⇒ mmap    (both backends open the GGUF via mmap today)
 #   blas        — unchanged; opt-in GEMM accelerator
+#   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)
 default = ["parallel", "mmap", "std-fs", "disk-cache"]
 parallel = ["dep:rayon"]
 std-fs = []
@@ -68,3 +72,7 @@ disk-cache = ["std-fs"]
 gpu = ["dep:wgpu", "dep:pollster", "mmap"]
 metal = ["dep:metal", "dep:objc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
+# BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and
+# tightly-scoped embedded builds don't pull reqwest. (See
+# `src/bundle/mod.rs` for the verification policy.)
+remote = ["dep:reqwest", "dep:sha2", "std-fs"]

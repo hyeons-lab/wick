@@ -6,7 +6,10 @@
 //!
 //! Currently just [`download::ensure_cached`] for tests that need a real
 //! GGUF but don't want to bake multi-hundred-MB fixtures into the repo.
+//! The download helper compiles only when the `remote` feature is
+//! active; callers are `#[cfg(feature = "remote")]`'d accordingly.
 
 #![allow(dead_code)]
 
+#[cfg(feature = "remote")]
 pub mod download;

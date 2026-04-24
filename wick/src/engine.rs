@@ -91,6 +91,12 @@ pub struct EngineConfig {
     pub context_size: usize,
     /// Which compute backend to prefer.
     pub backend: BackendPreference,
+    /// Optional repository used to resolve `http(s)://` URLs found in a
+    /// manifest's `files` entries. When `None`, remote URLs fail with a
+    /// clear error asking the caller to either set this field or
+    /// pre-download the bundle. Requires the `remote` feature.
+    #[cfg(feature = "remote")]
+    pub bundle_repo: Option<crate::bundle::BundleRepo>,
 }
 
 impl Default for EngineConfig {
@@ -98,6 +104,8 @@ impl Default for EngineConfig {
         Self {
             context_size: 4096,
             backend: BackendPreference::Auto,
+            #[cfg(feature = "remote")]
+            bundle_repo: None,
         }
     }
 }
@@ -316,7 +324,7 @@ impl WickEngine {
             WickError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
         })?;
         let manifest_dir = path.parent().map(Path::to_path_buf);
-        let primary = resolve_primary_model_path(&manifest, manifest_dir.as_deref())?;
+        let primary = resolve_primary_model_path(&manifest, manifest_dir.as_deref(), &cfg)?;
         Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
 
@@ -345,7 +353,7 @@ impl WickEngine {
     /// [`Self::from_manifest_with_primary`].
     #[cfg(feature = "mmap")]
     fn from_manifest(manifest: Manifest, cfg: EngineConfig) -> Result<Self, WickError> {
-        let primary = resolve_primary_model_path(&manifest, None)?;
+        let primary = resolve_primary_model_path(&manifest, None, &cfg)?;
         Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
 
@@ -438,8 +446,10 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, WickError> {
 }
 
 /// Resolve the manifest's primary model reference to a local filesystem
-/// path. HTTP(S) URLs are rejected with a pointer at Phase 1.6's
-/// downloader; relative paths resolve against `manifest_dir` when
+/// path. With the `remote` feature + an `EngineConfig::bundle_repo`, an
+/// `http(s)://` URL is fetched-and-cached via `BundleRepo`; otherwise
+/// remote URLs return an error pointing the caller at the feature and
+/// config field. Relative paths resolve against `manifest_dir` when
 /// provided (for on-disk manifests loaded via `from_manifest_file`).
 ///
 /// Gated on `mmap` — the only callers are `from_manifest_with_primary`
@@ -449,17 +459,38 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, WickError> {
 fn resolve_primary_model_path(
     manifest: &Manifest,
     manifest_dir: Option<&Path>,
+    cfg: &EngineConfig,
 ) -> Result<PathBuf, WickError> {
-    resolve_url_or_path(&manifest.files.model, manifest_dir)
+    resolve_url_or_path(&manifest.files.model, manifest_dir, cfg)
 }
 
 #[cfg(feature = "mmap")]
-fn resolve_url_or_path(value: &str, base_dir: Option<&Path>) -> Result<PathBuf, WickError> {
+fn resolve_url_or_path(
+    value: &str,
+    base_dir: Option<&Path>,
+    cfg: &EngineConfig,
+) -> Result<PathBuf, WickError> {
     if is_remote_url(value) {
-        return Err(WickError::Backend(format!(
-            "manifest references remote URL `{value}` — bundle downloads land in Phase 1.6 (`BundleRepo`). \
-             Pass a local file path or pre-download the bundle."
-        )));
+        #[cfg(feature = "remote")]
+        {
+            if let Some(repo) = cfg.bundle_repo.as_ref() {
+                return repo.resolve_url(value);
+            }
+            return Err(WickError::Backend(format!(
+                "manifest references remote URL `{value}` — set `EngineConfig::bundle_repo` \
+                 to a `BundleRepo` rooted at your desired store directory, or pre-download \
+                 the bundle and pass a local file path."
+            )));
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            let _ = cfg;
+            return Err(WickError::Backend(format!(
+                "manifest references remote URL `{value}` — rebuild wick with the `remote` \
+                 feature + set `EngineConfig::bundle_repo`, or pre-download the bundle \
+                 and pass a local file path."
+            )));
+        }
     }
     if let Some(rest) = strip_file_scheme(value) {
         // `file://…` isn't portable via `Path::new` (Windows especially),
@@ -863,19 +894,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_url_or_path_rejects_remote() {
-        let e =
-            resolve_url_or_path("https://hf.co/x.gguf", None).expect_err("remote URL must error");
+    fn resolve_url_or_path_rejects_remote_without_repo() {
+        let cfg = EngineConfig::default();
+        let e = resolve_url_or_path("https://hf.co/x.gguf", None, &cfg)
+            .expect_err("remote URL must error without a BundleRepo");
         let msg = format!("{e}");
+        // Without the `remote` feature or with `bundle_repo = None`, the
+        // error should steer the user toward the fix.
         assert!(
-            msg.contains("remote URL") && msg.contains("Phase 1.6"),
-            "error should point at the downloader follow-up; got `{msg}`"
+            msg.contains("remote URL"),
+            "error should mention remote URL; got `{msg}`"
+        );
+        #[cfg(feature = "remote")]
+        assert!(
+            msg.contains("bundle_repo"),
+            "error under `remote` feature should point at the config field; got `{msg}`"
+        );
+        #[cfg(not(feature = "remote"))]
+        assert!(
+            msg.contains("`remote` feature"),
+            "error without `remote` feature should point at enabling it; got `{msg}`"
         );
     }
 
     #[test]
     fn resolve_url_or_path_rejects_file_scheme() {
-        let e = resolve_url_or_path("file:///models/x.gguf", None)
+        let cfg = EngineConfig::default();
+        let e = resolve_url_or_path("file:///models/x.gguf", None, &cfg)
             .expect_err("file:// URIs aren't supported yet");
         let msg = format!("{e}");
         assert!(
@@ -897,15 +942,17 @@ mod tests {
 
     #[test]
     fn resolve_url_or_path_joins_relative_against_base() {
+        let cfg = EngineConfig::default();
         let base = PathBuf::from("/models/bundles");
-        let got = resolve_url_or_path("LFM2-1.2B-Q4_0.gguf", Some(&base)).unwrap();
+        let got = resolve_url_or_path("LFM2-1.2B-Q4_0.gguf", Some(&base), &cfg).unwrap();
         assert_eq!(got, PathBuf::from("/models/bundles/LFM2-1.2B-Q4_0.gguf"));
     }
 
     #[test]
     fn resolve_url_or_path_keeps_absolute_unchanged() {
+        let cfg = EngineConfig::default();
         let base = PathBuf::from("/models/bundles");
-        let got = resolve_url_or_path("/opt/foo.gguf", Some(&base)).unwrap();
+        let got = resolve_url_or_path("/opt/foo.gguf", Some(&base), &cfg).unwrap();
         assert_eq!(got, PathBuf::from("/opt/foo.gguf"));
     }
 

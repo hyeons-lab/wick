@@ -25,6 +25,7 @@ fn cpu_cfg() -> EngineConfig {
     EngineConfig {
         context_size: 256,
         backend: BackendPreference::Cpu,
+        ..Default::default()
     }
 }
 
