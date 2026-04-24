@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,3 +57,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --workspace --release
+
+  integration-test:
+    name: Integration Tests (gated)
+    needs: check
+    # Only run on main-branch pushes and manual dispatch. Skipping PR runs
+    # keeps PR cycle latency low — these tests download ~700 MB and are
+    # meant as a correctness backstop, not per-PR regression guardrail.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Cap at 15 min: a healthy run is ~2 min; a stuck download or
+    # runaway prefill should fail loudly rather than consume CI minutes.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache downloaded test models
+        uses: actions/cache@v4
+        with:
+          path: target/tmp/wick-test-models
+          # Bump the key suffix to invalidate after model-file changes.
+          key: wick-test-models-lfm2-1.2b-q4_0-v1
+      # NOTE: targeted to the `shift_real_model` binary only.
+      # `cargo test -- --ignored` without `--test` would sweep every
+      # #[ignore]'d test in the workspace (Metal microbenchmarks,
+      # parity tests requiring WICK_TEST_MODEL, etc.), most of which
+      # don't belong on an Ubuntu CI runner.
+      - name: Run gated integration test
+        env:
+          WICK_TEST_DOWNLOAD: "1"
+        run: cargo test -p wick --test shift_real_model -- --ignored
