@@ -757,41 +757,66 @@ impl Session {
 // blocking worker pool (`tokio::runtime::Builder::new_multi_thread`
 // default). We don't need to create or enter a runtime ourselves.
 
-/// RAII guard that fires `Session::cancel()` on drop unless explicitly
-/// disarmed. Addresses a subtle hazard of wrapping sync decode in
+/// RAII guard that cancels the in-flight `spawn_blocking` decode on
+/// future-drop. Addresses a subtle hazard of wrapping sync decode in
 /// `tokio::task::spawn_blocking`: dropping the outer future drops the
 /// `JoinHandle`, but tokio does **not** abort a `spawn_blocking` task
 /// on handle-drop — the blocking worker keeps decoding, keeps holding
 /// the session mutex, keeps mutating `Session::state`.
 ///
-/// Without this guard, a foreign-side cancellation (e.g. a Kotlin
-/// coroutine scope going out of scope, a Swift `Task` being cancelled,
-/// a Python `asyncio.Task.cancel()`) would silently leak decode work
-/// into the background. The caller's next `generate*` call would block
-/// on the still-held mutex or observe state advanced by the "cancelled"
-/// call.
+/// Without this guard, a foreign-side cancellation (Kotlin coroutine
+/// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`) would
+/// silently leak decode work into the background. The caller's next
+/// `generate*` call would block on the still-held mutex or observe
+/// state advanced by the "cancelled" call.
 ///
-/// The guard closes that loop: on future-drop, call `session.cancel()`
-/// so the decode loop sees the flag at its next between-token check
-/// and exits with `FinishReason::Cancelled`. The blocking worker then
-/// releases the mutex and the task completes normally (its discarded
-/// output is harmless). Next call sees a clean session.
+/// Two code paths, two mitigations — both fire together because the
+/// guard can't know which path applies:
 ///
-/// `wick::Session::generate` resets `cancel` at the start of every
-/// call, so a spuriously-armed cancel (e.g. if the guard drops right
-/// after the await resolves but before disarm — not possible in
-/// practice since futures aren't preemptively dropped between
-/// synchronous statements) wouldn't affect the next call.
+/// 1. **Running decode.** The task is executing `wick::Session::generate`
+///    on a blocking worker. `session.cancel()` flips the cancel atomic;
+///    the decode loop polls it between tokens and exits with
+///    `FinishReason::Cancelled`. `JoinHandle::abort` has no effect
+///    here — `spawn_blocking` tasks are opaque synchronous code with
+///    no await points to interrupt.
+///
+/// 2. **Queued decode.** The task is in the blocking pool's queue
+///    waiting for a worker (pool saturated, or just hasn't been
+///    scheduled). `JoinHandle::abort` cancels queued-but-not-started
+///    blocking tasks before their closure runs — the closure never
+///    executes, so `wick::Session::generate` never starts, so the
+///    session's cancel flag is never reset. Without this, the race is:
+///    guard sets cancel → task eventually dequeues → decode's first
+///    line clears cancel back to `false` (`wick/src/session.rs:603-605`)
+///    → decode runs to completion despite the caller having dropped
+///    the future.
+///
+/// Both operations are idempotent / harmless on the irrelevant path:
+/// `session.cancel()` on a queued task is overridden by `abort`; an
+/// already-completed task ignores both. `wick::Session::generate`
+/// resets the cancel atomic on entry, so a spurious late-arriving
+/// cancel from a guard that dropped just after the await resolved
+/// (not reachable in practice — futures aren't preemptively dropped
+/// between synchronous statements) wouldn't affect the next call.
 struct AsyncCancelGuard {
     session: Arc<Session>,
+    /// Abort handle for the `spawn_blocking` task. Calling `abort()`
+    /// on a queued task removes it from the pool's queue; on a running
+    /// task it's a no-op (no await point to unwind through). Kept as
+    /// an `AbortHandle` rather than a `JoinHandle` so the guard can
+    /// coexist with the outer `.await` on the same handle (we take
+    /// `abort_handle()` before awaiting).
+    abort: tokio::task::AbortHandle,
     /// `true` until the await successfully resolves. Dropping with
-    /// `armed = true` means we're being dropped mid-await: fire cancel.
+    /// `armed = true` means we're being dropped mid-await: fire both
+    /// abort (for queued-but-not-started) and cancel (for in-flight).
     armed: bool,
 }
 
 impl Drop for AsyncCancelGuard {
     fn drop(&mut self) {
         if self.armed {
+            self.abort.abort();
             self.session.cancel();
         }
     }
@@ -804,15 +829,17 @@ impl Session {
     /// worker so the caller's async context isn't stalled by the
     /// synchronous decode loop.
     ///
-    /// Cancellation: dropping the returned future (e.g. Kotlin
-    /// coroutine scope cancellation, Swift `Task.cancel`, Python
-    /// `asyncio.Task.cancel`) calls [`Session::cancel`] on drop, so
-    /// the background decode exits with [`FinishReason::Cancelled`]
-    /// at its next between-token check. The blocking worker then
-    /// releases the session mutex; subsequent calls see a clean
-    /// session. You can also call [`Session::cancel`] directly from
-    /// any thread to trigger the same exit without dropping the
-    /// future.
+    /// Cancellation: dropping the returned future (Kotlin coroutine
+    /// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`)
+    /// triggers both an abort of the queued `spawn_blocking` task (so
+    /// a not-yet-started decode never runs) and a
+    /// [`Session::cancel`] call (so an in-flight decode exits at its
+    /// next between-token check with [`FinishReason::Cancelled`]).
+    /// Either path releases the session mutex; subsequent calls see
+    /// a clean session. You can also call [`Session::cancel`]
+    /// directly from any thread to trigger the same in-flight exit
+    /// without dropping the future. See [`AsyncCancelGuard`] for the
+    /// full rationale.
     ///
     /// On error the wrapper performs the same poisoned-mutex handling
     /// as sync [`Session::generate`]. `JoinError` from a panic in the
@@ -822,11 +849,13 @@ impl Session {
         self: Arc<Self>,
         opts: GenerateOpts,
     ) -> Result<GenerateOutput, FfiError> {
+        let session_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.generate(opts));
         let mut guard = AsyncCancelGuard {
-            session: Arc::clone(&self),
+            session: session_for_guard,
+            abort: handle.abort_handle(),
             armed: true,
         };
-        let handle = tokio::task::spawn_blocking(move || self.generate(opts));
         let join_result = handle.await;
         guard.armed = false;
         join_result.map_err(|e| FfiError::Backend {
@@ -849,23 +878,27 @@ impl Session {
     /// backed and safe to invoke from any thread (including from
     /// inside a callback).
     ///
-    /// Cancellation: dropping the returned future fires
-    /// [`Session::cancel`] on drop (same RAII guard as
-    /// [`Session::generate_async`]). The decode exits with
-    /// [`FinishReason::Cancelled`]; the sink's `on_done` fires on
-    /// the blocking worker before the task completes, so foreign
-    /// consumers get the terminal signal even though they've already
-    /// stopped awaiting.
+    /// Cancellation: dropping the returned future fires the same
+    /// abort + [`Session::cancel`] pair as [`Session::generate_async`]
+    /// (see [`AsyncCancelGuard`]). For an in-flight decode, the loop
+    /// exits with [`FinishReason::Cancelled`] and the sink's `on_done`
+    /// fires on the blocking worker before the task completes —
+    /// foreign consumers get the terminal signal even though they've
+    /// already stopped awaiting. For a queued-but-not-started decode,
+    /// abort cancels the task without ever running the closure; no
+    /// sink callbacks fire for that case (the decode never began).
     pub async fn generate_streaming_async(
         self: Arc<Self>,
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
+        let session_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink));
         let mut guard = AsyncCancelGuard {
-            session: Arc::clone(&self),
+            session: session_for_guard,
+            abort: handle.abort_handle(),
             armed: true,
         };
-        let handle = tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink));
         let join_result = handle.await;
         guard.armed = false;
         join_result.map_err(|e| FfiError::Backend {
