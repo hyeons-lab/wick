@@ -95,4 +95,5 @@ jobs:
           cargo test -p wick --features remote \
             --test shift_real_model \
             --test bundle_download \
+            --test bundle_from_id \
             -- --ignored

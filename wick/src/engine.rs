@@ -276,6 +276,42 @@ impl WickEngine {
         Self::from_manifest_with_primary(manifest, files.model.as_path(), cfg)
     }
 
+    /// Load from a LeapBundles ID + quantization selector, e.g.
+    /// `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", cfg)`.
+    ///
+    /// Resolves to
+    /// `https://huggingface.co/LiquidAI/LeapBundles/resolve/main/{bundle_id}/{quant}.json`,
+    /// downloads + caches it via `cfg.bundle_repo`, then loads the
+    /// engine through the normal manifest path — which in turn fetches
+    /// the GGUF (also via `bundle_repo`) since the manifest's model URL
+    /// is an `http(s)://` reference to the model's own HF repo.
+    ///
+    /// `cfg.bundle_repo` **must** be set; otherwise this returns an
+    /// error telling the caller to set it. Requires both `remote` and
+    /// `mmap` features.
+    #[cfg(all(feature = "remote", feature = "mmap"))]
+    pub fn from_bundle_id(
+        bundle_id: &str,
+        quant: &str,
+        cfg: EngineConfig,
+    ) -> Result<Self, WickError> {
+        let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
+            WickError::Backend(
+                "`WickEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set — \
+                 construct a `BundleRepo` rooted at your desired store directory and assign it \
+                 before calling this constructor."
+                    .to_string(),
+            )
+        })?;
+        let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, quant)?;
+        // No caller-supplied hash for manifest JSONs (LeapBundles schema
+        // doesn't carry one, and the file is tiny — etag fallback is
+        // sufficient). Manifest-level per-file hashes, when they land,
+        // would be threaded through from inside `from_manifest_file`.
+        let manifest_path = repo.resolve_url(&manifest_url, None)?;
+        Self::from_manifest_file(&manifest_path, cfg)
+    }
+
     // --- internal constructors ---
 
     /// Core assembly: take a pre-constructed `GgufFile` + parsed
@@ -320,11 +356,11 @@ impl WickEngine {
 
     #[cfg(feature = "mmap")]
     fn from_manifest_file(path: &Path, cfg: EngineConfig) -> Result<Self, WickError> {
-        let manifest = Manifest::from_file(path).map_err(|e| {
+        let mut manifest = Manifest::from_file(path).map_err(|e| {
             WickError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
         })?;
-        let manifest_dir = path.parent().map(Path::to_path_buf);
-        let primary = resolve_primary_model_path(&manifest, manifest_dir.as_deref(), &cfg)?;
+        resolve_all_manifest_files(&mut manifest, path.parent(), &cfg)?;
+        let primary = PathBuf::from(&manifest.files.model);
         Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
 
@@ -352,8 +388,9 @@ impl WickEngine {
     /// from the synthetic manifest and dispatches through
     /// [`Self::from_manifest_with_primary`].
     #[cfg(feature = "mmap")]
-    fn from_manifest(manifest: Manifest, cfg: EngineConfig) -> Result<Self, WickError> {
-        let primary = resolve_primary_model_path(&manifest, None, &cfg)?;
+    fn from_manifest(mut manifest: Manifest, cfg: EngineConfig) -> Result<Self, WickError> {
+        resolve_all_manifest_files(&mut manifest, None, &cfg)?;
+        let primary = PathBuf::from(&manifest.files.model);
         Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
 
@@ -445,23 +482,54 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, WickError> {
     }
 }
 
-/// Resolve the manifest's primary model reference to a local filesystem
-/// path. With the `remote` feature + an `EngineConfig::bundle_repo`, an
-/// `http(s)://` URL is fetched-and-cached via `BundleRepo`; otherwise
-/// remote URLs return an error pointing the caller at the feature and
-/// config field. Relative paths resolve against `manifest_dir` when
-/// provided (for on-disk manifests loaded via `from_manifest_file`).
+/// Resolve every file reference in `manifest.files` to a local path,
+/// rewriting the manifest's URL/path strings in place. A remote
+/// `http(s)://` URL is downloaded + cached via `EngineConfig::bundle_repo`
+/// (with the `remote` feature); a relative path is joined against
+/// `manifest_dir` when provided; an absolute path is kept as-is.
 ///
-/// Gated on `mmap` — the only callers are `from_manifest_with_primary`
-/// and `from_manifest` (both `mmap`-only). `from_bytes` / `from_reader`
-/// skip path resolution entirely.
+/// Fields walked (in declaration order):
+/// - `files.model` (required)
+/// - `files.multimodal_projector` (optional — VL + audio bundles)
+/// - `files.audio_decoder` (optional — audio-out bundles)
+/// - `files.audio_tokenizer` (optional — audio-in bundles)
+/// - `files.extras` (every entry — forward-compat aux roles)
+///
+/// Consumers downstream of the loader (audio pipeline, VL loader, etc.)
+/// read back from `engine.manifest().files.*` and expect local paths,
+/// so every URL must be rewritten before we hand the manifest on.
+///
+/// Gated on `mmap` — the callers (`from_manifest_file`, `from_manifest`)
+/// are both `mmap`-only. `from_bytes` / `from_reader` skip path
+/// resolution entirely since they receive bytes.
 #[cfg(feature = "mmap")]
-fn resolve_primary_model_path(
-    manifest: &Manifest,
+fn resolve_all_manifest_files(
+    manifest: &mut Manifest,
     manifest_dir: Option<&Path>,
     cfg: &EngineConfig,
-) -> Result<PathBuf, WickError> {
-    resolve_url_or_path(&manifest.files.model, manifest_dir, cfg)
+) -> Result<(), WickError> {
+    manifest.files.model = resolve_url_or_path(&manifest.files.model, manifest_dir, cfg)?
+        .to_string_lossy()
+        .into_owned();
+
+    for slot in [
+        &mut manifest.files.multimodal_projector,
+        &mut manifest.files.audio_decoder,
+        &mut manifest.files.audio_tokenizer,
+    ] {
+        if let Some(s) = slot.as_ref() {
+            let resolved = resolve_url_or_path(s, manifest_dir, cfg)?;
+            *slot = Some(resolved.to_string_lossy().into_owned());
+        }
+    }
+
+    for value in manifest.files.extras.values_mut() {
+        *value = resolve_url_or_path(value, manifest_dir, cfg)?
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "mmap")]
@@ -954,6 +1022,89 @@ mod tests {
         let base = PathBuf::from("/models/bundles");
         let got = resolve_url_or_path("/opt/foo.gguf", Some(&base), &cfg).unwrap();
         assert_eq!(got, PathBuf::from("/opt/foo.gguf"));
+    }
+
+    /// Regression guard: the resolver must touch every file field, not
+    /// just `files.model`. Previously `resolve_primary_model_path` only
+    /// handled the primary, silently leaving audio / VL / extras
+    /// fields as raw URLs — which then broke downstream consumers.
+    #[test]
+    fn resolve_all_manifest_files_walks_every_field() {
+        use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
+
+        let base = PathBuf::from("/models/bundles");
+        let mut extras = std::collections::HashMap::new();
+        extras.insert("cover_art".to_string(), "cover.png".to_string());
+        extras.insert("config".to_string(), "/abs/config.toml".to_string());
+
+        let mut manifest = Manifest {
+            inference_type: InferenceType::LlamaCppLfm2AudioV1,
+            schema_version: "1.0.0".to_string(),
+            files: ManifestFiles {
+                model: "model.gguf".to_string(),
+                multimodal_projector: Some("mmproj.gguf".to_string()),
+                audio_decoder: Some("decoder.gguf".to_string()),
+                audio_tokenizer: Some("tokenizer.safetensors".to_string()),
+                extras,
+            },
+            chat_template: None,
+            generation_defaults: GenerationDefaults::Other {
+                raw: serde_json::Value::Null,
+            },
+            raw: serde_json::Value::Null,
+        };
+
+        let cfg = EngineConfig::default();
+        resolve_all_manifest_files(&mut manifest, Some(&base), &cfg).unwrap();
+
+        assert_eq!(manifest.files.model, "/models/bundles/model.gguf");
+        assert_eq!(
+            manifest.files.multimodal_projector.as_deref(),
+            Some("/models/bundles/mmproj.gguf")
+        );
+        assert_eq!(
+            manifest.files.audio_decoder.as_deref(),
+            Some("/models/bundles/decoder.gguf")
+        );
+        assert_eq!(
+            manifest.files.audio_tokenizer.as_deref(),
+            Some("/models/bundles/tokenizer.safetensors")
+        );
+        assert_eq!(
+            manifest.files.extras.get("cover_art").map(String::as_str),
+            Some("/models/bundles/cover.png")
+        );
+        // Absolute extras stay absolute.
+        assert_eq!(
+            manifest.files.extras.get("config").map(String::as_str),
+            Some("/abs/config.toml")
+        );
+    }
+
+    #[test]
+    fn resolve_all_manifest_files_none_optionals_stay_none() {
+        use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
+        let mut manifest = Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".to_string(),
+            files: ManifestFiles {
+                model: "/abs/model.gguf".to_string(),
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                extras: std::collections::HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: GenerationDefaults::Other {
+                raw: serde_json::Value::Null,
+            },
+            raw: serde_json::Value::Null,
+        };
+        let cfg = EngineConfig::default();
+        resolve_all_manifest_files(&mut manifest, None, &cfg).unwrap();
+        assert!(manifest.files.multimodal_projector.is_none());
+        assert!(manifest.files.audio_decoder.is_none());
+        assert!(manifest.files.audio_tokenizer.is_none());
     }
 
     #[test]
