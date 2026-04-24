@@ -441,10 +441,20 @@ impl Session {
     ///
     /// **Current status (Phase 1.x scaffold):** the API is locked in
     /// for FFI surface-freeze reasons, but the actual audio-tokenizer
-    /// wiring lands in a follow-up PR. Today this always returns
-    /// [`WickError::UnsupportedModality`] regardless of the loaded
-    /// model; capability reporting via [`Session::capabilities`] still
-    /// reflects the model accurately so callers can gate on it.
+    /// wiring lands in a follow-up PR. Two distinct error modes:
+    ///
+    /// - When the loaded model **does not** support audio input
+    ///   ([`Session::capabilities`]`.audio_in == false`):
+    ///   [`WickError::UnsupportedModality`] — structurally unfixable by
+    ///   the caller; they need a different model.
+    /// - When the model **does** support audio input but the Session
+    ///   wiring isn't in place yet: [`WickError::Backend`] with a
+    ///   message pointing at [`crate::audio_engine::generate_audio`] as
+    ///   the interim driver. Caller can switch code paths.
+    ///
+    /// Distinguishing the two matters for FFI consumers gating UI on
+    /// the error — one is a hard "model can't do this," the other is
+    /// "wick can't do this yet."
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), WickError> {
         let _ = samples;
         let _ = sample_rate;
@@ -455,7 +465,12 @@ impl Session {
         // isn't wired through Session yet. Callers that need audio
         // input today should drive it through the existing
         // `wick::audio_engine::generate_audio` free function.
-        Err(WickError::UnsupportedModality)
+        Err(WickError::Backend(
+            "Session::append_audio is not yet implemented for audio-capable models — \
+             drive `wick::audio_engine::generate_audio` directly until the \
+             Session-side audio-tokenizer wiring lands"
+                .to_string(),
+        ))
     }
 
     /// Append raw token IDs, running a prefill pass from the current position

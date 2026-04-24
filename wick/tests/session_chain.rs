@@ -25,9 +25,14 @@ use wick::{
 /// Test-local helper: wrap a freshly-loaded `(model, tokenizer)` pair
 /// in the `Arc`s that `Session::new` now requires post-lifetime-refactor.
 /// Collapses what would otherwise be three `Arc::from`/`Arc::new` calls
-/// at every test site. All tests here load a plain text LFM2, so
-/// capabilities pin to `text_only()`; audio / VL tests would pass
-/// something else.
+/// at every test site.
+///
+/// Every test in this file exercises the text-in / text-out path only
+/// (`find_model()`'s default falls back to the LFM2-VL GGUF because
+/// that's what the host has handy, but these tests never feed it an
+/// image). Pinning capabilities to `text_only()` reflects what the
+/// tests exercise, not the underlying model's full capabilities — a VL
+/// or audio test would pass the matching constructor.
 fn make_session(model: Box<dyn Model>, tokenizer: BpeTokenizer, config: SessionConfig) -> Session {
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
