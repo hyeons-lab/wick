@@ -17,19 +17,31 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # standard `uniffi-bindgen generate --library <dylib> --language <lang>`
 # CLI is available in-repo. Invoked from `just bindings` + CI; see
 # `wick-ffi/README.md`.
+#
+# `required-features = ["bindgen"]` is the load-bearing bit: it keeps
+# the `uniffi/cli` dep (clap + friends) out of every cdylib / staticlib
+# consumer's build. Mobile consumers (Android cdylib, iOS staticlib)
+# never run the CLI; there's no reason to pull clap through their
+# binary. `cargo run -p wick-ffi --bin uniffi-bindgen --features
+# bindgen -- ...` is the full invocation. The justfile recipe +
+# CI job both pass the flag.
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Opt-in crate feature that lights up the `uniffi/cli` feature. Only
+# needed by the `uniffi-bindgen` binary target; library consumers
+# (including the `cdylib` / `staticlib` targets used by mobile builds)
+# don't need it and shouldn't pay for the extra dep cost.
+bindgen = ["uniffi/cli"]
 
 [dependencies]
 # `tokio` feature activates the `async_runtime = "tokio"` export path
 # — required for the `async fn` methods on `Session` that offload the
 # synchronous decode loop to a blocking worker.
-# `cli` feature gates `uniffi::uniffi_bindgen_main()` — the entry point
-# used by the `uniffi-bindgen` binary target above. Without it the
-# binary won't compile in 0.31 (the CLI scaffolding moved behind the
-# feature flag so library-only consumers don't pay for clap etc.).
-uniffi = { workspace = true, features = ["tokio", "cli"] }
+uniffi = { workspace = true, features = ["tokio"] }
 # `FfiError` derives `thiserror::Error` so `WickError` messages can
 # flow through the FFI boundary unchanged. Already a workspace dep.
 thiserror.workspace = true

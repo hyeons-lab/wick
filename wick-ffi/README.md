@@ -67,6 +67,24 @@ just bindings
 git add wick-ffi/bindings && git commit
 ```
 
+Manual invocation (without `just`) — note `--features bindgen` to
+turn on `uniffi/cli`; the binary target's `required-features`
+enforces it:
+
+```bash
+cargo build -p wick-ffi
+cargo run -p wick-ffi --bin uniffi-bindgen --features bindgen -- \
+    generate --library target/debug/libwick_ffi.dylib \
+    --language kotlin --out-dir wick-ffi/bindings/kotlin
+cargo run -p wick-ffi --bin uniffi-bindgen --features bindgen -- \
+    generate --library target/debug/libwick_ffi.dylib \
+    --language swift --out-dir wick-ffi/bindings/swift
+```
+
+Mobile library consumers (Android `cdylib`, iOS `staticlib`) build
+without the `bindgen` feature so `uniffi/cli` (clap + friends) stays
+out of their binaries.
+
 `just bindings` requires `ktlint` on `PATH` (macOS: `brew install
 ktlint`; Linux: `curl` the standalone binary from the ktlint releases
 page). Without ktlint the generator will warn and emit unformatted
