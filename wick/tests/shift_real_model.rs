@@ -35,6 +35,8 @@
 //! On CI, the download is cached under `target/tmp/wick-test-models/`
 //! so repeat runs pay only an HTTP HEAD probe.
 
+#![cfg(feature = "remote")]
+
 mod common;
 
 use std::sync::Arc;
@@ -105,6 +107,7 @@ fn shift_runs_through_real_model() {
         EngineConfig {
             context_size: CTX,
             backend: BackendPreference::Cpu,
+            ..Default::default()
         },
     )
     .expect("load engine");

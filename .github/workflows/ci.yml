@@ -81,12 +81,18 @@ jobs:
           path: target/tmp/wick-test-models
           # Bump the key suffix to invalidate after model-file changes.
           key: wick-test-models-lfm2-1.2b-q4_0-v1
-      # NOTE: targeted to the `shift_real_model` binary only.
+      # NOTE: targeted to the download-gated test binaries only.
       # `cargo test -- --ignored` without `--test` would sweep every
       # #[ignore]'d test in the workspace (Metal microbenchmarks,
       # parity tests requiring WICK_TEST_MODEL, etc.), most of which
-      # don't belong on an Ubuntu CI runner.
-      - name: Run gated integration test
+      # don't belong on an Ubuntu CI runner. `--features remote` is
+      # required — the bundle downloader + `tests/common/download.rs`
+      # shim both live behind that feature.
+      - name: Run gated integration tests
         env:
           WICK_TEST_DOWNLOAD: "1"
-        run: cargo test -p wick --test shift_real_model -- --ignored
+        run: |
+          cargo test -p wick --features remote \
+            --test shift_real_model \
+            --test bundle_download \
+            -- --ignored
