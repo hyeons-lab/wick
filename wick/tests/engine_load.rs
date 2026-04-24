@@ -58,12 +58,25 @@ fn from_path_rejects_remote_model_url() {
 
     let err = expect_err(
         WickEngine::from_path(&manifest, cpu_cfg()),
-        "remote URL must be rejected until Phase 1.6",
+        "remote URL must be rejected without a BundleRepo",
     );
     let msg = format!("{err}");
+    // Error must name the problem (remote URL) and steer the caller at
+    // the fix. Without `remote` feature → point at enabling it; with it
+    // on → point at the `bundle_repo` config field.
     assert!(
-        msg.contains("remote URL") && msg.contains("Phase 1.6"),
-        "error should point at BundleRepo follow-up; got `{msg}`"
+        msg.contains("remote URL"),
+        "error should name the remote URL; got `{msg}`"
+    );
+    #[cfg(feature = "remote")]
+    assert!(
+        msg.contains("bundle_repo"),
+        "error under `remote` feature should name the config field; got `{msg}`"
+    );
+    #[cfg(not(feature = "remote"))]
+    assert!(
+        msg.contains("`remote` feature"),
+        "error without `remote` feature should point at enabling it; got `{msg}`"
     );
     // The typed variant: Backend(_) with the remote-URL message lives
     // behind Backend; not a dedicated variant.
@@ -182,7 +195,15 @@ fn from_path_directory_dispatches_single_manifest() {
         WickEngine::from_path(dir.path(), cpu_cfg()),
         "directory-with-remote-manifest must still reject the remote URL",
     );
-    assert!(format!("{err}").contains("Phase 1.6"));
+    // After PR A lands BundleRepo, the error still fires when no
+    // `bundle_repo` is configured; the message no longer name-checks
+    // "Phase 1.6" (the feature shipped), but it names "remote URL" and
+    // the fix path. Assert the essentials.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("remote URL"),
+        "directory-with-remote error should name the remote URL; got `{msg}`"
+    );
 }
 
 #[test]
