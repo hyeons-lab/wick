@@ -1,6 +1,6 @@
 //! Audio-aware generation loop with text ↔ audio modality switching.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -57,6 +57,154 @@ enum Modality {
     Audio,
 }
 
+// ---------------------------------------------------------------------------
+// AudioOutputDecoder
+// ---------------------------------------------------------------------------
+
+/// Per-frame outcome from [`AudioOutputDecoder::decode_frame`].
+enum FrameOutcome {
+    /// Codes sampled + detokenized; `audio_embedding` is the feedback
+    /// embedding the caller should pass back through the main LLM.
+    Codes { audio_embedding: Vec<f32> },
+    /// Audio stream terminated (`codes[0] == AUDIO_END_CODE`). No
+    /// spectrum produced for this frame; caller should return control
+    /// to the text modality per its mode's exit convention.
+    End,
+}
+
+/// Owns the audio output-decoder state and exposes per-frame operations.
+/// Extracted from `generate_audio` so the same per-frame logic is shared
+/// between the Sequential and Interleaved paths and so future decoder
+/// variants can slot in behind a common interface.
+///
+/// External `generate_audio` signature is unchanged; this is a purely
+/// internal refactor.
+struct AudioOutputDecoder<'a> {
+    weights: &'a AudioDecoderWeights,
+    detok_weights: &'a DetokenizerWeights,
+    gpu: Option<&'a dyn AudioGpu>,
+    df_state: DepthformerState,
+    detok_state: DetokenizerState,
+    /// Accumulated spectrum across the entire generate_audio call.
+    /// Flushed by `finish()` via a single ISTFT pass — per-frame ISTFT
+    /// would produce discontinuities from fresh overlap buffers.
+    all_spectrum: Vec<f32>,
+    audio_frames: usize,
+    time_depthformer: Duration,
+    time_detokenizer: Duration,
+    audio_temperature: f32,
+    audio_top_k: usize,
+    /// Precomputed: `gpu.is_some() && config.gpu_depthformer`.
+    use_gpu_df: bool,
+}
+
+impl<'a> AudioOutputDecoder<'a> {
+    fn new(
+        weights: &'a AudioDecoderWeights,
+        detok_weights: &'a DetokenizerWeights,
+        gpu: Option<&'a dyn AudioGpu>,
+        audio_temperature: f32,
+        audio_top_k: usize,
+        gpu_depthformer: bool,
+    ) -> Self {
+        // One-shot GPU reset so repeated generate_audio calls don't leak
+        // state across invocations.
+        if let Some(g) = gpu {
+            g.reset_detokenizer();
+            g.reset_depthformer();
+        }
+        let df_state = DepthformerState::new(&weights.depthformer_config);
+        let detok_state = DetokenizerState::new(&detok_weights.config);
+        Self {
+            weights,
+            detok_weights,
+            gpu,
+            df_state,
+            detok_state,
+            all_spectrum: Vec::new(),
+            audio_frames: 0,
+            time_depthformer: Duration::ZERO,
+            time_detokenizer: Duration::ZERO,
+            audio_temperature,
+            audio_top_k,
+            use_gpu_df: gpu_depthformer && gpu.is_some(),
+        }
+    }
+
+    /// Sample one audio frame via depthformer, detect end-of-stream,
+    /// detokenize into spectrum, and produce the feedback embedding the
+    /// caller feeds back through the main LLM.
+    ///
+    /// `embed` is the main LLM's hidden state / embedding to condition
+    /// this frame on (the audio_start token embedding on the first
+    /// frame, or the prior frame's feedback embedding afterward).
+    fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
+        let t0 = Instant::now();
+        let codes = if self.use_gpu_df {
+            let g = self
+                .gpu
+                .expect("use_gpu_df implies gpu is Some (set at construction)");
+            g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
+        } else {
+            sample_audio_frame(
+                self.weights,
+                &mut self.df_state,
+                embed,
+                self.audio_temperature,
+                self.audio_top_k,
+            )
+        };
+        self.time_depthformer += t0.elapsed();
+
+        if codes[0] == AUDIO_END_CODE {
+            return FrameOutcome::End;
+        }
+
+        let t1 = Instant::now();
+        let spectrum = if let Some(g) = self.gpu {
+            g.detokenize_to_spectrum(self.detok_weights, &codes)
+        } else {
+            detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                &codes,
+            )
+        };
+        self.time_detokenizer += t1.elapsed();
+        self.all_spectrum.extend_from_slice(&spectrum);
+        self.audio_frames += 1;
+
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+        FrameOutcome::Codes { audio_embedding }
+    }
+
+    /// Drain the accumulated spectrum through a single ISTFT pass and
+    /// emit the resulting PCM via `sink`. Returns the PCM sample count.
+    /// A single end-of-generation ISTFT (rather than per-frame) avoids
+    /// discontinuities from fresh overlap buffers.
+    fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+        if self.all_spectrum.is_empty() {
+            return 0;
+        }
+        let pcm = istft_to_pcm(
+            &self.all_spectrum,
+            self.detok_weights.config.n_fft,
+            self.detok_weights.config.hop_length,
+        );
+        if pcm.is_empty() {
+            return 0;
+        }
+        let n = pcm.len();
+        sink(&pcm, self.detok_weights.config.sample_rate as u32);
+        n
+    }
+}
+
+// ---------------------------------------------------------------------------
+// generate_audio
+// ---------------------------------------------------------------------------
+
 /// Generate text + audio from a model with vocoder.
 ///
 /// `gpu`: optional GPU backend for depthformer + detokenizer acceleration.
@@ -77,22 +225,16 @@ pub fn generate_audio(
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config);
     let mut sampler = Sampler::new(config.sampler.clone());
-    let mut df_state = DepthformerState::new(&decoder_weights.depthformer_config);
-    let mut detok_state = DetokenizerState::new(&detok_weights.config);
-
-    // Reset GPU backend to ensure clean state across calls.
-    if let Some(g) = gpu {
-        g.reset_detokenizer();
-        g.reset_depthformer();
-    }
-
-    // Accumulate all spectrum data for a single ISTFT pass at the end.
-    // This avoids discontinuities from per-frame ISTFT with fresh overlap buffers.
-    let mut all_spectrum = Vec::new();
+    let mut decoder = AudioOutputDecoder::new(
+        decoder_weights,
+        detok_weights,
+        gpu,
+        config.audio_temperature,
+        config.audio_top_k,
+        config.gpu_depthformer,
+    );
 
     let start = Instant::now();
-    let mut time_depthformer = std::time::Duration::ZERO;
-    let mut time_detokenizer = std::time::Duration::ZERO;
 
     // Prefill.
     let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
@@ -100,8 +242,6 @@ pub fn generate_audio(
     let mut modality = Modality::Text;
     let mut generated = 0usize;
     let mut text_tokens = 0usize;
-    let mut audio_frames = 0usize;
-    let mut audio_samples = 0usize;
     let mut pos = prompt_tokens.len();
 
     // Interleaved mode counters.
@@ -179,46 +319,15 @@ pub fn generate_audio(
 
                 // Run audio loop with this embedding.
                 loop {
-                    let t0 = Instant::now();
-                    let use_gpu_df = gpu.is_some() && config.gpu_depthformer;
-                    let codes = if use_gpu_df {
-                        gpu.unwrap().sample_audio_frame(
-                            &emb,
-                            config.audio_temperature,
-                            config.audio_top_k,
-                        )
-                    } else {
-                        sample_audio_frame(
-                            decoder_weights,
-                            &mut df_state,
-                            &emb,
-                            config.audio_temperature,
-                            config.audio_top_k,
-                        )
+                    let outcome = decoder.decode_frame(&emb);
+                    let audio_emb = match outcome {
+                        FrameOutcome::End => {
+                            text_done = true;
+                            break;
+                        }
+                        FrameOutcome::Codes { audio_embedding } => audio_embedding,
                     };
-                    time_depthformer += t0.elapsed();
-                    if codes[0] == AUDIO_END_CODE {
-                        text_done = true;
-                        break;
-                    }
-
-                    let t1 = Instant::now();
-                    let spectrum = if let Some(g) = gpu {
-                        g.detokenize_to_spectrum(detok_weights, &codes)
-                    } else {
-                        detokenize_to_spectrum(
-                            detok_weights,
-                            decoder_weights,
-                            &mut detok_state,
-                            &codes,
-                        )
-                    };
-                    time_detokenizer += t1.elapsed();
-                    all_spectrum.extend_from_slice(&spectrum);
-                    audio_frames += 1;
                     modality_budget = modality_budget.saturating_sub(1);
-
-                    let audio_emb = embed_audio_token(decoder_weights, &codes);
 
                     if generated >= config.max_tokens || pos >= model_config.max_seq_len {
                         break;
@@ -257,51 +366,25 @@ pub fn generate_audio(
             generated += 1;
 
             loop {
-                let t0 = Instant::now();
-                let use_gpu_df = gpu.is_some() && config.gpu_depthformer;
-                let codes = if use_gpu_df {
-                    gpu.unwrap().sample_audio_frame(
-                        &emb,
-                        config.audio_temperature,
-                        config.audio_top_k,
-                    )
-                } else {
-                    sample_audio_frame(
-                        decoder_weights,
-                        &mut df_state,
-                        &emb,
-                        config.audio_temperature,
-                        config.audio_top_k,
-                    )
+                let outcome = decoder.decode_frame(&emb);
+                let audio_emb = match outcome {
+                    FrameOutcome::End => {
+                        modality = Modality::Text;
+                        text_done = true;
+                        modality_budget = match config.mode {
+                            AudioMode::Interleaved => 6,
+                            AudioMode::Sequential => usize::MAX,
+                        };
+                        logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                        next_token = sampler.sample(&mut logits);
+                        pos += 1;
+                        break;
+                    }
+                    FrameOutcome::Codes { audio_embedding } => audio_embedding,
                 };
-                time_depthformer += t0.elapsed();
-
-                if codes[0] == AUDIO_END_CODE {
-                    modality = Modality::Text;
-                    text_done = true;
-                    modality_budget = match config.mode {
-                        AudioMode::Interleaved => 6,
-                        AudioMode::Sequential => usize::MAX,
-                    };
-                    logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
-                    next_token = sampler.sample(&mut logits);
-                    pos += 1;
-                    break;
-                }
-
-                let t1 = Instant::now();
-                let spectrum = if let Some(g) = gpu {
-                    g.detokenize_to_spectrum(detok_weights, &codes)
-                } else {
-                    detokenize_to_spectrum(detok_weights, decoder_weights, &mut detok_state, &codes)
-                };
-                time_detokenizer += t1.elapsed();
-                all_spectrum.extend_from_slice(&spectrum);
-                audio_frames += 1;
                 modality_budget = modality_budget.saturating_sub(1);
 
                 // Feed codes back as embedding → next hidden state.
-                let audio_emb = embed_audio_token(decoder_weights, &codes);
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                 pos += 1;
                 generated += 1;
@@ -325,24 +408,14 @@ pub fn generate_audio(
     }
 
     // Batch ISTFT: all accumulated spectrum → PCM in one pass with proper overlap.
-    if !all_spectrum.is_empty() {
-        let pcm = istft_to_pcm(
-            &all_spectrum,
-            detok_weights.config.n_fft,
-            detok_weights.config.hop_length,
-        );
-        if !pcm.is_empty() {
-            audio_callback(&pcm, detok_weights.config.sample_rate as u32);
-            audio_samples = pcm.len();
-        }
-    }
+    let audio_samples = decoder.finish(&mut audio_callback);
 
     Ok(AudioGenerateResult {
         text_tokens,
-        audio_frames,
+        audio_frames: decoder.audio_frames,
         audio_samples,
         elapsed_secs: start.elapsed().as_secs_f64(),
-        depthformer_secs: time_depthformer.as_secs_f64(),
-        detokenizer_secs: time_detokenizer.as_secs_f64(),
+        depthformer_secs: decoder.time_depthformer.as_secs_f64(),
+        detokenizer_secs: decoder.time_detokenizer.as_secs_f64(),
     })
 }
