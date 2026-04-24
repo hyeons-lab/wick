@@ -233,9 +233,17 @@ impl BundleRepo {
     /// component). This is a pre-`PathBuf::push` filter — `PathBuf`
     /// itself is not a validator; an attacker-controlled URL must not
     /// be able to write outside the cache root.
+    ///
+    /// The **host** is lowercased before it becomes a cache-dir name so
+    /// URLs that differ only in host casing (per RFC 3986 §3.2.2,
+    /// hosts are case-insensitive) share a cache entry on
+    /// case-sensitive filesystems. Path segments stay as-is — they're
+    /// content-addressable and different casings can legitimately
+    /// resolve to different resources on the origin.
     fn path_for_url(&self, url: &str) -> Result<PathBuf, WickError> {
         let (host, path) = split_url(url)?;
-        validate_path_segment("url host", host)?;
+        let host_lower = host.to_ascii_lowercase();
+        validate_path_segment("url host", &host_lower)?;
 
         // Strip the leading `/` and any trailing query/fragment before
         // segmenting. `?` / `#` are URL syntax that don't belong in the
@@ -254,7 +262,7 @@ impl BundleRepo {
         }
 
         let mut out = self.store_dir.clone();
-        out.push(host);
+        out.push(&host_lower);
         for segment in path_no_qs.split('/') {
             validate_path_segment("url path segment", segment)?;
             out.push(segment);
@@ -351,16 +359,27 @@ fn validate_path_segment(kind: &str, segment: &str) -> Result<(), WickError> {
 }
 
 /// Minimal URL parser: extract `(host, path)` from `https://host/path`.
-/// We avoid pulling in a full `url` crate dep — this is the only URL
-/// handling `wick` needs and the shape we accept is narrow.
+/// Scheme comparison is case-insensitive (RFC 3986 §3.1) to match the
+/// case-insensitive check in `engine::is_remote_url` — otherwise a
+/// `HTTPS://…` URL would be accepted by the remote-URL gate but
+/// rejected here. We avoid pulling in a full `url` crate dep — this
+/// is the only URL handling `wick` needs and the shape we accept is
+/// narrow.
 fn split_url(url: &str) -> Result<(&str, &str), WickError> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| {
-            WickError::Backend(format!("url `{url}` must start with https:// or http://"))
-        })?;
-    let (host, path) = rest
+    // Case-insensitive scheme match: find the `://` and check the
+    // preceding label against our supported schemes.
+    let scheme_end = url.find("://").ok_or_else(|| {
+        WickError::Backend(format!("url `{url}` must start with https:// or http://"))
+    })?;
+    let scheme = &url[..scheme_end];
+    let lower = scheme.to_ascii_lowercase();
+    if lower != "http" && lower != "https" {
+        return Err(WickError::Backend(format!(
+            "url `{url}` must start with https:// or http://"
+        )));
+    }
+    let after_scheme = &url[scheme_end + 3..]; // skip "://"
+    let (host, path) = after_scheme
         .split_once('/')
         .ok_or_else(|| WickError::Backend(format!("url `{url}` has no path component")))?;
     if host.is_empty() {
@@ -368,7 +387,10 @@ fn split_url(url: &str) -> Result<(&str, &str), WickError> {
             "url `{url}` has empty host component"
         )));
     }
-    Ok((host, &url[url.len() - path.len() - 1..]))
+    // Return the path slice preserving its leading `/` so the caller
+    // can detect an empty path after trimming.
+    let path_start = url.len() - path.len() - 1;
+    Ok((host, &url[path_start..]))
 }
 
 #[cfg(test)]
@@ -401,6 +423,36 @@ mod tests {
     fn split_url_accepts_http_and_https() {
         assert!(split_url("http://example.com/x").is_ok());
         assert!(split_url("https://example.com/x").is_ok());
+    }
+
+    #[test]
+    fn split_url_scheme_is_case_insensitive() {
+        // Mixed-case schemes must be accepted (RFC 3986 §3.1) so we
+        // don't drift from `engine::is_remote_url`, which already
+        // does case-insensitive matching. Otherwise an `HTTPS://…`
+        // URL would pass the remote-URL gate but fail here.
+        assert!(split_url("HTTPS://example.com/x").is_ok());
+        assert!(split_url("Http://example.com/x").is_ok());
+        assert!(split_url("HTTP://example.com/x").is_ok());
+    }
+
+    #[test]
+    fn path_for_url_lowercases_host_for_cache_consistency() {
+        // Two URLs that differ only in host casing must share a cache
+        // entry — hosts are case-insensitive per RFC 3986 §3.2.2, but
+        // case-sensitive filesystems would otherwise double-cache.
+        let repo = BundleRepo::new("/tmp/store");
+        let a = repo
+            .path_for_url("https://HuggingFace.co/LiquidAI/M/x.gguf")
+            .unwrap();
+        let b = repo
+            .path_for_url("https://huggingface.co/LiquidAI/M/x.gguf")
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            PathBuf::from("/tmp/store/huggingface.co/LiquidAI/M/x.gguf")
+        );
     }
 
     #[test]

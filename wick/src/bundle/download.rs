@@ -248,9 +248,16 @@ pub(crate) fn download_to(
 
     // `fs::rename` on Windows fails if `dest` exists (POSIX would
     // silently replace). Remove first so cache invalidation + re-
-    // download works cross-platform.
+    // download works cross-platform. If the rename itself fails
+    // (cross-filesystem move, permission issue, etc.), clean up the
+    // partial before propagating — otherwise each retry leaves yet
+    // another `.partial.<pid>.<unique>` file on disk since the
+    // unique suffix means retries never overwrite.
     let _ = fs::remove_file(dest);
-    fs::rename(&partial, dest)?;
+    if let Err(e) = fs::rename(&partial, dest) {
+        let _ = fs::remove_file(&partial);
+        return Err(e.into());
+    }
     // Persist the sidecar hash so subsequent cache hits can skip
     // rehashing a multi-GB GGUF. Best-effort; write failure only
     // costs us one rehash on the next resolve.
