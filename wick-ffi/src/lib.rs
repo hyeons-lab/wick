@@ -299,6 +299,17 @@ impl From<KvCompression> for wick::kv_cache::KvCompression {
     }
 }
 
+impl From<wick::kv_cache::KvCompression> for KvCompression {
+    fn from(c: wick::kv_cache::KvCompression) -> Self {
+        match c {
+            wick::kv_cache::KvCompression::None => KvCompression::None,
+            wick::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
+                KvCompression::TurboQuant { seed, keys, values }
+            }
+        }
+    }
+}
+
 /// Per-session configuration. Mirrors [`wick::SessionConfig`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SessionConfig {
@@ -319,17 +330,12 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         // Delegate to `wick::SessionConfig::default()` so the defaults
-        // stay in one place; convert `kv_compression` through our
-        // wrapper enum.
+        // stay in one place; `kv_compression` flows through the
+        // wrapper's `From` impl (both directions live above).
         let core = wick::SessionConfig::default();
         Self {
             max_seq_len: core.max_seq_len,
-            kv_compression: match core.kv_compression {
-                wick::kv_cache::KvCompression::None => KvCompression::None,
-                wick::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
-                    KvCompression::TurboQuant { seed, keys, values }
-                }
-            },
+            kv_compression: core.kv_compression.into(),
             n_keep: core.n_keep,
             seed: core.seed,
             ubatch_size: core.ubatch_size,
@@ -485,25 +491,43 @@ pub struct Session {
     capabilities: ModalityCapabilities,
 }
 
+impl Session {
+    /// Lock the inner session, converting `PoisonError` into
+    /// `FfiError::Backend` instead of panicking. `expect` on a
+    /// poisoned mutex would propagate as a panic across the FFI
+    /// boundary — Kotlin / Swift / Python callers see that as an
+    /// uncatchable abort of the host process, which is unusable in
+    /// production. Returning an error lets callers decide whether to
+    /// retry, reset, or surface the failure.
+    ///
+    /// A poisoned mutex here means a prior session method panicked
+    /// while holding the lock — the session's internal state (KV
+    /// cache, sampler, position counters) is therefore in an unknown
+    /// state. The error message gives the caller enough context to
+    /// decide whether to reset or drop the session entirely.
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, wick::Session>, FfiError> {
+        self.inner.lock().map_err(|e| FfiError::Backend {
+            message: format!(
+                "session mutex poisoned (a prior call panicked mid-lock; session state is \
+                 inconsistent): {e}"
+            ),
+        })
+    }
+}
+
 #[uniffi::export]
 impl Session {
     /// Append raw text to the context, running a prefill over just
     /// the new tokens. `EmptyInput` error if `text` is empty.
     pub fn append_text(&self, text: String) -> Result<(), FfiError> {
-        self.inner
-            .lock()
-            .expect("session mutex poisoned")
-            .append_text(&text)?;
+        self.lock_inner()?.append_text(&text)?;
         Ok(())
     }
 
     /// Append pre-tokenized IDs. Useful when the caller has its own
     /// tokenizer + chat-template pipeline.
     pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError> {
-        self.inner
-            .lock()
-            .expect("session mutex poisoned")
-            .append_tokens(&tokens)?;
+        self.lock_inner()?.append_tokens(&tokens)?;
         Ok(())
     }
 
@@ -526,11 +550,7 @@ impl Session {
             fn on_done(&mut self, _reason: wick::FinishReason) {}
         }
         let mut sink = CollectSink(Vec::new());
-        let summary = self
-            .inner
-            .lock()
-            .expect("session mutex poisoned")
-            .generate(&opts.into(), &mut sink)?;
+        let summary = self.lock_inner()?.generate(&opts.into(), &mut sink)?;
         Ok(GenerateOutput {
             tokens: sink.0,
             summary: summary.into(),
@@ -555,8 +575,12 @@ impl Session {
     /// Drop cached state + resample the seed. After `reset()` the
     /// session behaves like a freshly-opened one (same
     /// model/tokenizer/config, no accumulated context).
-    pub fn reset(&self) {
-        self.inner.lock().expect("session mutex poisoned").reset();
+    ///
+    /// Returns `Result` so a poisoned-mutex case surfaces as an error
+    /// instead of panicking across the FFI boundary.
+    pub fn reset(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.reset();
+        Ok(())
     }
 
     /// Capabilities reported by the loaded model. Cheap — reads a
