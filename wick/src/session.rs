@@ -319,7 +319,7 @@ impl Session {
     /// for callers (tests, FFI wrappers) that want to encode / decode
     /// without threading the tokenizer through separately.
     pub fn tokenizer(&self) -> &BpeTokenizer {
-        &self.tokenizer
+        self.tokenizer.as_ref()
     }
 
     /// Borrow the model the session was constructed with. Primarily

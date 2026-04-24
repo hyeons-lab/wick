@@ -427,7 +427,7 @@ impl WickEngine {
 
     /// Borrow the tokenizer.
     pub fn tokenizer(&self) -> &BpeTokenizer {
-        &self.tokenizer
+        self.tokenizer.as_ref()
     }
 
     /// Shared refcounted handle to the tokenizer.
