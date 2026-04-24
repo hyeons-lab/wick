@@ -59,26 +59,40 @@ use crate::session::WickError;
 /// directory. Construction is cheap — create one per `WickEngine` at
 /// most, or pass the same instance to multiple engines.
 ///
-/// Holds a pooled `reqwest::blocking::Client` so `HEAD` + `GET` on the
-/// same URL can reuse a single TCP/TLS session instead of reconnecting
-/// for each call.
+/// Holds two pooled `reqwest::blocking::Client`s:
+/// - `http_client`: default redirect policy. Used for the `GET`
+///   streaming-download path so HF's 302 to the CDN is followed
+///   automatically.
+/// - `head_client`: redirects **disabled**. Used for `HEAD` probes so
+///   the code reads headers from HF's origin-hop 302 (which carries
+///   `X-Linked-Etag`, the content SHA-256). A redirect-following
+///   client would surface the CDN's unrelated `ETag` instead.
 #[derive(Clone, Debug)]
 pub struct BundleRepo {
     store_dir: PathBuf,
     http_client: Client,
+    head_client: Client,
 }
 
 impl BundleRepo {
     /// Create a new repo rooted at `store_dir`. The directory does not
     /// need to exist yet — it will be created on the first download.
     ///
-    /// The HTTP client is constructed with reqwest's defaults; per-
-    /// request timeouts override at the call site (30s for HEAD, 10min
-    /// for GET). `Client::new()` is infallible for rustls defaults.
+    /// Constructs two clients (see [`BundleRepo`] docs for the
+    /// redirect-policy split). Both use reqwest's defaults otherwise;
+    /// per-request timeouts override at the call site (30s for HEAD,
+    /// 10min for GET). `Client::builder().build()` panics only on
+    /// severe OS resource failure (can't create a Tokio runtime) —
+    /// documented failure mode, acceptable for a process-startup path.
     pub fn new(store_dir: impl Into<PathBuf>) -> Self {
+        let head_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build no-redirect reqwest client");
         Self {
             store_dir: store_dir.into(),
             http_client: Client::new(),
+            head_client,
         }
     }
 
@@ -122,17 +136,45 @@ impl BundleRepo {
             fs::create_dir_all(parent)?;
         }
 
-        if dest.exists() && self.cache_hit_valid(&dest, url, expected_sha256) {
+        // Probe HEAD once up front (no-redirect client so HF's
+        // `X-Linked-Etag` is captured from the first hop). Used both
+        // to validate a cached file and — on cache miss — to hand the
+        // server's advertised content hash to `download_to`, so the
+        // first download is integrity-verified even when the caller
+        // didn't pin a hash. Re-used across cache-hit and cache-miss
+        // code paths so we issue at most one HEAD per resolve.
+        let head = if expected_sha256.is_some() {
+            // Caller pinned a hash — no need to consult the server.
+            download::HeadInfo {
+                content_length: None,
+                linked_sha256: None,
+            }
+        } else {
+            download::head_info(&self.head_client, url)
+        };
+
+        if dest.exists() && self.cache_hit_valid(&dest, url, expected_sha256, &head) {
             return Ok(dest);
         }
+
+        // Prefer caller's hash; else use the server's linked-etag
+        // captured pre-redirect.
+        let download_hash = expected_sha256
+            .map(|s| s.to_ascii_lowercase())
+            .or_else(|| head.linked_sha256.clone());
 
         tracing::info!(
             target: "wick::bundle",
             url,
             dest = %dest.display(),
+            hash_source = match (expected_sha256.is_some(), head.linked_sha256.is_some()) {
+                (true, _) => "caller",
+                (false, true) => "x-linked-etag",
+                (false, false) => "unverified",
+            },
             "downloading bundle file"
         );
-        download::download_to(&self.http_client, url, &dest, expected_sha256)?;
+        download::download_to(&self.http_client, url, &dest, download_hash.as_deref())?;
         Ok(dest)
     }
 
@@ -140,23 +182,25 @@ impl BundleRepo {
     /// valid. Verification prefers caller-supplied hash, then etag via
     /// sidecar, then etag via full rehash, then size, then reuse-on-
     /// HEAD-failure. Any mismatch returns `false` → caller re-downloads.
-    fn cache_hit_valid(&self, dest: &Path, url: &str, expected_sha256: Option<&str>) -> bool {
-        // If the caller pinned a hash, use that as the expected value
-        // regardless of what the server advertises. Otherwise, probe
-        // HEAD to pick up an `X-Linked-Etag` (only called in this
-        // arm — redundant when we already have caller's hash).
-        let (expected_hash, content_length) = if let Some(h) = expected_sha256 {
-            (Some(h.to_ascii_lowercase()), None)
-        } else {
-            let head = download::head_info(&self.http_client, url);
-            (head.linked_sha256, head.content_length)
-        };
+    fn cache_hit_valid(
+        &self,
+        dest: &Path,
+        url: &str,
+        expected_sha256: Option<&str>,
+        head: &download::HeadInfo,
+    ) -> bool {
+        // Caller hash takes precedence over whatever the server
+        // advertised — lets manifest-level hashes override an etag
+        // that's been rotated.
+        let expected_hash = expected_sha256
+            .map(|s| s.to_ascii_lowercase())
+            .or_else(|| head.linked_sha256.clone());
 
         if let Some(exp_hash) = expected_hash {
             return hash_matches(dest, url, &exp_hash);
         }
 
-        if let Some(exp_len) = content_length {
+        if let Some(exp_len) = head.content_length {
             let actual = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
             if actual == exp_len {
                 return true;
@@ -171,7 +215,8 @@ impl BundleRepo {
             return false;
         }
 
-        // HEAD failed entirely — best-effort reuse.
+        // HEAD failed entirely — best-effort reuse so a transient
+        // outage doesn't defeat a CI cache hit.
         true
     }
 

@@ -13,8 +13,16 @@
 //!    Lets a caller (e.g. a manifest with per-file hashes) pin an exact
 //!    value regardless of what the server advertises.
 //! 2. **`X-Linked-Etag`**: HuggingFace serves LFS objects with an
-//!    `X-Linked-Etag: sha256:<hex>` header — content-addressed, stable
-//!    across revisions. Used as a fallback when the caller doesn't pin.
+//!    `X-Linked-Etag: sha256:<hex>` header. **Critical detail:** this
+//!    header is only present on the first-hop response (the 302
+//!    redirect from `huggingface.co`). The final CDN response after
+//!    the redirect carries a different `ETag` that is the CAS storage
+//!    key, NOT the file's content SHA-256. [`head_info`] therefore
+//!    uses a no-redirect client so it reads headers from the origin's
+//!    302. `BundleRepo::resolve_url` then threads the captured
+//!    linked-etag into [`download_to`] as `expected_sha256`, so the
+//!    cache-miss path is integrity-verified even when the caller
+//!    didn't pin a hash.
 //!
 //! When neither a caller hash nor a server etag is available, the
 //! download succeeds without hash verification (HTTPS still protects
@@ -95,6 +103,15 @@ pub(crate) fn write_sidecar(dest: &Path, sha256_hex: &str) {
 /// Issue a `HEAD` for `url` using `client` and extract size +
 /// linked-etag. Swallows network errors into `None` fields — the caller
 /// decides how strict to be.
+///
+/// **The `client` passed here MUST be configured with redirects
+/// disabled.** HuggingFace serves `X-Linked-Etag` only on the first
+/// response (the 302 redirect to the CDN); a redirect-following client
+/// surfaces the CDN's unrelated `ETag` instead. `BundleRepo::new`
+/// constructs a dedicated no-redirect client for this reason. On a
+/// 3xx response from the non-following client we still read the
+/// headers (that's the whole point); on any non-success, non-3xx
+/// response we conservatively return `None` fields.
 pub(crate) fn head_info(client: &Client, url: &str) -> HeadInfo {
     let none = HeadInfo {
         content_length: None,
@@ -103,12 +120,28 @@ pub(crate) fn head_info(client: &Client, url: &str) -> HeadInfo {
     let Ok(resp) = client.head(url).timeout(HEAD_TIMEOUT).send() else {
         return none;
     };
-    let content_length = resp
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
+    // HF first-hop for LFS objects is a 302. Anything outside 2xx/3xx
+    // (auth failure, gone, server error) gives up — don't trust the
+    // headers on an error response.
+    let status = resp.status();
+    if !(status.is_success() || status.is_redirection()) {
+        return none;
+    }
+    // HF sets `x-linked-size` on the first hop; prefer that over
+    // `Content-Length` because `Content-Length` on a 302 reflects the
+    // redirect body (zero or a tiny HTML stub), not the file size.
+    let headers = resp.headers();
+    let content_length = headers
+        .get("x-linked-size")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    let linked_sha256 = extract_linked_sha256(resp.headers());
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+    let linked_sha256 = extract_linked_sha256(headers);
     HeadInfo {
         content_length,
         linked_sha256,
