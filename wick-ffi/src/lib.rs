@@ -35,9 +35,11 @@
 //! - [`FfiError`] — typed error surface mirroring [`wick::WickError`]
 //!   one-to-one (`ContextOverflow { max_seq_len, by }`,
 //!   `UnsupportedModality`, `UnsupportedInferenceType`, `Busy`,
-//!   `Cancelled`, `EmptyInput`, `Io`, plus `Backend` as the FFI-
-//!   internal catch-all for poisoned mutex / join-error / future
-//!   upstream additions).
+//!   `Cancelled`, `EmptyInput`, `Io`), plus `Backend` for FFI-internal
+//!   errors that have no wick analog (poisoned mutex, `JoinError`).
+//!   The `From<WickError>` conversion is exhaustive — new wick
+//!   variants break compilation, never silently fall through to
+//!   `Backend`.
 //!
 //! ## Not exposed yet
 //!
@@ -69,10 +71,12 @@ uniffi::setup_scaffolding!();
 /// `when`, Swift `switch`, Python `match`) instead of string-sniffing
 /// a generic message.
 ///
-/// `Backend` stays as a catch-all for FFI-internal errors that don't
-/// have a `WickError` analog — poisoned session mutex, `JoinError`
-/// from a panicking blocking task, etc. — and for `wick::WickError`
-/// variants added upstream before the mapping here catches up.
+/// `Backend` is **not** a silent fallback for unmapped `wick::WickError`
+/// variants — the `From<WickError>` impl is exhaustive, so adding a
+/// new wick variant breaks compilation here. `Backend` exists solely
+/// for FFI-internal errors that have no wick analog: `JoinError` from
+/// a panicking `spawn_blocking` task, a poisoned `Session::inner`
+/// mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`.
 ///
 /// Every variant carries the data needed to act on it:
 /// `ContextOverflow` exposes `max_seq_len` and `by` so callers can
@@ -80,6 +84,11 @@ uniffi::setup_scaffolding!();
 /// `UnsupportedInferenceType` exposes the offending value;
 /// `Io` preserves the underlying OS error message as a string since
 /// `io::Error` isn't UniFFI-marshallable.
+///
+/// `#[error(...)]` format strings match `wick::WickError` exactly for
+/// every shared variant, so `Display` output is identical whether the
+/// error originates from wick directly or routes through the FFI
+/// wrapper. Pinned by `ffi_error_display_matches_wick_error_for_every_shared_variant`.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     /// The loaded model doesn't support the modality the caller
@@ -122,13 +131,22 @@ pub enum FfiError {
     /// underlying `io::Error` isn't marshallable, so the message is
     /// flattened to a string. Callers that need the raw kind should
     /// parse the message or open an issue to request a typed field.
-    #[error("I/O error: {message}")]
+    ///
+    /// Format string matches `wick::WickError::Io`'s `"io: {0}"` so
+    /// foreign `.toString()` / `String(describing:)` gives the same
+    /// output Rust consumers see.
+    #[error("io: {message}")]
     Io { message: String },
 
-    /// Catch-all for FFI-internal errors (poisoned mutex, `JoinError`
-    /// from a panicking blocking task) and for `wick::WickError`
-    /// variants that pre-date a mapping here.
-    #[error("{message}")]
+    /// FFI-internal error with no wick analog: `JoinError` from a
+    /// panicking `spawn_blocking` task, poisoned `Session::inner`
+    /// mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`,
+    /// or `wick::WickError::Backend` routed through the `From` impl.
+    /// Format string matches `wick::WickError::Backend`'s
+    /// `"backend: {0}"` — FFI-internal constructors that have already
+    /// formatted a descriptive message (e.g. "generate_async join
+    /// error: ...") still read cleanly with the `backend:` label.
+    #[error("backend: {message}")]
     Backend { message: String },
 }
 
@@ -1170,21 +1188,38 @@ mod tests {
         }
     }
 
-    /// Display (`thiserror`-derived) produces the same message text as
-    /// the equivalent `wick::WickError` — foreign callers logging the
-    /// error via `.toString()` / `String(describing:)` / `str()` see
-    /// identical output whether the error came from `wick` directly
-    /// or routed through the FFI wrapper.
+    /// Display (`thiserror`-derived) produces byte-identical message
+    /// text to the equivalent `wick::WickError` for every variant
+    /// that has a wick analog. Foreign callers logging the error via
+    /// `.toString()` / `String(describing:)` / `str()` see the same
+    /// output whether the error originates from wick directly or
+    /// routes through the FFI wrapper.
+    ///
+    /// Tests every shared variant including `Backend`, `Io`, and
+    /// `UnsupportedInferenceType` — an earlier iteration of this test
+    /// quietly excluded them, which masked a real drift where the FFI
+    /// side had dropped the `"backend: "` and `"io: "` label prefixes.
     #[test]
-    fn ffi_error_display_matches_wick_error_for_shared_variants() {
+    fn ffi_error_display_matches_wick_error_for_every_shared_variant() {
+        // Prep the Io pair outside the vec since io::Error isn't
+        // `Clone`: we need to consume one into `WickError::Io` and
+        // stash its pre-wrap display string for the FFI side.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let io_msg = io_err.to_string();
+
         let pairs: Vec<(FfiError, wick::WickError)> = vec![
             (
                 FfiError::UnsupportedModality,
                 wick::WickError::UnsupportedModality,
             ),
+            (
+                FfiError::UnsupportedInferenceType {
+                    inference_type: "audio-magic".into(),
+                },
+                wick::WickError::UnsupportedInferenceType("audio-magic".into()),
+            ),
             (FfiError::Busy, wick::WickError::Busy),
             (FfiError::Cancelled, wick::WickError::Cancelled),
-            (FfiError::EmptyInput, wick::WickError::EmptyInput),
             (
                 FfiError::ContextOverflow {
                     max_seq_len: 2048,
@@ -1194,6 +1229,17 @@ mod tests {
                     max_seq_len: 2048,
                     by: 5,
                 },
+            ),
+            (FfiError::EmptyInput, wick::WickError::EmptyInput),
+            (
+                FfiError::Backend {
+                    message: "metal driver crashed".into(),
+                },
+                wick::WickError::Backend("metal driver crashed".into()),
+            ),
+            (
+                FfiError::Io { message: io_msg },
+                wick::WickError::Io(io_err),
             ),
         ];
         for (ffi, core) in pairs {

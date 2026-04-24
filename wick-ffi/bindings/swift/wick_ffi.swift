@@ -2223,10 +2223,12 @@ public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) 
  * `when`, Swift `switch`, Python `match`) instead of string-sniffing
  * a generic message.
  *
- * `Backend` stays as a catch-all for FFI-internal errors that don't
- * have a `WickError` analog — poisoned session mutex, `JoinError`
- * from a panicking blocking task, etc. — and for `wick::WickError`
- * variants added upstream before the mapping here catches up.
+ * `Backend` is **not** a silent fallback for unmapped `wick::WickError`
+ * variants — the `From<WickError>` impl is exhaustive, so adding a
+ * new wick variant breaks compilation here. `Backend` exists solely
+ * for FFI-internal errors that have no wick analog: `JoinError` from
+ * a panicking `spawn_blocking` task, a poisoned `Session::inner`
+ * mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`.
  *
  * Every variant carries the data needed to act on it:
  * `ContextOverflow` exposes `max_seq_len` and `by` so callers can
@@ -2234,6 +2236,11 @@ public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) 
  * `UnsupportedInferenceType` exposes the offending value;
  * `Io` preserves the underlying OS error message as a string since
  * `io::Error` isn't UniFFI-marshallable.
+ *
+ * `#[error(...)]` format strings match `wick::WickError` exactly for
+ * every shared variant, so `Display` output is identical whether the
+ * error originates from wick directly or routes through the FFI
+ * wrapper. Pinned by `ffi_error_display_matches_wick_error_for_every_shared_variant`.
  */
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -2282,13 +2289,22 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      * underlying `io::Error` isn't marshallable, so the message is
      * flattened to a string. Callers that need the raw kind should
      * parse the message or open an issue to request a typed field.
+     *
+     * Format string matches `wick::WickError::Io`'s `"io: {0}"` so
+     * foreign `.toString()` / `String(describing:)` gives the same
+     * output Rust consumers see.
      */
     case Io(message: String
     )
     /**
-     * Catch-all for FFI-internal errors (poisoned mutex, `JoinError`
-     * from a panicking blocking task) and for `wick::WickError`
-     * variants that pre-date a mapping here.
+     * FFI-internal error with no wick analog: `JoinError` from a
+     * panicking `spawn_blocking` task, poisoned `Session::inner`
+     * mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`,
+     * or `wick::WickError::Backend` routed through the `From` impl.
+     * Format string matches `wick::WickError::Backend`'s
+     * `"backend: {0}"` — FFI-internal constructors that have already
+     * formatted a descriptive message (e.g. "generate_async join
+     * error: ...") still read cleanly with the `backend:` label.
      */
     case Backend(message: String
     )
