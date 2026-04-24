@@ -2288,13 +2288,22 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      * Filesystem / mmap / network error surfaced from wick. The
      * underlying `io::Error` isn't marshallable, so the message is
      * flattened to a string. Callers that need the raw kind should
-     * parse the message or open an issue to request a typed field.
+     * parse the `detail` field or open an issue to request a typed
+     * field.
+     *
+     * Field is named `detail` rather than `message` because UniFFI's
+     * 0.31 Kotlin generator emits `class Io(val `message`) : FfiException()`
+     * AND `override val message` in the body when the field is literally
+     * named `message`, producing a "conflicting declarations" error
+     * (the constructor param collides with the inherited
+     * `Throwable.message` override). Renaming to `detail` sidesteps
+     * the collision.
      *
      * Format string matches `wick::WickError::Io`'s `"io: {0}"` so
      * foreign `.toString()` / `String(describing:)` gives the same
      * output Rust consumers see.
      */
-    case Io(message: String
+    case Io(detail: String
     )
     /**
      * FFI-internal error with no wick analog: `JoinError` from a
@@ -2305,8 +2314,11 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      * `"backend: {0}"` — FFI-internal constructors that have already
      * formatted a descriptive message (e.g. "generate_async join
      * error: ...") still read cleanly with the `backend:` label.
+     *
+     * Field is named `detail` rather than `message` for the same
+     * `Throwable.message` collision reason as [`FfiError::Io`].
      */
-    case Backend(message: String
+    case Backend(detail: String
     )
 
     
@@ -2349,10 +2361,10 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 6: return .EmptyInput
         case 7: return .Io(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 8: return .Backend(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -2393,14 +2405,14 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
         
         
-        case let .Io(message):
+        case let .Io(detail):
             writeInt(&buf, Int32(7))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Backend(message):
+        case let .Backend(detail):
             writeInt(&buf, Int32(8))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         }
     }

@@ -3577,17 +3577,26 @@ sealed class FfiException : kotlin.Exception() {
      * Filesystem / mmap / network error surfaced from wick. The
      * underlying `io::Error` isn't marshallable, so the message is
      * flattened to a string. Callers that need the raw kind should
-     * parse the message or open an issue to request a typed field.
+     * parse the `detail` field or open an issue to request a typed
+     * field.
+     *
+     * Field is named `detail` rather than `message` because UniFFI's
+     * 0.31 Kotlin generator emits `class Io(val `message`) : FfiException()`
+     * AND `override val message` in the body when the field is literally
+     * named `message`, producing a "conflicting declarations" error
+     * (the constructor param collides with the inherited
+     * `Throwable.message` override). Renaming to `detail` sidesteps
+     * the collision.
      *
      * Format string matches `wick::WickError::Io`'s `"io: {0}"` so
      * foreign `.toString()` / `String(describing:)` gives the same
      * output Rust consumers see.
      */
     class Io(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : FfiException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     /**
@@ -3599,12 +3608,15 @@ sealed class FfiException : kotlin.Exception() {
      * `"backend: {0}"` — FFI-internal constructors that have already
      * formatted a descriptive message (e.g. "generate_async join
      * error: ...") still read cleanly with the `backend:` label.
+     *
+     * Field is named `detail` rather than `message` for the same
+     * `Throwable.message` collision reason as [`FfiError::Io`].
      */
     class Backend(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : FfiException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
@@ -3702,13 +3714,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.Io -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
 
             is FfiException.Backend -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
         }
 
@@ -3752,13 +3764,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
 
             is FfiException.Io -> {
                 buf.putInt(7)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
 
             is FfiException.Backend -> {
                 buf.putInt(8)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

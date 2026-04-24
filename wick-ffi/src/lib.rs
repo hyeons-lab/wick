@@ -130,13 +130,22 @@ pub enum FfiError {
     /// Filesystem / mmap / network error surfaced from wick. The
     /// underlying `io::Error` isn't marshallable, so the message is
     /// flattened to a string. Callers that need the raw kind should
-    /// parse the message or open an issue to request a typed field.
+    /// parse the `detail` field or open an issue to request a typed
+    /// field.
+    ///
+    /// Field is named `detail` rather than `message` because UniFFI's
+    /// 0.31 Kotlin generator emits `class Io(val `message`) : FfiException()`
+    /// AND `override val message` in the body when the field is literally
+    /// named `message`, producing a "conflicting declarations" error
+    /// (the constructor param collides with the inherited
+    /// `Throwable.message` override). Renaming to `detail` sidesteps
+    /// the collision.
     ///
     /// Format string matches `wick::WickError::Io`'s `"io: {0}"` so
     /// foreign `.toString()` / `String(describing:)` gives the same
     /// output Rust consumers see.
-    #[error("io: {message}")]
-    Io { message: String },
+    #[error("io: {detail}")]
+    Io { detail: String },
 
     /// FFI-internal error with no wick analog: `JoinError` from a
     /// panicking `spawn_blocking` task, poisoned `Session::inner`
@@ -146,8 +155,11 @@ pub enum FfiError {
     /// `"backend: {0}"` — FFI-internal constructors that have already
     /// formatted a descriptive message (e.g. "generate_async join
     /// error: ...") still read cleanly with the `backend:` label.
-    #[error("backend: {message}")]
-    Backend { message: String },
+    ///
+    /// Field is named `detail` rather than `message` for the same
+    /// `Throwable.message` collision reason as [`FfiError::Io`].
+    #[error("backend: {detail}")]
+    Backend { detail: String },
 }
 
 impl From<wick::WickError> for FfiError {
@@ -166,9 +178,9 @@ impl From<wick::WickError> for FfiError {
                 FfiError::ContextOverflow { max_seq_len, by }
             }
             wick::WickError::EmptyInput => FfiError::EmptyInput,
-            wick::WickError::Backend(s) => FfiError::Backend { message: s },
+            wick::WickError::Backend(s) => FfiError::Backend { detail: s },
             wick::WickError::Io(io_err) => FfiError::Io {
-                message: io_err.to_string(),
+                detail: io_err.to_string(),
             },
         }
     }
@@ -254,7 +266,7 @@ impl TryFrom<EngineConfig> for wick::EngineConfig {
             usize::MAX
         } else {
             usize::try_from(c.context_size).map_err(|_| FfiError::Backend {
-                message: format!(
+                detail: format!(
                     "context_size {} exceeds usize::MAX on this target",
                     c.context_size
                 ),
@@ -681,7 +693,7 @@ impl Session {
     /// decide whether to reset or drop the session entirely.
     fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, wick::Session>, FfiError> {
         self.inner.lock().map_err(|e| FfiError::Backend {
-            message: format!(
+            detail: format!(
                 "session mutex poisoned (a prior call panicked mid-lock; session state is \
                  inconsistent): {e}"
             ),
@@ -959,7 +971,7 @@ impl Session {
         let join_result = handle.await;
         guard.armed = false;
         join_result.map_err(|e| FfiError::Backend {
-            message: format!("generate_async join error: {e}"),
+            detail: format!("generate_async join error: {e}"),
         })?
     }
 
@@ -1002,7 +1014,7 @@ impl Session {
         let join_result = handle.await;
         guard.armed = false;
         join_result.map_err(|e| FfiError::Backend {
-            message: format!("generate_streaming_async join error: {e}"),
+            detail: format!("generate_streaming_async join error: {e}"),
         })?
     }
 }
@@ -1091,10 +1103,10 @@ mod tests {
         {
             let err = result.expect_err("u64::MAX must fail on 32-bit");
             match err {
-                FfiError::Backend { message } => {
+                FfiError::Backend { detail } => {
                     assert!(
-                        message.contains("exceeds usize::MAX"),
-                        "unexpected: {message}"
+                        detail.contains("exceeds usize::MAX"),
+                        "unexpected: {detail}"
                     );
                 }
                 other => panic!("expected Backend, got: {other:?}"),
@@ -1171,8 +1183,8 @@ mod tests {
         }
 
         match FfiError::from(wick::WickError::Backend("metal driver crashed".into())) {
-            FfiError::Backend { message } => {
-                assert_eq!(message, "metal driver crashed");
+            FfiError::Backend { detail } => {
+                assert_eq!(detail, "metal driver crashed");
             }
             other => panic!("expected Backend, got: {other:?}"),
         }
@@ -1181,8 +1193,8 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let io_str = io_err.to_string();
         match FfiError::from(wick::WickError::Io(io_err)) {
-            FfiError::Io { message } => {
-                assert_eq!(message, io_str);
+            FfiError::Io { detail } => {
+                assert_eq!(detail, io_str);
             }
             other => panic!("expected Io, got: {other:?}"),
         }
@@ -1233,14 +1245,11 @@ mod tests {
             (FfiError::EmptyInput, wick::WickError::EmptyInput),
             (
                 FfiError::Backend {
-                    message: "metal driver crashed".into(),
+                    detail: "metal driver crashed".into(),
                 },
                 wick::WickError::Backend("metal driver crashed".into()),
             ),
-            (
-                FfiError::Io { message: io_msg },
-                wick::WickError::Io(io_err),
-            ),
+            (FfiError::Io { detail: io_msg }, wick::WickError::Io(io_err)),
         ];
         for (ffi, core) in pairs {
             assert_eq!(
@@ -1508,7 +1517,7 @@ mod tests {
         // closure returns the final value, spawn_blocking + await +
         // map_err hands it back via `?`.
         let map_join = |e: tokio::task::JoinError| FfiError::Backend {
-            message: format!("test join error: {e}"),
+            detail: format!("test join error: {e}"),
         };
 
         let ok: u32 = tokio::task::spawn_blocking(|| 42u32)
@@ -1526,10 +1535,10 @@ mod tests {
         .await
         .map_err(map_join);
         match panicked {
-            Err(FfiError::Backend { message }) => {
+            Err(FfiError::Backend { detail }) => {
                 assert!(
-                    message.contains("test join error"),
-                    "expected prefix, got: {message}"
+                    detail.contains("test join error"),
+                    "expected prefix, got: {detail}"
                 );
             }
             other => panic!("expected Err(Backend), got: {other:?}"),
