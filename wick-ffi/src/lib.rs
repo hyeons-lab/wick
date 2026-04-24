@@ -32,16 +32,20 @@
 //!   decode output to Kotlin / Swift / Python implementations.
 //!
 //! Error:
-//! - [`FfiError`] — minimal error shell (string-based). Typed variants
-//!   (`ContextOverflow { max_seq_len, by }` etc.) split into separate
-//!   enum cases in a later PR.
+//! - [`FfiError`] — typed error surface mirroring [`wick::WickError`]
+//!   one-to-one (`ContextOverflow { max_seq_len, by }`,
+//!   `UnsupportedModality`, `UnsupportedInferenceType`, `Busy`,
+//!   `Cancelled`, `EmptyInput`, `Io`, plus `Backend` as the FFI-
+//!   internal catch-all for poisoned mutex / join-error / future
+//!   upstream additions).
 //!
 //! ## Not exposed yet
 //!
 //! Future PRs grow the surface per the roadmap in
 //! `wick-ffi/README.md`. Highlights: remote URL loading through
-//! `BundleRepo` (gated on the `remote` feature), binding generation
-//! for Kotlin / Swift / Python, and typed error variants.
+//! `BundleRepo` (gated on the `remote` feature) and a parity harness
+//! crate that cross-checks `wick-ffi` output against a reference
+//! implementation.
 //!
 //! ## Design notes
 //!
@@ -60,20 +64,94 @@ uniffi::setup_scaffolding!();
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Minimal error type for v1 of the FFI surface. Wraps a human-readable
-/// message; the typed variants (`ContextOverflow`, `UnsupportedModality`,
-/// etc.) will land as additional variants on this enum in a later PR
-/// so callers can pattern-match on error class rather than string-sniff.
+/// Typed error surface for `wick-ffi`. Mirrors [`wick::WickError`] one-
+/// to-one so foreign callers can pattern-match on error class (Kotlin
+/// `when`, Swift `switch`, Python `match`) instead of string-sniffing
+/// a generic message.
+///
+/// `Backend` stays as a catch-all for FFI-internal errors that don't
+/// have a `WickError` analog — poisoned session mutex, `JoinError`
+/// from a panicking blocking task, etc. — and for `wick::WickError`
+/// variants added upstream before the mapping here catches up.
+///
+/// Every variant carries the data needed to act on it:
+/// `ContextOverflow` exposes `max_seq_len` and `by` so callers can
+/// reset or truncate rather than re-reading the message;
+/// `UnsupportedInferenceType` exposes the offending value;
+/// `Io` preserves the underlying OS error message as a string since
+/// `io::Error` isn't UniFFI-marshallable.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
+    /// The loaded model doesn't support the modality the caller
+    /// requested (e.g. `append_audio` on a text-only LLM).
+    #[error("modality not supported by this model")]
+    UnsupportedModality,
+
+    /// The manifest's `inference_type` is one wick doesn't recognize
+    /// at this version. Field carries the offending string.
+    #[error("inference_type `{inference_type}` is not supported in this version of wick")]
+    UnsupportedInferenceType { inference_type: String },
+
+    /// A concurrent `generate*` call is already in flight on this
+    /// session. Rust side guards with a mutex; this surfaces when the
+    /// FFI detects contention.
+    #[error("session is busy with another operation")]
+    Busy,
+
+    /// The caller (or the cancel-on-drop guard) flipped the cancel
+    /// atomic. Currently wick's `generate` returns this as a
+    /// `FinishReason::Cancelled` success rather than an `Err`, but
+    /// the variant exists so a future `append_tokens` cancel (or
+    /// similar) can surface typed.
+    #[error("cancelled")]
+    Cancelled,
+
+    /// The context window is full and the session can't shift to make
+    /// room (e.g. `n_keep == 0`, TurboQuant caches, or the active
+    /// model doesn't support rope-shift). `max_seq_len` is the cap
+    /// that was hit; `by` is the overshoot in tokens.
+    #[error("context window ({max_seq_len}) exceeded by {by} tokens")]
+    ContextOverflow { max_seq_len: u32, by: u32 },
+
+    /// Input buffer was empty (e.g. `append_text("")`, or decode with
+    /// no prefill state).
+    #[error("empty input")]
+    EmptyInput,
+
+    /// Filesystem / mmap / network error surfaced from wick. The
+    /// underlying `io::Error` isn't marshallable, so the message is
+    /// flattened to a string. Callers that need the raw kind should
+    /// parse the message or open an issue to request a typed field.
+    #[error("I/O error: {message}")]
+    Io { message: String },
+
+    /// Catch-all for FFI-internal errors (poisoned mutex, `JoinError`
+    /// from a panicking blocking task) and for `wick::WickError`
+    /// variants that pre-date a mapping here.
     #[error("{message}")]
     Backend { message: String },
 }
 
 impl From<wick::WickError> for FfiError {
     fn from(e: wick::WickError) -> Self {
-        FfiError::Backend {
-            message: e.to_string(),
+        // Match exhaustively on the upstream enum so a future wick
+        // variant-add breaks compilation here loudly rather than
+        // silently routing through the `Backend` catch-all.
+        match e {
+            wick::WickError::UnsupportedModality => FfiError::UnsupportedModality,
+            wick::WickError::UnsupportedInferenceType(s) => {
+                FfiError::UnsupportedInferenceType { inference_type: s }
+            }
+            wick::WickError::Busy => FfiError::Busy,
+            wick::WickError::Cancelled => FfiError::Cancelled,
+            wick::WickError::ContextOverflow { max_seq_len, by } => {
+                FfiError::ContextOverflow { max_seq_len, by }
+            }
+            wick::WickError::EmptyInput => FfiError::EmptyInput,
+            wick::WickError::Backend(s) => FfiError::Backend { message: s },
+            wick::WickError::Io(io_err) => FfiError::Io {
+                message: io_err.to_string(),
+            },
         }
     }
 }
@@ -690,10 +768,14 @@ impl Session {
             Ok(summary) => Ok(summary.into()),
             Err(err) => {
                 if !adapter.done_called {
-                    let message = match &err {
-                        FfiError::Backend { message } => message.clone(),
-                    };
-                    adapter.inner.on_done(FinishReason::Error { message });
+                    // `FinishReason::Error` only carries a message string,
+                    // so flatten whichever typed FfiError variant via
+                    // Display. Foreign callers still receive the full
+                    // typed error from the return value; the sink's
+                    // on_done(Error) is a best-effort terminal signal.
+                    adapter.inner.on_done(FinishReason::Error {
+                        message: err.to_string(),
+                    });
                 }
                 Err(err)
             }
@@ -997,6 +1079,7 @@ mod tests {
                         "unexpected: {message}"
                     );
                 }
+                other => panic!("expected Backend, got: {other:?}"),
             }
         }
         #[cfg(target_pointer_width = "64")]
@@ -1022,13 +1105,103 @@ mod tests {
         }
     }
 
+    /// Every `wick::WickError` variant maps to a specific `FfiError`
+    /// variant (not the generic `Backend` catch-all) so foreign
+    /// callers can pattern-match on class. If wick adds a new
+    /// `WickError` variant and forgets to update `From<WickError>`,
+    /// the exhaustive match in that impl breaks compilation loudly —
+    /// this test just asserts the existing mapping is correct.
     #[test]
-    fn ffi_error_wraps_wick_error_message() {
-        let we = wick::WickError::EmptyInput;
-        let expected = we.to_string();
-        let fe: FfiError = we.into();
-        match fe {
-            FfiError::Backend { message } => assert_eq!(message, expected),
+    fn wick_error_variants_map_to_typed_ffi_error_variants() {
+        // Payload-free variants.
+        assert!(matches!(
+            FfiError::from(wick::WickError::UnsupportedModality),
+            FfiError::UnsupportedModality
+        ));
+        assert!(matches!(
+            FfiError::from(wick::WickError::Busy),
+            FfiError::Busy
+        ));
+        assert!(matches!(
+            FfiError::from(wick::WickError::Cancelled),
+            FfiError::Cancelled
+        ));
+        assert!(matches!(
+            FfiError::from(wick::WickError::EmptyInput),
+            FfiError::EmptyInput
+        ));
+
+        // Payload-carrying variants preserve their fields.
+        match FfiError::from(wick::WickError::UnsupportedInferenceType(
+            "audio-magic".into(),
+        )) {
+            FfiError::UnsupportedInferenceType { inference_type } => {
+                assert_eq!(inference_type, "audio-magic");
+            }
+            other => panic!("expected UnsupportedInferenceType, got: {other:?}"),
+        }
+
+        match FfiError::from(wick::WickError::ContextOverflow {
+            max_seq_len: 4096,
+            by: 17,
+        }) {
+            FfiError::ContextOverflow { max_seq_len, by } => {
+                assert_eq!(max_seq_len, 4096);
+                assert_eq!(by, 17);
+            }
+            other => panic!("expected ContextOverflow, got: {other:?}"),
+        }
+
+        match FfiError::from(wick::WickError::Backend("metal driver crashed".into())) {
+            FfiError::Backend { message } => {
+                assert_eq!(message, "metal driver crashed");
+            }
+            other => panic!("expected Backend, got: {other:?}"),
+        }
+
+        // Io flattens the OS error to a string.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let io_str = io_err.to_string();
+        match FfiError::from(wick::WickError::Io(io_err)) {
+            FfiError::Io { message } => {
+                assert_eq!(message, io_str);
+            }
+            other => panic!("expected Io, got: {other:?}"),
+        }
+    }
+
+    /// Display (`thiserror`-derived) produces the same message text as
+    /// the equivalent `wick::WickError` — foreign callers logging the
+    /// error via `.toString()` / `String(describing:)` / `str()` see
+    /// identical output whether the error came from `wick` directly
+    /// or routed through the FFI wrapper.
+    #[test]
+    fn ffi_error_display_matches_wick_error_for_shared_variants() {
+        let pairs: Vec<(FfiError, wick::WickError)> = vec![
+            (
+                FfiError::UnsupportedModality,
+                wick::WickError::UnsupportedModality,
+            ),
+            (FfiError::Busy, wick::WickError::Busy),
+            (FfiError::Cancelled, wick::WickError::Cancelled),
+            (FfiError::EmptyInput, wick::WickError::EmptyInput),
+            (
+                FfiError::ContextOverflow {
+                    max_seq_len: 2048,
+                    by: 5,
+                },
+                wick::WickError::ContextOverflow {
+                    max_seq_len: 2048,
+                    by: 5,
+                },
+            ),
+        ];
+        for (ffi, core) in pairs {
+            assert_eq!(
+                ffi.to_string(),
+                core.to_string(),
+                "display mismatch for {ffi:?} vs {core:?}"
+            );
         }
     }
 

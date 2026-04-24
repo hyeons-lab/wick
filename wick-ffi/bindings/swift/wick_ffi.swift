@@ -2218,15 +2218,78 @@ public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) 
 
 
 /**
- * Minimal error type for v1 of the FFI surface. Wraps a human-readable
- * message; the typed variants (`ContextOverflow`, `UnsupportedModality`,
- * etc.) will land as additional variants on this enum in a later PR
- * so callers can pattern-match on error class rather than string-sniff.
+ * Typed error surface for `wick-ffi`. Mirrors [`wick::WickError`] one-
+ * to-one so foreign callers can pattern-match on error class (Kotlin
+ * `when`, Swift `switch`, Python `match`) instead of string-sniffing
+ * a generic message.
+ *
+ * `Backend` stays as a catch-all for FFI-internal errors that don't
+ * have a `WickError` analog — poisoned session mutex, `JoinError`
+ * from a panicking blocking task, etc. — and for `wick::WickError`
+ * variants added upstream before the mapping here catches up.
+ *
+ * Every variant carries the data needed to act on it:
+ * `ContextOverflow` exposes `max_seq_len` and `by` so callers can
+ * reset or truncate rather than re-reading the message;
+ * `UnsupportedInferenceType` exposes the offending value;
+ * `Io` preserves the underlying OS error message as a string since
+ * `io::Error` isn't UniFFI-marshallable.
  */
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
+    /**
+     * The loaded model doesn't support the modality the caller
+     * requested (e.g. `append_audio` on a text-only LLM).
+     */
+    case UnsupportedModality
+    /**
+     * The manifest's `inference_type` is one wick doesn't recognize
+     * at this version. Field carries the offending string.
+     */
+    case UnsupportedInferenceType(inferenceType: String
+    )
+    /**
+     * A concurrent `generate*` call is already in flight on this
+     * session. Rust side guards with a mutex; this surfaces when the
+     * FFI detects contention.
+     */
+    case Busy
+    /**
+     * The caller (or the cancel-on-drop guard) flipped the cancel
+     * atomic. Currently wick's `generate` returns this as a
+     * `FinishReason::Cancelled` success rather than an `Err`, but
+     * the variant exists so a future `append_tokens` cancel (or
+     * similar) can surface typed.
+     */
+    case Cancelled
+    /**
+     * The context window is full and the session can't shift to make
+     * room (e.g. `n_keep == 0`, TurboQuant caches, or the active
+     * model doesn't support rope-shift). `max_seq_len` is the cap
+     * that was hit; `by` is the overshoot in tokens.
+     */
+    case ContextOverflow(maxSeqLen: UInt32, by: UInt32
+    )
+    /**
+     * Input buffer was empty (e.g. `append_text("")`, or decode with
+     * no prefill state).
+     */
+    case EmptyInput
+    /**
+     * Filesystem / mmap / network error surfaced from wick. The
+     * underlying `io::Error` isn't marshallable, so the message is
+     * flattened to a string. Callers that need the raw kind should
+     * parse the message or open an issue to request a typed field.
+     */
+    case Io(message: String
+    )
+    /**
+     * Catch-all for FFI-internal errors (poisoned mutex, `JoinError`
+     * from a panicking blocking task) and for `wick::WickError`
+     * variants that pre-date a mapping here.
+     */
     case Backend(message: String
     )
 
@@ -2258,7 +2321,21 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         
 
         
-        case 1: return .Backend(
+        case 1: return .UnsupportedModality
+        case 2: return .UnsupportedInferenceType(
+            inferenceType: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .Busy
+        case 4: return .Cancelled
+        case 5: return .ContextOverflow(
+            maxSeqLen: try FfiConverterUInt32.read(from: &buf), 
+            by: try FfiConverterUInt32.read(from: &buf)
+            )
+        case 6: return .EmptyInput
+        case 7: return .Io(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .Backend(
             message: try FfiConverterString.read(from: &buf)
             )
 
@@ -2273,8 +2350,40 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
 
         
         
-        case let .Backend(message):
+        case .UnsupportedModality:
             writeInt(&buf, Int32(1))
+        
+        
+        case let .UnsupportedInferenceType(inferenceType):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(inferenceType, into: &buf)
+            
+        
+        case .Busy:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .Cancelled:
+            writeInt(&buf, Int32(4))
+        
+        
+        case let .ContextOverflow(maxSeqLen,by):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt32.write(maxSeqLen, into: &buf)
+            FfiConverterUInt32.write(by, into: &buf)
+            
+        
+        case .EmptyInput:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .Io(message):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Backend(message):
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(message, into: &buf)
             
         }
