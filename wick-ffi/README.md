@@ -6,13 +6,15 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Bindings.** `WickEngine` + `Session` + sync, streaming, and async
-`generate` surfaced through PRs 2–5; PR 6 adds Kotlin + Swift binding
-generation via the in-repo `uniffi-bindgen` binary, with the generated
-files vendored under `wick-ffi/bindings/` and a CI job that fails on
-drift from the Rust `#[uniffi::*]` exports. UniFFI is pinned to 0.31.x
-(upgraded from 0.28 in this PR — no proc-macro source changes, the
-bindgen-tooling CLI path is the only surface that moved).
+**Typed errors.** `WickEngine` + `Session` + sync, streaming, and
+async `generate` surfaced through PRs 2–5; PR 6 vendored the Kotlin +
+Swift bindings; PR 7 replaces the single-variant `FfiError::Backend`
+with a typed enum that mirrors every `wick::WickError` variant
+(`ContextOverflow { max_seq_len, by }`, `UnsupportedModality`,
+`UnsupportedInferenceType`, `Busy`, `Cancelled`, `EmptyInput`, `Io`,
+plus `Backend` as the catch-all for FFI-internal errors). Foreign
+callers can now pattern-match on error class instead of string-
+sniffing a generic message.
 
 | PR | Scope |
 |---|---|
@@ -21,8 +23,9 @@ bindgen-tooling CLI path is the only surface that moved).
 | 3 | `Session`, `SessionConfig`, `GenerateOpts`, `GenerateSummary`, sync `generate` |
 | 4 | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
 | 5 | `async` `generate_async` + `generate_streaming_async` via `#[uniffi::export(async_runtime = "tokio")]` |
-| 6 *(this one)* | Kotlin + Swift binding generation + vendored outputs + CI drift check; UniFFI 0.28 → 0.31.1 |
-| 7+ | Error-type marshalling, parity harness, Android ABIs, iOS XCFramework |
+| 6 | Kotlin + Swift binding generation + vendored outputs + CI drift check; UniFFI 0.28 → 0.31.1 |
+| 7 *(this one)* | Typed `FfiError` variants mirroring `wick::WickError` |
+| 8+ | `BundleRepo` remote loading (`remote` feature), parity harness, Android ABIs, iOS XCFramework |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.

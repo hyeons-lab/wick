@@ -3483,17 +3483,140 @@ public object FfiConverterTypeBackendPreference : FfiConverterRustBuffer<Backend
 }
 
 /**
- * Minimal error type for v1 of the FFI surface. Wraps a human-readable
- * message; the typed variants (`ContextOverflow`, `UnsupportedModality`,
- * etc.) will land as additional variants on this enum in a later PR
- * so callers can pattern-match on error class rather than string-sniff.
+ * Typed error surface for `wick-ffi`. Mirrors [`wick::WickError`] one-
+ * to-one so foreign callers can pattern-match on error class (Kotlin
+ * `when`, Swift `switch`, Python `match`) instead of string-sniffing
+ * a generic message.
+ *
+ * `Backend` is **not** a silent fallback for unmapped `wick::WickError`
+ * variants — the `From<WickError>` impl is exhaustive, so adding a
+ * new wick variant breaks compilation here. `Backend` exists solely
+ * for FFI-internal errors that have no wick analog: `JoinError` from
+ * a panicking `spawn_blocking` task, a poisoned `Session::inner`
+ * mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`.
+ *
+ * Every variant carries the data needed to act on it:
+ * `ContextOverflow` exposes `max_seq_len` and `by` so callers can
+ * reset or truncate rather than re-reading the message;
+ * `UnsupportedInferenceType` exposes the offending value;
+ * `Io` preserves the underlying OS error message as a string since
+ * `io::Error` isn't UniFFI-marshallable.
+ *
+ * `#[error(...)]` format strings match `wick::WickError` exactly for
+ * every shared variant, so `Display` output is identical whether the
+ * error originates from wick directly or routes through the FFI
+ * wrapper. Pinned by `ffi_error_display_matches_wick_error_for_every_shared_variant`.
  */
 sealed class FfiException : kotlin.Exception() {
-    class Backend(
-        val `message`: kotlin.String,
+    /**
+     * The loaded model doesn't support the modality the caller
+     * requested (e.g. `append_audio` on a text-only LLM).
+     */
+    class UnsupportedModality : FfiException() {
+        override val message
+            get() = ""
+    }
+
+    /**
+     * The manifest's `inference_type` is one wick doesn't recognize
+     * at this version. Field carries the offending string.
+     */
+    class UnsupportedInferenceType(
+        val `inferenceType`: kotlin.String,
     ) : FfiException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "inferenceType=${ `inferenceType` }"
+    }
+
+    /**
+     * A concurrent `generate*` call is already in flight on this
+     * session. Rust side guards with a mutex; this surfaces when the
+     * FFI detects contention.
+     */
+    class Busy : FfiException() {
+        override val message
+            get() = ""
+    }
+
+    /**
+     * The caller (or the cancel-on-drop guard) flipped the cancel
+     * atomic. Currently wick's `generate` returns this as a
+     * `FinishReason::Cancelled` success rather than an `Err`, but
+     * the variant exists so a future `append_tokens` cancel (or
+     * similar) can surface typed.
+     */
+    class Cancelled : FfiException() {
+        override val message
+            get() = ""
+    }
+
+    /**
+     * The context window is full and the session can't shift to make
+     * room (e.g. `n_keep == 0`, TurboQuant caches, or the active
+     * model doesn't support rope-shift). `max_seq_len` is the cap
+     * that was hit; `by` is the overshoot in tokens.
+     */
+    class ContextOverflow(
+        val `maxSeqLen`: kotlin.UInt,
+        val `by`: kotlin.UInt,
+    ) : FfiException() {
+        override val message
+            get() = "maxSeqLen=${ `maxSeqLen` }, by=${ `by` }"
+    }
+
+    /**
+     * Input buffer was empty (e.g. `append_text("")`, or decode with
+     * no prefill state).
+     */
+    class EmptyInput : FfiException() {
+        override val message
+            get() = ""
+    }
+
+    /**
+     * Filesystem / mmap / network error surfaced from wick. The
+     * underlying `io::Error` isn't marshallable, so the message is
+     * flattened to a string. Callers that need the raw kind should
+     * parse the `detail` field or open an issue to request a typed
+     * field.
+     *
+     * Field is named `detail` rather than `message` because UniFFI's
+     * 0.31 Kotlin generator emits `class Io(val `message`) : FfiException()`
+     * AND `override val message` in the body when the field is literally
+     * named `message`, producing a "conflicting declarations" error
+     * (the constructor param collides with the inherited
+     * `Throwable.message` override). Renaming to `detail` sidesteps
+     * the collision.
+     *
+     * Format string matches `wick::WickError::Io`'s `"io: {0}"` so
+     * foreign `.toString()` / `String(describing:)` gives the same
+     * output Rust consumers see.
+     */
+    class Io(
+        val `detail`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
+    /**
+     * FFI-internal error with no wick analog: `JoinError` from a
+     * panicking `spawn_blocking` task, poisoned `Session::inner`
+     * mutex, 32-bit `u64 → usize` overflow in `EngineConfig::try_from`,
+     * or `wick::WickError::Backend` routed through the `From` impl.
+     * Format string matches `wick::WickError::Backend`'s
+     * `"backend: {0}"` — FFI-internal constructors that have already
+     * formatted a descriptive message (e.g. "generate_async join
+     * error: ...") still read cleanly with the `backend:` label.
+     *
+     * Field is named `detail` rather than `message` for the same
+     * `Throwable.message` collision reason as [`FfiError::Io`].
+     */
+    class Backend(
+        val `detail`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "detail=${ `detail` }"
     }
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
@@ -3508,6 +3631,41 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
     override fun read(buf: ByteBuffer): FfiException =
         when (buf.getInt()) {
             1 -> {
+                FfiException.UnsupportedModality()
+            }
+
+            2 -> {
+                FfiException.UnsupportedInferenceType(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            3 -> {
+                FfiException.Busy()
+            }
+
+            4 -> {
+                FfiException.Cancelled()
+            }
+
+            5 -> {
+                FfiException.ContextOverflow(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            6 -> {
+                FfiException.EmptyInput()
+            }
+
+            7 -> {
+                FfiException.Io(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            8 -> {
                 FfiException.Backend(
                     FfiConverterString.read(buf),
                 )
@@ -3520,10 +3678,49 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
 
     override fun allocationSize(value: FfiException): ULong =
         when (value) {
+            is FfiException.UnsupportedModality -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+
+            is FfiException.UnsupportedInferenceType -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`inferenceType`)
+            )
+
+            is FfiException.Busy -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+
+            is FfiException.Cancelled -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+
+            is FfiException.ContextOverflow -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterUInt.allocationSize(value.`maxSeqLen`) +
+                    FfiConverterUInt.allocationSize(value.`by`)
+            )
+
+            is FfiException.EmptyInput -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+
+            is FfiException.Io -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
             is FfiException.Backend -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
         }
 
@@ -3532,9 +3729,48 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
         buf: ByteBuffer,
     ) {
         when (value) {
-            is FfiException.Backend -> {
+            is FfiException.UnsupportedModality -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+
+            is FfiException.UnsupportedInferenceType -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`inferenceType`, buf)
+                Unit
+            }
+
+            is FfiException.Busy -> {
+                buf.putInt(3)
+                Unit
+            }
+
+            is FfiException.Cancelled -> {
+                buf.putInt(4)
+                Unit
+            }
+
+            is FfiException.ContextOverflow -> {
+                buf.putInt(5)
+                FfiConverterUInt.write(value.`maxSeqLen`, buf)
+                FfiConverterUInt.write(value.`by`, buf)
+                Unit
+            }
+
+            is FfiException.EmptyInput -> {
+                buf.putInt(6)
+                Unit
+            }
+
+            is FfiException.Io -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is FfiException.Backend -> {
+                buf.putInt(8)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
