@@ -147,21 +147,66 @@ impl BundleRepo {
     /// Compute the on-disk cache location for `url`, rooted at
     /// `store_dir`. Mirrors `<host>/<path>` so the cache is inspectable
     /// and safely swappable with a host-preserving mirror.
+    ///
+    /// Rejects URLs whose host or path contain segments that could
+    /// escape `store_dir` (e.g. `..`, null bytes, a bare `/` path
+    /// component). This is a pre-`PathBuf::push` filter — `PathBuf`
+    /// itself is not a validator; an attacker-controlled URL must not
+    /// be able to write outside the cache root.
     fn path_for_url(&self, url: &str) -> Result<PathBuf, WickError> {
         let (host, path) = split_url(url)?;
-        let mut out = self.store_dir.clone();
-        out.push(host);
-        // Strip the leading `/` before pushing — otherwise `PathBuf::push`
-        // treats it as absolute and throws away the `host` prefix.
-        let rel = path.trim_start_matches('/');
-        if rel.is_empty() {
+        validate_path_segment("url host", host)?;
+
+        // Strip the leading `/` and any trailing query/fragment before
+        // segmenting. `?` / `#` are URL syntax that don't belong in the
+        // on-disk path. If the request actually depends on them we'd
+        // need a caller to pass them through separately; today every
+        // bundle URL is a clean path.
+        let path_no_qs = path
+            .trim_start_matches('/')
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("");
+        if path_no_qs.is_empty() {
             return Err(WickError::Backend(format!(
                 "url `{url}` has no path component"
             )));
         }
-        out.push(rel);
+
+        let mut out = self.store_dir.clone();
+        out.push(host);
+        for segment in path_no_qs.split('/') {
+            validate_path_segment("url path segment", segment)?;
+            out.push(segment);
+        }
         Ok(out)
     }
+}
+
+/// Reject a path segment if it could escape or break the cache dir.
+/// Narrow allowlist spirit: anything not clearly a plain filename
+/// component is refused with a clear error.
+fn validate_path_segment(kind: &str, segment: &str) -> Result<(), WickError> {
+    if segment.is_empty() {
+        return Err(WickError::Backend(format!("{kind} must not be empty")));
+    }
+    if segment == "." || segment == ".." {
+        return Err(WickError::Backend(format!(
+            "{kind} `{segment}` would escape the cache root"
+        )));
+    }
+    // Null bytes terminate C strings on most OS calls and can
+    // truncate the effective path. Backslash is a path separator on
+    // Windows. Colon is path-significant on Windows (drive letters,
+    // NTFS alternate data streams). Reject all three uniformly.
+    for ch in segment.chars() {
+        if ch == '\0' || ch == '\\' || ch == ':' {
+            return Err(WickError::Backend(format!(
+                "{kind} `{segment}` contains forbidden character {ch:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Minimal URL parser: extract `(host, path)` from `https://host/path`.
@@ -215,5 +260,46 @@ mod tests {
     fn split_url_accepts_http_and_https() {
         assert!(split_url("http://example.com/x").is_ok());
         assert!(split_url("https://example.com/x").is_ok());
+    }
+
+    #[test]
+    fn path_for_url_rejects_parent_dir_segment() {
+        let repo = BundleRepo::new("/tmp/store");
+        // Attacker-controlled URL with `..` would otherwise escape
+        // `store_dir` after PathBuf::push canonicalization.
+        let e = repo
+            .path_for_url("https://evil.example.com/a/../../etc/passwd")
+            .expect_err("`..` segment must be rejected");
+        assert!(format!("{e}").contains("escape the cache root"));
+    }
+
+    #[test]
+    fn path_for_url_rejects_empty_segment() {
+        let repo = BundleRepo::new("/tmp/store");
+        // Double slash produces an empty segment.
+        let e = repo
+            .path_for_url("https://example.com/a//b")
+            .expect_err("empty path segment must be rejected");
+        assert!(format!("{e}").contains("must not be empty"));
+    }
+
+    #[test]
+    fn path_for_url_strips_query_and_fragment() {
+        let repo = BundleRepo::new("/tmp/store");
+        // Query / fragment are URL syntax; they must not appear in the
+        // on-disk path or the filename becomes `model.gguf?x=1` etc.
+        let p = repo
+            .path_for_url("https://example.com/model.gguf?foo=bar#frag")
+            .unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/store/example.com/model.gguf"));
+    }
+
+    #[test]
+    fn path_for_url_rejects_null_byte_in_path() {
+        let repo = BundleRepo::new("/tmp/store");
+        let e = repo
+            .path_for_url("https://example.com/a\0b")
+            .expect_err("null byte in path must be rejected");
+        assert!(format!("{e}").contains("forbidden"));
     }
 }

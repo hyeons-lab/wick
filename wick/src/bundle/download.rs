@@ -38,7 +38,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// HTTP timeout for HEAD probes. Short because a slow HEAD means the
 /// server is struggling and we'd rather fall back to a best-effort
 /// cache reuse than block the caller.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HEAD-probe result.
 pub(crate) struct HeadInfo {
@@ -130,11 +130,18 @@ pub(crate) fn download_to(
         .map(|s| s.to_ascii_lowercase())
         .or(server_hash);
 
-    let mut partial = dest.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    // Best-effort remove of a leftover `.partial` from a prior crash.
-    let _ = fs::remove_file(&partial);
+    // Unique temp suffix so two concurrent processes (or threads)
+    // fetching the same URL don't race on one `.partial` name. The
+    // random tail uses SystemTime nanos + a PID — cheap, doesn't drag
+    // in a new RNG dep, and collision probability is negligible for the
+    // realistic case (human-initiated concurrent bundle downloads).
+    let mut partial_name = dest.as_os_str().to_owned();
+    partial_name.push(format!(
+        ".partial.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let partial = PathBuf::from(partial_name);
 
     // Scope so the file is closed before rename.
     let actual_hex = {
@@ -150,17 +157,40 @@ pub(crate) fn download_to(
         hex_encode(&digest)
     };
 
-    if let Some(exp) = expected.as_deref()
-        && exp != actual_hex
-    {
-        let _ = fs::remove_file(&partial);
-        return Err(WickError::Backend(format!(
-            "integrity check failed for {url}: expected sha256:{exp}, got sha256:{actual_hex}"
-        )));
+    if let Some(exp) = expected.as_deref() {
+        if exp != actual_hex {
+            let _ = fs::remove_file(&partial);
+            return Err(WickError::Backend(format!(
+                "integrity check failed for {url}: expected sha256:{exp}, got sha256:{actual_hex}"
+            )));
+        }
     }
 
+    // `fs::rename` on Windows fails if `dest` exists (POSIX would
+    // silently replace). Remove first so cache invalidation + re-
+    // download works cross-platform. Best-effort: if remove fails
+    // (e.g., file never existed), the rename below still handles the
+    // common path.
+    let _ = fs::remove_file(dest);
     fs::rename(&partial, dest)?;
     Ok(())
+}
+
+/// Process-unique-ish suffix for the temp download filename. Combines
+/// SystemTime nanos with a thread ID hash — cheap and avoids pulling a
+/// dedicated RNG dep through just for this.
+fn unique_suffix() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        .hash(&mut h);
+    h.finish()
 }
 
 /// `io::Write` adapter that fans bytes into both the wrapped writer
