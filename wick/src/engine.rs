@@ -355,8 +355,7 @@ impl WickEngine {
         let mut manifest = Manifest::from_file(path).map_err(|e| {
             WickError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
         })?;
-        let manifest_dir = path.parent().map(Path::to_path_buf);
-        resolve_all_manifest_files(&mut manifest, manifest_dir.as_deref(), &cfg)?;
+        resolve_all_manifest_files(&mut manifest, path.parent(), &cfg)?;
         let primary = PathBuf::from(&manifest.files.model);
         Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
