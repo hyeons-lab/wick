@@ -18,16 +18,25 @@ use std::sync::Arc;
 use wick::kv_cache::KvCompression;
 use wick::model::Model;
 use wick::tokenizer::BpeTokenizer;
-use wick::{FinishReason, GenerateOpts, ModalitySink, Session, SessionConfig};
+use wick::{
+    FinishReason, GenerateOpts, ModalityCapabilities, ModalitySink, Session, SessionConfig,
+};
 
 /// Test-local helper: wrap a freshly-loaded `(model, tokenizer)` pair
 /// in the `Arc`s that `Session::new` now requires post-lifetime-refactor.
 /// Collapses what would otherwise be three `Arc::from`/`Arc::new` calls
 /// at every test site.
+///
+/// Every test in this file exercises the text-in / text-out path only
+/// (`find_model()`'s default falls back to the LFM2-VL GGUF because
+/// that's what the host has handy, but these tests never feed it an
+/// image). Pinning capabilities to `text_only()` reflects what the
+/// tests exercise, not the underlying model's full capabilities — a VL
+/// or audio test would pass the matching constructor.
 fn make_session(model: Box<dyn Model>, tokenizer: BpeTokenizer, config: SessionConfig) -> Session {
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
-    Session::new(model, tokenizer, config)
+    Session::new(model, tokenizer, ModalityCapabilities::text_only(), config)
 }
 
 /// Locate a text-path GGUF for the tests. Prefers the `WICK_MODEL` env var;
@@ -367,6 +376,7 @@ fn stochastic_split_matches_single_call_under_seed() {
         let mut session = Session::new(
             model,
             Arc::clone(&tokenizer),
+            ModalityCapabilities::text_only(),
             SessionConfig {
                 seed: Some(999),
                 ..Default::default()
@@ -384,6 +394,7 @@ fn stochastic_split_matches_single_call_under_seed() {
         let mut session = Session::new(
             model,
             Arc::clone(&tokenizer),
+            ModalityCapabilities::text_only(),
             SessionConfig {
                 seed: Some(999),
                 ..Default::default()

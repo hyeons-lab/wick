@@ -44,7 +44,7 @@ use crate::kv_cache::KvCacheConfig;
 use crate::manifest::ManifestFiles;
 use crate::manifest::{InferenceType, Manifest};
 use crate::model::{self, Model};
-use crate::session::{Session, SessionConfig, WickError};
+use crate::session::{ModalityCapabilities, Session, SessionConfig, WickError};
 use crate::tokenizer::BpeTokenizer;
 
 // ---------------------------------------------------------------------------
@@ -407,9 +407,23 @@ impl WickEngine {
     /// Create a new [`Session`] sharing ownership of the engine's model
     /// and tokenizer via `Arc` clones. The returned session outlives
     /// `&self`; the engine keeps the originals live for every session
-    /// it handed out.
+    /// it handed out. The session's [`ModalityCapabilities`] is derived
+    /// from the manifest's `inference_type`.
     pub fn new_session(&self, cfg: SessionConfig) -> Session {
-        Session::new(Arc::clone(&self.model), Arc::clone(&self.tokenizer), cfg)
+        Session::new(
+            Arc::clone(&self.model),
+            Arc::clone(&self.tokenizer),
+            self.capabilities(),
+            cfg,
+        )
+    }
+
+    /// Modality capabilities reported by the loaded model, derived from
+    /// the manifest's `inference_type`. Useful for FFI consumers that
+    /// want to gate UI / API surfaces on what the model supports
+    /// without constructing a [`Session`].
+    pub fn capabilities(&self) -> ModalityCapabilities {
+        ModalityCapabilities::from_inference_type(&self.manifest.inference_type)
     }
 
     /// Borrow the loaded model. Used by the audio pipeline today;

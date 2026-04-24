@@ -38,7 +38,9 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
     use wick::kv_cache::KvCompression;
     use wick::model::Model;
     use wick::model::metal_lfm2::MetalLfm2Model;
-    use wick::{FinishReason, GenerateOpts, ModalitySink, Session, SessionConfig};
+    use wick::{
+        FinishReason, GenerateOpts, ModalityCapabilities, ModalitySink, Session, SessionConfig,
+    };
 
     let gguf = wick::gguf::GgufFile::open(model_path).unwrap();
     let tokenizer = Arc::new(wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
@@ -57,6 +59,7 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
     let mut session = Session::new(
         model,
         tokenizer,
+        ModalityCapabilities::text_only(),
         SessionConfig {
             kv_compression: KvCompression::None,
             seed: None,
