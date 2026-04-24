@@ -169,10 +169,15 @@ pub struct ModelMetadata {
 // ---------------------------------------------------------------------------
 
 /// Owning handle to a loaded model + tokenizer + manifest.
+///
+/// `model` and `tokenizer` are stored as `Arc` rather than `Box`/owned
+/// so [`new_session`](Self::new_session) can hand out cheap
+/// lifetime-free [`Session`] handles (see [`Session`]'s doc comment for
+/// why the FFI story requires this).
 pub struct WickEngine {
     manifest: Manifest,
-    model: Box<dyn Model>,
-    tokenizer: BpeTokenizer,
+    model: Arc<dyn Model>,
+    tokenizer: Arc<BpeTokenizer>,
     metadata: ModelMetadata,
     config: EngineConfig,
 }
@@ -343,12 +348,15 @@ impl WickEngine {
         let add_bos_token = gguf
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(false);
-        let model = load_text_model(gguf, path, &cfg)?;
+        // `load_text_model` returns `Box<dyn Model>`; convert to `Arc`
+        // at the engine boundary. `Arc::from(Box<T>)` is documented on
+        // `Arc` for exactly this sizing dance (including `T: ?Sized`).
+        let model: Arc<dyn Model> = Arc::from(load_text_model(gguf, path, &cfg)?);
         let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
         Ok(Self {
             manifest,
             model,
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             metadata,
             config: cfg,
         })
@@ -396,10 +404,12 @@ impl WickEngine {
 
     // --- accessors ---
 
-    /// Create a new `Session` borrowing the engine's model + tokenizer.
-    /// The returned session's lifetime is tied to `&self`.
-    pub fn new_session(&self, cfg: SessionConfig) -> Session<'_> {
-        Session::new(self.model.as_ref(), &self.tokenizer, cfg)
+    /// Create a new [`Session`] sharing ownership of the engine's model
+    /// and tokenizer via `Arc` clones. The returned session outlives
+    /// `&self`; the engine keeps the originals live for every session
+    /// it handed out.
+    pub fn new_session(&self, cfg: SessionConfig) -> Session {
+        Session::new(Arc::clone(&self.model), Arc::clone(&self.tokenizer), cfg)
     }
 
     /// Borrow the loaded model. Used by the audio pipeline today;
@@ -408,9 +418,21 @@ impl WickEngine {
         self.model.as_ref()
     }
 
+    /// Shared refcounted handle to the loaded model. Used by callers
+    /// (FFI wrappers, the audio pipeline, future trait impls) that
+    /// need to keep the model alive independently of the engine.
+    pub fn model_arc(&self) -> Arc<dyn Model> {
+        Arc::clone(&self.model)
+    }
+
     /// Borrow the tokenizer.
     pub fn tokenizer(&self) -> &BpeTokenizer {
-        &self.tokenizer
+        self.tokenizer.as_ref()
+    }
+
+    /// Shared refcounted handle to the tokenizer.
+    pub fn tokenizer_arc(&self) -> Arc<BpeTokenizer> {
+        Arc::clone(&self.tokenizer)
     }
 
     /// Borrow the parsed manifest.

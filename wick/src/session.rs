@@ -198,10 +198,18 @@ pub fn can_shift(
     supports_kv_shift && n_keep > 0 && !is_compressed && current_pos >= n_keep + shift_needed
 }
 
-/// Stateful inference session. Borrows the model + tokenizer for its lifetime.
-pub struct Session<'a> {
-    model: &'a dyn Model,
-    tokenizer: &'a BpeTokenizer,
+/// Stateful inference session. Owns refcounted handles to the model
+/// and tokenizer — no borrow lifetime — so `Session` values can flow
+/// across an FFI boundary or be returned from a constructor without
+/// tying them to an owning `WickEngine`.
+///
+/// The `Arc`-based design replaced the earlier `Session<'a> { model:
+/// &'a dyn Model, tokenizer: &'a BpeTokenizer }` form because UniFFI
+/// and bindgen tools don't marshal Rust lifetimes — the exposed type
+/// has to own its dependencies.
+pub struct Session {
+    model: Arc<dyn Model>,
+    tokenizer: Arc<BpeTokenizer>,
     state: InferenceState,
     sampler: Sampler,
     /// Total tokens currently in KV.
@@ -219,9 +227,12 @@ pub struct Session<'a> {
     config: SessionConfig,
 }
 
-impl<'a> Session<'a> {
+impl Session {
     /// Construct a new session backed by an already-loaded model + tokenizer.
-    pub fn new(model: &'a dyn Model, tokenizer: &'a BpeTokenizer, config: SessionConfig) -> Self {
+    /// Both are taken by `Arc` — in-process callers typically clone from
+    /// [`crate::WickEngine`] (see [`crate::WickEngine::new_session`]); FFI
+    /// callers wrap owned handles.
+    pub fn new(model: Arc<dyn Model>, tokenizer: Arc<BpeTokenizer>, config: SessionConfig) -> Self {
         let model_cfg = model.config();
         let max_seq_len = config
             .max_seq_len
@@ -302,6 +313,20 @@ impl<'a> Session<'a> {
     /// and audio loaders.
     pub fn capabilities(&self) -> ModalityCapabilities {
         ModalityCapabilities::text_only()
+    }
+
+    /// Borrow the tokenizer the session was constructed with. Useful
+    /// for callers (tests, FFI wrappers) that want to encode / decode
+    /// without threading the tokenizer through separately.
+    pub fn tokenizer(&self) -> &BpeTokenizer {
+        self.tokenizer.as_ref()
+    }
+
+    /// Borrow the model the session was constructed with. Primarily
+    /// for introspection (vocab size, max_seq_len, etc.); hot-path
+    /// forward calls still go through `Session`'s own methods.
+    pub fn model(&self) -> &dyn Model {
+        self.model.as_ref()
     }
 
     /// Current KV position — tokens live. Atomic; safe from any thread.
