@@ -38,7 +38,7 @@ fn assert_close(name: &str, a: &[f32], b: &[f32], tol: f32) {
 
 fn run_1d(
     ctx: &MetalContext,
-    src: &str,
+    src: &'static str,
     entry: &str,
     buffers: &[&metal::Buffer],
     grid_x: u64,
@@ -808,7 +808,7 @@ fn test_classic_vs_flash_attention_synthetic() {
     let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
     let out_bytes = (n_heads * head_dim) as u64 * 4;
 
-    let run_attn = |src: &str, entry: &str| -> Vec<f32> {
+    let run_attn = |src: &'static str, entry: &str| -> Vec<f32> {
         let pipe = ctx.create_pipeline(src, entry).expect("compile");
         let out_buf = ctx.create_buffer(out_bytes);
         let cb = ctx.queue.new_command_buffer();
@@ -872,7 +872,7 @@ fn test_classic_vs_gqa_attention_synthetic() {
     let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
     let out_bytes = (n_heads * head_dim) as u64 * 4;
 
-    let run_attn = |src: &str, entry: &str, tg_count: u64| -> Vec<f32> {
+    let run_attn = |src: &'static str, entry: &str, tg_count: u64| -> Vec<f32> {
         let pipe = ctx.create_pipeline(src, entry).expect("compile");
         let out_buf = ctx.create_buffer(out_bytes);
         let cb = ctx.queue.new_command_buffer();

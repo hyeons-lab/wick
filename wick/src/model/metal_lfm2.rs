@@ -3,7 +3,8 @@
 // Mirrors GpuLfm2Model (wgpu) but dispatches directly through the metal crate.
 // All GPU work per token is encoded into ONE command buffer and committed once.
 
-use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
@@ -118,7 +119,7 @@ struct MetalPipelines {
 struct MetalState {
     kv_caches: Vec<Option<(Buffer, Buffer)>>,
     conv_buffers: Vec<Option<Buffer>>,
-    seq_len: Cell<usize>,
+    seq_len: AtomicUsize,
     max_seq_len: usize,
     embedding_hidden_size: usize,
 }
@@ -197,7 +198,7 @@ pub struct MetalLfm2Model {
     mmap_data_offset: usize,
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
-    pub prefix_cache: std::cell::RefCell<crate::kv_cache::KvPrefixCache>,
+    pub prefix_cache: Mutex<crate::kv_cache::KvPrefixCache>,
     /// Cached env var values: read once at init to avoid per-dispatch syscalls.
     force_flash: bool,
     attn_mode: String,
@@ -439,7 +440,7 @@ impl MetalLfm2Model {
         // Use the GGUF file path as the model identifier so different model
         // files (even with the same architecture) don't share cache entries.
         let model_id = path.to_string_lossy();
-        let prefix_cache = std::cell::RefCell::new(crate::kv_cache::KvPrefixCache::new(
+        let prefix_cache = Mutex::new(crate::kv_cache::KvPrefixCache::new(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
             &model_id,
@@ -501,7 +502,7 @@ impl MetalLfm2Model {
             state: MetalState {
                 kv_caches,
                 conv_buffers,
-                seq_len: Cell::new(0),
+                seq_len: AtomicUsize::new(0),
                 max_seq_len,
                 embedding_hidden_size: hs,
             },
@@ -1960,9 +1961,9 @@ impl Model for MetalLfm2Model {
         let hs = cfg.hidden_size;
 
         assert!(
-            self.state.seq_len.get() < self.state.max_seq_len,
+            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
             "Metal seq_len {} exceeds max_seq_len {}",
-            self.state.seq_len.get(),
+            self.state.seq_len.load(Ordering::Relaxed),
             self.state.max_seq_len,
         );
 
@@ -1972,7 +1973,7 @@ impl Model for MetalLfm2Model {
             self.dequant_embedding_row(token_id, dst);
         }
 
-        let pos = self.state.seq_len.get();
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
 
         if let Some(timer) = &self.profile_timer {
             // Profiling path: each category is its own command buffer so we can
@@ -1984,15 +1985,15 @@ impl Model for MetalLfm2Model {
             });
             timer.bump_token();
             // Print cumulative breakdown every 32 tokens to avoid noise.
-            if timer.tokens.get() % 32 == 0 {
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
                 timer.print();
             }
         } else if let Some(timer) = &self.gpu_timer {
             // GPU-timestamp profiling: one command buffer, many compute
             // encoders (one per category) — each with start/end timestamp
             // samples attached. Single commit+wait, then resolve samples.
-            timer.next_idx.set(0);
-            timer.labels.borrow_mut().clear();
+            timer.next_idx.store(0, Ordering::Relaxed);
+            timer.labels.lock().expect("timer mutex poisoned").clear();
             let cb = self.ctx.queue.new_command_buffer();
             self.encode_layers_gpu_timed(cb, pos, timer);
             self.gpu_sampled_pass(timer, cb, "out", |enc| {
@@ -2003,7 +2004,7 @@ impl Model for MetalLfm2Model {
             cb.wait_until_completed();
             self.gpu_timer_resolve(timer);
             timer.bump_token();
-            if timer.tokens.get() % 32 == 0 {
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
                 timer.print();
             }
         } else {
@@ -2020,7 +2021,7 @@ impl Model for MetalLfm2Model {
         }
 
         // Update state + read back logits (unified memory zero-copy)
-        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
         self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
     }
@@ -2038,9 +2039,9 @@ impl Model for MetalLfm2Model {
         let hs = cfg.hidden_size;
 
         assert!(
-            self.state.seq_len.get() < self.state.max_seq_len,
+            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
             "Metal seq_len {} exceeds max_seq_len {}",
-            self.state.seq_len.get(),
+            self.state.seq_len.load(Ordering::Relaxed),
             self.state.max_seq_len,
         );
 
@@ -2049,7 +2050,7 @@ impl Model for MetalLfm2Model {
             self.dequant_embedding_row(token_id, dst);
         }
 
-        let pos = self.state.seq_len.get();
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
 
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -2066,7 +2067,7 @@ impl Model for MetalLfm2Model {
         cb.commit();
         cb.wait_until_completed();
 
-        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
 
         // Read only 4 bytes instead of vocab_size × 4.
@@ -2084,7 +2085,7 @@ impl Model for MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
-        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+        assert!(self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len);
 
         // 1. Dequant embedding → hidden_buf.
         unsafe {
@@ -2092,7 +2093,7 @@ impl Model for MetalLfm2Model {
             self.dequant_embedding_row(token_id, dst);
         }
 
-        let pos = self.state.seq_len.get();
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
 
         // 2. Run layers only (no output norm, no logit projection).
         // The reference's llama_get_embeddings returns the raw hidden state
@@ -2106,7 +2107,7 @@ impl Model for MetalLfm2Model {
         cb.commit();
         cb.wait_until_completed();
 
-        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
 
         // Apply output norm.
@@ -2129,14 +2130,14 @@ impl Model for MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
-        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+        assert!(self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len);
 
         unsafe {
             let dst = self.hidden_buf.contents() as *mut f32;
             std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
         }
 
-        let pos = self.state.seq_len.get();
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
 
         // Run layers + output norm.
         let cb = self.ctx.queue.new_command_buffer();
@@ -2147,7 +2148,7 @@ impl Model for MetalLfm2Model {
         cb.commit();
         cb.wait_until_completed();
 
-        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
         self.ctx.read_f32(&self.normed_buf, hs)
     }
@@ -2161,7 +2162,7 @@ impl Model for MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
-        assert!(self.state.seq_len.get() < self.state.max_seq_len);
+        assert!(self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len);
 
         // 1. Write embedding directly into hidden_buf (skip token lookup).
         unsafe {
@@ -2169,7 +2170,7 @@ impl Model for MetalLfm2Model {
             std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, hs);
         }
 
-        let pos = self.state.seq_len.get();
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
 
         // 2. Run layers + logit projection.
         let cb = self.ctx.queue.new_command_buffer();
@@ -2181,7 +2182,7 @@ impl Model for MetalLfm2Model {
         cb.commit();
         cb.wait_until_completed();
 
-        self.state.seq_len.set(self.state.seq_len.get() + 1);
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
         self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
     }
@@ -2195,13 +2196,16 @@ impl Model for MetalLfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
-        *self.prefix_cache.borrow_mut() =
+        *self
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned") =
             crate::kv_cache::KvPrefixCache::new(config, &self.config, &self.model_id);
     }
 
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
         use crate::kv_cache::{LayerSnapshot, StateSnapshot};
-        let seq_len = self.state.seq_len.get();
+        let seq_len = self.state.seq_len.load(Ordering::Relaxed);
         let cfg = &self.config;
         let mut layers = Vec::with_capacity(cfg.n_layers);
 
@@ -2263,7 +2267,9 @@ impl Model for MetalLfm2Model {
                 }
             }
         }
-        self.state.seq_len.set(snapshot.seq_len);
+        self.state
+            .seq_len
+            .store(snapshot.seq_len, Ordering::Relaxed);
     }
 
     fn forward_prefill(
@@ -2277,10 +2283,14 @@ impl Model for MetalLfm2Model {
         // InferenceState is already fresh when callers invoke generate() again,
         // but the Metal model holds its own seq_len counter and GPU KV buffers.
         if start_pos == 0 {
-            self.state.seq_len.set(0);
+            self.state.seq_len.store(0, Ordering::Relaxed);
 
             // Cache lookup: only for fresh prefills.
-            let hit = self.prefix_cache.borrow_mut().find_longest_prefix(tokens);
+            let hit = self
+                .prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned")
+                .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
                 // Always keep at least 1 token for forward_prefill_inner to produce logits.
                 let use_len = prefix_len.min(tokens.len().saturating_sub(1));
@@ -2290,7 +2300,8 @@ impl Model for MetalLfm2Model {
 
                     let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
                     self.prefix_cache
-                        .borrow_mut()
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
                         .insert(tokens, self.snapshot_state());
                     return logits;
                 }
@@ -2300,7 +2311,8 @@ impl Model for MetalLfm2Model {
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
         if start_pos == 0 {
             self.prefix_cache
-                .borrow_mut()
+                .lock()
+                .expect("prefix_cache mutex poisoned")
                 .insert(tokens, self.snapshot_state());
         }
         logits
@@ -2809,7 +2821,7 @@ impl MetalLfm2Model {
         cb.commit();
         cb.wait_until_completed();
 
-        self.state.seq_len.set(start_pos + n);
+        self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
         self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
     }
@@ -3259,7 +3271,7 @@ impl MetalLfm2Model {
             timings.push((name, us));
         });
 
-        self.state.seq_len.set(start_pos + n);
+        self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
         let _ = self.ctx.read_f32(&self.logits_buf, self.config.vocab_size);
 
@@ -3327,7 +3339,7 @@ impl MetalLfm2Model {
             timings.push((label, us));
         }
 
-        self.state.seq_len.set(start_pos + n);
+        self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
         let _ = self.ctx.read_f32(&self.logits_buf, self.config.vocab_size);
 
@@ -3358,10 +3370,10 @@ fn build_gpu_timer(ctx: &MetalContext, capacity: usize) -> Option<GpuTimer> {
         sample_buf,
         capacity,
         ns_per_tick,
-        next_idx: Cell::new(0),
-        labels: RefCell::new(Vec::new()),
-        totals_ns: RefCell::new(Vec::new()),
-        tokens: Cell::new(0),
+        next_idx: AtomicUsize::new(0),
+        labels: Mutex::new(Vec::new()),
+        totals_ns: Mutex::new(Vec::new()),
+        tokens: AtomicU32::new(0),
     })
 }
 
@@ -3376,18 +3388,18 @@ struct GpuTimer {
     /// ns per GPU tick (from calibration against wall clock).
     ns_per_tick: f64,
     /// Index of the NEXT sample to emit (reset per-forward).
-    next_idx: Cell<usize>,
+    next_idx: AtomicUsize,
     /// Category labels in insertion order for the current forward.
-    labels: RefCell<Vec<&'static str>>,
+    labels: Mutex<Vec<&'static str>>,
     /// Accumulated totals per category, in ns, across all forwards.
-    totals_ns: RefCell<Vec<(&'static str, f64)>>,
-    tokens: Cell<u32>,
+    totals_ns: Mutex<Vec<(&'static str, f64)>>,
+    tokens: AtomicU32,
 }
 
 impl GpuTimer {
     fn record_pair(&self, cat: &'static str, delta_ticks: u64) {
         let delta_ns = delta_ticks as f64 * self.ns_per_tick;
-        let mut totals = self.totals_ns.borrow_mut();
+        let mut totals = self.totals_ns.lock().expect("timer mutex poisoned");
         if let Some((_, v)) = totals.iter_mut().find(|(k, _)| *k == cat) {
             *v += delta_ns;
         } else {
@@ -3396,16 +3408,16 @@ impl GpuTimer {
     }
 
     fn bump_token(&self) {
-        self.tokens.set(self.tokens.get() + 1);
+        self.tokens.fetch_add(1, Ordering::Relaxed);
     }
 
     fn print(&self) {
-        let tokens = self.tokens.get().max(1) as f64;
-        let totals = self.totals_ns.borrow();
+        let tokens = self.tokens.load(Ordering::Relaxed).max(1) as f64;
+        let totals = self.totals_ns.lock().expect("timer mutex poisoned");
         let total_ns: f64 = totals.iter().map(|(_, v)| v).sum();
         eprintln!(
             "[wick-metal] per-category GPU µs/token ({} tokens):",
-            self.tokens.get()
+            self.tokens.load(Ordering::Relaxed)
         );
         let mut widest = 0usize;
         for (k, _) in totals.iter() {
@@ -3434,20 +3446,20 @@ impl GpuTimer {
 /// Categories are kept in insertion order so the printed table reflects the
 /// logical pipeline stages.
 struct CategoryTimer {
-    totals: RefCell<Vec<(&'static str, f64)>>,
-    tokens: Cell<u32>,
+    totals: Mutex<Vec<(&'static str, f64)>>,
+    tokens: AtomicU32,
 }
 
 impl CategoryTimer {
     fn new() -> Self {
         Self {
-            totals: RefCell::new(Vec::new()),
-            tokens: Cell::new(0),
+            totals: Mutex::new(Vec::new()),
+            tokens: AtomicU32::new(0),
         }
     }
 
     fn record(&self, cat: &'static str, ms: f64) {
-        let mut totals = self.totals.borrow_mut();
+        let mut totals = self.totals.lock().expect("timer mutex poisoned");
         if let Some((_, v)) = totals.iter_mut().find(|(k, _)| *k == cat) {
             *v += ms;
         } else {
@@ -3456,16 +3468,16 @@ impl CategoryTimer {
     }
 
     fn bump_token(&self) {
-        self.tokens.set(self.tokens.get() + 1);
+        self.tokens.fetch_add(1, Ordering::Relaxed);
     }
 
     fn print(&self) {
-        let tokens = self.tokens.get().max(1) as f64;
-        let totals = self.totals.borrow();
+        let tokens = self.tokens.load(Ordering::Relaxed).max(1) as f64;
+        let totals = self.totals.lock().expect("timer mutex poisoned");
         let total_ms: f64 = totals.iter().map(|(_, v)| v).sum();
         eprintln!(
             "[wick-metal] per-category ms/token breakdown ({} tokens):",
-            self.tokens.get()
+            self.tokens.load(Ordering::Relaxed)
         );
         let mut widest = 0usize;
         for (k, _) in totals.iter() {
@@ -3500,7 +3512,7 @@ impl MetalLfm2Model {
     ) where
         F: FnOnce(&metal::ComputeCommandEncoderRef),
     {
-        let idx = timer.next_idx.get();
+        let idx = timer.next_idx.load(Ordering::Relaxed);
         if idx + 2 > timer.capacity {
             // Over capacity — fall back to untimed encoder.
             let enc = cb.new_compute_command_encoder();
@@ -3518,14 +3530,14 @@ impl MetalLfm2Model {
         let enc = cb.compute_command_encoder_with_descriptor(desc);
         f(enc);
         enc.end_encoding();
-        timer.labels.borrow_mut().push(cat);
-        timer.next_idx.set(idx + 2);
+        timer.labels.lock().expect("timer mutex poisoned").push(cat);
+        timer.next_idx.store(idx + 2, Ordering::Relaxed);
     }
 
     /// Resolve the GPU sample buffer after wait_until_completed, compute per-
     /// category deltas, and accumulate into totals.
     fn gpu_timer_resolve(&self, timer: &GpuTimer) {
-        let n = timer.next_idx.get();
+        let n = timer.next_idx.load(Ordering::Relaxed);
         if n == 0 {
             return;
         }
@@ -3534,7 +3546,7 @@ impl MetalLfm2Model {
             length: n as u64,
         };
         let samples = timer.sample_buf.resolve_counter_range(range);
-        let labels = timer.labels.borrow();
+        let labels = timer.labels.lock().expect("timer mutex poisoned");
         // Each category has a (start, end) pair at indices [2i, 2i+1].
         for (i, cat) in labels.iter().enumerate() {
             let a = samples[i * 2];
