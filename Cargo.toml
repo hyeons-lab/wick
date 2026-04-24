@@ -43,8 +43,8 @@ openblas-src = { version = "0.10", features = ["system"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
 # UniFFI for multi-language bindings (wick-ffi crate). Version pinned to
-# a 0.28.x series — bindings are ABI-stable within a minor.
-uniffi = "0.28"
+# a 0.31.x series — bindings are ABI-stable within a minor.
+uniffi = "0.31"
 
 [profile.release]
 lto = "thin"

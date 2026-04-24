@@ -58,6 +58,73 @@ jobs:
       - name: Build release
         run: cargo build --workspace --release
 
+  ffi-bindings-drift:
+    # Verifies the committed Kotlin + Swift bindings under
+    # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`
+    # surface. Regenerates via `uniffi-bindgen` (the in-repo binary
+    # target) against the freshly-built debug dylib and fails if
+    # `git diff` shows changes — signalling someone touched the FFI
+    # exports without running `just bindings` and committing the result.
+    #
+    # Skips Kotlin/Swift compilation: we're only checking that the
+    # generator produces the same bytes for the same input. No JDK /
+    # Swift toolchain needed beyond `ktlint` (which uniffi-bindgen
+    # invokes on the Kotlin output so the committed file stays
+    # formatter-stable).
+    name: FFI Bindings Drift
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ktlint
+        # Pin the ktlint version + verify its sha256 so the formatter
+        # output is reproducible across CI runs + developer workstations
+        # AND so a compromised mirror can't slip a different binary past
+        # the drift check. Bump in lockstep with whatever's documented
+        # in wick-ffi/README.md (regenerate the bindings in the same PR).
+        #
+        # `curl --fail --proto '=https' --tlsv1.2` hardens the download
+        # against silent HTTP errors and legacy TLS downgrades.
+        # The sha256 below is for the ktlint 1.8.0 standalone release
+        # binary from pinterest/ktlint; bumping the version requires
+        # recomputing it (locally: `shasum -a 256 ktlint`).
+        run: |
+          KTLINT_VERSION=1.8.0
+          KTLINT_SHA256=a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75
+          curl --fail --proto '=https' --tlsv1.2 -sSLo /tmp/ktlint \
+            "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
+          echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c -
+          chmod +x /tmp/ktlint
+          sudo mv /tmp/ktlint /usr/local/bin/ktlint
+          ktlint --version
+      - name: Build wick-ffi (cdylib for bindgen)
+        run: cargo build -p wick-ffi
+      - name: Regenerate bindings
+        # `--features bindgen` opts into the crate's `bindgen` feature,
+        # which lights up `uniffi/cli`. Library consumers never pay for
+        # this feature; only the binary target needs it.
+        run: |
+          cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
+            --library target/debug/libwick_ffi.so \
+            --language kotlin \
+            --out-dir wick-ffi/bindings/kotlin
+          cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
+            --library target/debug/libwick_ffi.so \
+            --language swift \
+            --out-dir wick-ffi/bindings/swift
+      - name: Diff committed bindings
+        run: |
+          if [ -n "$(git status --porcelain wick-ffi/bindings)" ]; then
+            echo "::error::Vendored bindings under wick-ffi/bindings/ are out of date."
+            echo "Run 'just bindings' locally and commit the resulting diff."
+            git --no-pager diff wick-ffi/bindings
+            exit 1
+          fi
+
   integration-test:
     name: Integration Tests (gated)
     needs: check

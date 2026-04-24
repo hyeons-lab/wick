@@ -13,6 +13,30 @@ description = "UniFFI bindings for wick — exposes the core inference engine to
 #   harness, examples) can depend on the crate as a normal library.
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# Binding-generation binary. Runs `uniffi::uniffi_bindgen_main()` so the
+# standard `uniffi-bindgen generate --library <dylib> --language <lang>`
+# CLI is available in-repo. Invoked from `just bindings` + CI; see
+# `wick-ffi/README.md`.
+#
+# `required-features = ["bindgen"]` is the load-bearing bit: it keeps
+# the `uniffi/cli` dep (clap + friends) out of every cdylib / staticlib
+# consumer's build. Mobile consumers (Android cdylib, iOS staticlib)
+# never run the CLI; there's no reason to pull clap through their
+# binary. `cargo run -p wick-ffi --bin uniffi-bindgen --features
+# bindgen -- ...` is the full invocation. The justfile recipe +
+# CI job both pass the flag.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Opt-in crate feature that lights up the `uniffi/cli` feature. Only
+# needed by the `uniffi-bindgen` binary target; library consumers
+# (including the `cdylib` / `staticlib` targets used by mobile builds)
+# don't need it and shouldn't pay for the extra dep cost.
+bindgen = ["uniffi/cli"]
+
 [dependencies]
 # `tokio` feature activates the `async_runtime = "tokio"` export path
 # — required for the `async fn` methods on `Session` that offload the
