@@ -20,7 +20,10 @@
 //!   [`Session::generate`] returning [`GenerateOutput`] (tokens +
 //!   [`GenerateSummary`]), or [`Session::generate_streaming`] that
 //!   delivers tokens + audio frames through a foreign [`ModalitySink`]
-//!   as they're produced.
+//!   as they're produced. Async twins
+//!   [`Session::generate_async`] + [`Session::generate_streaming_async`]
+//!   let foreign async runtimes (Kotlin coroutines, Swift `async`,
+//!   Python `asyncio`) `.await` decode without stalling the caller.
 //! - [`SessionConfig`] + [`KvCompression`] — per-session knobs.
 //! - [`GenerateOpts`] + [`FinishReason`] — per-call decode config + exit reason.
 //! - [`Session::cancel`] / [`Session::position`] for cooperative
@@ -36,11 +39,9 @@
 //! ## Not exposed yet
 //!
 //! Future PRs grow the surface per the roadmap in
-//! `wick-ffi/README.md`. Highlights: `async` `generate` via
-//! `#[uniffi::export(async_runtime = "tokio")]` (PR 5), remote URL
-//! loading through `BundleRepo` (gated on the `remote` feature),
-//! binding generation for Kotlin / Swift / Python, and typed error
-//! variants.
+//! `wick-ffi/README.md`. Highlights: remote URL loading through
+//! `BundleRepo` (gated on the `remote` feature), binding generation
+//! for Kotlin / Swift / Python, and typed error variants.
 //!
 //! ## Design notes
 //!
@@ -732,6 +733,80 @@ impl Session {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async Session methods (PR 5)
+// ---------------------------------------------------------------------------
+//
+// Foreign callers driving an async runtime (Kotlin coroutines, Swift
+// `async`, Python `asyncio`) can `.await` these without bouncing into
+// a sync context. Every method defers to its synchronous twin inside
+// `tokio::task::spawn_blocking`, which moves the actual decode work
+// onto a blocking worker thread — so the tokio async worker pool
+// stays free to poll other futures while decoding is in flight.
+//
+// `self: Arc<Self>` rather than `&self` so the session handle can
+// cross the `spawn_blocking` boundary (requires `'static`). UniFFI
+// wraps `#[uniffi::Object]` types in `Arc` on the foreign side anyway,
+// so this doesn't change the foreign API shape — it's still
+// `session.generateAsync(opts)` on Kotlin / `session.generateAsync(opts)`
+// on Swift / `session.generate_async(opts)` on Python.
+//
+// UniFFI's `tokio` feature starts an internal multi-thread tokio
+// runtime the first time a `#[uniffi::export(async_runtime = "tokio")]`
+// method is invoked. Spawned blocking tasks inherit that runtime's
+// blocking worker pool (`tokio::runtime::Builder::new_multi_thread`
+// default). We don't need to create or enter a runtime ourselves.
+#[uniffi::export(async_runtime = "tokio")]
+impl Session {
+    /// Async variant of [`Session::generate`] — runs buffered decode
+    /// (returning every emitted token + a summary) on a tokio blocking
+    /// worker so the caller's async context isn't stalled by the
+    /// synchronous decode loop.
+    ///
+    /// Equivalent to `generate` in behavior: on error paths the
+    /// wrapper still performs the same poisoned-mutex handling. The
+    /// only difference is the call shape on the foreign side
+    /// (`suspend fun` / `async`) and the fact that the caller can
+    /// `join` / `cancel` / race the future through its own runtime's
+    /// primitives.
+    pub async fn generate_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+    ) -> Result<GenerateOutput, FfiError> {
+        tokio::task::spawn_blocking(move || self.generate(opts))
+            .await
+            .map_err(|e| FfiError::Backend {
+                message: format!("generate_async join error: {e}"),
+            })?
+    }
+
+    /// Async variant of [`Session::generate_streaming`] — delivers
+    /// tokens and audio frames to the foreign [`ModalitySink`] as the
+    /// decode loop produces them, from within a blocking worker so
+    /// the caller's async runtime stays responsive.
+    ///
+    /// Sink callbacks run on the blocking worker thread that's
+    /// executing the decode — **not** on the caller's async thread.
+    /// The reentrancy hazard documented on
+    /// [`Session::generate_streaming`] still applies: sink callbacks
+    /// that call back into `append_text` / `generate*` / `reset` from
+    /// inside the session will deadlock on the session mutex.
+    /// [`Session::cancel`] and [`Session::position`] remain atomic-
+    /// backed and safe to invoke from any thread (including from
+    /// inside a callback).
+    pub async fn generate_streaming_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink))
+            .await
+            .map_err(|e| FfiError::Backend {
+                message: format!("generate_streaming_async join error: {e}"),
+            })?
+    }
+}
+
 // Session-level method on WickEngine.
 #[uniffi::export]
 impl WickEngine {
@@ -1046,5 +1121,54 @@ mod tests {
             1,
             "still one — no double-fire"
         );
+    }
+
+    /// Replicates the `spawn_blocking(..).await.map_err(..)?` pattern
+    /// used by `generate_async` / `generate_streaming_async` — the
+    /// wrapper's entire logic. Proves:
+    ///
+    /// - Successful blocking-closure results propagate through the
+    ///   await + ?-sugar unchanged.
+    /// - A panic in the blocking closure surfaces as
+    ///   `tokio::task::JoinError`, which our `map_err` folds into
+    ///   `FfiError::Backend` with the documented prefix.
+    ///
+    /// Can't construct a real `Session` in a unit test (no model to
+    /// load), so the actual async wrappers are exercised only via
+    /// this shape-equivalent stand-in. The binding generation step
+    /// (PR 6) and the parity harness (PR 7+) will end-to-end exercise
+    /// the real methods.
+    #[tokio::test]
+    async fn spawn_blocking_pattern_propagates_ok_and_maps_join_error() {
+        // Ok path: same shape as `generate_async`'s body — the sync
+        // closure returns the final value, spawn_blocking + await +
+        // map_err hands it back via `?`.
+        let map_join = |e: tokio::task::JoinError| FfiError::Backend {
+            message: format!("test join error: {e}"),
+        };
+
+        let ok: u32 = tokio::task::spawn_blocking(|| 42u32)
+            .await
+            .map_err(map_join)
+            .expect("tokio should not drop the blocking task");
+        assert_eq!(ok, 42);
+
+        // Panic path: the blocking closure panics, JoinError bubbles
+        // out, map_err converts it. No `?` here so we can inspect the
+        // error variant.
+        let panicked = tokio::task::spawn_blocking(|| -> u32 {
+            panic!("simulated decode panic");
+        })
+        .await
+        .map_err(map_join);
+        match panicked {
+            Err(FfiError::Backend { message }) => {
+                assert!(
+                    message.contains("test join error"),
+                    "expected prefix, got: {message}"
+                );
+            }
+            other => panic!("expected Err(Backend), got: {other:?}"),
+        }
     }
 }
