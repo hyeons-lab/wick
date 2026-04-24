@@ -19,7 +19,7 @@ stalling their async thread. Surface grows in follow-up PRs:
 | 2 | `WickEngine::from_path`, `EngineConfig`, `ModelMetadata`, `ModalityCapabilities` |
 | 3 | `Session`, `SessionConfig`, `GenerateOpts`, `GenerateSummary`, sync `generate` |
 | 4 | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
-| 5 *(this one)* | `async` `generate` + `generate_streaming` via `#[uniffi::export(async_runtime = "tokio")]` |
+| 5 *(this one)* | `async` `generate_async` + `generate_streaming_async` via `#[uniffi::export(async_runtime = "tokio")]` |
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI |
 | 7+ | Error-type marshalling, parity harness, Android ABIs, iOS XCFramework |
 

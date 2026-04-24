@@ -24,8 +24,10 @@ thiserror.workspace = true
 # Async runtime for `#[uniffi::export(async_runtime = "tokio")]`.
 # `rt` for the runtime core, `rt-multi-thread` so `spawn_blocking`
 # dispatches decode work onto a dedicated blocking worker thread
-# instead of the runtime's async worker pool.
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# instead of the runtime's async worker pool. `default-features = false`
+# is currently a no-op (tokio 1.x defaults to empty) but makes the
+# intent explicit and defends against a future tokio adding defaults.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
 # wick: default features for the core surface we expose. The `remote`
 # feature lights up when `BundleRepo` surfaces through FFI (a later
 # PR); keeps the dep tree small for now.

@@ -22,8 +22,8 @@
 //!   delivers tokens + audio frames through a foreign [`ModalitySink`]
 //!   as they're produced. Async twins
 //!   [`Session::generate_async`] + [`Session::generate_streaming_async`]
-//!   let foreign async runtimes (Kotlin coroutines, Swift `async`,
-//!   Python `asyncio`) `.await` decode without stalling the caller.
+//!   let foreign async runtimes — Kotlin coroutines, Swift `async`,
+//!   Python `asyncio` — `.await` decode without stalling the caller.
 //! - [`SessionConfig`] + [`KvCompression`] — per-session knobs.
 //! - [`GenerateOpts`] + [`FinishReason`] — per-call decode config + exit reason.
 //! - [`Session::cancel`] / [`Session::position`] for cooperative
@@ -756,6 +756,47 @@ impl Session {
 // method is invoked. Spawned blocking tasks inherit that runtime's
 // blocking worker pool (`tokio::runtime::Builder::new_multi_thread`
 // default). We don't need to create or enter a runtime ourselves.
+
+/// RAII guard that fires `Session::cancel()` on drop unless explicitly
+/// disarmed. Addresses a subtle hazard of wrapping sync decode in
+/// `tokio::task::spawn_blocking`: dropping the outer future drops the
+/// `JoinHandle`, but tokio does **not** abort a `spawn_blocking` task
+/// on handle-drop — the blocking worker keeps decoding, keeps holding
+/// the session mutex, keeps mutating `Session::state`.
+///
+/// Without this guard, a foreign-side cancellation (e.g. a Kotlin
+/// coroutine scope going out of scope, a Swift `Task` being cancelled,
+/// a Python `asyncio.Task.cancel()`) would silently leak decode work
+/// into the background. The caller's next `generate*` call would block
+/// on the still-held mutex or observe state advanced by the "cancelled"
+/// call.
+///
+/// The guard closes that loop: on future-drop, call `session.cancel()`
+/// so the decode loop sees the flag at its next between-token check
+/// and exits with `FinishReason::Cancelled`. The blocking worker then
+/// releases the mutex and the task completes normally (its discarded
+/// output is harmless). Next call sees a clean session.
+///
+/// `wick::Session::generate` resets `cancel` at the start of every
+/// call, so a spuriously-armed cancel (e.g. if the guard drops right
+/// after the await resolves but before disarm — not possible in
+/// practice since futures aren't preemptively dropped between
+/// synchronous statements) wouldn't affect the next call.
+struct AsyncCancelGuard {
+    session: Arc<Session>,
+    /// `true` until the await successfully resolves. Dropping with
+    /// `armed = true` means we're being dropped mid-await: fire cancel.
+    armed: bool,
+}
+
+impl Drop for AsyncCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.cancel();
+        }
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Session {
     /// Async variant of [`Session::generate`] — runs buffered decode
@@ -763,21 +804,34 @@ impl Session {
     /// worker so the caller's async context isn't stalled by the
     /// synchronous decode loop.
     ///
-    /// Equivalent to `generate` in behavior: on error paths the
-    /// wrapper still performs the same poisoned-mutex handling. The
-    /// only difference is the call shape on the foreign side
-    /// (`suspend fun` / `async`) and the fact that the caller can
-    /// `join` / `cancel` / race the future through its own runtime's
-    /// primitives.
+    /// Cancellation: dropping the returned future (e.g. Kotlin
+    /// coroutine scope cancellation, Swift `Task.cancel`, Python
+    /// `asyncio.Task.cancel`) calls [`Session::cancel`] on drop, so
+    /// the background decode exits with [`FinishReason::Cancelled`]
+    /// at its next between-token check. The blocking worker then
+    /// releases the session mutex; subsequent calls see a clean
+    /// session. You can also call [`Session::cancel`] directly from
+    /// any thread to trigger the same exit without dropping the
+    /// future.
+    ///
+    /// On error the wrapper performs the same poisoned-mutex handling
+    /// as sync [`Session::generate`]. `JoinError` from a panic in the
+    /// blocking closure surfaces as [`FfiError::Backend`] with a
+    /// diagnostic prefix.
     pub async fn generate_async(
         self: Arc<Self>,
         opts: GenerateOpts,
     ) -> Result<GenerateOutput, FfiError> {
-        tokio::task::spawn_blocking(move || self.generate(opts))
-            .await
-            .map_err(|e| FfiError::Backend {
-                message: format!("generate_async join error: {e}"),
-            })?
+        let mut guard = AsyncCancelGuard {
+            session: Arc::clone(&self),
+            armed: true,
+        };
+        let handle = tokio::task::spawn_blocking(move || self.generate(opts));
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            message: format!("generate_async join error: {e}"),
+        })?
     }
 
     /// Async variant of [`Session::generate_streaming`] — delivers
@@ -794,16 +848,29 @@ impl Session {
     /// [`Session::cancel`] and [`Session::position`] remain atomic-
     /// backed and safe to invoke from any thread (including from
     /// inside a callback).
+    ///
+    /// Cancellation: dropping the returned future fires
+    /// [`Session::cancel`] on drop (same RAII guard as
+    /// [`Session::generate_async`]). The decode exits with
+    /// [`FinishReason::Cancelled`]; the sink's `on_done` fires on
+    /// the blocking worker before the task completes, so foreign
+    /// consumers get the terminal signal even though they've already
+    /// stopped awaiting.
     pub async fn generate_streaming_async(
         self: Arc<Self>,
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink))
-            .await
-            .map_err(|e| FfiError::Backend {
-                message: format!("generate_streaming_async join error: {e}"),
-            })?
+        let mut guard = AsyncCancelGuard {
+            session: Arc::clone(&self),
+            armed: true,
+        };
+        let handle = tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink));
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            message: format!("generate_streaming_async join error: {e}"),
+        })?
     }
 }
 
@@ -1120,6 +1187,51 @@ mod tests {
             *recorder.calls.lock().unwrap(),
             1,
             "still one — no double-fire"
+        );
+    }
+
+    /// Mirrors the exact `if armed { ... }` branch in
+    /// `AsyncCancelGuard::drop`. Can't build a real `wick::Session`
+    /// in a unit test (no model to load), but the guard's logic is
+    /// one conditional — a structurally identical probe guard gives
+    /// the same coverage. End-to-end verification of
+    /// "drop-future-cancels-decode" requires a real model and lands
+    /// with PR 6's binding smoke tests / PR 7+'s parity harness.
+    #[test]
+    fn async_cancel_guard_drop_fires_when_armed_only() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ProbeGuard {
+            fired: Arc<AtomicBool>,
+            armed: bool,
+        }
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.fired.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Armed drop → fires.
+        let armed_fired = Arc::new(AtomicBool::new(false));
+        drop(ProbeGuard {
+            fired: armed_fired.clone(),
+            armed: true,
+        });
+        assert!(armed_fired.load(Ordering::Relaxed), "armed drop must fire");
+
+        // Disarmed drop → does not fire (the await-resolved path).
+        let disarmed_fired = Arc::new(AtomicBool::new(false));
+        let mut g = ProbeGuard {
+            fired: disarmed_fired.clone(),
+            armed: true,
+        };
+        g.armed = false;
+        drop(g);
+        assert!(
+            !disarmed_fired.load(Ordering::Relaxed),
+            "disarmed drop must not fire"
         );
     }
 
