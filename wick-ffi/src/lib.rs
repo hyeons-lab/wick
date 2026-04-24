@@ -118,9 +118,14 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
+        // Delegate to `wick::EngineConfig::default()` so the
+        // defaults stay in one place. `usize → u64` is infallible on
+        // every platform wick targets (`usize` is 32 or 64 bit; both
+        // fit in u64).
+        let core = wick::EngineConfig::default();
         Self {
-            context_size: 4096,
-            backend: BackendPreference::Auto,
+            context_size: core.context_size as u64,
+            backend: core.backend.into(),
         }
     }
 }
