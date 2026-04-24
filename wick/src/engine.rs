@@ -276,6 +276,38 @@ impl WickEngine {
         Self::from_manifest_with_primary(manifest, files.model.as_path(), cfg)
     }
 
+    /// Load from a LeapBundles ID + quantization selector, e.g.
+    /// `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", cfg)`.
+    ///
+    /// Resolves to
+    /// `https://huggingface.co/LiquidAI/LeapBundles/resolve/main/{bundle_id}/{quant}.json`,
+    /// downloads + caches it via `cfg.bundle_repo`, then loads the
+    /// engine through the normal manifest path — which in turn fetches
+    /// the GGUF (also via `bundle_repo`) since the manifest's model URL
+    /// is an `http(s)://` reference to the model's own HF repo.
+    ///
+    /// `cfg.bundle_repo` **must** be set; otherwise this returns an
+    /// error telling the caller to set it. Requires both `remote` and
+    /// `mmap` features.
+    #[cfg(all(feature = "remote", feature = "mmap"))]
+    pub fn from_bundle_id(
+        bundle_id: &str,
+        quant: &str,
+        cfg: EngineConfig,
+    ) -> Result<Self, WickError> {
+        let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
+            WickError::Backend(
+                "`WickEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set — \
+                 construct a `BundleRepo` rooted at your desired store directory and assign it \
+                 before calling this constructor."
+                    .to_string(),
+            )
+        })?;
+        let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, quant)?;
+        let manifest_path = repo.resolve_url(&manifest_url)?;
+        Self::from_manifest_file(&manifest_path, cfg)
+    }
+
     // --- internal constructors ---
 
     /// Core assembly: take a pre-constructed `GgufFile` + parsed

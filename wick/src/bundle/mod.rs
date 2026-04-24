@@ -325,19 +325,44 @@ fn hash_matches(dest: &Path, url: &str, expected_hash: &str) -> bool {
     }
 }
 
+/// Build the canonical manifest URL for a LeapBundles entry.
+///
+/// The LeapBundles repo on HuggingFace is a flat catalog at
+/// `LiquidAI/LeapBundles`; each bundle occupies a top-level directory
+/// named after the model (e.g. `LFM2-1.2B-GGUF/`), and per-quant
+/// manifests live inside as `<QUANT>.json` (e.g. `Q4_0.json`,
+/// `F16.json`). There is no top-level index — bundle IDs are passed in
+/// as opaque strings.
+///
+/// `bundle_id` / `quant` are interpolated directly into a URL path and
+/// must be safe filesystem components, so they go through the same
+/// strict [`validate_path_segment`] allowlist used for cache-dir
+/// segments. URL-reserved characters (`?`, `#`, `%`) are rejected so
+/// they can't alter URL semantics when interpolated.
+pub fn leap_bundles_manifest_url(bundle_id: &str, quant: &str) -> Result<String, WickError> {
+    validate_path_segment("bundle_id", bundle_id)?;
+    validate_path_segment("quant", quant)?;
+    Ok(format!(
+        "https://huggingface.co/LiquidAI/LeapBundles/resolve/main/{bundle_id}/{quant}.json"
+    ))
+}
+
 /// Strict allowlist for path segments: ASCII alphanumerics and
 /// `-`, `_`, `.`. Everything else is rejected:
 /// - `/`, `\` (path separators on any OS)
 /// - `:` (Windows drive letters / NTFS alternate data streams)
-/// - `*`, `?`, `"`, `<`, `>`, `|` (Windows-reserved)
+/// - `*`, `"`, `<`, `>`, `|` (Windows-reserved)
 /// - whitespace, null bytes, control chars (confusing / truncating)
 /// - URL-reserved `?`, `#`, `%` (semantics-altering under URL parsing)
 /// - non-ASCII (keeps paths portable across codepages; real bundle IDs
 ///   and URL segments in `LiquidAI/LeapBundles` are all ASCII today)
 ///
 /// Used for both URL-derived cache-dir segments (in `path_for_url`,
-/// where lax input could escape `store_dir` via `..`) and any future
-/// caller that hand-assembles URLs from user input.
+/// where lax input could escape `store_dir` via `..`) and LeapBundles
+/// bundle-id / quant components (in `leap_bundles_manifest_url`, where
+/// lax input could 404 or manipulate the cache path). One allowlist
+/// covers both because the same filename-safe subset works for every
+/// real bundle identifier shipped in `LiquidAI/LeapBundles` today.
 fn validate_path_segment(kind: &str, segment: &str) -> Result<(), WickError> {
     if segment.is_empty() {
         return Err(WickError::Backend(format!("{kind} must not be empty")));
@@ -524,15 +549,9 @@ mod tests {
         // concern about rehashing large cached GGUFs: when a sidecar
         // exists and matches, `hash_matches` must return `true`
         // WITHOUT touching the file contents. We prove the latter by
-        // never writing file contents at all — only a sidecar. If the
-        // code ever regresses into full-rehash mode here, `sha256_file`
-        // will error (file doesn't exist / is empty vs. expected hash)
-        // and this test will fail.
+        // never writing file contents at all — only a sidecar.
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.gguf");
-        // Create a dummy empty file so `dest.exists()` would be true
-        // in a real resolve, but we're calling `hash_matches` directly
-        // here so this isn't strictly necessary.
         std::fs::write(&dest, b"").unwrap();
         let hex = "0123456789abcdef".repeat(4);
         assert_eq!(hex.len(), 64);
@@ -553,9 +572,7 @@ mod tests {
     #[test]
     fn hash_matches_full_rehash_when_no_sidecar() {
         // When the sidecar is absent, `hash_matches` falls back to
-        // hashing the file. This is a correctness test, not a
-        // performance test — it just proves the fallback produces the
-        // right answer for a known input.
+        // hashing the file.
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.bin");
         std::fs::write(&dest, b"hello").unwrap();
@@ -563,5 +580,45 @@ mod tests {
         let wrong = "0".repeat(64);
         assert!(hash_matches(&dest, "https://example.com/x", correct));
         assert!(!hash_matches(&dest, "https://example.com/x", &wrong));
+    }
+
+    #[test]
+    fn leap_manifest_url_happy_path() {
+        let url = leap_bundles_manifest_url("LFM2-1.2B-GGUF", "Q4_0").unwrap();
+        assert_eq!(
+            url,
+            "https://huggingface.co/LiquidAI/LeapBundles/resolve/main/LFM2-1.2B-GGUF/Q4_0.json"
+        );
+    }
+
+    #[test]
+    fn leap_manifest_url_rejects_empty() {
+        assert!(leap_bundles_manifest_url("", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2-1.2B-GGUF", "").is_err());
+    }
+
+    #[test]
+    fn leap_manifest_url_rejects_path_separators() {
+        assert!(leap_bundles_manifest_url("LFM2/GGUF", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2-1.2B-GGUF", "sub/Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2\\GGUF", "Q4_0").is_err());
+    }
+
+    #[test]
+    fn leap_manifest_url_rejects_parent_dir() {
+        assert!(leap_bundles_manifest_url("..", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2-1.2B-GGUF", "..").is_err());
+    }
+
+    #[test]
+    fn leap_manifest_url_rejects_whitespace_and_url_reserved() {
+        assert!(leap_bundles_manifest_url("LFM2 GGUF", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2-1.2B-GGUF", "Q4 0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2-1.2B-GGUF", "Q4_0\n").is_err());
+        // URL-reserved chars must be rejected so they can't alter URL
+        // semantics when interpolated.
+        assert!(leap_bundles_manifest_url("LFM2?x", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2#x", "Q4_0").is_err());
+        assert!(leap_bundles_manifest_url("LFM2%2E", "Q4_0").is_err());
     }
 }
