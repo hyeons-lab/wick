@@ -58,6 +58,6 @@ pub fn cache_dir() -> PathBuf {
 /// panic here is the correct failure mode.
 pub fn ensure_cached(url: &str, _filename: &str) -> PathBuf {
     let repo = BundleRepo::new(cache_dir());
-    repo.resolve_url(url)
+    repo.resolve_url(url, None)
         .unwrap_or_else(|e| panic!("resolve {url}: {e}"))
 }

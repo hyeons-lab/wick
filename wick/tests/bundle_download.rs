@@ -105,7 +105,9 @@ fn bundle_repo_cache_hit_does_not_redownload() {
     // A fresh BundleRepo pointed at the same store_dir must see the
     // cached file via the HEAD-probe policy — no rewrite.
     let repo = BundleRepo::new(common::download::cache_dir());
-    let second = repo.resolve_url(MODEL_URL).expect("resolve on cache hit");
+    let second = repo
+        .resolve_url(MODEL_URL, None)
+        .expect("resolve on cache hit");
     assert_eq!(first, second, "cache-hit path should match the first call");
 
     let mtime_after = second

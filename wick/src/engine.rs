@@ -474,7 +474,7 @@ fn resolve_url_or_path(
         #[cfg(feature = "remote")]
         {
             if let Some(repo) = cfg.bundle_repo.as_ref() {
-                return repo.resolve_url(value);
+                return repo.resolve_url(value, None);
             }
             return Err(WickError::Backend(format!(
                 "manifest references remote URL `{value}` — set `EngineConfig::bundle_repo` \
