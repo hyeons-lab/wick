@@ -1,0 +1,28 @@
+[package]
+name = "wick-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "UniFFI bindings for wick — exposes the core inference engine to Kotlin, Swift, Python, etc."
+
+[lib]
+# - `cdylib` for Android / Linux / macOS dynamic linking (UniFFI loadBundle at runtime).
+# - `staticlib` for iOS (XCFramework static archive, Swift Package Manager).
+# - `lib` stays so other Rust crates in the workspace (future parity
+#   harness, examples) can depend on the crate as a normal library.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+uniffi.workspace = true
+# wick: default features for the core surface we expose. The `remote`
+# feature lights up when `BundleRepo` surfaces through FFI (a later
+# PR); keeps the bootstrap dep tree small for now.
+wick = { path = "../wick" }
+
+# No `[build-dependencies]` block: the proc-macro path doesn't need
+# UDL-scaffolding generation at build time, so `uniffi = { features =
+# ["build"] }` as a build-dep would compile UniFFI twice for no gain.
+# If/when we migrate to UDL, add `uniffi = { workspace = true,
+# features = ["build"] }` here and call `uniffi::generate_scaffolding`
+# from `build.rs`.
