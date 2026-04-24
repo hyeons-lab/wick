@@ -13,11 +13,23 @@ description = "UniFFI bindings for wick — exposes the core inference engine to
 #   harness, examples) can depend on the crate as a normal library.
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# Binding-generation binary. Runs `uniffi::uniffi_bindgen_main()` so the
+# standard `uniffi-bindgen generate --library <dylib> --language <lang>`
+# CLI is available in-repo. Invoked from `just bindings` + CI; see
+# `wick-ffi/README.md`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
 [dependencies]
 # `tokio` feature activates the `async_runtime = "tokio"` export path
 # — required for the `async fn` methods on `Session` that offload the
 # synchronous decode loop to a blocking worker.
-uniffi = { workspace = true, features = ["tokio"] }
+# `cli` feature gates `uniffi::uniffi_bindgen_main()` — the entry point
+# used by the `uniffi-bindgen` binary target above. Without it the
+# binary won't compile in 0.31 (the CLI scaffolding moved behind the
+# feature flag so library-only consumers don't pay for clap etc.).
+uniffi = { workspace = true, features = ["tokio", "cli"] }
 # `FfiError` derives `thiserror::Error` so `WickError` messages can
 # flow through the FFI boundary unchanged. Already a workspace dep.
 thiserror.workspace = true

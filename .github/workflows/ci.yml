@@ -58,6 +58,60 @@ jobs:
       - name: Build release
         run: cargo build --workspace --release
 
+  ffi-bindings-drift:
+    # Verifies the committed Kotlin + Swift bindings under
+    # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`
+    # surface. Regenerates via `uniffi-bindgen` (the in-repo binary
+    # target) against the freshly-built debug dylib and fails if
+    # `git diff` shows changes — signalling someone touched the FFI
+    # exports without running `just bindings` and committing the result.
+    #
+    # Skips Kotlin/Swift compilation: we're only checking that the
+    # generator produces the same bytes for the same input. No JDK /
+    # Swift toolchain needed beyond `ktlint` (which uniffi-bindgen
+    # invokes on the Kotlin output so the committed file stays
+    # formatter-stable).
+    name: FFI Bindings Drift
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ktlint
+        # Pin the ktlint version so the formatter output is
+        # reproducible across CI runs + developer workstations. Bump
+        # in lockstep with whatever's documented in wick-ffi/README.md
+        # (and regenerate the bindings in the same PR).
+        run: |
+          curl -sSLo /tmp/ktlint \
+            https://github.com/pinterest/ktlint/releases/download/1.8.0/ktlint
+          chmod +x /tmp/ktlint
+          sudo mv /tmp/ktlint /usr/local/bin/ktlint
+          ktlint --version
+      - name: Build wick-ffi (cdylib for bindgen)
+        run: cargo build -p wick-ffi
+      - name: Regenerate bindings
+        run: |
+          cargo run -q -p wick-ffi --bin uniffi-bindgen -- generate \
+            --library target/debug/libwick_ffi.so \
+            --language kotlin \
+            --out-dir wick-ffi/bindings/kotlin
+          cargo run -q -p wick-ffi --bin uniffi-bindgen -- generate \
+            --library target/debug/libwick_ffi.so \
+            --language swift \
+            --out-dir wick-ffi/bindings/swift
+      - name: Diff committed bindings
+        run: |
+          if [ -n "$(git status --porcelain wick-ffi/bindings)" ]; then
+            echo "::error::Vendored bindings under wick-ffi/bindings/ are out of date."
+            echo "Run 'just bindings' locally and commit the resulting diff."
+            git --no-pager diff wick-ffi/bindings
+            exit 1
+          fi
+
   integration-test:
     name: Integration Tests (gated)
     needs: check
