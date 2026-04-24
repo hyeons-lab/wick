@@ -117,16 +117,18 @@ pub(crate) fn head_info(client: &Client, url: &str) -> HeadInfo {
         content_length: None,
         linked_sha256: None,
     };
-    let Ok(resp) = client.head(url).timeout(HEAD_TIMEOUT).send() else {
+    // Chain `.error_for_status()` so 4xx/5xx responses are rejected
+    // (we don't trust headers on an error page). 3xx passes through —
+    // which is the whole point, since HF's `X-Linked-Etag` lives on
+    // the 302.
+    let Ok(resp) = client
+        .head(url)
+        .timeout(HEAD_TIMEOUT)
+        .send()
+        .and_then(|r| r.error_for_status())
+    else {
         return none;
     };
-    // HF first-hop for LFS objects is a 302. Anything outside 2xx/3xx
-    // (auth failure, gone, server error) gives up — don't trust the
-    // headers on an error response.
-    let status = resp.status();
-    if !(status.is_success() || status.is_redirection()) {
-        return none;
-    }
     // HF sets `x-linked-size` on the first hop; prefer that over
     // `Content-Length` because `Content-Length` on a 302 reflects the
     // redirect body (zero or a tiny HTML stub), not the file size.
@@ -206,27 +208,33 @@ pub(crate) fn download_to(
     ));
     let partial = PathBuf::from(partial_name);
 
-    // Scope so the file is closed before rename.
-    let actual_hex = {
+    // Compute-and-close in an inner scope so the file handle is
+    // dropped before any cleanup or rename. On Windows, `fs::remove_file`
+    // (and `fs::rename` onto the destination) can fail if the handle
+    // is still open — we must release it before touching the partial
+    // path again. POSIX tolerates unlink-while-open, but closing early
+    // is strictly safer.
+    let copy_result: Result<String, WickError> = {
         let mut file = fs::File::create(&partial)?;
         let mut hashing = HashingWriter {
             inner: &mut file,
             hasher: Sha256::new(),
         };
-        // Mid-stream failure must not leave a `.partial.<pid>.<hash>`
-        // behind — those would accumulate across repeated network
-        // errors since the unique suffix means the next run won't
-        // overwrite. Clean up before returning.
-        if let Err(e) = io::copy(&mut resp, &mut hashing) {
-            let _ = fs::remove_file(&partial);
-            return Err(WickError::Backend(format!(
-                "write {}: {e}",
-                partial.display()
-            )));
-        }
+        io::copy(&mut resp, &mut hashing)
+            .map_err(|e| WickError::Backend(format!("write {}: {e}", partial.display())))?;
         let digest = hashing.hasher.finalize();
         file.sync_all()?;
-        hex_encode(&digest)
+        Ok(hex_encode(&digest))
+    };
+    let actual_hex = match copy_result {
+        Ok(h) => h,
+        Err(e) => {
+            // File handle is out of scope now — safe to unlink on Windows.
+            // Mid-stream failure must not leave a `.partial.<pid>.<hash>`
+            // behind; unique suffixes mean a retry won't overwrite.
+            let _ = fs::remove_file(&partial);
+            return Err(e);
+        }
     };
 
     if let Some(exp) = expected.as_deref() {
