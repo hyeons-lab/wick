@@ -3,7 +3,6 @@
 // Bypasses wgpu's WGSL→MSL translation and per-dispatch validation overhead.
 // Uses the `metal` crate directly for access to MTL APIs.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -13,13 +12,19 @@ use metal::{
 };
 
 /// Metal compute context: device, command queue, compiled shader library cache.
+///
+/// `library_cache` uses `Mutex` rather than `RefCell` so `MetalContext`
+/// (and transitively `MetalLfm2Model`, `Arc<dyn Model>`, `Session`) is
+/// `Sync`, which UniFFI requires on every type it exposes. Contention
+/// is negligible — MSL libraries are only looked up during pipeline
+/// creation, not on the per-token hot path.
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
     pub device_name: String,
     /// Cache compiled MSL libraries by source pointer address.
     /// Since sources are `include_str!` statics, pointer identity = source identity.
-    library_cache: RefCell<HashMap<usize, Library>>,
+    library_cache: std::sync::Mutex<HashMap<usize, Library>>,
 }
 
 impl MetalContext {
@@ -32,7 +37,7 @@ impl MetalContext {
             device,
             queue,
             device_name,
-            library_cache: RefCell::new(HashMap::new()),
+            library_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -64,29 +69,61 @@ impl MetalContext {
     /// Compile an MSL source string into a compute pipeline.
     /// Libraries are cached by source pointer — multiple entry points from the
     /// same `include_str!` source share one compilation.
-    pub fn create_pipeline(&self, src: &str, entry: &str) -> Result<ComputePipelineState> {
+    ///
+    /// `src` is `&'static str` by contract: the cache is keyed on the
+    /// string's pointer address, and non-'static strings can be dropped
+    /// and have their allocation reused for a different source, which
+    /// would cause the cache to return the wrong compiled library. All
+    /// real callers pass `include_str!` statics; this bound makes the
+    /// invariant enforceable at the type level.
+    pub fn create_pipeline(&self, src: &'static str, entry: &str) -> Result<ComputePipelineState> {
         let key = src.as_ptr() as usize;
-        let mut cache = self.library_cache.borrow_mut();
-        let library = cache
-            .entry(key)
-            .or_insert_with(|| {
-                let opts = metal::CompileOptions::new();
-                self.device
-                    .new_library_with_source(src, &opts)
-                    .expect("MSL compile failed")
-            })
-            .clone();
-        drop(cache);
-        let function = library
-            .get_function(entry, None)
-            .map_err(|e| anyhow::anyhow!("entry point '{entry}' not found: {e}"))?;
-        let pipeline = self
+        // Fast path: look up under the lock, release before compiling.
+        // Compiling MSL can take tens of ms — holding the mutex across
+        // that would serialize concurrent pipeline creation and, if the
+        // compile panics, poison the mutex for every other pipeline
+        // creation that follows. Cloning the cached `Library` (cheap,
+        // it's an NSObject handle) lets us drop the lock immediately.
+        {
+            let cache = self
+                .library_cache
+                .lock()
+                .expect("library_cache mutex poisoned");
+            if let Some(lib) = cache.get(&key) {
+                let library = lib.clone();
+                drop(cache);
+                return build_pipeline(&self.device, &library, entry);
+            }
+        }
+        // Slow path: compile without holding the lock. A second caller
+        // racing in between the drop above and the insert below will
+        // compile again — wasted work but correctness-preserving (both
+        // `Library`s reference the same underlying MSL source; last
+        // writer wins into the cache).
+        let opts = metal::CompileOptions::new();
+        let library = self
             .device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| anyhow::anyhow!("pipeline creation failed: {e}"))?;
-        Ok(pipeline)
+            .new_library_with_source(src, &opts)
+            .map_err(|e| anyhow::anyhow!("MSL compile failed: {e}"))?;
+        self.library_cache
+            .lock()
+            .expect("library_cache mutex poisoned")
+            .entry(key)
+            .or_insert_with(|| library.clone());
+        build_pipeline(&self.device, &library, entry)
     }
+}
 
+fn build_pipeline(device: &Device, library: &Library, entry: &str) -> Result<ComputePipelineState> {
+    let function = library
+        .get_function(entry, None)
+        .map_err(|e| anyhow::anyhow!("entry point '{entry}' not found: {e}"))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| anyhow::anyhow!("pipeline creation failed: {e}"))
+}
+
+impl MetalContext {
     /// Read f32 data back from a shared buffer (unified memory = zero copy).
     pub fn read_f32(&self, buf: &Buffer, count: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const f32;

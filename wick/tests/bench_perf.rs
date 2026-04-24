@@ -681,7 +681,10 @@ fn test_prefix_cache_cold_roundtrip() {
 
     // Configure cache with disk.
     {
-        let mut cache = model1.prefix_cache.borrow_mut();
+        let mut cache = model1
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned");
         cache.config.cache_dir = Some(cache_dir.clone());
     }
 
@@ -702,7 +705,10 @@ fn test_prefix_cache_cold_roundtrip() {
     let gguf2 = wick::gguf::GgufFile::open(&path).unwrap();
     let model2 = MetalLfm2Model::from_gguf(gguf2, &path, 8192).unwrap();
     {
-        let mut cache = model2.prefix_cache.borrow_mut();
+        let mut cache = model2
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned");
         cache.config.cache_dir = Some(cache_dir.clone());
     }
 

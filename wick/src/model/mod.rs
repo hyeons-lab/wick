@@ -46,7 +46,24 @@ pub struct ModelConfig {
 }
 
 /// Trait for loaded models that can run forward passes.
-pub trait Model: Send {
+///
+/// `Send + Sync` is required so `std::sync::Arc<dyn Model>` is itself
+/// `Send + Sync`, which is the prerequisite for exposing `Session`
+/// through UniFFI's foreign-function boundary (the bindgen'd
+/// Kotlin/Swift wrappers move the `Arc` between threads and require
+/// both bounds).
+///
+/// **GPU backends are NOT safe across concurrent `Session`s** even
+/// though the type bounds permit it: `MetalLfm2Model` / `GpuLfm2Model`
+/// keep per-forward scratch buffers + GPU-resident KV caches in their
+/// own state. Two threads cloning the same `Arc<dyn Model>` and
+/// running `forward()` concurrently would trample those buffers. The
+/// plan's multi-session invariant (one GPU model instance per concurrent
+/// Session) is enforced at the caller; this bound only covers the
+/// *trait-object shape*, not the GPU-state sharing contract. CPU
+/// `Lfm2Model` has no such shared state and is safely shareable across
+/// concurrent Sessions.
+pub trait Model: Send + Sync {
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
 
@@ -279,3 +296,14 @@ pub fn load_model_metal(
     unused_variables
 )]
 pub mod audio_decoder;
+
+// Compile-time proof that `Arc<dyn Model>` is `Send + Sync`. If a new
+// backend impl introduces a non-`Sync` field (e.g. a `RefCell` / `Cell`),
+// this assertion fires at lib-build time with a clear pointer at the
+// invariant, instead of the regression surfacing at a downstream FFI
+// crate's build that doesn't have enough context to explain the error.
+#[allow(dead_code)]
+fn _assert_arc_dyn_model_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<std::sync::Arc<dyn Model>>();
+}

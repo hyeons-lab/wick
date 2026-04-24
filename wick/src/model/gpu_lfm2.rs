@@ -4,7 +4,7 @@
 // The full forward pass runs in a single CommandEncoder per token — only the
 // logits vector is read back to CPU.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 
@@ -75,7 +75,7 @@ struct GpuState {
     kv_caches: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     /// Per conv layer: rolling buffer.
     conv_buffers: Vec<Option<wgpu::Buffer>>,
-    seq_len: Cell<usize>,
+    seq_len: AtomicUsize,
     max_seq_len: usize,
     /// Pre-dequantized embedding rows (CPU-side cache for fast lookup).
     embedding_f32: Vec<f32>,
@@ -320,7 +320,7 @@ impl GpuLfm2Model {
         let gpu_state = GpuState {
             kv_caches,
             conv_buffers,
-            seq_len: Cell::new(0),
+            seq_len: AtomicUsize::new(0),
             max_seq_len,
             embedding_f32,
         };
@@ -737,9 +737,9 @@ impl Model for GpuLfm2Model {
 
         // Bounds check: KV cache capacity
         assert!(
-            self.gpu_state.seq_len.get() < self.gpu_state.max_seq_len,
+            self.gpu_state.seq_len.load(Ordering::Relaxed) < self.gpu_state.max_seq_len,
             "GPU seq_len {} exceeds max_seq_len {}",
-            self.gpu_state.seq_len.get(),
+            self.gpu_state.seq_len.load(Ordering::Relaxed),
             self.gpu_state.max_seq_len,
         );
 
@@ -1188,7 +1188,7 @@ impl Model for GpuLfm2Model {
 
                 // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
-                let seq_len = self.gpu_state.seq_len.get();
+                let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
                 let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
                 self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
                 self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
@@ -1433,7 +1433,7 @@ impl Model for GpuLfm2Model {
         self.submit_and_wait(enc);
 
         // 4. Update seq_len, profile, and read back logits
-        self.gpu_state.seq_len.set(self.gpu_state.seq_len.get() + 1);
+        self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
         self.ctx.finish_profiler();
         self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
@@ -1451,7 +1451,7 @@ impl Model for GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         // Reset internal seq_len so repeated generate() calls (bench) work.
-        self.gpu_state.seq_len.set(start_pos);
+        self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
         // Default: sequential single-token forward.
         let mut logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {

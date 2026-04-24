@@ -16,8 +16,10 @@ pub struct GpuContext {
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<GpuProfiler>,
     /// Pre-allocated staging buffer for download_f32. Resized on demand.
-    staging: std::cell::RefCell<Option<wgpu::Buffer>>,
-    staging_size: std::cell::Cell<u64>,
+    /// `Mutex` (not `RefCell`) so `GpuContext` is `Sync`, which is the
+    /// prerequisite for `Arc<dyn Model>: Send + Sync` through the FFI.
+    staging: std::sync::Mutex<Option<wgpu::Buffer>>,
+    staging_size: std::sync::atomic::AtomicU64,
 }
 
 /// GPU timestamp profiler — records per-dispatch timing.
@@ -27,8 +29,8 @@ pub struct GpuProfiler {
     read_buf: wgpu::Buffer,
     timestamp_period: f32, // nanoseconds per tick
     /// (label, start_idx, end_idx) for each recorded span.
-    spans: std::cell::RefCell<Vec<(String, u32, u32)>>,
-    next_query: std::cell::Cell<u32>,
+    spans: std::sync::Mutex<Vec<(String, u32, u32)>>,
+    next_query: std::sync::atomic::AtomicU32,
     max_queries: u32,
 }
 
@@ -105,8 +107,8 @@ impl GpuContext {
                 resolve_buf,
                 read_buf,
                 timestamp_period,
-                spans: std::cell::RefCell::new(Vec::new()),
-                next_query: std::cell::Cell::new(0),
+                spans: std::sync::Mutex::new(Vec::new()),
+                next_query: std::sync::atomic::AtomicU32::new(0),
                 max_queries,
             })
         } else {
@@ -127,8 +129,8 @@ impl GpuContext {
             adapter_name,
             backend,
             profiler,
-            staging: std::cell::RefCell::new(None),
-            staging_size: std::cell::Cell::new(0),
+            staging: std::sync::Mutex::new(None),
+            staging_size: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -162,19 +164,26 @@ impl GpuContext {
     /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
     /// staging buffer to avoid per-token allocation.
     pub fn download_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
+        use std::sync::atomic::Ordering;
         let size = (count * std::mem::size_of::<f32>()) as u64;
-        // Grow staging buffer if needed (typically allocated once for vocab_size).
-        if size > self.staging_size.get() {
-            *self.staging.borrow_mut() = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("staging-download"),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.staging_size.set(size);
-        }
-        let staging_ref = self.staging.borrow();
-        let staging = staging_ref.as_ref().unwrap();
+        // Grow staging buffer if needed (typically allocated once for
+        // vocab_size). Size check + possible re-allocation happen under
+        // a single mutex acquisition so two racing callers can't both
+        // hit the !sufficient branch and reallocate twice.
+        let staging_guard = {
+            let mut guard = self.staging.lock().expect("staging mutex poisoned");
+            if guard.as_ref().map(|b| b.size() < size).unwrap_or(true) {
+                *guard = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("staging-download"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.staging_size.store(size, Ordering::Relaxed);
+            }
+            guard
+        };
+        let staging = staging_guard.as_ref().unwrap();
 
         let mut encoder = self
             .device
@@ -228,15 +237,17 @@ impl GpuContext {
     /// Get timestamp_writes for a compute pass (if profiling enabled).
     /// Returns (begin_query_idx, end_query_idx) for later resolution.
     pub fn begin_profile_span(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        use std::sync::atomic::Ordering;
         let profiler = self.profiler.as_ref()?;
-        let idx = profiler.next_query.get();
+        let idx = profiler.next_query.load(Ordering::Relaxed);
         if idx + 2 > profiler.max_queries {
             return None; // out of query slots
         }
-        profiler.next_query.set(idx + 2);
+        profiler.next_query.store(idx + 2, Ordering::Relaxed);
         profiler
             .spans
-            .borrow_mut()
+            .lock()
+            .expect("profiler mutex poisoned")
             .push((label.to_string(), idx, idx + 1));
         Some(wgpu::ComputePassTimestampWrites {
             query_set: &profiler.query_set,
@@ -247,19 +258,25 @@ impl GpuContext {
 
     /// Reset profiler for a new forward pass.
     pub fn reset_profiler(&self) {
+        use std::sync::atomic::Ordering;
         if let Some(profiler) = &self.profiler {
-            profiler.next_query.set(0);
-            profiler.spans.borrow_mut().clear();
+            profiler.next_query.store(0, Ordering::Relaxed);
+            profiler
+                .spans
+                .lock()
+                .expect("profiler mutex poisoned")
+                .clear();
         }
     }
 
     /// Resolve timestamps and print per-span timings.
     pub fn finish_profiler(&self) {
+        use std::sync::atomic::Ordering;
         let profiler = match &self.profiler {
             Some(p) => p,
             None => return,
         };
-        let n_queries = profiler.next_query.get();
+        let n_queries = profiler.next_query.load(Ordering::Relaxed);
         if n_queries == 0 {
             return;
         }
@@ -290,7 +307,7 @@ impl GpuContext {
         let timestamps: &[u64] = bytemuck::cast_slice(&data);
 
         let period_ns = profiler.timestamp_period as f64;
-        let spans = profiler.spans.borrow();
+        let spans = profiler.spans.lock().expect("profiler mutex poisoned");
 
         // Aggregate by label
         let mut totals: std::collections::HashMap<String, (f64, usize)> =
