@@ -6,15 +6,15 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Typed errors.** `WickEngine` + `Session` + sync, streaming, and
-async `generate` surfaced through PRs 2–5; PR 6 vendored the Kotlin +
-Swift bindings; PR 7 replaces the single-variant `FfiError::Backend`
-with a typed enum that mirrors every `wick::WickError` variant
-(`ContextOverflow { max_seq_len, by }`, `UnsupportedModality`,
-`UnsupportedInferenceType`, `Busy`, `Cancelled`, `EmptyInput`, `Io`,
-plus `Backend` as the catch-all for FFI-internal errors). Foreign
-callers can now pattern-match on error class instead of string-
-sniffing a generic message.
+**Phase 2.1 progression** — the Rust FFI surface + binding generation +
+Android ABI cross-compile pipeline. `WickEngine` + `Session` + sync,
+streaming, and async `generate` surfaced through PRs 2–5. PR 6
+vendored the Kotlin + Swift bindings with a CI drift check. PR 7
+typed the `FfiError` enum. PR 8 added Android ABI cross-compile:
+`wick-ffi` now builds for `arm64-v8a`, `armeabi-v7a`, `x86_64`, and
+`x86` in CI, each `.so` is ELF-shape-verified, and the release
+libraries are published as per-ABI CI artifacts so consumer Android
+apps can grab them without running the NDK toolchain themselves.
 
 | PR | Scope |
 |---|---|
@@ -24,8 +24,9 @@ sniffing a generic message.
 | 4 | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
 | 5 | `async` `generate_async` + `generate_streaming_async` via `#[uniffi::export(async_runtime = "tokio")]` |
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI drift check; UniFFI 0.28 → 0.31.1 |
-| 7 *(this one)* | Typed `FfiError` variants mirroring `wick::WickError` |
-| 8+ | `BundleRepo` remote loading (`remote` feature), parity harness, Android ABIs, iOS XCFramework |
+| 7 | Typed `FfiError` variants mirroring `wick::WickError` |
+| 8 | Android ABI cross-compile + CI matrix + per-ABI artifact upload |
+| 9+ | `BundleRepo` remote loading (`remote` feature), parity harness, iOS XCFramework packaging |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -112,6 +113,74 @@ the vendored bindings being regenerated.
   generated file from a tag without running Rust tooling.
 - **Determinism.** The committed output is the source of truth; CI
   verifies it.
+
+## Android
+
+`wick-ffi` cross-compiles to every Android ABI via the Android NDK.
+The `android-abis` CI job builds each target in parallel on every PR
+and uploads the release `.so` as a per-ABI artifact, so consumer apps
+can grab them without running the NDK toolchain themselves. Local
+workflow mirrors the CI setup.
+
+### Local setup
+
+```bash
+# One-time (pin cargo-ndk to the v4.x series — CI uses the same
+# major; earlier cargo-ndk had a different flag shape and would
+# fail against the `just android-*` recipes + CI job below):
+cargo install cargo-ndk --version '^4' --locked
+rustup target add \
+    aarch64-linux-android armv7-linux-androideabi \
+    x86_64-linux-android i686-linux-android
+
+# Then (ANDROID_NDK_HOME must point at the NDK root —
+# typically `~/Library/Android/sdk/ndk/<version>/` if you installed
+# via Android Studio, or whatever sdkmanager placed it):
+export ANDROID_NDK_HOME=...
+just android-all            # all four ABIs, release
+just android-arm64          # just arm64-v8a, release (fast iteration)
+```
+
+Outputs land at `target/<triple>/release/libwick_ffi.so` per ABI
+(~2.5 MB release, ~75 MB debug with embedded debuginfo).
+
+### JNI layout for consumer apps
+
+Drop the release `.so` into your Android module's source set:
+
+```
+src/main/jniLibs/
+├── arm64-v8a/libwick_ffi.so
+├── armeabi-v7a/libwick_ffi.so
+├── x86_64/libwick_ffi.so
+└── x86/libwick_ffi.so
+```
+
+Gradle / AGP will bundle the correct ABI into the APK / AAB at
+install time based on the target device. Pair with the vendored
+Kotlin binding from `wick-ffi/bindings/kotlin/` for the generated
+API surface.
+
+### CI artifacts
+
+The `android-abis` matrix job publishes four artifacts per run:
+`wick-ffi-android-arm64-v8a`, `wick-ffi-android-armeabi-v7a`,
+`wick-ffi-android-x86_64`, `wick-ffi-android-x86`. Each contains the
+single `libwick_ffi.so` for that ABI. 7-day retention — copy to your
+app's `jniLibs/` as needed.
+
+### NDK version
+
+CI pins NDK **r27c** — a stable release the workspace is validated
+against. The workflow installs it through `nttld/setup-ndk@v1` by
+version string (no checksum; the action fetches from Google's CDN
+which serves signed artifacts). Bumping is a one-line change: update
+the `ndk-version:` value in `.github/workflows/ci.yml`'s
+`android-abis` job and re-run CI to confirm every ABI still builds.
+The `cargo ndk` flag shape is compatible across recent NDK majors so
+the pin is mostly about toolchain + sysroot stability across runs,
+not a hard constraint — later NDKs that keep the `armv7-linux-androideabi`
+and `i686-linux-android` sysroots should drop in cleanly.
 
 ## Design notes
 
