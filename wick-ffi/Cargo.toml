@@ -15,9 +15,12 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 uniffi.workspace = true
+# `FfiError` derives `thiserror::Error` so `WickError` messages can
+# flow through the FFI boundary unchanged. Already a workspace dep.
+thiserror.workspace = true
 # wick: default features for the core surface we expose. The `remote`
 # feature lights up when `BundleRepo` surfaces through FFI (a later
-# PR); keeps the bootstrap dep tree small for now.
+# PR); keeps the dep tree small for now.
 wick = { path = "../wick" }
 
 # No `[build-dependencies]` block: the proc-macro path doesn't need
