@@ -8,26 +8,36 @@
 //!
 //! ## Current surface
 //!
-//! - [`WickEngine`] — load a model from a local path; introspect
-//!   metadata + capabilities.
-//! - [`EngineConfig`] — construction-time config (context size,
-//!   backend preference).
-//! - [`BackendPreference`] — CPU / GPU / Metal / Auto selector.
-//! - [`ModelMetadata`] — architecture, vocab size, max context, etc.
-//! - [`ModalityCapabilities`] — what the loaded model accepts / emits.
-//! - [`FfiError`] — minimal error shell (string-based). The typed
-//!   variants (`ContextOverflow { max_seq_len, by }` etc.) will land
-//!   as additional variants on this enum in a later PR; for now the
-//!   string form preserves the message without locking in a premature
-//!   schema.
+//! Engine-level:
+//! - [`WickEngine`] — load a model; open sessions; introspect metadata
+//!   + capabilities.
+//! - [`EngineConfig`] + [`BackendPreference`] — load-time config.
+//! - [`ModelMetadata`] + [`ModalityCapabilities`] — model-level info.
+//!
+//! Session-level:
+//! - [`Session`] — stateful inference handle (one per conversation).
+//!   `append_text` / `append_tokens` for input, synchronous
+//!   [`Session::generate`] returning [`GenerateOutput`] (tokens +
+//!   [`GenerateSummary`]).
+//! - [`SessionConfig`] + [`KvCompression`] — per-session knobs.
+//! - [`GenerateOpts`] + [`FinishReason`] — per-call decode config + exit reason.
+//! - [`Session::cancel`] / [`Session::position`] for cooperative
+//!   interrupt + progress monitoring across threads.
+//!
+//! Error:
+//! - [`FfiError`] — minimal error shell (string-based). Typed variants
+//!   (`ContextOverflow { max_seq_len, by }` etc.) split into separate
+//!   enum cases in a later PR.
 //!
 //! ## Not exposed yet
 //!
 //! Future PRs grow the surface per the roadmap in
-//! `wick-ffi/README.md`: `Session` + `generate` (sync → async → with
-//! callbacks), `BundleRepo` + remote URL loading (gated on the
-//! `remote` feature), binding generation for Kotlin / Swift / Python,
-//! and typed error variants.
+//! `wick-ffi/README.md`. Highlights: streaming via `ModalitySink` as
+//! a UniFFI foreign-trait callback (PR 4), `async` `generate` via
+//! `#[uniffi::export(async_runtime = "tokio")]` (PR 5), remote URL
+//! loading through `BundleRepo` (gated on the `remote` feature),
+//! binding generation for Kotlin / Swift / Python, and typed error
+//! variants.
 //!
 //! ## Design notes
 //!
@@ -260,6 +270,348 @@ impl WickEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Session types (PR 3)
+// ---------------------------------------------------------------------------
+
+/// KV-cache compression mode. Mirrors [`wick::kv_cache::KvCompression`].
+/// `TurboQuant` is honored by the CPU backend only; Metal / GPU ignore
+/// the setting and use the f32 path.
+#[derive(Debug, Clone, Default, uniffi::Enum)]
+pub enum KvCompression {
+    /// No compression — f32 keys and values (default).
+    #[default]
+    None,
+    /// TurboQuant compression. Both `keys` + `values` true is the
+    /// production configuration; toggling them individually is
+    /// primarily for debugging the drift contribution of each side.
+    /// `seed` drives the per-layer randomized Hadamard rotations.
+    TurboQuant { seed: u64, keys: bool, values: bool },
+}
+
+impl From<KvCompression> for wick::kv_cache::KvCompression {
+    fn from(c: KvCompression) -> Self {
+        match c {
+            KvCompression::None => wick::kv_cache::KvCompression::None,
+            KvCompression::TurboQuant { seed, keys, values } => {
+                wick::kv_cache::KvCompression::TurboQuant { seed, keys, values }
+            }
+        }
+    }
+}
+
+impl From<wick::kv_cache::KvCompression> for KvCompression {
+    fn from(c: wick::kv_cache::KvCompression) -> Self {
+        match c {
+            wick::kv_cache::KvCompression::None => KvCompression::None,
+            wick::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
+                KvCompression::TurboQuant { seed, keys, values }
+            }
+        }
+    }
+}
+
+/// Per-session configuration. Mirrors [`wick::SessionConfig`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionConfig {
+    /// Cap on total tokens held in KV. `None` → model's default
+    /// `max_seq_len`.
+    pub max_seq_len: Option<u32>,
+    /// KV cache compression mode.
+    pub kv_compression: KvCompression,
+    /// Pinned-prefix length for Phase-1.5 context shift on overflow.
+    /// `0` disables shift; overflow returns `ContextOverflow` error.
+    pub n_keep: u32,
+    /// Deterministic sampling seed. `None` = fresh entropy per call.
+    pub seed: Option<u64>,
+    /// Chunked-prefill ubatch size. `0` = monolithic prefill.
+    pub ubatch_size: u32,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        // Delegate to `wick::SessionConfig::default()` so the defaults
+        // stay in one place; `kv_compression` flows through the
+        // wrapper's `From` impl (both directions live above).
+        let core = wick::SessionConfig::default();
+        Self {
+            max_seq_len: core.max_seq_len,
+            kv_compression: core.kv_compression.into(),
+            n_keep: core.n_keep,
+            seed: core.seed,
+            ubatch_size: core.ubatch_size,
+        }
+    }
+}
+
+impl From<SessionConfig> for wick::SessionConfig {
+    fn from(c: SessionConfig) -> Self {
+        wick::SessionConfig {
+            max_seq_len: c.max_seq_len,
+            kv_compression: c.kv_compression.into(),
+            n_keep: c.n_keep,
+            seed: c.seed,
+            ubatch_size: c.ubatch_size,
+        }
+    }
+}
+
+/// Per-call decode options. Mirrors [`wick::GenerateOpts`].
+///
+/// `flush_every_tokens` / `flush_every_ms` are accepted but have no
+/// effect under the synchronous [`Session::generate`] — they're
+/// meaningful once streaming (foreign-trait `ModalitySink`) lands
+/// in a follow-up PR. Including them in the record now keeps the FFI
+/// surface stable across that transition.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GenerateOpts {
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    /// Reserved — the sampler doesn't implement rep-penalty yet.
+    pub repetition_penalty: f32,
+    /// Early-stop IDs (EOS / instruction markers / end-of-turn).
+    pub stop_tokens: Vec<u32>,
+    /// Ignored under synchronous generate; reserved for streaming.
+    pub flush_every_tokens: u32,
+    /// Ignored under synchronous generate; reserved for streaming.
+    pub flush_every_ms: u32,
+}
+
+impl Default for GenerateOpts {
+    fn default() -> Self {
+        let core = wick::GenerateOpts::default();
+        Self {
+            max_tokens: core.max_tokens,
+            temperature: core.temperature,
+            top_p: core.top_p,
+            top_k: core.top_k,
+            repetition_penalty: core.repetition_penalty,
+            stop_tokens: core.stop_tokens,
+            flush_every_tokens: core.flush_every_tokens,
+            flush_every_ms: core.flush_every_ms,
+        }
+    }
+}
+
+impl From<GenerateOpts> for wick::GenerateOpts {
+    fn from(o: GenerateOpts) -> Self {
+        wick::GenerateOpts {
+            max_tokens: o.max_tokens,
+            temperature: o.temperature,
+            top_p: o.top_p,
+            top_k: o.top_k,
+            repetition_penalty: o.repetition_penalty,
+            stop_tokens: o.stop_tokens,
+            flush_every_tokens: o.flush_every_tokens,
+            flush_every_ms: o.flush_every_ms,
+        }
+    }
+}
+
+/// Why a decode loop exited. Mirrors [`wick::FinishReason`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FinishReason {
+    MaxTokens,
+    Stop,
+    Cancelled,
+    ContextFull,
+    Error { message: String },
+}
+
+impl From<wick::FinishReason> for FinishReason {
+    fn from(r: wick::FinishReason) -> Self {
+        match r {
+            wick::FinishReason::MaxTokens => FinishReason::MaxTokens,
+            wick::FinishReason::Stop => FinishReason::Stop,
+            wick::FinishReason::Cancelled => FinishReason::Cancelled,
+            wick::FinishReason::ContextFull => FinishReason::ContextFull,
+            wick::FinishReason::Error(msg) => FinishReason::Error { message: msg },
+        }
+    }
+}
+
+/// Decode-run metadata. Mirrors [`wick::GenerateSummary`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GenerateSummary {
+    pub tokens_generated: u32,
+    pub prompt_eval_tokens: u32,
+    pub prompt_eval_ms: u32,
+    pub decode_ms: u32,
+    pub finish_reason: FinishReason,
+}
+
+impl From<wick::GenerateSummary> for GenerateSummary {
+    fn from(s: wick::GenerateSummary) -> Self {
+        Self {
+            tokens_generated: s.tokens_generated,
+            prompt_eval_tokens: s.prompt_eval_tokens,
+            prompt_eval_ms: s.prompt_eval_ms,
+            decode_ms: s.decode_ms,
+            finish_reason: s.finish_reason.into(),
+        }
+    }
+}
+
+/// Bundle of everything a synchronous `generate` call produces:
+/// the generated token IDs plus the decode summary. The two are
+/// returned together so callers don't have to manage a separate
+/// callback channel; streaming (per-chunk delivery) lands in PR 4.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GenerateOutput {
+    /// Generated token IDs, in order, not including any prompt
+    /// tokens. Decode with [`wick::tokenizer::BpeTokenizer`] on the
+    /// Rust side or (once exposed) through a tokenizer handle on the
+    /// FFI side.
+    pub tokens: Vec<u32>,
+    pub summary: GenerateSummary,
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+/// Stateful inference handle. Wraps [`wick::Session`] behind a
+/// `Mutex` so UniFFI's `Arc<Session>` shape works with methods that
+/// need `&mut self` on the inner session (prefill, generate, reset).
+///
+/// Call [`WickEngine::new_session`] to open a session; the engine's
+/// `Arc<Model>` and `Arc<BpeTokenizer>` are cloned into the new
+/// session so it outlives the engine handle across FFI calls.
+#[derive(uniffi::Object)]
+pub struct Session {
+    inner: std::sync::Mutex<wick::Session>,
+    /// Cloned from the inner session at construction time. Shared
+    /// atomic — `position()` / `cancel()` don't need to acquire the
+    /// mutex, so they're safe to call from a different thread while
+    /// `generate()` is running.
+    position: Arc<std::sync::atomic::AtomicU32>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Stored at construction so `capabilities()` doesn't need a lock.
+    capabilities: ModalityCapabilities,
+}
+
+impl Session {
+    /// Lock the inner session, converting `PoisonError` into
+    /// `FfiError::Backend` instead of panicking. `expect` on a
+    /// poisoned mutex would propagate as a panic across the FFI
+    /// boundary — Kotlin / Swift / Python callers see that as an
+    /// uncatchable abort of the host process, which is unusable in
+    /// production. Returning an error lets callers decide whether to
+    /// retry, reset, or surface the failure.
+    ///
+    /// A poisoned mutex here means a prior session method panicked
+    /// while holding the lock — the session's internal state (KV
+    /// cache, sampler, position counters) is therefore in an unknown
+    /// state. The error message gives the caller enough context to
+    /// decide whether to reset or drop the session entirely.
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, wick::Session>, FfiError> {
+        self.inner.lock().map_err(|e| FfiError::Backend {
+            message: format!(
+                "session mutex poisoned (a prior call panicked mid-lock; session state is \
+                 inconsistent): {e}"
+            ),
+        })
+    }
+}
+
+#[uniffi::export]
+impl Session {
+    /// Append raw text to the context, running a prefill over just
+    /// the new tokens. `EmptyInput` error if `text` is empty.
+    pub fn append_text(&self, text: String) -> Result<(), FfiError> {
+        self.lock_inner()?.append_text(&text)?;
+        Ok(())
+    }
+
+    /// Append pre-tokenized IDs. Useful when the caller has its own
+    /// tokenizer + chat-template pipeline.
+    pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError> {
+        self.lock_inner()?.append_tokens(&tokens)?;
+        Ok(())
+    }
+
+    /// Run autoregressive decode and return all emitted tokens +
+    /// a summary. Synchronous — the call blocks until the decode
+    /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
+    ///
+    /// For streaming (per-chunk delivery) and async, see the PR 4 /
+    /// PR 5 follow-ups in `wick-ffi/README.md`.
+    pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError> {
+        // Collector sink: captures every token the decode loop emits.
+        // `on_done` is invoked once at the end regardless of exit
+        // reason; we read the Result from `session.generate` to see
+        // whether the run succeeded.
+        struct CollectSink(Vec<u32>);
+        impl wick::ModalitySink for CollectSink {
+            fn on_text_tokens(&mut self, tokens: &[u32]) {
+                self.0.extend_from_slice(tokens);
+            }
+            fn on_done(&mut self, _reason: wick::FinishReason) {}
+        }
+        let mut sink = CollectSink(Vec::new());
+        let summary = self.lock_inner()?.generate(&opts.into(), &mut sink)?;
+        Ok(GenerateOutput {
+            tokens: sink.0,
+            summary: summary.into(),
+        })
+    }
+
+    /// Current KV position — how many tokens live in the cache.
+    /// Atomic-backed; safe to call from a different thread while
+    /// `generate()` is in flight.
+    pub fn position(&self) -> u32 {
+        self.position.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Signal in-flight `generate()` to exit with
+    /// `FinishReason::Cancelled` at the next between-token check.
+    /// Safe from any thread. No-op if no `generate()` is running.
+    pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop cached state + resample the seed. After `reset()` the
+    /// session behaves like a freshly-opened one (same
+    /// model/tokenizer/config, no accumulated context).
+    ///
+    /// Returns `Result` so a poisoned-mutex case surfaces as an error
+    /// instead of panicking across the FFI boundary.
+    pub fn reset(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.reset();
+        Ok(())
+    }
+
+    /// Capabilities reported by the loaded model. Cheap — reads a
+    /// cached copy, no lock.
+    pub fn capabilities(&self) -> ModalityCapabilities {
+        self.capabilities
+    }
+}
+
+// Session-level method on WickEngine.
+#[uniffi::export]
+impl WickEngine {
+    /// Open a new [`Session`] sharing this engine's model + tokenizer
+    /// by `Arc` clone. The returned session outlives `&self`; the
+    /// engine keeps the shared state live for every session it hands
+    /// out. Cheap — no model load, just config + state allocation.
+    pub fn new_session(&self, config: SessionConfig) -> Arc<Session> {
+        let session = self.inner.new_session(config.into());
+        let position = session.position_handle();
+        let cancel = session.cancel_handle();
+        let capabilities = session.capabilities().into();
+        Arc::new(Session {
+            inner: std::sync::Mutex::new(session),
+            position,
+            cancel,
+            capabilities,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Smoke test (from PR 1)
 // ---------------------------------------------------------------------------
 
@@ -360,6 +712,81 @@ mod tests {
         let fe: FfiError = we.into();
         match fe {
             FfiError::Backend { message } => assert_eq!(message, expected),
+        }
+    }
+
+    #[test]
+    fn session_config_default_roundtrips_to_wick() {
+        let ffi = SessionConfig::default();
+        let core: wick::SessionConfig = ffi.into();
+        let default_core = wick::SessionConfig::default();
+        assert_eq!(core.max_seq_len, default_core.max_seq_len);
+        assert_eq!(core.n_keep, default_core.n_keep);
+        assert_eq!(core.seed, default_core.seed);
+        assert_eq!(core.ubatch_size, default_core.ubatch_size);
+    }
+
+    #[test]
+    fn kv_compression_none_roundtrips() {
+        let ffi = KvCompression::None;
+        let core: wick::kv_cache::KvCompression = ffi.into();
+        assert!(matches!(core, wick::kv_cache::KvCompression::None));
+    }
+
+    #[test]
+    fn kv_compression_turboquant_roundtrips() {
+        let ffi = KvCompression::TurboQuant {
+            seed: 42,
+            keys: true,
+            values: false,
+        };
+        let core: wick::kv_cache::KvCompression = ffi.into();
+        match core {
+            wick::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
+                assert_eq!(seed, 42);
+                assert!(keys);
+                assert!(!values);
+            }
+            _ => panic!("expected TurboQuant variant"),
+        }
+    }
+
+    #[test]
+    fn generate_opts_default_roundtrips_to_wick() {
+        let ffi = GenerateOpts::default();
+        let core: wick::GenerateOpts = ffi.into();
+        let default_core = wick::GenerateOpts::default();
+        // Field-by-field so a future wick field-add breaks here loudly.
+        assert_eq!(core.max_tokens, default_core.max_tokens);
+        assert_eq!(core.temperature, default_core.temperature);
+        assert_eq!(core.top_p, default_core.top_p);
+        assert_eq!(core.top_k, default_core.top_k);
+        assert_eq!(core.repetition_penalty, default_core.repetition_penalty);
+        assert_eq!(core.stop_tokens, default_core.stop_tokens);
+        assert_eq!(core.flush_every_tokens, default_core.flush_every_tokens);
+        assert_eq!(core.flush_every_ms, default_core.flush_every_ms);
+    }
+
+    #[test]
+    fn finish_reason_covers_every_variant() {
+        use wick::FinishReason as Core;
+        let cases = [
+            (Core::MaxTokens, "MaxTokens"),
+            (Core::Stop, "Stop"),
+            (Core::Cancelled, "Cancelled"),
+            (Core::ContextFull, "ContextFull"),
+            (Core::Error("boom".into()), "Error"),
+        ];
+        for (core, tag) in cases {
+            let ffi: FinishReason = core.into();
+            match (&ffi, tag) {
+                (FinishReason::MaxTokens, "MaxTokens") => {}
+                (FinishReason::Stop, "Stop") => {}
+                (FinishReason::Cancelled, "Cancelled") => {}
+                (FinishReason::ContextFull, "ContextFull") => {}
+                (FinishReason::Error { message }, "Error") => assert_eq!(message, "boom"),
+                _ => panic!("variant mismatch: {ffi:?} tagged {tag}"),
+            }
         }
     }
 }
