@@ -13,9 +13,22 @@
 //! message rather than failing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use wick::kv_cache::KvCompression;
+use wick::model::Model;
+use wick::tokenizer::BpeTokenizer;
 use wick::{FinishReason, GenerateOpts, ModalitySink, Session, SessionConfig};
+
+/// Test-local helper: wrap a freshly-loaded `(model, tokenizer)` pair
+/// in the `Arc`s that `Session::new` now requires post-lifetime-refactor.
+/// Collapses what would otherwise be three `Arc::from`/`Arc::new` calls
+/// at every test site.
+fn make_session(model: Box<dyn Model>, tokenizer: BpeTokenizer, config: SessionConfig) -> Session {
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    Session::new(model, tokenizer, config)
+}
 
 /// Locate a text-path GGUF for the tests. Prefers the `WICK_MODEL` env var;
 /// falls back to the LFM2-VL-450M copy that the session-api smoke test used.
@@ -71,9 +84,9 @@ fn stochastic_generate_is_chainable_without_append() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             kv_compression: KvCompression::None,
             seed: Some(42),
@@ -123,9 +136,9 @@ fn greedy_chain_requires_append_tokens() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             seed: Some(42),
             ..Default::default()
@@ -149,7 +162,7 @@ fn greedy_chain_requires_append_tokens() {
 
     // After appending a FRESH user-side token suffix (the real chat loop —
     // new user turn appended between generates), greedy can continue.
-    let follow_up = tokenizer.encode(" and the currency is");
+    let follow_up = session.tokenizer().encode(" and the currency is");
     session.append_tokens(&follow_up).unwrap();
     let mut sink_b = CollectSink(Vec::new());
     let summary = session.generate(&greedy_opts(4), &mut sink_b).unwrap();
@@ -180,9 +193,9 @@ fn no_kv_gap_after_bounded_generate_greedy() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             seed: Some(7),
             ..Default::default()
@@ -202,7 +215,7 @@ fn no_kv_gap_after_bounded_generate_greedy() {
     // fire but subsequent generate output would be garbage. We use a
     // fresh user-side token suffix (mirrors the real chat loop) rather
     // than re-feeding an already-emitted token.
-    let follow_up = tokenizer.encode(" and the language is");
+    let follow_up = session.tokenizer().encode(" and the language is");
     session.append_tokens(&follow_up).unwrap();
     assert_eq!(
         session.position() as usize,
@@ -217,14 +230,15 @@ fn no_kv_gap_after_bounded_generate_greedy() {
     assert_eq!(sink2.0.len(), 4);
     // Sanity: each emitted token is a valid vocab id (not the EOS, not
     // out of range). Catches a broken KV producing nonsense logits.
-    let vocab_size = model.config().vocab_size as u32;
+    let vocab_size = session.model().config().vocab_size as u32;
+    let eos = session.tokenizer().eos_token();
     for t in &sink2.0 {
         assert!(
             *t < vocab_size,
             "emitted token {t} outside vocab {vocab_size}"
         );
         assert!(
-            Some(*t) != tokenizer.eos_token(),
+            Some(*t) != eos,
             "greedy continuation shouldn't immediately hit EOS on 'France is ... '"
         );
     }
@@ -247,9 +261,9 @@ fn reset_reseeds_sampler_for_reproducibility() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("Tell me a story about");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             seed: Some(123),
             ..Default::default()
@@ -295,9 +309,9 @@ fn position_handle_observes_progress() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             seed: Some(42),
             ..Default::default()
@@ -334,7 +348,9 @@ fn stochastic_split_matches_single_call_under_seed() {
     };
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    // Tokenizer is reused by two session blocks below — wrap once,
+    // clone the `Arc` into each `Session::new` call.
+    let tokenizer = Arc::new(wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
     let prompt_toks = tokenizer.encode("Tell me a story about");
 
     let stochastic_opts = |n: u32| GenerateOpts {
@@ -347,10 +363,10 @@ fn stochastic_split_matches_single_call_under_seed() {
 
     let baseline = {
         let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-        let model = wick::model::load_model(gguf, 4096).unwrap();
+        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, 4096).unwrap());
         let mut session = Session::new(
-            model.as_ref(),
-            &tokenizer,
+            model,
+            Arc::clone(&tokenizer),
             SessionConfig {
                 seed: Some(999),
                 ..Default::default()
@@ -364,10 +380,10 @@ fn stochastic_split_matches_single_call_under_seed() {
 
     let split = {
         let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-        let model = wick::model::load_model(gguf, 4096).unwrap();
+        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, 4096).unwrap());
         let mut session = Session::new(
-            model.as_ref(),
-            &tokenizer,
+            model,
+            Arc::clone(&tokenizer),
             SessionConfig {
                 seed: Some(999),
                 ..Default::default()
@@ -407,9 +423,9 @@ fn position_updates_per_token_during_decode() {
     let model = wick::model::load_model(gguf, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
-    let mut session = Session::new(
-        model.as_ref(),
-        &tokenizer,
+    let mut session = make_session(
+        model,
+        tokenizer,
         SessionConfig {
             seed: Some(42),
             ..Default::default()

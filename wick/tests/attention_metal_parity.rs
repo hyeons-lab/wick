@@ -34,13 +34,16 @@ fn find_model(name: &str) -> Option<PathBuf> {
 /// generated-token slice. Constructs a fresh model so the `WICK_FLASH` env
 /// var is picked up at load time (`metal_lfm2.rs:509`).
 fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u32> {
+    use std::sync::Arc;
     use wick::kv_cache::KvCompression;
+    use wick::model::Model;
     use wick::model::metal_lfm2::MetalLfm2Model;
     use wick::{FinishReason, GenerateOpts, ModalitySink, Session, SessionConfig};
 
     let gguf = wick::gguf::GgufFile::open(model_path).unwrap();
-    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, model_path, 4096).unwrap();
+    let tokenizer = Arc::new(wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
+    let model: Arc<dyn Model> =
+        Arc::new(MetalLfm2Model::from_gguf(gguf, model_path, 4096).unwrap());
     let prompt_toks = tokenizer.encode(prompt);
 
     struct CollectSink(Vec<u32>);
@@ -52,8 +55,8 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
     }
 
     let mut session = Session::new(
-        &model,
-        &tokenizer,
+        model,
+        tokenizer,
         SessionConfig {
             kv_compression: KvCompression::None,
             seed: None,
