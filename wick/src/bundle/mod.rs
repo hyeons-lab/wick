@@ -132,9 +132,6 @@ impl BundleRepo {
         expected_sha256: Option<&str>,
     ) -> Result<PathBuf, WickError> {
         let dest = self.path_for_url(url)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
 
         // Probe HEAD once up front (no-redirect client so HF's
         // `X-Linked-Etag` is captured from the first hop). Used both
@@ -155,6 +152,13 @@ impl BundleRepo {
 
         if dest.exists() && self.cache_hit_valid(&dest, url, expected_sha256, &head) {
             return Ok(dest);
+        }
+
+        // Cache miss: only now does the filesystem need to exist.
+        // Deferred so cache-hit callers don't pay a `stat` on the
+        // parent directory on every resolve.
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
         }
 
         // Prefer caller's hash; else use the server's linked-etag
@@ -313,24 +317,31 @@ fn hash_matches(dest: &Path, url: &str, expected_hash: &str) -> bool {
     }
 }
 
-/// Reject a path segment if it could escape or break the cache dir.
-/// Narrow allowlist spirit: anything not clearly a plain filename
-/// component is refused with a clear error.
+/// Strict allowlist for path segments: ASCII alphanumerics and
+/// `-`, `_`, `.`. Everything else is rejected:
+/// - `/`, `\` (path separators on any OS)
+/// - `:` (Windows drive letters / NTFS alternate data streams)
+/// - `*`, `?`, `"`, `<`, `>`, `|` (Windows-reserved)
+/// - whitespace, null bytes, control chars (confusing / truncating)
+/// - URL-reserved `?`, `#`, `%` (semantics-altering under URL parsing)
+/// - non-ASCII (keeps paths portable across codepages; real bundle IDs
+///   and URL segments in `LiquidAI/LeapBundles` are all ASCII today)
+///
+/// Used for both URL-derived cache-dir segments (in `path_for_url`,
+/// where lax input could escape `store_dir` via `..`) and any future
+/// caller that hand-assembles URLs from user input.
 fn validate_path_segment(kind: &str, segment: &str) -> Result<(), WickError> {
     if segment.is_empty() {
         return Err(WickError::Backend(format!("{kind} must not be empty")));
     }
     if segment == "." || segment == ".." {
         return Err(WickError::Backend(format!(
-            "{kind} `{segment}` would escape the cache root"
+            "{kind} `{segment}` is not a valid path component"
         )));
     }
-    // Null bytes terminate C strings on most OS calls and can
-    // truncate the effective path. Backslash is a path separator on
-    // Windows. Colon is path-significant on Windows (drive letters,
-    // NTFS alternate data streams). Reject all three uniformly.
     for ch in segment.chars() {
-        if ch == '\0' || ch == '\\' || ch == ':' {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+        if !ok {
             return Err(WickError::Backend(format!(
                 "{kind} `{segment}` contains forbidden character {ch:?}"
             )));
@@ -400,7 +411,29 @@ mod tests {
         let e = repo
             .path_for_url("https://evil.example.com/a/../../etc/passwd")
             .expect_err("`..` segment must be rejected");
-        assert!(format!("{e}").contains("escape the cache root"));
+        assert!(format!("{e}").contains("not a valid path component"));
+    }
+
+    #[test]
+    fn path_for_url_rejects_windows_reserved_chars() {
+        // Chars that appear as segment content and are Windows-reserved:
+        // `*`, `"`, `<`, `>`, `|`. (`?` and `#` are separately stripped
+        // by `path_for_url` as URL syntax — see
+        // `path_for_url_strips_query_and_fragment`.) Catching these up
+        // front means a Windows consumer never sees a cryptic
+        // filesystem error at `PathBuf::push` time.
+        let repo = BundleRepo::new("/tmp/store");
+        for bad in ["a*b", "a\"b", "a<b", "a>b", "a|b"] {
+            let url = format!("https://example.com/{bad}");
+            let e = repo
+                .path_for_url(&url)
+                .expect_err(&format!("{bad:?} must be rejected"));
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("forbidden"),
+                "unexpected error for {bad:?}: {msg}"
+            );
+        }
     }
 
     #[test]

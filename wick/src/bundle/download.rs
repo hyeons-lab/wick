@@ -213,8 +213,17 @@ pub(crate) fn download_to(
             inner: &mut file,
             hasher: Sha256::new(),
         };
-        io::copy(&mut resp, &mut hashing)
-            .map_err(|e| WickError::Backend(format!("write {}: {e}", partial.display())))?;
+        // Mid-stream failure must not leave a `.partial.<pid>.<hash>`
+        // behind — those would accumulate across repeated network
+        // errors since the unique suffix means the next run won't
+        // overwrite. Clean up before returning.
+        if let Err(e) = io::copy(&mut resp, &mut hashing) {
+            let _ = fs::remove_file(&partial);
+            return Err(WickError::Backend(format!(
+                "write {}: {e}",
+                partial.display()
+            )));
+        }
         let digest = hashing.hasher.finalize();
         file.sync_all()?;
         hex_encode(&digest)
