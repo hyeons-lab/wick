@@ -14,14 +14,30 @@ description = "UniFFI bindings for wick — exposes the core inference engine to
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-uniffi.workspace = true
+# `tokio` feature activates the `async_runtime = "tokio"` export path
+# — required for the `async fn` methods on `Session` that offload the
+# synchronous decode loop to a blocking worker.
+uniffi = { workspace = true, features = ["tokio"] }
 # `FfiError` derives `thiserror::Error` so `WickError` messages can
 # flow through the FFI boundary unchanged. Already a workspace dep.
 thiserror.workspace = true
+# Async runtime for `#[uniffi::export(async_runtime = "tokio")]`.
+# `rt` for the runtime core, `rt-multi-thread` so `spawn_blocking`
+# dispatches decode work onto a dedicated blocking worker thread
+# instead of the runtime's async worker pool. `default-features = false`
+# is currently a no-op (tokio 1.x defaults to empty) but makes the
+# intent explicit and defends against a future tokio adding defaults.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
 # wick: default features for the core surface we expose. The `remote`
 # feature lights up when `BundleRepo` surfaces through FFI (a later
 # PR); keeps the dep tree small for now.
 wick = { path = "../wick" }
+
+[dev-dependencies]
+# Full tokio feature set for `#[tokio::test]` so the async unit tests
+# get a runtime + macro expansion. Kept dev-only — non-test builds
+# stay minimal.
+tokio = { version = "1", features = ["full"] }
 
 # No `[build-dependencies]` block: the proc-macro path doesn't need
 # UDL-scaffolding generation at build time, so `uniffi = { features =

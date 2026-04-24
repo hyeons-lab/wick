@@ -20,7 +20,10 @@
 //!   [`Session::generate`] returning [`GenerateOutput`] (tokens +
 //!   [`GenerateSummary`]), or [`Session::generate_streaming`] that
 //!   delivers tokens + audio frames through a foreign [`ModalitySink`]
-//!   as they're produced.
+//!   as they're produced. Async twins
+//!   [`Session::generate_async`] + [`Session::generate_streaming_async`]
+//!   let foreign async runtimes — Kotlin coroutines, Swift `async`,
+//!   Python `asyncio` — `.await` decode without stalling the caller.
 //! - [`SessionConfig`] + [`KvCompression`] — per-session knobs.
 //! - [`GenerateOpts`] + [`FinishReason`] — per-call decode config + exit reason.
 //! - [`Session::cancel`] / [`Session::position`] for cooperative
@@ -36,11 +39,9 @@
 //! ## Not exposed yet
 //!
 //! Future PRs grow the surface per the roadmap in
-//! `wick-ffi/README.md`. Highlights: `async` `generate` via
-//! `#[uniffi::export(async_runtime = "tokio")]` (PR 5), remote URL
-//! loading through `BundleRepo` (gated on the `remote` feature),
-//! binding generation for Kotlin / Swift / Python, and typed error
-//! variants.
+//! `wick-ffi/README.md`. Highlights: remote URL loading through
+//! `BundleRepo` (gated on the `remote` feature), binding generation
+//! for Kotlin / Swift / Python, and typed error variants.
 //!
 //! ## Design notes
 //!
@@ -732,6 +733,180 @@ impl Session {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async Session methods (PR 5)
+// ---------------------------------------------------------------------------
+//
+// Foreign callers driving an async runtime (Kotlin coroutines, Swift
+// `async`, Python `asyncio`) can `.await` these without bouncing into
+// a sync context. Every method defers to its synchronous twin inside
+// `tokio::task::spawn_blocking`, which moves the actual decode work
+// onto a blocking worker thread — so the tokio async worker pool
+// stays free to poll other futures while decoding is in flight.
+//
+// `self: Arc<Self>` rather than `&self` so the session handle can
+// cross the `spawn_blocking` boundary (requires `'static`). UniFFI
+// wraps `#[uniffi::Object]` types in `Arc` on the foreign side anyway,
+// so this doesn't change the foreign API shape — it's still
+// `session.generateAsync(opts)` on Kotlin / `session.generateAsync(opts)`
+// on Swift / `session.generate_async(opts)` on Python.
+//
+// UniFFI's `tokio` feature starts an internal multi-thread tokio
+// runtime the first time a `#[uniffi::export(async_runtime = "tokio")]`
+// method is invoked. Spawned blocking tasks inherit that runtime's
+// blocking worker pool (`tokio::runtime::Builder::new_multi_thread`
+// default). We don't need to create or enter a runtime ourselves.
+
+/// RAII guard that cancels the in-flight `spawn_blocking` decode on
+/// future-drop. Addresses a subtle hazard of wrapping sync decode in
+/// `tokio::task::spawn_blocking`: dropping the outer future drops the
+/// `JoinHandle`, but tokio does **not** abort a `spawn_blocking` task
+/// on handle-drop — the blocking worker keeps decoding, keeps holding
+/// the session mutex, keeps mutating `Session::state`.
+///
+/// Without this guard, a foreign-side cancellation (Kotlin coroutine
+/// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`) would
+/// silently leak decode work into the background. The caller's next
+/// `generate*` call would block on the still-held mutex or observe
+/// state advanced by the "cancelled" call.
+///
+/// Two code paths, two mitigations — both fire together because the
+/// guard can't know which path applies:
+///
+/// 1. **Running decode.** The task is executing `wick::Session::generate`
+///    on a blocking worker. `session.cancel()` flips the cancel atomic;
+///    the decode loop polls it between tokens and exits with
+///    `FinishReason::Cancelled`. `JoinHandle::abort` has no effect
+///    here — `spawn_blocking` tasks are opaque synchronous code with
+///    no await points to interrupt.
+///
+/// 2. **Queued decode.** The task is in the blocking pool's queue
+///    waiting for a worker (pool saturated, or just hasn't been
+///    scheduled). `JoinHandle::abort` cancels queued-but-not-started
+///    blocking tasks before their closure runs — the closure never
+///    executes, so `wick::Session::generate` never starts, so the
+///    session's cancel flag is never reset. Without this, the race is:
+///    guard sets cancel → task eventually dequeues → decode's first
+///    line clears cancel back to `false` (`wick/src/session.rs:603-605`)
+///    → decode runs to completion despite the caller having dropped
+///    the future.
+///
+/// Both operations are idempotent / harmless on the irrelevant path:
+/// `session.cancel()` on a queued task is overridden by `abort`; an
+/// already-completed task ignores both. `wick::Session::generate`
+/// resets the cancel atomic on entry, so a spurious late-arriving
+/// cancel from a guard that dropped just after the await resolved
+/// (not reachable in practice — futures aren't preemptively dropped
+/// between synchronous statements) wouldn't affect the next call.
+struct AsyncCancelGuard {
+    session: Arc<Session>,
+    /// Abort handle for the `spawn_blocking` task. Calling `abort()`
+    /// on a queued task removes it from the pool's queue; on a running
+    /// task it's a no-op (no await point to unwind through). Kept as
+    /// an `AbortHandle` rather than a `JoinHandle` so the guard can
+    /// coexist with the outer `.await` on the same handle (we take
+    /// `abort_handle()` before awaiting).
+    abort: tokio::task::AbortHandle,
+    /// `true` until the await successfully resolves. Dropping with
+    /// `armed = true` means we're being dropped mid-await: fire both
+    /// abort (for queued-but-not-started) and cancel (for in-flight).
+    armed: bool,
+}
+
+impl Drop for AsyncCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort.abort();
+            self.session.cancel();
+        }
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Session {
+    /// Async variant of [`Session::generate`] — runs buffered decode
+    /// (returning every emitted token + a summary) on a tokio blocking
+    /// worker so the caller's async context isn't stalled by the
+    /// synchronous decode loop.
+    ///
+    /// Cancellation: dropping the returned future (Kotlin coroutine
+    /// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`)
+    /// triggers both an abort of the queued `spawn_blocking` task (so
+    /// a not-yet-started decode never runs) and a
+    /// [`Session::cancel`] call (so an in-flight decode exits at its
+    /// next between-token check with [`FinishReason::Cancelled`]).
+    /// Either path releases the session mutex; subsequent calls see
+    /// a clean session. You can also call [`Session::cancel`]
+    /// directly from any thread to trigger the same in-flight exit
+    /// without dropping the future. See [`AsyncCancelGuard`] for the
+    /// full rationale.
+    ///
+    /// On error the wrapper performs the same poisoned-mutex handling
+    /// as sync [`Session::generate`]. `JoinError` from a panic in the
+    /// blocking closure surfaces as [`FfiError::Backend`] with a
+    /// diagnostic prefix.
+    pub async fn generate_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+    ) -> Result<GenerateOutput, FfiError> {
+        let session_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.generate(opts));
+        let mut guard = AsyncCancelGuard {
+            session: session_for_guard,
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            message: format!("generate_async join error: {e}"),
+        })?
+    }
+
+    /// Async variant of [`Session::generate_streaming`] — delivers
+    /// tokens and audio frames to the foreign [`ModalitySink`] as the
+    /// decode loop produces them, from within a blocking worker so
+    /// the caller's async runtime stays responsive.
+    ///
+    /// Sink callbacks run on the blocking worker thread that's
+    /// executing the decode — **not** on the caller's async thread.
+    /// The reentrancy hazard documented on
+    /// [`Session::generate_streaming`] still applies: sink callbacks
+    /// that call back into `append_text` / `generate*` / `reset` from
+    /// inside the session will deadlock on the session mutex.
+    /// [`Session::cancel`] and [`Session::position`] remain atomic-
+    /// backed and safe to invoke from any thread (including from
+    /// inside a callback).
+    ///
+    /// Cancellation: dropping the returned future fires the same
+    /// abort + [`Session::cancel`] pair as [`Session::generate_async`]
+    /// (see [`AsyncCancelGuard`]). For an in-flight decode, the loop
+    /// exits with [`FinishReason::Cancelled`] and the sink's `on_done`
+    /// fires on the blocking worker before the task completes —
+    /// foreign consumers get the terminal signal even though they've
+    /// already stopped awaiting. For a queued-but-not-started decode,
+    /// abort cancels the task without ever running the closure; no
+    /// sink callbacks fire for that case (the decode never began).
+    pub async fn generate_streaming_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        let session_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink));
+        let mut guard = AsyncCancelGuard {
+            session: session_for_guard,
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            message: format!("generate_streaming_async join error: {e}"),
+        })?
+    }
+}
+
 // Session-level method on WickEngine.
 #[uniffi::export]
 impl WickEngine {
@@ -1046,5 +1221,99 @@ mod tests {
             1,
             "still one — no double-fire"
         );
+    }
+
+    /// Mirrors the exact `if armed { ... }` branch in
+    /// `AsyncCancelGuard::drop`. Can't build a real `wick::Session`
+    /// in a unit test (no model to load), but the guard's logic is
+    /// one conditional — a structurally identical probe guard gives
+    /// the same coverage. End-to-end verification of
+    /// "drop-future-cancels-decode" requires a real model and lands
+    /// with PR 6's binding smoke tests / PR 7+'s parity harness.
+    #[test]
+    fn async_cancel_guard_drop_fires_when_armed_only() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ProbeGuard {
+            fired: Arc<AtomicBool>,
+            armed: bool,
+        }
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.fired.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Armed drop → fires.
+        let armed_fired = Arc::new(AtomicBool::new(false));
+        drop(ProbeGuard {
+            fired: armed_fired.clone(),
+            armed: true,
+        });
+        assert!(armed_fired.load(Ordering::Relaxed), "armed drop must fire");
+
+        // Disarmed drop → does not fire (the await-resolved path).
+        let disarmed_fired = Arc::new(AtomicBool::new(false));
+        let mut g = ProbeGuard {
+            fired: disarmed_fired.clone(),
+            armed: true,
+        };
+        g.armed = false;
+        drop(g);
+        assert!(
+            !disarmed_fired.load(Ordering::Relaxed),
+            "disarmed drop must not fire"
+        );
+    }
+
+    /// Replicates the `spawn_blocking(..).await.map_err(..)?` pattern
+    /// used by `generate_async` / `generate_streaming_async` — the
+    /// wrapper's entire logic. Proves:
+    ///
+    /// - Successful blocking-closure results propagate through the
+    ///   await + ?-sugar unchanged.
+    /// - A panic in the blocking closure surfaces as
+    ///   `tokio::task::JoinError`, which our `map_err` folds into
+    ///   `FfiError::Backend` with the documented prefix.
+    ///
+    /// Can't construct a real `Session` in a unit test (no model to
+    /// load), so the actual async wrappers are exercised only via
+    /// this shape-equivalent stand-in. The binding generation step
+    /// (PR 6) and the parity harness (PR 7+) will end-to-end exercise
+    /// the real methods.
+    #[tokio::test]
+    async fn spawn_blocking_pattern_propagates_ok_and_maps_join_error() {
+        // Ok path: same shape as `generate_async`'s body — the sync
+        // closure returns the final value, spawn_blocking + await +
+        // map_err hands it back via `?`.
+        let map_join = |e: tokio::task::JoinError| FfiError::Backend {
+            message: format!("test join error: {e}"),
+        };
+
+        let ok: u32 = tokio::task::spawn_blocking(|| 42u32)
+            .await
+            .map_err(map_join)
+            .expect("tokio should not drop the blocking task");
+        assert_eq!(ok, 42);
+
+        // Panic path: the blocking closure panics, JoinError bubbles
+        // out, map_err converts it. No `?` here so we can inspect the
+        // error variant.
+        let panicked = tokio::task::spawn_blocking(|| -> u32 {
+            panic!("simulated decode panic");
+        })
+        .await
+        .map_err(map_join);
+        match panicked {
+            Err(FfiError::Backend { message }) => {
+                assert!(
+                    message.contains("test join error"),
+                    "expected prefix, got: {message}"
+                );
+            }
+            other => panic!("expected Err(Backend), got: {other:?}"),
+        }
     }
 }

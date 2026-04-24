@@ -6,18 +6,20 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Streaming.** `WickEngine` + `Session` + sync `generate` shipped in
-PRs 2–3; PR 4 adds `ModalitySink` as a UniFFI foreign-trait callback
-so foreign callers can receive tokens + audio frames as they're
-produced. Real surface grows in follow-up PRs per the Phase 2 roadmap:
+**Async.** `WickEngine` + `Session` + sync `generate` + streaming
+`generate_streaming` shipped in PRs 2–4; PR 5 adds `async` twins
+(`generate_async` + `generate_streaming_async`) via
+`#[uniffi::export(async_runtime = "tokio")]` so Kotlin coroutines /
+Swift `async` / Python `asyncio` callers can `.await` decode without
+stalling their async thread. Surface grows in follow-up PRs:
 
 | PR | Scope |
 |---|---|
 | 1 | Crate shell + UniFFI scaffolding + smoke-test export |
 | 2 | `WickEngine::from_path`, `EngineConfig`, `ModelMetadata`, `ModalityCapabilities` |
 | 3 | `Session`, `SessionConfig`, `GenerateOpts`, `GenerateSummary`, sync `generate` |
-| 4 *(this one)* | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
-| 5 | `async` `generate` via `#[uniffi::export(async_runtime = "tokio")]` |
+| 4 | `ModalitySink` as UniFFI foreign-trait callback + streaming `generate` |
+| 5 *(this one)* | `async` `generate_async` + `generate_streaming_async` via `#[uniffi::export(async_runtime = "tokio")]` |
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI |
 | 7+ | Error-type marshalling, parity harness, Android ABIs, iOS XCFramework |
 
@@ -54,9 +56,12 @@ the crate is Rust-only.
   Annotations live next to the Rust types they describe; no separate
   grammar to maintain. Can migrate to UDL if the annotation density
   ever becomes unmanageable.
-- **Async runtime** will be `tokio` when `async fn generate` lands
-  (PR 5). `tokio` is a `wick-ffi` dep only, never `wick` itself —
-  keeps the core crate runtime-agnostic.
+- **Async runtime** is `tokio` (via UniFFI's `tokio` feature flag +
+  `#[uniffi::export(async_runtime = "tokio")]`). `tokio` is a `wick-ffi`
+  dep only, never `wick` itself — keeps the core crate runtime-agnostic.
+  Sync decode work runs on `tokio::task::spawn_blocking` so the async
+  worker pool stays free to poll other futures while a generate is in
+  flight.
 - **Send + Sync** is already guaranteed on every `wick` type we plan
   to expose (landed in PR #42). UniFFI requires it for every
   `#[uniffi::Object]`.
