@@ -26,6 +26,11 @@ wasm-bindgen.workspace = true
 # wasm builds get the same compact `e: cause: …` output JS callers
 # can render.
 anyhow.workspace = true
+# `js_sys::Function` (token-streaming callback arg type) and
+# `js_sys::Uint32Array` (copying token batches into JS-owned memory
+# for the `on_text_tokens` trampoline). Already a transitive dep of
+# wasm-bindgen; declared here because we use the public types.
+js-sys = "0.3"
 
 [package.metadata.docs.rs]
 # docs.rs runs on linux x86_64 by default, which would skip the

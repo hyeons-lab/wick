@@ -4,8 +4,8 @@
 [wick](https://github.com/hyeons-lab/wick) inference engine.
 
 > Status: pre-1.0. Today's surface covers manifest parsing, model
-> loading (CPU-only), metadata access, and tokenizer encode/decode.
-> `Session` / streaming generation lands in a follow-up release.
+> loading (CPU-only), metadata access, tokenizer encode/decode, and
+> sync streaming text generation via `Session.generate(opts, cb)`.
 
 ## Install
 
@@ -83,11 +83,76 @@ engine.free();
 > resource management) when you're done — otherwise the model
 > stays alive until the page unloads.
 
-`Session` (the actual `generate(...)` call with token streaming) is
-**not yet exposed** — that surface needs an async-streaming design
-that lands in a follow-up release. For now this package is useful
-for: client-side token counting, chat-template rendering before an
-API call, and inspecting model metadata before deciding to download.
+### Inference (text)
+
+```js
+import { WickEngine, GenerateOpts } from '@hyeonslab/wick-wasm';
+
+const engine = WickEngine.fromGgufBytes(gguf, 2048);
+const tok = engine.tokenizer;
+const session = engine.newSession();
+
+// Seed the conversation. Use `session.appendText(prompt)` for the
+// common case (tokenizer is invoked internally), or
+// `session.appendTokens(ids)` when you need control over BOS/EOS.
+session.appendText('Hello, what is the capital of France?');
+
+// Configure decoding. All fields default to wick's native defaults
+// (max 256 tokens, temperature 0.7, top-p 0.9, top-k 40, no stops,
+// flush every 16 tokens or 50 ms).
+const opts = new GenerateOpts();
+opts.maxTokens = 64;
+opts.temperature = 0.0;
+opts.stopTokens = new Uint32Array([tok.eosToken]);  // honor model EOS
+
+// Stream tokens as they decode. The callback fires per flush
+// boundary (every `flushEveryTokens` decoded tokens, OR every
+// `flushEveryMs` ms — whichever hits first) with just the *new*
+// tokens, not the cumulative buffer.
+let acc = [];
+const summary = session.generate(opts, (newTokens) => {
+    acc.push(...newTokens);
+    process.stdout.write(tok.decode(newTokens));  // streaming text
+});
+
+console.log('\n---');
+console.log('finish:', summary.finishReason);          // "Stop" | "MaxTokens" | ...
+console.log('tokens:', summary.tokensGenerated);
+console.log('decode ms:', summary.decodeMs);
+
+session.free();
+engine.free();
+```
+
+> **Worker note:** `Session.generate` is **synchronous** and blocks
+> the thread it runs on for the full decode duration (potentially
+> seconds). On the browser main thread that freezes the page —
+> always call from a Web Worker:
+>
+> ```js
+> // worker.js
+> import { WickEngine, GenerateOpts } from '@hyeonslab/wick-wasm';
+> self.onmessage = async (ev) => {
+>     const engine = WickEngine.fromGgufBytes(ev.data.gguf);
+>     const session = engine.newSession();
+>     session.appendText(ev.data.prompt);
+>     const opts = new GenerateOpts();
+>     opts.maxTokens = 128;
+>     session.generate(opts, (toks) => self.postMessage({ kind: 'tokens', toks }));
+>     self.postMessage({ kind: 'done' });
+> };
+> ```
+>
+> On Node the sync call only blocks the running script — libuv's
+> event loop keeps handling I/O — so calling directly is fine.
+
+### Cancellation
+
+`session.cancel()` flips an atomic checked at every flush
+boundary. Generation exits with `finishReason === "Cancelled"` at
+the next checkpoint. Safe to call from the same thread that owns
+the session (typical Worker pattern: a `cancel` message handler
+calling `session.cancel()`).
 
 Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
