@@ -166,7 +166,6 @@ impl BundleRepo {
             Err(e) => return Err(e.into()),
         };
         for entry in entries.flatten() {
-            let path = entry.path();
             // `entry.file_type()` is a syscall on POSIX, so use it
             // instead of `metadata()` for the directory test — cheaper
             // when we don't need the size yet.
@@ -174,7 +173,7 @@ impl BundleRepo {
                 continue;
             };
             if file_type.is_dir() {
-                Self::walk_dir_size(&path, total)?;
+                Self::walk_dir_size(&entry.path(), total)?;
             } else if file_type.is_file()
                 && let Ok(meta) = entry.metadata()
             {
@@ -197,13 +196,22 @@ impl BundleRepo {
     /// any active `from_bundle_id*` calls themselves (typically
     /// trivial since the action is user-driven).
     pub fn clear_cache(&self) -> Result<(), WickError> {
-        if !self.store_dir.exists() {
-            return Ok(());
-        }
         // `remove_dir_all` + `create_dir_all` is simpler than walking
         // and `unlink`-ing each file. The dir-recreate keeps the
         // store_dir invariant (parent for future downloads).
-        fs::remove_dir_all(&self.store_dir)?;
+        //
+        // `NotFound` from `remove_dir_all` is treated as success: the
+        // dir is already absent (lazy-creation invariant — no download
+        // has run, or a concurrent clear got there first). In that
+        // case we also skip `create_dir_all` to preserve the lazy
+        // contract: nothing eagerly materializes `store_dir`. No
+        // `exists()` pre-check — it would be a TOCTOU race against
+        // the remove.
+        match fs::remove_dir_all(&self.store_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
         fs::create_dir_all(&self.store_dir)?;
         Ok(())
     }
