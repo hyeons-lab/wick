@@ -148,16 +148,43 @@ engine.free();
 > };
 > ```
 >
-> On Node the sync call only blocks the running script — libuv's
-> event loop keeps handling I/O — so calling directly is fine.
+> On Node the sync call also blocks the JS event loop — libuv's
+> background I/O thread pool keeps running, but JS callbacks (HTTP
+> handlers, timers, etc.) queue up and don't fire until generate
+> returns. For server processes that need to handle other requests
+> during inference, run generate inside a `worker_threads` Worker.
+> For one-off scripts the block is fine.
 
 ### Cancellation
 
-`session.cancel()` flips an atomic checked at every flush
-boundary. Generation exits with `finishReason === "Cancelled"` at
-the next checkpoint. Safe to call from the same thread that owns
-the session (typical Worker pattern: a `cancel` message handler
-calling `session.cancel()`).
+`session.cancel()` flips an atomic that the decode loop checks at
+every flush boundary; generation exits with `finishReason === "Cancelled"`
+at the next checkpoint.
+
+The catch: JS workers (web + `worker_threads`) are single-threaded.
+While `generate()` is blocking, the worker's own message handlers
+**cannot run** — a `postMessage({ kind: 'cancel' })` from the main
+thread queues but doesn't dispatch until generate returns. So the
+useful place to call `session.cancel()` is **from inside the token
+callback** (the only JS code that runs during a blocking generate):
+
+```js
+let cancelRequested = false;
+// Receive a cancel signal from outside the generate call …
+self.addEventListener('message', (ev) => {
+    if (ev.data.kind === 'cancel') cancelRequested = true;
+});
+
+session.generate(opts, (toks) => {
+    self.postMessage({ kind: 'tokens', toks });
+    if (cancelRequested) session.cancel();
+});
+```
+
+Out-of-thread cancellation (truly async, no callback round-trip)
+needs `SharedArrayBuffer` + `Atomics.store` from another thread,
+which requires cross-origin isolation in browsers. Not exposed by
+this package today.
 
 Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
