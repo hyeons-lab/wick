@@ -308,6 +308,37 @@ jobs:
           XCF=target/xcframework-build/WickFFI.xcframework
           du -sh "$XCF"
           du -sh "$XCF"/*/libwick_ffi*.a
+      - name: Swift smoke test (macOS)
+        # Validates the entire pipeline end-to-end: compiles a small
+        # Swift program against the freshly-built macOS staticlib +
+        # the vendored Swift binding, runs it, asserts every surface
+        # area we expect to work works (function call, enum
+        # marshaling, record construction, error round-trip).
+        #
+        # Why macOS only: the Rust FFI surface is identical across
+        # iOS device, iOS Simulator, and native macOS — same
+        # generated Swift binding, same C ABI, same staticlib code
+        # path. Running a native macOS test exercises the entire
+        # cross-language integration without paying for an iOS
+        # simulator boot. A regression that broke iOS specifically
+        # (e.g., a platform-conditional staticlib symbol) wouldn't
+        # be caught here, but those have not been a real failure
+        # mode for UniFFI 0.31.
+        #
+        # `-import-objc-header` exposes the C declarations from
+        # `wick_ffiFFI.h` without needing a separate module map +
+        # SPM ceremony for a single-binary test. Foundation auto-
+        # links on Apple platforms.
+        run: |
+          set -euo pipefail
+          swiftc \
+              wick-ffi/tests/swift/main.swift \
+              wick-ffi/bindings/swift/wick_ffi.swift \
+              -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+              -L target/aarch64-apple-darwin/release \
+              -lwick_ffi \
+              -o /tmp/wick-swift-smoke
+          /tmp/wick-swift-smoke
       - name: Verify XCFramework slices
         # Catches a regression where one slice silently has the wrong
         # architecture or platform — `Info.plist` advertises

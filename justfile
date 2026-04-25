@@ -165,13 +165,40 @@ ios-xcframework:
     echo "Built $OUT/WickFFI.xcframework"
 
 # Single-target iOS smoke test — verifies the device cross-compile
-# works without paying for the full sim + lipo + xcodebuild pipeline
+# works without paying for the full ios-xcframework pipeline
 # (~30s vs ~90s+). Output `.a` isn't directly usable in an iOS app
 # (consumers need the XCFramework or a custom SPM `linkedLibrary`
 # wiring); this recipe is mostly a "did the cross-compile break?"
 # fast probe. Assumes `aarch64-apple-ios` is rustup-installed.
 ios-arm64:
     cargo build -p wick-ffi --target aarch64-apple-ios --release
+
+# End-to-end Swift integration test against the macOS slice. Compiles
+# `wick-ffi/tests/swift/main.swift` together with the vendored Swift
+# binding, links against the freshly-built `aarch64-apple-darwin`
+# staticlib, runs the resulting binary. Exercises function calls,
+# enum + record marshaling, and FfiError round-trip end-to-end.
+#
+# Why macOS-only smoke: the Rust FFI is identical across iOS device,
+# iOS Simulator, and native macOS — same Swift binding, same C ABI,
+# same staticlib. Validating macOS proves the integration; iOS
+# device + Simulator share the same code path so the test covers
+# them by proxy.
+#
+# Requires Xcode (`swiftc`) + `aarch64-apple-darwin` rustup target.
+# Builds the staticlib first if it isn't already cached.
+swift-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
+    swiftc \
+        wick-ffi/tests/swift/main.swift \
+        wick-ffi/bindings/swift/wick_ffi.swift \
+        -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+        -L target/aarch64-apple-darwin/release \
+        -lwick_ffi \
+        -o target/wick-swift-smoke
+    target/wick-swift-smoke
 
 # Clean build artifacts
 clean:
