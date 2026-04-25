@@ -35,10 +35,13 @@ use wick::engine::{BackendPreference, EngineConfig, ModelFiles, WickEngine};
 /// CI's `target/tmp/wick-test-models` cache is shared across all three
 /// integration tests and pays only a HEAD probe on subsequent runs.
 /// Mutable `resolve/main/` ref is intentional — these tests assert
-/// load-and-shift sanity, not bit-exact weight equality; if upstream
-/// re-uploads, the cache's Content-Length check triggers a re-download.
-/// Phase 1.6's `BundleRepo` is where pinning to a revision hash
-/// belongs.
+/// load-and-shift sanity, not bit-exact weight equality. If upstream
+/// re-uploads, `BundleRepo`'s validation policy detects the changed
+/// artifact via `X-Linked-Etag` (or per-file SHA-256 when supplied)
+/// and falls back to `Content-Length` only when no hash-like
+/// identifier is available — either way a re-download fires on the
+/// next run. Phase 1.6's `BundleRepo` is where pinning to a revision
+/// hash belongs.
 const MODEL_URL: &str = "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_0.gguf";
 const MODEL_FILE: &str = "LFM2-350M-Extract-Q4_0.gguf";
 

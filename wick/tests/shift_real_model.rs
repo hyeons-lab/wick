@@ -29,7 +29,8 @@
 //! never hits the network. To opt in:
 //!
 //! ```sh
-//! WICK_TEST_DOWNLOAD=1 cargo test -p wick --test shift_real_model -- --ignored
+//! WICK_TEST_DOWNLOAD=1 cargo test -p wick --features remote \
+//!     --test shift_real_model -- --ignored
 //! ```
 //!
 //! On CI, the download is cached under `target/tmp/wick-test-models/`
@@ -42,7 +43,10 @@
 //! hitting the job's 15-minute cap; the 350M brings that down to a
 //! few minutes with the same shift-firing coverage.
 
-#![cfg(feature = "remote")]
+// `from_bundle_id` is gated on both `remote` (for the downloader) and
+// `mmap` (for the loader); the cfg here must mirror that or
+// `--no-default-features --features remote` fails to compile.
+#![cfg(all(feature = "remote", feature = "mmap"))]
 
 mod common;
 
