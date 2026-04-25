@@ -49,8 +49,12 @@ pub struct Manifest {
 #[wasm_bindgen]
 impl Manifest {
     /// Parse a JSON manifest from raw bytes. Throws a `JsError` on
-    /// malformed JSON, missing required fields, or unknown
-    /// `inference_type`-discriminated shapes.
+    /// malformed JSON or when required fields are missing or wrongly
+    /// typed (e.g. no `load_time_parameters.model`). Unknown
+    /// `inference_type` values are **not** an error — they round-trip
+    /// through `wick::manifest::InferenceType::Unknown(String)` and
+    /// surface verbatim via the `inferenceType` getter, so JS callers
+    /// can decide how to react instead of catching here.
     #[wasm_bindgen]
     pub fn parse(json_bytes: &[u8]) -> Result<Manifest, JsError> {
         wick::manifest::Manifest::from_bytes(json_bytes)
