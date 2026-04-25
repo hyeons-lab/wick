@@ -6,19 +6,14 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Phase 2.1 progression** — the Rust FFI surface + binding generation +
-mobile cross-compile pipelines. `WickEngine` + `Session` + sync,
-streaming, and async `generate` surfaced through PRs 2–5. PR 6
-vendored the Kotlin + Swift bindings with a CI drift check. PR 7
-typed the `FfiError` enum. PR 8 added Android ABI cross-compile +
-per-ABI artifacts. PR 9 adds the Apple-platform counterpart:
-`wick-ffi` now cross-compiles to `aarch64-apple-ios` (real iPhones),
-`aarch64-apple-ios-sim` (Apple Silicon Mac iOS Simulator), and
-`aarch64-apple-darwin` (native Apple Silicon Macs); assembles a
-3-slice `WickFFI.xcframework`; and publishes it as a CI artifact
-ready for Swift Package Manager / Xcode consumption. Apple Silicon
-only — x86_64 slices are deliberately omitted (Apple stopped selling
-Intel Macs in 2023).
+**Remote loading.** Through PRs 2–9 `wick-ffi` built up a typed
+foreign-language surface (sync / streaming / async generate, typed
+errors, vendored Kotlin + Swift bindings) and the Android ABI +
+Apple XCFramework distribution pipelines. PR 10 enables the `wick`
+`remote` feature and exposes [`BundleRepo`] + `WickEngine::from_bundle_id`
+to foreign callers: a mobile app can now download a LeapBundles model
+by HF ID at runtime — e.g. `"LFM2-1.2B-GGUF" + "Q4_0"` — into a
+persistent cache directory, without bundling the GGUF in the app.
 
 | PR | Scope |
 |---|---|
@@ -31,7 +26,8 @@ Intel Macs in 2023).
 | 7 | Typed `FfiError` variants mirroring `wick::WickError` |
 | 8 | Android ABI cross-compile + CI matrix + per-ABI artifact upload |
 | 9 | Apple-platform XCFramework: arm64-only iOS device + iOS Simulator + native macOS slices, CI artifact |
-| 10+ | `BundleRepo` remote loading (`remote` feature), parity harness, Maven publishing |
+| 10 | `BundleRepo` remote loading (`remote` feature) + `WickEngine::from_bundle_id` |
+| 11+ | Parity harness, Maven publishing, async `from_bundle_id` |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -314,6 +310,133 @@ silent runner-image bumps are visible in the build output. iOS Rust
 targets are pinned to whatever nightly the workspace uses; bumping
 requires a corresponding
 toolchain re-validation.
+
+## Remote model loading
+
+`BundleRepo` + `WickEngine::from_bundle_id` let foreign callers load
+LeapBundles models by HF ID at runtime. The model's manifest and
+GGUF files are downloaded into a persistent cache directory and
+reused on subsequent calls — apps don't have to bundle the GGUF
+in-app, which matters because a 1B-parameter model is ~500 MB–1 GB
+and consumer app stores cap at ~200 MB.
+
+### Kotlin
+
+```kotlin
+import uniffi.wick_ffi.*
+
+// Construct the repo once per app (typical lifecycle: Application
+// onCreate). `filesDir` is the Android-recommended persistent path
+// — NOT `cacheDir`, which the OS can purge under storage pressure.
+val repo = BundleRepo(storeDir = context.filesDir.absolutePath + "/wick-bundles")
+
+val config = EngineConfig(
+    contextSize = 0UL,                           // use model default
+    backend = BackendPreference.AUTO,
+    bundleRepo = repo,                           // enables from_bundle_id
+)
+
+val engine = WickEngine.fromBundleId(
+    bundleId = "LFM2-1.2B-GGUF",
+    quant = "Q4_0",
+    config = config,
+)
+```
+
+### Swift
+
+```swift
+import Foundation
+// `WickFFI` here is the XCFramework module from PR 9.
+
+let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+let repo = BundleRepo(storeDir: appSupport.appendingPathComponent("wick-bundles").path)
+
+let config = EngineConfig(
+    contextSize: 0,
+    backend: .auto,
+    bundleRepo: repo,
+)
+
+let engine = try WickEngine.fromBundleId(
+    bundleId: "LFM2-1.2B-GGUF",
+    quant: "Q4_0",
+    config: config
+)
+```
+
+### Cache layout + idempotency
+
+Bundles land under `<store_dir>/huggingface.co/<full URL path>`,
+mirroring the URL structure. Concrete example for
+`from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", _)`:
+
+```
+<store_dir>/huggingface.co/
+└── LiquidAI/LeapBundles/resolve/main/LFM2-1.2B-GGUF/Q4_0.json
+<store_dir>/huggingface.co/
+└── LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_0.gguf
+```
+
+Second and subsequent calls with the same `bundle_id` + `quant`
+resolve entirely from the cache — no network I/O. Integrity
+verification: caller-supplied SHA-256 when available (manifest per-
+file hashes once they land upstream), otherwise HF's `X-Linked-Etag`
+or a `Content-Length` size check.
+
+### Blocking semantics + async
+
+`from_bundle_id` is **synchronous**; the first call blocks on the
+download over the network (potentially minutes for a multi-GB
+model). Foreign async runtimes should wrap the call in
+`spawn_blocking` / `withContext(Dispatchers.IO)` / `asyncio.to_thread`
+to avoid stalling the async worker pool. A native async
+counterpart matching `generate_async`'s pattern is a reasonable
+PR 11+ follow-up; it'd share the same `BundleRepo` + drop a
+blocking-context requirement on the caller.
+
+### Per-platform cache-path recommendations
+
+| Platform | Recommended `store_dir` |
+|---|---|
+| Android | `Context.getFilesDir()` + subdir — persistent; survives app restarts |
+| iOS | `FileManager.applicationSupportDirectory` + subdir — persistent, not iCloud-synced |
+| macOS (native) | `~/Library/Application Support/<app bundle id>/wick-bundles` |
+| Linux (CLI/server) | `$XDG_CACHE_HOME/wick-bundles` or `~/.cache/wick-bundles` |
+
+Do not use `Context.getCacheDir()` on Android or `tmp` on any
+platform — the OS can purge those under storage pressure, forcing
+a full re-download every time pressure gets reset.
+
+### Known breaking change: Swift `EngineConfig` equality
+
+Adding `bundleRepo: BundleRepo?` to `EngineConfig` drops the
+auto-synthesized `Equatable` + `Hashable` conformance from the
+generated Swift struct — `BundleRepo` is a UniFFI Object (reference
+type) which has no structural equality, so Swift can't derive
+`Equatable` on a struct containing one. Swift callers that were
+comparing `EngineConfig` values with `==` or using them as
+`Dictionary` keys / `Set` elements will need to compare the scalar
+fields (`contextSize`, `backend`) directly, or provide a local
+extension:
+
+```swift
+extension EngineConfig: Equatable {
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.contextSize == rhs.contextSize
+            && lhs.backend == rhs.backend
+            && (lhs.bundleRepo === rhs.bundleRepo)  // identity, not structural
+    }
+}
+```
+
+This would go in the consumer app, not in the vendored binding —
+`ffi-bindings-drift` overwrites the generated file on every surface
+change, and UniFFI can't currently be told to re-derive the
+conformance across reference-type fields.
+
+Kotlin isn't affected (`data class` equality compiles against any
+field type, using reference-equality for object fields automatically).
 
 ## Design notes
 

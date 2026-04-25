@@ -275,6 +275,26 @@ typedef struct UniffiVTableCallbackInterfaceModalitySink {
 } UniffiVTableCallbackInterfaceModalitySink;
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_BUNDLEREPO
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_BUNDLEREPO
+uint64_t uniffi_wick_ffi_fn_clone_bundlerepo(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_BUNDLEREPO
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_BUNDLEREPO
+void uniffi_wick_ffi_fn_free_bundlerepo(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_BUNDLEREPO_NEW
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_BUNDLEREPO_NEW
+uint64_t uniffi_wick_ffi_fn_constructor_bundlerepo_new(RustBuffer store_dir, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
+RustBuffer uniffi_wick_ffi_fn_method_bundlerepo_store_dir(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_MODALITYSINK
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_MODALITYSINK
 uint64_t uniffi_wick_ffi_fn_clone_modalitysink(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -373,6 +393,11 @@ uint64_t uniffi_wick_ffi_fn_clone_wickengine(uint64_t handle, RustCallStatus *_N
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_WICKENGINE
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_WICKENGINE
 void uniffi_wick_ffi_fn_free_wickengine(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
+uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id(RustBuffer bundle_id, RustBuffer quant, RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_PATH
@@ -667,6 +692,12 @@ uint16_t uniffi_wick_ffi_checksum_func_wick_ffi_version(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_STORE_DIR
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_STORE_DIR
+uint16_t uniffi_wick_ffi_checksum_method_bundlerepo_store_dir(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 uint16_t uniffi_wick_ffi_checksum_method_modalitysink_on_text_tokens(void
@@ -760,6 +791,18 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_metadata(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_NEW_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_NEW_SESSION
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_new_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
+uint16_t uniffi_wick_ffi_checksum_constructor_bundlerepo_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
+uint16_t uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id(void
     
 );
 #endif

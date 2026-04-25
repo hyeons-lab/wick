@@ -9,8 +9,12 @@
 //! ## Current surface
 //!
 //! Engine-level:
-//! - [`WickEngine`] — load a model; open sessions; introspect metadata
-//!   + capabilities.
+//! - [`WickEngine`] — model loader and session factory. Two
+//!   constructors: [`WickEngine::from_path`] for a local GGUF,
+//!   manifest, or directory; [`WickEngine::from_bundle_id`] for
+//!   LeapBundles-style remote loading.
+//! - [`BundleRepo`] — HTTP model cache; construct once per app and
+//!   attach via [`EngineConfig::bundle_repo`] for remote loading.
 //! - [`EngineConfig`] + [`BackendPreference`] — load-time config.
 //! - [`ModelMetadata`] + [`ModalityCapabilities`] — model-level info.
 //!
@@ -236,6 +240,13 @@ pub struct EngineConfig {
     /// capped by the loader).
     pub context_size: u64,
     pub backend: BackendPreference,
+    /// Bundle repository for resolving `http(s)://` URLs in manifests
+    /// (or for [`WickEngine::from_bundle_id`]). `None` means "remote
+    /// URLs will fail with an error"; set this to a [`BundleRepo`]
+    /// rooted at a persistent cache directory to enable remote
+    /// downloads. Construct the repo once + reuse it across engine
+    /// loads so its HTTP client pool + on-disk cache are shared.
+    pub bundle_repo: Option<Arc<BundleRepo>>,
 }
 
 impl Default for EngineConfig {
@@ -248,6 +259,10 @@ impl Default for EngineConfig {
         Self {
             context_size: core.context_size as u64,
             backend: core.backend.into(),
+            // `bundle_repo` defaults to None; foreign callers who want
+            // remote-URL loading set it explicitly before passing the
+            // config to `WickEngine::from_path` / `from_bundle_id`.
+            bundle_repo: None,
         }
     }
 }
@@ -272,18 +287,16 @@ impl TryFrom<EngineConfig> for wick::EngineConfig {
                 ),
             })?
         };
-        // `..Default::default()` is intentional forward-compat — under
-        // the `remote` feature `wick::EngineConfig` gains a
-        // `bundle_repo: Option<BundleRepo>` field, and the spread
-        // supplies `None` without this file needing to know. Without
-        // the feature clippy sees two specified fields + a redundant
-        // update; the #[allow] keeps the spread in place so a future
-        // remote-feature activation doesn't require a diff here.
-        #[allow(clippy::needless_update)]
+        // Under the `remote` feature `wick::EngineConfig` carries a
+        // `bundle_repo: Option<wick::bundle::BundleRepo>` field. Pull
+        // the inner from our FFI `Arc<BundleRepo>` wrapper (cheap —
+        // `wick::bundle::BundleRepo` is `Clone` and the two reqwest
+        // clients inside share their connection pool via Arc-backed
+        // refcounts).
         Ok(wick::EngineConfig {
             context_size,
             backend: c.backend.into(),
-            ..Default::default()
+            bundle_repo: c.bundle_repo.map(|r| r.inner.clone()),
         })
     }
 }
@@ -342,6 +355,50 @@ impl From<wick::ModalityCapabilities> for ModalityCapabilities {
 }
 
 // ---------------------------------------------------------------------------
+// BundleRepo
+// ---------------------------------------------------------------------------
+
+/// Remote model-bundle downloader + on-disk cache. Wraps
+/// [`wick::bundle::BundleRepo`]; construct once per application with
+/// a persistent `store_dir` and reuse across engine loads so the
+/// HTTP client pool + downloaded-file cache are shared.
+///
+/// On Android the `store_dir` should typically be
+/// `Context.getFilesDir()` (persistent), not `getCacheDir()` (OS-
+/// purgeable under storage pressure). On iOS / macOS, the app's
+/// Application Support or a dedicated subdirectory under Documents
+/// is a reasonable baseline.
+///
+/// Cache layout mirrors the remote URL structure under
+/// `<store_dir>/huggingface.co/<full path>`, so inspecting the
+/// on-disk state with a file browser is straightforward and multiple
+/// wick-powered apps on the same device can share the same cache
+/// directory without conflicting.
+#[derive(Debug, uniffi::Object)]
+pub struct BundleRepo {
+    inner: wick::bundle::BundleRepo,
+}
+
+#[uniffi::export]
+impl BundleRepo {
+    /// Create a new repo rooted at `store_dir`. The directory doesn't
+    /// need to exist yet — it's created on the first download. Pass
+    /// the same path to subsequent runs to reuse the cached bundles.
+    #[uniffi::constructor]
+    pub fn new(store_dir: String) -> Arc<Self> {
+        Arc::new(Self {
+            inner: wick::bundle::BundleRepo::new(store_dir),
+        })
+    }
+
+    /// The directory this repo caches bundles under. Matches what was
+    /// passed to [`BundleRepo::new`], useful for log / telemetry.
+    pub fn store_dir(&self) -> String {
+        self.inner.store_dir().to_string_lossy().into_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WickEngine
 // ---------------------------------------------------------------------------
 
@@ -356,15 +413,43 @@ pub struct WickEngine {
 #[uniffi::export]
 impl WickEngine {
     /// Load a model from a local filesystem path. Accepts the same
-    /// inputs as the native [`wick::WickEngine::from_path`]:
-    /// a bare `.gguf`, a LeapBundles `.json` manifest, or a directory
+    /// inputs as the native [`wick::WickEngine::from_path`]: a bare
+    /// `.gguf`, a LeapBundles `.json` manifest, or a directory
     /// containing exactly one `.json` manifest.
     ///
-    /// Remote URLs in manifests are rejected in this PR — `BundleRepo`
-    /// wiring lands when the `remote` feature activates here.
+    /// If the manifest carries `http(s)://` URLs for its files,
+    /// `config.bundle_repo` must be set — otherwise those URLs fail
+    /// to resolve. For a pure-local workflow (bundle already on
+    /// disk) leave `bundle_repo = None`.
     #[uniffi::constructor]
     pub fn from_path(path: String, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = wick::WickEngine::from_path(&path, config.try_into()?)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Load a model by LeapBundles ID + quantization selector, e.g.
+    /// `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", config)`. Resolves
+    /// to the matching `<bundle_id>/<quant>.json` manifest under
+    /// `huggingface.co/LiquidAI/LeapBundles` and downloads whatever
+    /// isn't already in `config.bundle_repo`'s on-disk cache.
+    ///
+    /// `config.bundle_repo` must be set; otherwise this returns an
+    /// [`FfiError::Backend`] telling the caller to construct a
+    /// [`BundleRepo`] and attach it. Idempotent across calls — the
+    /// repo's cache deduplicates subsequent downloads.
+    ///
+    /// Blocking: this call fetches over the network on first run +
+    /// opens / parses the GGUF. Foreign async runtimes should wrap
+    /// the call in `spawn_blocking` / its equivalent. (An async
+    /// counterpart matching `generate_async` could be added later;
+    /// not in this PR.)
+    #[uniffi::constructor]
+    pub fn from_bundle_id(
+        bundle_id: String,
+        quant: String,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let inner = wick::WickEngine::from_bundle_id(&bundle_id, &quant, config.try_into()?)?;
         Ok(Arc::new(Self { inner }))
     }
 
@@ -1072,6 +1157,60 @@ mod tests {
         let core: wick::EngineConfig = ffi.try_into().unwrap();
         assert_eq!(core.context_size, 4096);
         assert_eq!(core.backend, wick::BackendPreference::Auto);
+        // bundle_repo defaults to None — foreign callers opt in by
+        // attaching a BundleRepo before the try_into.
+        assert!(core.bundle_repo.is_none());
+    }
+
+    /// Pick a temp path scoped to this process + test name so parallel
+    /// test binaries and prior runs don't collide. `std::env::temp_dir()`
+    /// honors `TMPDIR` on macOS and `/tmp` elsewhere; the process-id
+    /// suffix is stable across the test's lifetime but unique per run.
+    /// `remove_dir_all` on entry makes the existence assertion below
+    /// deterministic even if a previous run's panic left the dir behind.
+    fn unique_test_bundle_dir(test_name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wick-ffi-test-{}-{}",
+            test_name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// `BundleRepo::new` wraps a `wick::bundle::BundleRepo` without
+    /// creating the store_dir on disk (that happens lazily on first
+    /// download). Store_dir round-trips.
+    #[test]
+    fn bundle_repo_constructs_and_store_dir_roundtrips() {
+        let dir = unique_test_bundle_dir("construct");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let repo = BundleRepo::new(dir_str.clone());
+        assert_eq!(repo.store_dir(), dir_str);
+        // Directory creation is lazy; the path must not exist yet.
+        assert!(
+            !dir.exists(),
+            "BundleRepo::new eagerly created {}",
+            dir.display()
+        );
+    }
+
+    /// Attaching a `BundleRepo` to `EngineConfig` plumbs through to
+    /// `wick::EngineConfig::bundle_repo` — proves the From/TryFrom
+    /// conversion handles the Arc<BundleRepo> → Option<wick::BundleRepo>
+    /// path correctly.
+    #[test]
+    fn engine_config_carries_bundle_repo_through_try_from() {
+        let dir = unique_test_bundle_dir("carry");
+        let repo = BundleRepo::new(dir.to_string_lossy().into_owned());
+        let ffi = EngineConfig {
+            context_size: 0,
+            backend: BackendPreference::Cpu,
+            bundle_repo: Some(repo.clone()),
+        };
+        let core: wick::EngineConfig = ffi.try_into().unwrap();
+        let core_repo = core.bundle_repo.expect("bundle_repo must be Some");
+        assert_eq!(core_repo.store_dir(), repo.inner.store_dir());
     }
 
     #[test]
@@ -1081,6 +1220,7 @@ mod tests {
         let ffi = EngineConfig {
             context_size: 0,
             backend: BackendPreference::Cpu,
+            bundle_repo: None,
         };
         let core: wick::EngineConfig = ffi.try_into().unwrap();
         assert_eq!(core.context_size, usize::MAX);
@@ -1097,6 +1237,7 @@ mod tests {
         let ffi = EngineConfig {
             context_size: u64::MAX,
             backend: BackendPreference::Cpu,
+            bundle_repo: None,
         };
         let result: Result<wick::EngineConfig, FfiError> = ffi.try_into();
         #[cfg(target_pointer_width = "32")]

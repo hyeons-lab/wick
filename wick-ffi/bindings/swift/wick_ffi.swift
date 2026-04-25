@@ -539,6 +539,179 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 /**
+ * Remote model-bundle downloader + on-disk cache. Wraps
+ * [`wick::bundle::BundleRepo`]; construct once per application with
+ * a persistent `store_dir` and reuse across engine loads so the
+ * HTTP client pool + downloaded-file cache are shared.
+ *
+ * On Android the `store_dir` should typically be
+ * `Context.getFilesDir()` (persistent), not `getCacheDir()` (OS-
+ * purgeable under storage pressure). On iOS / macOS, the app's
+ * Application Support or a dedicated subdirectory under Documents
+ * is a reasonable baseline.
+ *
+ * Cache layout mirrors the remote URL structure under
+ * `<store_dir>/huggingface.co/<full path>`, so inspecting the
+ * on-disk state with a file browser is straightforward and multiple
+ * wick-powered apps on the same device can share the same cache
+ * directory without conflicting.
+ */
+public protocol BundleRepoProtocol: AnyObject, Sendable {
+    
+    /**
+     * The directory this repo caches bundles under. Matches what was
+     * passed to [`BundleRepo::new`], useful for log / telemetry.
+     */
+    func storeDir()  -> String
+    
+}
+/**
+ * Remote model-bundle downloader + on-disk cache. Wraps
+ * [`wick::bundle::BundleRepo`]; construct once per application with
+ * a persistent `store_dir` and reuse across engine loads so the
+ * HTTP client pool + downloaded-file cache are shared.
+ *
+ * On Android the `store_dir` should typically be
+ * `Context.getFilesDir()` (persistent), not `getCacheDir()` (OS-
+ * purgeable under storage pressure). On iOS / macOS, the app's
+ * Application Support or a dedicated subdirectory under Documents
+ * is a reasonable baseline.
+ *
+ * Cache layout mirrors the remote URL structure under
+ * `<store_dir>/huggingface.co/<full path>`, so inspecting the
+ * on-disk state with a file browser is straightforward and multiple
+ * wick-powered apps on the same device can share the same cache
+ * directory without conflicting.
+ */
+open class BundleRepo: BundleRepoProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_wick_ffi_fn_clone_bundlerepo(self.handle, $0) }
+    }
+    /**
+     * Create a new repo rooted at `store_dir`. The directory doesn't
+     * need to exist yet — it's created on the first download. Pass
+     * the same path to subsequent runs to reuse the cached bundles.
+     */
+public convenience init(storeDir: String) {
+    let handle =
+        try! rustCall() {
+    uniffi_wick_ffi_fn_constructor_bundlerepo_new(
+        FfiConverterString.lower(storeDir),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_wick_ffi_fn_free_bundlerepo(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * The directory this repo caches bundles under. Matches what was
+     * passed to [`BundleRepo::new`], useful for log / telemetry.
+     */
+open func storeDir() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_bundlerepo_store_dir(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBundleRepo: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = BundleRepo
+
+    public static func lift(_ handle: UInt64) throws -> BundleRepo {
+        return BundleRepo(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: BundleRepo) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BundleRepo {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: BundleRepo, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBundleRepo_lift(_ handle: UInt64) throws -> BundleRepo {
+    return try FfiConverterTypeBundleRepo.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBundleRepo_lower(_ value: BundleRepo) -> UInt64 {
+    return FfiConverterTypeBundleRepo.lower(value)
+}
+
+
+
+
+
+
+/**
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
@@ -1440,13 +1613,43 @@ open class WickEngine: WickEngineProtocol, @unchecked Sendable {
 
     
     /**
+     * Load a model by LeapBundles ID + quantization selector, e.g.
+     * `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", config)`. Resolves
+     * to the matching `<bundle_id>/<quant>.json` manifest under
+     * `huggingface.co/LiquidAI/LeapBundles` and downloads whatever
+     * isn't already in `config.bundle_repo`'s on-disk cache.
+     *
+     * `config.bundle_repo` must be set; otherwise this returns an
+     * [`FfiError::Backend`] telling the caller to construct a
+     * [`BundleRepo`] and attach it. Idempotent across calls — the
+     * repo's cache deduplicates subsequent downloads.
+     *
+     * Blocking: this call fetches over the network on first run +
+     * opens / parses the GGUF. Foreign async runtimes should wrap
+     * the call in `spawn_blocking` / its equivalent. (An async
+     * counterpart matching `generate_async` could be added later;
+     * not in this PR.)
+     */
+public static func fromBundleId(bundleId: String, quant: String, config: EngineConfig)throws  -> WickEngine  {
+    return try  FfiConverterTypeWickEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id(
+        FfiConverterString.lower(bundleId),
+        FfiConverterString.lower(quant),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
      * Load a model from a local filesystem path. Accepts the same
-     * inputs as the native [`wick::WickEngine::from_path`]:
-     * a bare `.gguf`, a LeapBundles `.json` manifest, or a directory
+     * inputs as the native [`wick::WickEngine::from_path`]: a bare
+     * `.gguf`, a LeapBundles `.json` manifest, or a directory
      * containing exactly one `.json` manifest.
      *
-     * Remote URLs in manifests are rejected in this PR — `BundleRepo`
-     * wiring lands when the `remote` feature activates here.
+     * If the manifest carries `http(s)://` URLs for its files,
+     * `config.bundle_repo` must be set — otherwise those URLs fail
+     * to resolve. For a pure-local workflow (bundle already on
+     * disk) leave `bundle_repo = None`.
      */
 public static func fromPath(path: String, config: EngineConfig)throws  -> WickEngine  {
     return try  FfiConverterTypeWickEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1550,7 +1753,7 @@ public func FfiConverterTypeWickEngine_lower(_ value: WickEngine) -> UInt64 {
  * Per-engine configuration at load time. Mirrors [`wick::EngineConfig`]
  * with `u64` fields (UniFFI doesn't marshal `usize`).
  */
-public struct EngineConfig: Equatable, Hashable {
+public struct EngineConfig {
     /**
      * KV-cache capacity in tokens. Capped by the model's own
      * `max_seq_len`. Pass `0` to use the model's full declared
@@ -1559,6 +1762,15 @@ public struct EngineConfig: Equatable, Hashable {
      */
     public var contextSize: UInt64
     public var backend: BackendPreference
+    /**
+     * Bundle repository for resolving `http(s)://` URLs in manifests
+     * (or for [`WickEngine::from_bundle_id`]). `None` means "remote
+     * URLs will fail with an error"; set this to a [`BundleRepo`]
+     * rooted at a persistent cache directory to enable remote
+     * downloads. Construct the repo once + reuse it across engine
+     * loads so its HTTP client pool + on-disk cache are shared.
+     */
+    public var bundleRepo: BundleRepo?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1568,9 +1780,18 @@ public struct EngineConfig: Equatable, Hashable {
          * `max_seq_len`. Pass `0` to use the model's full declared
          * `max_seq_len` (translated to `usize::MAX` internally, then
          * capped by the loader).
-         */contextSize: UInt64, backend: BackendPreference) {
+         */contextSize: UInt64, backend: BackendPreference, 
+        /**
+         * Bundle repository for resolving `http(s)://` URLs in manifests
+         * (or for [`WickEngine::from_bundle_id`]). `None` means "remote
+         * URLs will fail with an error"; set this to a [`BundleRepo`]
+         * rooted at a persistent cache directory to enable remote
+         * downloads. Construct the repo once + reuse it across engine
+         * loads so its HTTP client pool + on-disk cache are shared.
+         */bundleRepo: BundleRepo?) {
         self.contextSize = contextSize
         self.backend = backend
+        self.bundleRepo = bundleRepo
     }
 
     
@@ -1590,13 +1811,15 @@ public struct FfiConverterTypeEngineConfig: FfiConverterRustBuffer {
         return
             try EngineConfig(
                 contextSize: FfiConverterUInt64.read(from: &buf), 
-                backend: FfiConverterTypeBackendPreference.read(from: &buf)
+                backend: FfiConverterTypeBackendPreference.read(from: &buf), 
+                bundleRepo: FfiConverterOptionTypeBundleRepo.read(from: &buf)
         )
     }
 
     public static func write(_ value: EngineConfig, into buf: inout [UInt8]) {
         FfiConverterUInt64.write(value.contextSize, into: &buf)
         FfiConverterTypeBackendPreference.write(value.backend, into: &buf)
+        FfiConverterOptionTypeBundleRepo.write(value.bundleRepo, into: &buf)
     }
 }
 
@@ -2664,6 +2887,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
+    typealias SwiftType = BundleRepo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeBundleRepo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeBundleRepo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -2788,6 +3035,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_func_wick_ffi_version() != 22410) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wick_ffi_checksum_method_bundlerepo_store_dir() != 15806) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wick_ffi_checksum_method_modalitysink_on_text_tokens() != 42733) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2836,7 +3086,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_method_wickengine_new_session() != 61697) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_path() != 41757) {
+    if (uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id() != 53217) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_path() != 10247) {
         return InitializationResult.apiChecksumMismatch
     }
 
