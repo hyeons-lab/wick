@@ -280,6 +280,20 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
 /// it (a JEP-472 forward-compat nudge), and the cleaner stderr makes
 /// it easier to spot a real error in the test output.
 pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> Result<Vec<u32>> {
+    // Validate UTF-8 up front for the same reason `run_ffi` does:
+    // the Kotlin runner deserializes `cache_dir` as a `String` (JSON
+    // strings are UTF-8 by spec), and `serde_json::to_vec` on a
+    // non-UTF-8 `PathBuf` would surface as an opaque encoding error
+    // instead of a tailored "cache_dir must be valid UTF-8" message.
+    // The Rust legs see the path directly via `&Path` and don't have
+    // this constraint — only the cross-language hop does.
+    args.cache_dir.to_str().with_context(|| {
+        format!(
+            "cache_dir {} is not valid UTF-8 (kotlin-jna leg requires String over JSON)",
+            args.cache_dir.display()
+        )
+    })?;
+
     let owned = RunArgsOwned {
         bundle: args.bundle.to_string(),
         quant: args.quant.to_string(),

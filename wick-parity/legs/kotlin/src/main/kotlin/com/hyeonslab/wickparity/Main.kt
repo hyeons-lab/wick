@@ -100,12 +100,19 @@ private fun runOnce(args: RunArgsOwned): List<UInt> {
     )
     val engine = WickEngine.fromBundleId(args.bundle, args.quant, cfg)
 
+    // `ubatchSize = 512u` mirrors `wick::SessionConfig::default()` —
+    // the Rust legs in `wick-parity/src/lib.rs` build their session
+    // config with `..Default::default()`, which fills in 512. Drifting
+    // here (e.g. monolithic `0u`) takes the prefill through a
+    // different kernel path; greedy decode happens to be insensitive
+    // to that for the parity prompt today, but the harness's whole
+    // job is to catch silent divergences — keep the configs aligned.
     val sessionCfg = SessionConfig(
         maxSeqLen = null,
         kvCompression = KvCompression.None,
         nKeep = 0u,
         seed = args.seed,
-        ubatchSize = 0u,
+        ubatchSize = 512u,
     )
     val session = engine.newSession(sessionCfg)
 

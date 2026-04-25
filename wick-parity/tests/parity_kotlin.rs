@@ -22,14 +22,17 @@
 //!     output dir). Set explicitly when running against a release
 //!     build.
 //!
-//! Manual invocation:
+//! Manual invocation (run from the workspace root):
 //!   ```sh
-//!   cd wick-parity/legs/kotlin && ./gradlew shadowJar
+//!   (cd wick-parity/legs/kotlin && ./gradlew shadowJar)
 //!   cargo build -p wick-ffi
 //!   WICK_PARITY_RUN=1 \
 //!     WICK_PARITY_KOTLIN_RUNNER=$(pwd)/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar \
 //!     cargo test -p wick-parity --test parity_kotlin -- --ignored
 //!   ```
+//! The `(cd ...)` subshell scopes the directory change so the
+//! subsequent `cargo build` and `$(pwd)` expansion stay rooted at
+//! the workspace.
 
 use std::path::PathBuf;
 

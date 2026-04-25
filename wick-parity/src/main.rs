@@ -45,12 +45,14 @@ enum Cmd {
         via: Leg,
         /// Path to the Kotlin runner fat jar
         /// (`wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar`).
-        /// Required when `--via kotlin-jna`; ignored otherwise.
+        /// Required when `--via kotlin-jna`; passing this flag with
+        /// any other `--via` value is rejected as a misuse.
         #[arg(long)]
         runner: Option<PathBuf>,
         /// Directory containing `libwick_ffi.{so,dylib}`. Defaults to
         /// `<workspace>/target/debug`. Used only by the `kotlin-jna`
-        /// leg (passed to JNA via `-Djna.library.path=...`).
+        /// leg (passed to JNA via `-Djna.library.path=...`); a no-op
+        /// for any other `--via` value.
         #[arg(long)]
         lib_dir: Option<PathBuf>,
         #[command(flatten)]
