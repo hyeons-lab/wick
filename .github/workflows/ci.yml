@@ -453,3 +453,37 @@ jobs:
             --test bundle_download \
             --test bundle_from_id \
             -- --ignored
+
+  parity-test:
+    name: Parity Harness (gated)
+    needs: check
+    # Same gating shape as `integration-test`: main-branch pushes +
+    # manual dispatch only. PR runs would pay a 200 MB cold-cache
+    # download for a regression check the FFI unit tests already
+    # cover; the parity harness's value lives at the rust↔kotlin /
+    # rust↔swift boundary that later PRs will add as additional legs.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache downloaded parity fixtures
+        uses: actions/cache@v4
+        with:
+          # Distinct from `wick-test-models` so a fixture rotation in
+          # one suite doesn't invalidate the other. Bump the key suffix
+          # when the bundle id / quant in `wick-parity/tests/parity.rs`
+          # changes.
+          path: target/tmp/wick-parity-cache
+          key: wick-parity-cache-lfm2-350m-q4_0-v1
+      - name: Run parity harness
+        env:
+          WICK_PARITY_RUN: "1"
+        # `--test parity` keeps the run scoped to the env-gated
+        # rust↔ffi check; future Kotlin/Swift legs add additional
+        # `--test` targets here.
+        run: cargo test -p wick-parity --test parity -- --ignored
