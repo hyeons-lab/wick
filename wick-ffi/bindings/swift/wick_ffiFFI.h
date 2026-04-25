@@ -400,6 +400,11 @@ void uniffi_wick_ffi_fn_free_wickengine(uint64_t handle, RustCallStatus *_Nonnul
 uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id(RustBuffer bundle_id, RustBuffer quant, RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID_ASYNC
+uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id_async(RustBuffer bundle_id, RustBuffer quant, RustBuffer config
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_WICKENGINE_FROM_PATH
 uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_path(RustBuffer path, RustBuffer config, RustCallStatus *_Nonnull out_status
@@ -803,6 +808,12 @@ uint16_t uniffi_wick_ffi_checksum_constructor_bundlerepo_new(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID
 uint16_t uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_WICKENGINE_FROM_BUNDLE_ID_ASYNC
+uint16_t uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async(void
     
 );
 #endif
