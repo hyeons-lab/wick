@@ -429,8 +429,10 @@ jobs:
     # ran ~14 min on the 2-core Ubuntu runner with `ubatch_size:0`
     # (vs ~32s locally on M-class arm64). 30 min gives comfortable
     # headroom while still catching a true hang. Real perf fixes
-    # (chunked prefill in the test, BLAS-on-CI, AVX2-tightened Q4_0
-    # kernel) are tracked separately.
+    # (un-gating `lfm2.rs`'s aarch64-only batched-prefill + BLAS path
+    # so x86_64 also benefits, AVX2-tightened Q4_0 kernel) are tracked
+    # separately — `--features blas` on x86_64 today is a no-op
+    # because `try_blas_prefill_gemm` is `cfg(target_arch = "aarch64")`.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

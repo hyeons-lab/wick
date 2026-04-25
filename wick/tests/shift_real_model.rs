@@ -131,7 +131,18 @@ fn shift_runs_through_real_model() {
         max_seq_len: Some(CTX as u32),
         n_keep: 32,
         seed: Some(0),
-        ubatch_size: 0,
+        // Exercise chunked prefill (PR #33). The repeated prompt and
+        // follow-up are sized to span multiple 64-token prefill chunks
+        // (the follow-up still has to fit `max_seq_len - n_keep = 224`
+        // for the shift to fire — that's the real upper bound on its
+        // length, not the chunk count). On x86_64 today this mostly
+        // shrinks per-chunk allocations in `forward_prefill`'s fallback
+        // path; the bigger ergonomic win is that it uses the same
+        // chunked code path users hit at runtime, so a regression there
+        // surfaces here. Real Ubuntu CI speedup needs the aarch64-only
+        // batched-GEMM / BLAS path in `lfm2.rs` un-gated for x86_64
+        // (tracked separately).
+        ubatch_size: 64,
         ..Default::default()
     };
 
