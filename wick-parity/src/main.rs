@@ -183,9 +183,6 @@ fn real_main() -> Result<ExitCode> {
     }
 }
 
-#[allow(dead_code)]
-fn _ensure_send<T: Send>(_: T) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
