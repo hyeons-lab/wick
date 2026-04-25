@@ -427,12 +427,12 @@ jobs:
     # second, but `shift_real_model` does ~457 tokens of prefill across
     # 16 attention layers + the post-shift K re-rotation work, which
     # ran ~14 min on the 2-core Ubuntu runner with `ubatch_size:0`
-    # (vs ~32s locally on M-class arm64). 30 min gives comfortable
-    # headroom while still catching a true hang. Real perf fixes
-    # (un-gating `lfm2.rs`'s aarch64-only batched-prefill + BLAS path
-    # so x86_64 also benefits, AVX2-tightened Q4_0 kernel) are tracked
-    # separately — `--features blas` on x86_64 today is a no-op
-    # because `try_blas_prefill_gemm` is `cfg(target_arch = "aarch64")`.
+    # before BLAS was wired up here. With `--features blas` + OpenBLAS
+    # installed below (this PR's scope), the batched prefill path now
+    # routes Q×Kᵀ / AV / FFN matmuls through OpenBLAS's `cblas_sgemm`
+    # instead of the per-token scalar fallback x86_64 used to hit. The
+    # 30-min cap stays as a safety net while we measure the actual
+    # post-merge speedup.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -440,6 +440,14 @@ jobs:
         with:
           toolchain: nightly-2026-04-02
       - uses: Swatinem/rust-cache@v2
+      # OpenBLAS provides cblas_sgemm for the wick `blas` feature
+      # (linked via `openblas-src` / `cblas-sys`, see wick/Cargo.toml).
+      # On x86_64 this is the actual SGEMM impl behind
+      # `try_blas_prefill_gemm` — meaningful only after this PR lifted
+      # the `cfg(target_arch = "aarch64")` gate that previously made
+      # `--features blas` a no-op on this runner.
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Cache downloaded test models
         uses: actions/cache@v4
         with:
@@ -454,17 +462,22 @@ jobs:
       # `cargo test -- --ignored` without `--test` would sweep every
       # #[ignore]'d test in the workspace (Metal microbenchmarks,
       # parity tests requiring WICK_TEST_MODEL, etc.), most of which
-      # don't belong on an Ubuntu CI runner. `--features remote` is
-      # required — the bundle downloader + `tests/common/download.rs`
-      # shim both live behind that feature.
+      # don't belong on an Ubuntu CI runner. `--features remote,blas`:
+      # `remote` for the bundle downloader + cache shim, `blas` to
+      # route SGEMM through OpenBLAS instead of the scalar fallback.
+      # `blas_correctness` is the new oracle that asserts BLAS-on-
+      # x86_64 produces tokens identical to the aarch64+blas reference;
+      # if it fails on Ubuntu CI but passes on macOS, we have a
+      # platform-specific BLAS bug to chase.
       - name: Run gated integration tests
         env:
           WICK_TEST_DOWNLOAD: "1"
         run: |
-          cargo test -p wick --features remote \
+          cargo test -p wick --features remote,blas \
             --test shift_real_model \
             --test bundle_download \
             --test bundle_from_id \
+            --test blas_correctness \
             -- --ignored
 
   parity-test:
