@@ -451,9 +451,39 @@ uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id_async(RustBuff
 uint64_t uniffi_wick_ffi_fn_constructor_wickengine_from_path(RustBuffer path, RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_APPLY_CHAT_TEMPLATE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_APPLY_CHAT_TEMPLATE
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_apply_chat_template(uint64_t ptr, RustBuffer messages, int8_t add_generation_prompt, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_BOS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_BOS_TOKEN
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_bos_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_CAPABILITIES
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_CAPABILITIES
 RustBuffer uniffi_wick_ffi_fn_method_wickengine_capabilities(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_DECODE_TOKENS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_DECODE_TOKENS
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_decode_tokens(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_ENCODE_TEXT
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_ENCODE_TEXT
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_encode_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_EOS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_EOS_TOKEN
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_eos_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
+int8_t uniffi_wick_ffi_fn_method_wickengine_has_chat_template(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_METADATA
@@ -464,6 +494,16 @@ RustBuffer uniffi_wick_ffi_fn_method_wickengine_metadata(uint64_t ptr, RustCallS
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_NEW_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_NEW_SESSION
 uint64_t uniffi_wick_ffi_fn_method_wickengine_new_session(uint64_t ptr, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_special_token_id(uint64_t ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_VOCAB_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_VOCAB_SIZE
+uint32_t uniffi_wick_ffi_fn_method_wickengine_vocab_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FUNC_WICK_FFI_VERSION
@@ -828,9 +868,45 @@ uint16_t uniffi_wick_ffi_checksum_method_session_reset(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_APPLY_CHAT_TEMPLATE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_APPLY_CHAT_TEMPLATE
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_apply_chat_template(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_BOS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_BOS_TOKEN
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_bos_token(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CAPABILITIES
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CAPABILITIES
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_capabilities(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_DECODE_TOKENS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_DECODE_TOKENS
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_decode_tokens(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_ENCODE_TEXT
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_ENCODE_TEXT
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_encode_text(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_EOS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_EOS_TOKEN
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_eos_token(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_has_chat_template(void
     
 );
 #endif
@@ -843,6 +919,18 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_metadata(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_NEW_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_NEW_SESSION
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_new_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_special_token_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_VOCAB_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_VOCAB_SIZE
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_vocab_size(void
     
 );
 #endif
