@@ -241,11 +241,16 @@ enum Command {
 /// handles for the audio pipeline.
 fn load_engine(path: &Path, device: &str, context_size: usize) -> Result<WickEngine> {
     let backend = BackendPreference::parse_str(device).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `..Default::default()` picks up optional fields (e.g. `bundle_repo`
+    // under the `remote` feature, which shows up whenever a workspace
+    // member pulls it transitively). Without the spread, enabling remote
+    // anywhere in the workspace breaks this construction.
     let engine = WickEngine::from_path(
         path,
         EngineConfig {
             context_size,
             backend,
+            ..Default::default()
         },
     )?;
     eprintln!(

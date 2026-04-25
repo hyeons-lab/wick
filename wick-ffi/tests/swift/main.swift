@@ -57,11 +57,28 @@ for b in backends {
 // 3. Record construction. EngineConfig is a Swift struct generated
 // from the UniFFI Record. Setting context_size = 0 is the FFI
 // sentinel for "use the model's default max_seq_len" (per the
-// docstring on `EngineConfig::context_size`).
-let config = EngineConfig(contextSize: 0, backend: .cpu)
+// docstring on `EngineConfig::context_size`). `bundleRepo: nil`
+// means pure-local workflow (no remote-URL resolution); PR 10 also
+// exercises the `BundleRepo` constructor + a non-nil attachment
+// below.
+let config = EngineConfig(contextSize: 0, backend: .cpu, bundleRepo: nil)
 guard config.contextSize == 0 else { fail("EngineConfig.contextSize round-trip") }
 guard config.backend == .cpu else { fail("EngineConfig.backend round-trip") }
-print("OK: EngineConfig(contextSize: 0, backend: .cpu)")
+guard config.bundleRepo == nil else { fail("EngineConfig.bundleRepo nil round-trip") }
+print("OK: EngineConfig(contextSize: 0, backend: .cpu, bundleRepo: nil)")
+
+// 3b. BundleRepo construction + attachment to an EngineConfig.
+// Verifies the new UniFFI Object surface from PR 10. Directory
+// creation is lazy so /tmp/wick-ffi-swift-smoke-bundles doesn't need
+// to exist beforehand, and the BundleRepo doesn't touch the disk
+// here (first touch is the first download, which we don't trigger).
+let repo = BundleRepo(storeDir: "/tmp/wick-ffi-swift-smoke-bundles")
+guard repo.storeDir() == "/tmp/wick-ffi-swift-smoke-bundles" else {
+    fail("BundleRepo.storeDir round-trip")
+}
+let configWithRepo = EngineConfig(contextSize: 0, backend: .cpu, bundleRepo: repo)
+guard configWithRepo.bundleRepo != nil else { fail("EngineConfig.bundleRepo attach") }
+print("OK: BundleRepo + EngineConfig.bundleRepo attach")
 
 // 4. Error type — try a constructor that we know will fail and
 // confirm we get a typed `FfiError` back, not a panic / abort.
