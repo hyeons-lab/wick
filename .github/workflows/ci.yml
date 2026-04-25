@@ -520,28 +520,54 @@ jobs:
           path: target/tmp/wick-parity-cache
           key: wick-parity-cache-lfm2-350m-q4_0-v1
       # The Kotlin leg loads `libwick_ffi.so` through JNA. Build the
-      # cdylib first so JNA's `-Djna.library.path` (set by the rust
-      # harness from `WICK_PARITY_LIB_DIR`) finds something to load.
-      - name: Build wick-ffi cdylib (debug)
-        run: cargo build -p wick-ffi
+      # cdylib first so JNA's `-Djna.library.path` (set on the
+      # subprocess via `--lib-dir`) finds something to load.
+      # `--release`: the harness below runs in `--release`; loading a
+      # debug cdylib here would compare release rust vs debug FFI
+      # native code — apples to oranges, and would make the kotlin
+      # leg look 5-10× slower than reality.
+      - name: Build wick-ffi cdylib (release)
+        run: cargo build --release -p wick-ffi
       # Build the Kotlin runner fat jar. `--no-daemon` is the right
       # default for CI (single-shot invocation; daemon adds startup
       # cost and disk usage that doesn't pay off across runs).
       - name: Build kotlin-jna runner
         working-directory: wick-parity/legs/kotlin
         run: ./gradlew --no-daemon shadowJar
-      # Runs `parity` (rust↔ffi sanity check) and `parity_kotlin`
-      # (real FFI-boundary check via JNA). `parity_swift` is also
-      # bundled by `--tests` but skips silently here because
-      # `WICK_PARITY_SWIFT_RUNNER` is unset — that test runs in
-      # `parity-test-swift` on macOS where the swift toolchain is
-      # the natural fit.
-      - name: Run parity harness
-        env:
-          WICK_PARITY_RUN: "1"
-          WICK_PARITY_KOTLIN_RUNNER: ${{ github.workspace }}/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar
-          WICK_PARITY_LIB_DIR: ${{ github.workspace }}/target/debug
-        run: cargo test -p wick-parity --tests -- --ignored
+      # `cargo run check` does both jobs the integration tests
+      # used to do — token equality across legs (rust ↔ ffi ↔
+      # kotlin-jna) and per-leg wall-clock with a threshold gate.
+      # `--release` matters: a debug build of wick is ~10× slower
+      # at LFM2 prefill, which would dominate the timing data and
+      # turn the perf table into noise.
+      #
+      # Threshold: `--max-slowdown 30` is sized from local M-class
+      # measurements (kotlin-jna runs 10-12× rust on a warm cache)
+      # plus a generous CI margin (cold caches + 2-core x86_64
+      # runner hit harder). If post-merge runs show a tighter
+      # steady-state, drop the threshold; if real CI variance
+      # rides it close, raise it. Per-leg-class thresholds (e.g.
+      # 2× for ffi, 30× for subprocess) are out of scope here —
+      # tracked as future work in devlog 000062.
+      #
+      # `--fail-on-slowdown` makes a breach exit non-zero so the
+      # gate is load-bearing. The same invocation also gates
+      # token equality (exit 1 on divergence) — replaces the old
+      # `cargo test --tests --ignored` step.
+      # `WICK_PARITY_RUN` is intentionally NOT set here — the
+      # `wick-parity check` CLI invocation doesn't read it (that env
+      # var only gates the `#[ignore]`'d cargo-test integration
+      # tests). Including it would imply the CLI cares about it.
+      - name: Run parity harness with perf gate
+        run: |
+          cargo run --release -p wick-parity -- check \
+            --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
+            --prompt "The capital of France is" \
+            --max-tokens 16 --seed 0 \
+            --kotlin-runner ${{ github.workspace }}/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar \
+            --lib-dir ${{ github.workspace }}/target/release \
+            --max-slowdown 30 \
+            --fail-on-slowdown
 
   parity-test-swift:
     name: Parity Harness Swift (gated)
@@ -582,34 +608,52 @@ jobs:
           key: wick-parity-swift-spm-${{ hashFiles('wick-parity/legs/swift/Package.swift', 'wick-ffi/bindings/swift/wick_ffi.swift', 'wick-ffi/bindings/swift/wick_ffiFFI.h') }}
       # The Swift leg links against `libwick_ffi.dylib` at build time.
       # The binary records an absolute install_name pointing at the
-      # cdylib's build-time location under `target/debug/` in this
+      # cdylib's build-time location under `target/release/` in this
       # same checkout, so dyld can find the dylib by that path alone.
       # We also export `DYLD_LIBRARY_PATH` at run time as a robustness
       # measure — dyld checks it before falling through to install_name
       # lookup, so a moved-or-renamed cdylib still resolves as long
-      # as a same-basename match exists in `WICK_PARITY_LIB_DIR`.
+      # as a same-basename match exists in the directory passed via
+      # the `--lib-dir` flag below (the rust harness translates that
+      # to `DYLD_LIBRARY_PATH` on the spawned subprocess).
       # Build the cdylib first so the `swift build -Xlinker -L<dir>`
-      # step has something to link against.
-      - name: Build wick-ffi cdylib (debug)
-        run: cargo build -p wick-ffi
+      # step has something to link against. `--release` matters: the
+      # harness below runs in `--release`; loading a debug cdylib
+      # would compare release rust vs debug FFI native code (apples
+      # to oranges) and inflate the swift slowdown ratio.
+      - name: Build wick-ffi cdylib (release)
+        run: cargo build --release -p wick-ffi
       # `swift build -c release -Xlinker -L<dir>` produces
       # `.build/release/WickParitySwift`. `-Xlinker -L<dir>` is the
       # SPM-portable way to add a library search path; `LDFLAGS` is
-      # not honored consistently by `swift build`.
+      # not honored consistently by `swift build`. Linking against
+      # `target/release` matches the `cargo build --release -p wick-ffi`
+      # output so install_name + runtime DYLD_LIBRARY_PATH agree.
       - name: Build swift-uniffi runner
         working-directory: wick-parity/legs/swift
         run: |
           swift build -c release \
-            -Xlinker -L${{ github.workspace }}/target/debug
-      # Targeted to the swift parity test binary only.
-      # `--tests -- --ignored` would also sweep `parity` (no-op
-      # without env vars on the kotlin side) and `parity_kotlin`
-      # (would fail because no kotlin runner here); explicit
-      # `--test parity_swift` keeps the run focused.
-      - name: Run parity harness
-        env:
-          WICK_PARITY_RUN: "1"
-          WICK_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/wick-parity/legs/swift/.build/release/WickParitySwift
-          WICK_PARITY_LIB_DIR: ${{ github.workspace }}/target/debug
+            -Xlinker -L${{ github.workspace }}/target/release
+      # `cargo run check --fail-on-slowdown` does token equality
+      # AND perf-threshold gating in one pass — same shape as the
+      # ubuntu kotlin-jna gate above. See that job's comment for
+      # the threshold rationale; same `30×` value applies here
+      # because swift-uniffi has shown nearly identical
+      # subprocess overhead to kotlin-jna on local M-class runs
+      # (10.5×–12× kotlin-jna vs 10.9×–12.3× swift-uniffi at the
+      # `wick-parity check` defaults).
+      #
+      # `WICK_PARITY_RUN` is intentionally NOT set here — the
+      # `wick-parity check` CLI invocation doesn't read it (that env
+      # var only gates the `#[ignore]`'d cargo-test integration
+      # tests).
+      - name: Run parity harness with perf gate
         run: |
-          cargo test -p wick-parity --test parity_swift -- --ignored
+          cargo run --release -p wick-parity -- check \
+            --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
+            --prompt "The capital of France is" \
+            --max-tokens 16 --seed 0 \
+            --swift-runner ${{ github.workspace }}/wick-parity/legs/swift/.build/release/WickParitySwift \
+            --lib-dir ${{ github.workspace }}/target/release \
+            --max-slowdown 30 \
+            --fail-on-slowdown
