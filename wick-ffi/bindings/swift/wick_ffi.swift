@@ -1652,17 +1652,18 @@ public static func fromBundleId(bundleId: String, quant: String, config: EngineC
      * directory and attach it to the config before calling.
      *
      * Cancellation semantics (weaker than [`Session::generate_async`]):
-     * dropping the returned future calls `JoinHandle::abort` on the
-     * spawned task. That cancels the task if it's still queued on
-     * tokio's blocking pool, so a not-yet-started download never
-     * runs. But if the task has started, abort is a no-op — the
-     * download is a `reqwest::blocking` call with no cooperative
-     * cancel point, and wick's engine-construction code (tokenizer
-     * build, model load, KV alloc) also isn't interruptible. In
-     * that case the task runs to completion and the engine is
-     * constructed then dropped; the downloaded bundle stays cached,
-     * so the caller's next attempt starts from that cache
-     * hit. Bandwidth isn't wasted, it's just shifted.
+     * dropping the returned future drops the [`AbortOnDrop`] guard,
+     * which calls `AbortHandle::abort` on the spawned task. That
+     * cancels the task if it's still queued on tokio's blocking
+     * pool, so a not-yet-started download never runs. But if the
+     * task has started, abort is a no-op — the download is a
+     * `reqwest::blocking` call with no cooperative cancel point,
+     * and wick's engine-construction code (tokenizer build, model
+     * load, KV alloc) also isn't interruptible. In that case the
+     * task runs to completion and the engine is constructed then
+     * dropped; the downloaded bundle stays cached, so the caller's
+     * next attempt starts from that cache hit. Bandwidth isn't
+     * wasted, it's just shifted.
      *
      * `JoinError` from a panicking blocking closure surfaces as
      * [`FfiError::Backend`] with a diagnostic prefix, same as
@@ -3135,7 +3136,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id() != 53217) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async() != 10520) {
+    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async() != 65129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_constructor_wickengine_from_path() != 10247) {
