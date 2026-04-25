@@ -138,6 +138,76 @@ impl BundleRepo {
         &self.store_dir
     }
 
+    /// Total bytes currently held in the cache. Recursively sums file
+    /// sizes under `store_dir`; returns `Ok(0)` if the dir doesn't
+    /// exist yet (no downloads have run). Skips files that fail to
+    /// `metadata()` (deleted mid-walk, permission glitches) — partial
+    /// totals beat hard-erroring on a transient I/O blip.
+    ///
+    /// O(n) over the cache contents; for a large cache (multiple GB
+    /// across many shards) this is a real walk, not a constant-time
+    /// query — the OS doesn't track per-directory totals. Callers
+    /// surfacing the value in a UI should run it off the main thread.
+    pub fn cache_size(&self) -> Result<u64, WickError> {
+        if !self.store_dir.exists() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        Self::walk_dir_size(&self.store_dir, &mut total)?;
+        Ok(total)
+    }
+
+    fn walk_dir_size(dir: &Path, total: &mut u64) -> Result<(), WickError> {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            // Directory disappeared mid-walk (concurrent clear, etc.) —
+            // treat as empty rather than propagate.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `entry.file_type()` is a syscall on POSIX, so use it
+            // instead of `metadata()` for the directory test — cheaper
+            // when we don't need the size yet.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                Self::walk_dir_size(&path, total)?;
+            } else if file_type.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(())
+    }
+
+    /// Wipe every file the repo has cached, leaving `store_dir` itself
+    /// in place (so subsequent downloads land in the same path).
+    /// Idempotent — calling on an empty repo or non-existent
+    /// `store_dir` is a no-op success.
+    ///
+    /// Mobile apps trigger this from a "clear downloaded models" UI
+    /// action. Removes the tree under `store_dir` (sidecar `.sha256`
+    /// files included) and recreates `store_dir` empty. In-flight
+    /// downloads to the same repo will see the partial files vanish
+    /// and may fail; callers should serialize the clear against
+    /// any active `from_bundle_id*` calls themselves (typically
+    /// trivial since the action is user-driven).
+    pub fn clear_cache(&self) -> Result<(), WickError> {
+        if !self.store_dir.exists() {
+            return Ok(());
+        }
+        // `remove_dir_all` + `create_dir_all` is simpler than walking
+        // and `unlink`-ing each file. The dir-recreate keeps the
+        // store_dir invariant (parent for future downloads).
+        fs::remove_dir_all(&self.store_dir)?;
+        fs::create_dir_all(&self.store_dir)?;
+        Ok(())
+    }
+
     /// Resolve a remote URL to a local path, downloading if not cached.
     ///
     /// `expected_sha256`: if provided, the cached entry's hash (or the
@@ -470,6 +540,85 @@ fn split_url(url: &str) -> Result<(&str, &str), WickError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pick a temp path scoped to this process + test name so parallel
+    /// test binaries and prior runs don't collide. tempfile is already
+    /// a workspace dev-dep (used by other bundle tests below).
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wick-bundle-test-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// `cache_size` returns 0 when the repo's `store_dir` doesn't
+    /// exist yet (no downloads have run). Lazy-creation invariant:
+    /// constructing a `BundleRepo` doesn't touch the disk; querying
+    /// size before any download returns 0 cleanly.
+    #[test]
+    fn cache_size_is_zero_when_store_dir_missing() {
+        let dir = unique_test_dir("size-empty");
+        let repo = BundleRepo::new(&dir);
+        assert!(
+            !dir.exists(),
+            "BundleRepo::new must not eagerly create store_dir"
+        );
+        assert_eq!(repo.cache_size().unwrap(), 0);
+    }
+
+    /// `cache_size` walks nested directories and sums file sizes.
+    /// Builds a small synthetic cache (3 files of known sizes spread
+    /// across two subdirectories), then asserts the total matches the
+    /// sum.
+    #[test]
+    fn cache_size_sums_nested_files() {
+        let dir = unique_test_dir("size-sum");
+        fs::create_dir_all(dir.join("huggingface.co/LiquidAI/A")).unwrap();
+        fs::create_dir_all(dir.join("huggingface.co/LiquidAI/B")).unwrap();
+        fs::write(dir.join("huggingface.co/LiquidAI/A/file1"), vec![0u8; 1024]).unwrap();
+        fs::write(
+            dir.join("huggingface.co/LiquidAI/A/file1.sha256"),
+            b"deadbeef",
+        )
+        .unwrap();
+        fs::write(dir.join("huggingface.co/LiquidAI/B/file2"), vec![0u8; 4096]).unwrap();
+
+        let repo = BundleRepo::new(&dir);
+        assert_eq!(repo.cache_size().unwrap(), 1024 + 8 + 4096);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `clear_cache` is idempotent: calling on a non-existent
+    /// `store_dir` is a no-op success. Mobile apps invoking it from
+    /// a "clear cache" UI before any download has run shouldn't crash.
+    #[test]
+    fn clear_cache_is_idempotent_on_missing_store_dir() {
+        let dir = unique_test_dir("clear-empty");
+        let repo = BundleRepo::new(&dir);
+        assert!(!dir.exists());
+        repo.clear_cache().unwrap();
+        // Still no eager creation.
+        assert!(!dir.exists());
+    }
+
+    /// `clear_cache` removes all files but leaves `store_dir` itself
+    /// in place (so subsequent downloads land in the same path).
+    /// Asserts the dir still exists + is empty after.
+    #[test]
+    fn clear_cache_wipes_files_but_keeps_store_dir() {
+        let dir = unique_test_dir("clear-wipe");
+        fs::create_dir_all(dir.join("huggingface.co/LiquidAI/A")).unwrap();
+        fs::write(dir.join("huggingface.co/LiquidAI/A/file"), vec![0u8; 100]).unwrap();
+        let repo = BundleRepo::new(&dir);
+        assert_eq!(repo.cache_size().unwrap(), 100);
+
+        repo.clear_cache().unwrap();
+        assert!(dir.exists(), "store_dir must survive clear_cache");
+        assert_eq!(repo.cache_size().unwrap(), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn path_for_url_mirrors_host_and_path() {

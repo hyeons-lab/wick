@@ -559,6 +559,34 @@ fileprivate struct FfiConverterString: FfiConverter {
 public protocol BundleRepoProtocol: AnyObject, Sendable {
     
     /**
+     * Total bytes currently held in the cache. Returns `0` if the
+     * `store_dir` doesn't exist yet (no downloads have run).
+     * O(n) over the cache contents; for a multi-GB cache it's a
+     * real walk, not a constant-time query — UIs surfacing the
+     * value should run it off the main thread (e.g. via
+     * `withContext(Dispatchers.IO)` on Kotlin or
+     * `Task.detached` on Swift).
+     *
+     * Mobile apps use this to drive a "Storage: X MB used" line in
+     * settings or to gate a "Clear cache" button on actual
+     * non-zero usage.
+     */
+    func cacheSize() throws  -> UInt64
+    
+    /**
+     * Wipe every file the repo has cached, leaving `store_dir`
+     * itself in place so subsequent downloads land in the same
+     * path. Idempotent — calling on an empty repo or non-existent
+     * `store_dir` is a no-op success.
+     *
+     * Mobile apps trigger this from a "Clear downloaded models"
+     * settings action. Caller is responsible for serializing
+     * against in-flight downloads — typically trivial since the
+     * action is user-driven.
+     */
+    func clearCache() throws 
+    
+    /**
      * The directory this repo caches bundles under. Matches what was
      * passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
      * useful for log / telemetry.
@@ -675,6 +703,45 @@ public static func withProgress(storeDir: String, progress: DownloadProgressSink
 }
     
 
+    
+    /**
+     * Total bytes currently held in the cache. Returns `0` if the
+     * `store_dir` doesn't exist yet (no downloads have run).
+     * O(n) over the cache contents; for a multi-GB cache it's a
+     * real walk, not a constant-time query — UIs surfacing the
+     * value should run it off the main thread (e.g. via
+     * `withContext(Dispatchers.IO)` on Kotlin or
+     * `Task.detached` on Swift).
+     *
+     * Mobile apps use this to drive a "Storage: X MB used" line in
+     * settings or to gate a "Clear cache" button on actual
+     * non-zero usage.
+     */
+open func cacheSize()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_method_bundlerepo_cache_size(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Wipe every file the repo has cached, leaving `store_dir`
+     * itself in place so subsequent downloads land in the same
+     * path. Idempotent — calling on an empty repo or non-existent
+     * `store_dir` is a no-op success.
+     *
+     * Mobile apps trigger this from a "Clear downloaded models"
+     * settings action. Caller is responsible for serializing
+     * against in-flight downloads — typically trivial since the
+     * action is user-driven.
+     */
+open func clearCache()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_method_bundlerepo_clear_cache(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
     
     /**
      * The directory this repo caches bundles under. Matches what was
@@ -3640,6 +3707,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_wick_ffi_checksum_func_wick_ffi_version() != 22410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_bundlerepo_cache_size() != 55589) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_bundlerepo_clear_cache() != 14157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_bundlerepo_store_dir() != 45004) {

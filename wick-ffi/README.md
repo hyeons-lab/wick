@@ -6,17 +6,14 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Tokenizer + chat templates.** Through PRs 2–12 `wick-ffi` built up
-a typed foreign-language surface, the Android ABI + Apple XCFramework
-distribution pipelines, runtime model loading via `BundleRepo` +
-`from_bundle_id[_async]`, and download-progress callbacks via
-`DownloadProgressSink`. PR 13 exposes the model's tokenizer +
-chat-template renderer to foreign callers: `WickEngine::encode_text` /
-`decode_tokens` for raw tokenization, `apply_chat_template` against
-a `Vec<ChatMessage>` to produce a prompt string ready for
-`Session::append_text`. Closes the gap where consumers building a
-chat UI had to either round-trip text through `append_text` (losing
-token-level visibility) or implement their own tokenizer.
+**Cache management.** Through PRs 2–13 `wick-ffi` built up a typed
+foreign-language surface, mobile cross-compile pipelines, remote
+model loading + download progress callbacks, and tokenizer +
+chat-template access. PR 14 closes the operational gap mobile apps
+need to ship: `BundleRepo::cache_size()` to drive a "Storage: X MB"
+UI line, and `BundleRepo::clear_cache()` to wipe downloaded models
+when the user runs out of disk. No more "shell out to delete the
+filesystem tree manually" workaround.
 
 | PR | Scope |
 |---|---|
@@ -33,7 +30,8 @@ token-level visibility) or implement their own tokenizer.
 | 11 | `WickEngine::from_bundle_id_async` via `spawn_blocking` + `AbortOnDrop` |
 | 12 | `DownloadProgressSink` foreign-trait callback + `BundleRepo::with_progress` |
 | 13 | Tokenizer + chat-template surface on `WickEngine` (encode/decode, `ChatMessage`, `apply_chat_template`) |
-| 14+ | Parity harness, Maven publishing |
+| 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
+| 15+ | Parity harness, Maven publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -521,6 +519,39 @@ under a second, sink wasn't called) gracefully.
 Do not use `Context.getCacheDir()` on Android or `tmp` on any
 platform — the OS can purge those under storage pressure, forcing
 a full re-download every time pressure gets reset.
+
+### Cache management
+
+Two operational methods on `BundleRepo` for mobile apps that need
+to surface "Storage: X MB used" in settings or wipe downloaded
+models on user request:
+
+| Method | Returns | Behavior |
+|---|---|---|
+| `repo.cacheSize()` | `u64` (bytes) | Recursive walk of `store_dir`. `0` if the dir doesn't exist yet (no downloads). |
+| `repo.clearCache()` | `void` (throws on I/O error) | Removes everything under `store_dir`, recreates `store_dir` empty. Idempotent. |
+
+**Threading.** Both walk / mutate the filesystem; for a multi-GB
+cache `cacheSize()` is a real walk (not a constant-time query —
+the OS doesn't track per-directory totals). Run off the main UI
+thread:
+
+```kotlin
+// Kotlin coroutine
+val sizeMb = withContext(Dispatchers.IO) { repo.cacheSize() } / 1_048_576
+```
+
+```swift
+// Swift async
+let sizeMb = try await Task.detached { try repo.cacheSize() }.value / 1_048_576
+```
+
+**Concurrency note.** `clearCache()` removes files that an
+in-flight `fromBundleId*` call might be writing to (manifest +
+GGUF). The caller is responsible for serializing a clear against
+any active downloads — typically trivial since the action is
+user-driven (settings tap), and apps usually don't run a download
+in the background while showing a "clear cache" button.
 
 ### Known breaking change: Swift `EngineConfig` equality
 

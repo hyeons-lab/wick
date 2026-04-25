@@ -311,6 +311,16 @@ uint64_t uniffi_wick_ffi_fn_constructor_bundlerepo_new(RustBuffer store_dir, Rus
 uint64_t uniffi_wick_ffi_fn_constructor_bundlerepo_with_progress(RustBuffer store_dir, uint64_t progress, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_CACHE_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_CACHE_SIZE
+uint64_t uniffi_wick_ffi_fn_method_bundlerepo_cache_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_CLEAR_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_CLEAR_CACHE
+void uniffi_wick_ffi_fn_method_bundlerepo_clear_cache(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 RustBuffer uniffi_wick_ffi_fn_method_bundlerepo_store_dir(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -775,6 +785,18 @@ void ffi_wick_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_No
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_FUNC_WICK_FFI_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_FUNC_WICK_FFI_VERSION
 uint16_t uniffi_wick_ffi_checksum_func_wick_ffi_version(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
+uint16_t uniffi_wick_ffi_checksum_method_bundlerepo_cache_size(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_CLEAR_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_BUNDLEREPO_CLEAR_CACHE
+uint16_t uniffi_wick_ffi_checksum_method_bundlerepo_clear_cache(void
     
 );
 #endif
