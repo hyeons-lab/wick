@@ -1162,15 +1162,37 @@ mod tests {
         assert!(core.bundle_repo.is_none());
     }
 
+    /// Pick a temp path scoped to this process + test name so parallel
+    /// test binaries and prior runs don't collide. `std::env::temp_dir()`
+    /// honors `TMPDIR` on macOS and `/tmp` elsewhere; the process-id
+    /// suffix is stable across the test's lifetime but unique per run.
+    /// `remove_dir_all` on entry makes the existence assertion below
+    /// deterministic even if a previous run's panic left the dir behind.
+    fn unique_test_bundle_dir(test_name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wick-ffi-test-{}-{}",
+            test_name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
     /// `BundleRepo::new` wraps a `wick::bundle::BundleRepo` without
     /// creating the store_dir on disk (that happens lazily on first
     /// download). Store_dir round-trips.
     #[test]
     fn bundle_repo_constructs_and_store_dir_roundtrips() {
-        let repo = BundleRepo::new("/tmp/wick-ffi-test-bundles".into());
-        assert_eq!(repo.store_dir(), "/tmp/wick-ffi-test-bundles");
-        // Directory creation is lazy; the path need not exist yet.
-        assert!(!std::path::Path::new("/tmp/wick-ffi-test-bundles").exists());
+        let dir = unique_test_bundle_dir("construct");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let repo = BundleRepo::new(dir_str.clone());
+        assert_eq!(repo.store_dir(), dir_str);
+        // Directory creation is lazy; the path must not exist yet.
+        assert!(
+            !dir.exists(),
+            "BundleRepo::new eagerly created {}",
+            dir.display()
+        );
     }
 
     /// Attaching a `BundleRepo` to `EngineConfig` plumbs through to
@@ -1179,7 +1201,8 @@ mod tests {
     /// path correctly.
     #[test]
     fn engine_config_carries_bundle_repo_through_try_from() {
-        let repo = BundleRepo::new("/tmp/wick-ffi-test-bundles-carry".into());
+        let dir = unique_test_bundle_dir("carry");
+        let repo = BundleRepo::new(dir.to_string_lossy().into_owned());
         let ffi = EngineConfig {
             context_size: 0,
             backend: BackendPreference::Cpu,

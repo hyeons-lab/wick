@@ -408,6 +408,36 @@ Do not use `Context.getCacheDir()` on Android or `tmp` on any
 platform — the OS can purge those under storage pressure, forcing
 a full re-download every time pressure gets reset.
 
+### Known breaking change: Swift `EngineConfig` equality
+
+Adding `bundleRepo: BundleRepo?` to `EngineConfig` drops the
+auto-synthesized `Equatable` + `Hashable` conformance from the
+generated Swift struct — `BundleRepo` is a UniFFI Object (reference
+type) which has no structural equality, so Swift can't derive
+`Equatable` on a struct containing one. Swift callers that were
+comparing `EngineConfig` values with `==` or using them as
+`Dictionary` keys / `Set` elements will need to compare the scalar
+fields (`contextSize`, `backend`) directly, or provide a local
+extension:
+
+```swift
+extension EngineConfig: Equatable {
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.contextSize == rhs.contextSize
+            && lhs.backend == rhs.backend
+            && (lhs.bundleRepo === rhs.bundleRepo)  // identity, not structural
+    }
+}
+```
+
+This would go in the consumer app, not in the vendored binding —
+`ffi-bindings-drift` overwrites the generated file on every surface
+change, and UniFFI can't currently be told to re-derive the
+conformance across reference-type fields.
+
+Kotlin isn't affected (`data class` equality compiles against any
+field type, using reference-equality for object fields automatically).
+
 ## Design notes
 
 - **Proc-macro path** chosen over UDL for smaller surface ergonomics.
