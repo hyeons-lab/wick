@@ -30,18 +30,23 @@ use std::time::SystemTime;
 use wick::bundle::BundleRepo;
 use wick::engine::{BackendPreference, EngineConfig, ModelFiles, WickEngine};
 
-/// Smallest LFM2 GGUF we already pull elsewhere (see
-/// `shift_real_model.rs`). Deliberately the same file so CI's
-/// `target/tmp/wick-test-models` cache is shared — the second test to
-/// run pays only a HEAD probe. Mutable `resolve/main/` ref is
-/// intentional for the same reasons documented in `shift_real_model.rs`;
-/// PR B will pin to a revision hash once `BundleRepo` grows an ID-
-/// indexed lookup layer.
-const MODEL_URL: &str =
-    "https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_0.gguf";
+/// LFM2-350M-Extract Q4_0 GGUF — the same file `from_bundle_id` pulls
+/// in `bundle_from_id.rs` (its manifest's `model` URL points here), so
+/// CI's `target/tmp/wick-test-models` cache is shared across all three
+/// integration tests and pays only a HEAD probe on subsequent runs.
+/// Mutable `resolve/main/` ref is intentional — these tests assert
+/// load-and-shift sanity, not bit-exact weight equality. If upstream
+/// re-uploads, `BundleRepo`'s validation policy detects the changed
+/// artifact via `X-Linked-Etag` (or per-file SHA-256 when supplied)
+/// and falls back to `Content-Length` only when no hash-like
+/// identifier is available — either way a re-download fires on the
+/// next run. Phase 1.6's `BundleRepo` is where pinning to a revision
+/// hash belongs.
+const MODEL_URL: &str = "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_0.gguf";
+const MODEL_FILE: &str = "LFM2-350M-Extract-Q4_0.gguf";
 
 #[test]
-#[ignore = "downloads ~700 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+#[ignore = "downloads ~210 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
 fn bundle_repo_resolves_and_loads_from_hf() {
     if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
         eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
@@ -51,19 +56,20 @@ fn bundle_repo_resolves_and_loads_from_hf() {
     // Use the shared test cache via the `common` helper — exercises the
     // same BundleRepo codepath but rooted in the CI-cached location so
     // repeat runs don't redownload.
-    let path = common::download::ensure_cached(MODEL_URL, "LFM2-1.2B-Q4_0.gguf");
+    let path = common::download::ensure_cached(MODEL_URL, MODEL_FILE);
     assert!(
         path.exists(),
         "BundleRepo.resolve_url did not produce an existing file at {}",
         path.display()
     );
 
-    // Sanity: the file is large enough to be a real GGUF (>500 MB).
+    // Sanity: the file is large enough to be a real GGUF (>150 MB —
+    // LFM2-350M-Extract Q4_0 is ~209 MB).
     let size = std::fs::metadata(&path)
         .expect("stat downloaded file")
         .len();
     assert!(
-        size > 500 * 1024 * 1024,
+        size > 150 * 1024 * 1024,
         "downloaded file only {size} bytes — HF returned an error page?"
     );
 
@@ -87,7 +93,7 @@ fn bundle_repo_resolves_and_loads_from_hf() {
 }
 
 #[test]
-#[ignore = "downloads ~700 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+#[ignore = "downloads ~210 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
 fn bundle_repo_cache_hit_does_not_redownload() {
     if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
         eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
@@ -96,7 +102,7 @@ fn bundle_repo_cache_hit_does_not_redownload() {
 
     // Pre-populate via the shared helper so we're measuring a cache hit
     // on the *second* call regardless of whether the first test ran.
-    let first = common::download::ensure_cached(MODEL_URL, "LFM2-1.2B-Q4_0.gguf");
+    let first = common::download::ensure_cached(MODEL_URL, MODEL_FILE);
     let mtime_before = first
         .metadata()
         .and_then(|m| m.modified())
