@@ -5,20 +5,23 @@
 //! UniFFI, …) and byte-compares the resulting greedy-decoded token
 //! streams. Divergence points to a marshalling bug at the FFI layer.
 //!
-//! This crate ships **two Rust legs** for the first PR: `run_rust`
-//! (calls `wick::WickEngine` directly) and `run_ffi` (calls
-//! `wick_ffi::WickEngine` through its Rust public surface). The two
-//! paths produce identical output by construction — the FFI wrapper
-//! is a thin Rust adapter over the same library — so this leg's
-//! signal is "the construction-path adapters round-trip cleanly". The
-//! real bug-detection bar arrives once a Kotlin/Swift leg lands and
-//! traffic actually crosses the FFI boundary.
+//! Three legs ship today: `run_rust` (calls `wick::WickEngine`
+//! directly), `run_ffi` (calls `wick_ffi::WickEngine` through its
+//! Rust public surface), and `run_kotlin_jna` (spawns a vendored
+//! Kotlin runner that loads the generated `wick_ffi.kt` bindings and
+//! `libwick_ffi.{so,dylib}` through JNA). The first two paths produce
+//! identical output by construction — the wick-ffi wrapper is a thin
+//! Rust adapter — so they form a construction-path sanity check; the
+//! Kotlin leg is the first to actually cross the FFI boundary, where
+//! marshalling bugs would surface as token-stream divergence.
 //!
-//! Public surface kept narrow on purpose: a future Kotlin or Swift
-//! leg only needs to produce a `Vec<u32>` from the same `RunArgs` —
-//! the harness binary does the diffing.
+//! Public surface kept narrow on purpose: a future Swift leg only
+//! needs to produce a `Vec<u32>` from the same `RunArgs` — the
+//! harness binary does the diffing.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -258,6 +261,93 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
         .generate(greedy_opts_ffi(args.max_tokens))
         .context("generate (ffi)")?;
     Ok(output.tokens)
+}
+
+/// Run the prompt through the Kotlin runner under
+/// `wick-parity/legs/kotlin/`. Spawns the vendored fat jar with
+/// `java -jar`, feeds it a `RunArgsOwned`-shaped JSON request on
+/// stdin, parses a `RunOutput` JSON document from stdout, and
+/// returns the token list.
+///
+/// `runner_jar` is the path to `wick-parity-kotlin-all.jar`
+/// produced by `./gradlew shadowJar`. `lib_dir` is the directory
+/// containing `libwick_ffi.{so,dylib}` — passed to JNA via
+/// `-Djna.library.path=...` so the dylib is found regardless of
+/// the working directory.
+///
+/// `--enable-native-access=ALL-UNNAMED` is added unconditionally:
+/// JDK 21 emits a warning every time JNA calls `System.load` without
+/// it (a JEP-472 forward-compat nudge), and the cleaner stderr makes
+/// it easier to spot a real error in the test output.
+pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> Result<Vec<u32>> {
+    // Validate UTF-8 up front for the same reason `run_ffi` does:
+    // the Kotlin runner deserializes `cache_dir` as a `String` (JSON
+    // strings are UTF-8 by spec), and `serde_json::to_vec` on a
+    // non-UTF-8 `PathBuf` would surface as an opaque encoding error
+    // instead of a tailored "cache_dir must be valid UTF-8" message.
+    // The Rust legs see the path directly via `&Path` and don't have
+    // this constraint — only the cross-language hop does.
+    args.cache_dir.to_str().with_context(|| {
+        format!(
+            "cache_dir {} is not valid UTF-8 (kotlin-jna leg requires String over JSON)",
+            args.cache_dir.display()
+        )
+    })?;
+
+    let owned = RunArgsOwned {
+        bundle: args.bundle.to_string(),
+        quant: args.quant.to_string(),
+        prompt: args.prompt.to_string(),
+        max_tokens: args.max_tokens,
+        seed: args.seed,
+        cache_dir: args.cache_dir.to_path_buf(),
+    };
+    let request_json = serde_json::to_vec(&owned)?;
+
+    let mut child = Command::new("java")
+        .arg(format!("-Djna.library.path={}", lib_dir.display()))
+        .arg("--enable-native-access=ALL-UNNAMED")
+        .arg("-jar")
+        .arg(runner_jar)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn java -jar {}", runner_jar.display()))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("kotlin-jna runner stdin unavailable")?;
+        stdin
+            .write_all(&request_json)
+            .context("write request JSON to kotlin-jna stdin")?;
+    }
+    // Drop stdin handle so the child sees EOF on its read. Without
+    // this the child blocks forever on `System.in.readBytes()`.
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .context("wait for kotlin-jna runner to exit")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "kotlin-jna runner failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+
+    let response: RunOutput = serde_json::from_slice(&output.stdout).with_context(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        format!(
+            "parse kotlin-jna RunOutput JSON; stderr was: {}",
+            stderr.trim()
+        )
+    })?;
+    Ok(response.tokens)
 }
 
 /// First index where `a` and `b` differ, or `None` if they're equal.

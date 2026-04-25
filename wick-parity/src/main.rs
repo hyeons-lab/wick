@@ -18,12 +18,14 @@
 //! minimal: produce a `Vec<u32>` from the same `RunArgs` and emit it
 //! as `RunOutput.tokens`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use wick_parity::{RunArgs, RunOutput, default_cache_dir, first_divergence, run_ffi, run_rust};
+use wick_parity::{
+    RunArgs, RunOutput, default_cache_dir, first_divergence, run_ffi, run_kotlin_jna, run_rust,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,6 +43,18 @@ enum Cmd {
     Dump {
         #[arg(long, value_enum)]
         via: Leg,
+        /// Path to the Kotlin runner fat jar
+        /// (`wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar`).
+        /// Required when `--via kotlin-jna`; passing this flag with
+        /// any other `--via` value is rejected as a misuse.
+        #[arg(long)]
+        runner: Option<PathBuf>,
+        /// Directory containing `libwick_ffi.{so,dylib}`. Defaults to
+        /// `<workspace>/target/debug`. Used only by the `kotlin-jna`
+        /// leg (passed to JNA via `-Djna.library.path=...`); a no-op
+        /// for any other `--via` value.
+        #[arg(long)]
+        lib_dir: Option<PathBuf>,
         #[command(flatten)]
         common: CommonArgs,
     },
@@ -57,6 +71,9 @@ enum Leg {
     Rust,
     /// `wick_ffi::WickEngine` through its Rust public surface.
     Ffi,
+    /// Kotlin runner under `wick-parity/legs/kotlin/`, loading the
+    /// generated UniFFI bindings + `libwick_ffi.{so,dylib}` via JNA.
+    KotlinJna,
 }
 
 impl Leg {
@@ -64,8 +81,18 @@ impl Leg {
         match self {
             Leg::Rust => "rust",
             Leg::Ffi => "ffi",
+            Leg::KotlinJna => "kotlin-jna",
         }
     }
+}
+
+fn default_lib_dir() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+        .join("target")
+        .join("debug")
 }
 
 #[derive(clap::Args, Debug)]
@@ -95,10 +122,29 @@ fn resolve_cache_dir(c: &CommonArgs) -> Result<PathBuf> {
     default_cache_dir()
 }
 
-fn run_leg(leg: &Leg, args: &RunArgs<'_>) -> Result<Vec<u32>> {
+fn run_leg(
+    leg: &Leg,
+    args: &RunArgs<'_>,
+    runner: Option<&Path>,
+    lib_dir: Option<&Path>,
+) -> Result<Vec<u32>> {
     match leg {
         Leg::Rust => run_rust(args),
         Leg::Ffi => run_ffi(args),
+        Leg::KotlinJna => {
+            let runner = runner.ok_or_else(|| {
+                anyhow::anyhow!("--runner <jar> is required for --via kotlin-jna")
+            })?;
+            let default_lib;
+            let lib_dir = match lib_dir {
+                Some(p) => p,
+                None => {
+                    default_lib = default_lib_dir();
+                    &default_lib
+                }
+            };
+            run_kotlin_jna(args, runner, lib_dir)
+        }
     }
 }
 
@@ -127,7 +173,18 @@ fn main() -> ExitCode {
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Dump { via, common } => {
+        Cmd::Dump {
+            via,
+            runner,
+            lib_dir,
+            common,
+        } => {
+            // Surface the misuse early — `--runner` only matters for
+            // the kotlin leg; passing it without `--via kotlin-jna`
+            // probably means the user got the flag wrong.
+            if runner.is_some() && !matches!(via, Leg::KotlinJna) {
+                bail!("--runner is only valid with --via kotlin-jna");
+            }
             let cache = resolve_cache_dir(&common)?;
             let args = RunArgs {
                 bundle: &common.bundle,
@@ -137,7 +194,7 @@ fn real_main() -> Result<ExitCode> {
                 seed: common.seed,
                 cache_dir: &cache,
             };
-            let tokens = run_leg(&via, &args)?;
+            let tokens = run_leg(&via, &args, runner.as_deref(), lib_dir.as_deref())?;
             let out = build_output(via.label(), &args, tokens);
             // Pretty JSON makes the diff readable when a human inspects
             // the dump; one-line JSON would be friendlier for piping
@@ -214,6 +271,8 @@ mod tests {
         match cli.cmd {
             Cmd::Dump {
                 via: Leg::Rust,
+                runner: None,
+                lib_dir: None,
                 common,
             } => {
                 assert_eq!(common.bundle, "B");
