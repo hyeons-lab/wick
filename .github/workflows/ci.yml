@@ -285,6 +285,17 @@ jobs:
               -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
               -library "$OUT/libwick_ffi-sim.a" -headers "$OUT/headers" \
               -output "$OUT/WickFFI.xcframework"
+      - name: Log XCFramework size
+        # Logs the per-slice + total size so a future regression where
+        # debuginfo slips back in (or a heavyweight dep accidentally
+        # gets feature-gated on) shows up as a number in the build
+        # log. No hard threshold — adjust when intentional size
+        # changes happen.
+        run: |
+          set -euo pipefail
+          XCF=target/xcframework-build/WickFFI.xcframework
+          du -sh "$XCF"
+          du -sh "$XCF"/*/libwick_ffi*.a
       - name: Verify XCFramework slices
         # Catches a regression where one slice silently has the wrong
         # architecture — `Info.plist` advertises supported archs +

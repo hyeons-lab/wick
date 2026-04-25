@@ -164,8 +164,12 @@ ios-xcframework:
         -output "$OUT/WickFFI.xcframework"
     echo "Built $OUT/WickFFI.xcframework"
 
-# Single-target iOS variant for fast device-only iteration.
-# Skips the simulator slice + xcframework assembly.
+# Single-target iOS smoke test — verifies the device cross-compile
+# works without paying for the full sim + lipo + xcodebuild pipeline
+# (~30s vs ~90s+). Output `.a` isn't directly usable in an iOS app
+# (consumers need the XCFramework or a custom SPM `linkedLibrary`
+# wiring); this recipe is mostly a "did the cross-compile break?"
+# fast probe. Assumes `aarch64-apple-ios` is rustup-installed.
 ios-arm64:
     cargo build -p wick-ffi --target aarch64-apple-ios --release
 

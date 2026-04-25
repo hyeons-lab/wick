@@ -220,8 +220,13 @@ just ios-arm64           # device-only, fast iteration (no XCFramework)
 ```
 
 Output lands at `target/xcframework-build/WickFFI.xcframework`
-(~55 MB release with debug symbols stripped per the workspace's
-release profile).
+(~125 MB on disk: a 42 MB device-arm64 staticlib + an 84 MB fat
+arm64+x86_64 simulator staticlib + small headers per slice). Consumer
+apps only embed one slice per device, so the per-device cost added
+to a real-iPhone `.ipa` is ~42 MB. Cargo's `release` profile in this
+workspace runs `strip = "symbols"` on the staticlibs; further size
+trimming would need feature-gating out tokio / rustfft / similar
+heavyweight deps.
 
 ### XCFramework structure
 
