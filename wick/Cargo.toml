@@ -39,26 +39,31 @@ accelerate-src = { workspace = true, optional = true }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 openblas-src = { workspace = true, optional = true }
 
-# wasm32-unknown-unknown portability deps. Reasons for each:
+# wasm32 portability deps, scoped by sub-target.
 #
-# - `getrandom` is a transitive dep pulled by `rand 0.8` above. On wasm32
-#   it refuses to compile without an explicit entropy backend; the `js`
-#   feature routes it through the browser's `crypto.getRandomValues`.
-#   wick code never references `getrandom` directly — this is the
-#   "fake dep" pattern: the dep exists purely to enable the cargo
-#   feature on the transitive copy. **The version is coupled to
-#   `rand 0.8` upstream**: a future `rand 0.9+` bump moves to
-#   `getrandom 0.3`, where the wasm feature is renamed to `wasm_js`.
-#   Update both together if/when that happens.
-#
-# - `web-time` re-exports `std::time::{Instant, Duration}` on native and
-#   provides wasm-bindgen-backed equivalents on wasm32. Re-exported by
-#   `wick::time` (see `src/time.rs`); the lib uses `crate::time::Instant`
-#   everywhere `std::time::Instant` would otherwise panic at runtime on
-#   wasm32-unknown-unknown.
+# `web-time` works on every wasm32 flavor (browser, Node, WASI) and is
+# applied to all `target_arch = "wasm32"` builds. It re-exports
+# `std::time::{Instant, Duration}` on native and provides equivalents on
+# wasm. Re-exported by `wick::time` (see `src/time.rs`); the lib uses
+# `crate::time::Instant` everywhere `std::time::Instant` would otherwise
+# panic at runtime on wasm32-unknown-unknown.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = ["js"] }
 web-time.workspace = true
+
+# `getrandom`'s `js` feature is JS-glue specific (browser
+# `crypto.getRandomValues`) and only makes sense on `wasm32-unknown-unknown`
+# — `wasm32-wasi` has its own native entropy source and should not be
+# forced through the JS path. Narrow the cfg to `target_os = "unknown"`
+# so a future WASI build picks up the WASI backend instead.
+#
+# `getrandom` is a transitive dep pulled by `rand 0.8`; wick code never
+# references it directly. This is the "fake dep" pattern: the dep exists
+# purely to enable the cargo feature on the transitive copy. **The version
+# is coupled to `rand 0.8` upstream** — a future `rand 0.9+` bump moves to
+# `getrandom 0.3`, where the wasm feature is renamed to `wasm_js`. Update
+# both together if/when that happens.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 tempfile.workspace = true

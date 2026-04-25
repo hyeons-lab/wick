@@ -6,10 +6,14 @@
 #[cfg(target_arch = "aarch64")]
 use crate::quant::BlockQ6K;
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
-// `half::f16` is consumed only by the NEON / AVX2 kernels below; on wasm32
-// (and any other unsupported arch) neither cfg block compiles, leaving the
-// import unused.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+// `half::f16` is consumed by the NEON / AVX2 kernels below and by the
+// `#[cfg(test)] mod tests` further down (the tests aren't arch-gated and
+// use `f16::from_f32` to seed quantized blocks). Including `test` in the
+// gate keeps `cargo test` compilable on architectures that don't have a
+// SIMD kernel here (e.g. armv7, riscv64) — without it those archs build
+// the tests but lose the import. On non-test wasm32 builds the import
+// remains correctly elided.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", test))]
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
