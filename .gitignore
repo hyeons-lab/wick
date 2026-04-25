@@ -9,6 +9,11 @@ Cargo.lock
 **/build/
 !**/src/**/build/
 
+# Swift Package Manager (wick-parity Swift leg + any future SPM subprojects)
+**/.build/
+**/.swiftpm/
+**/Package.resolved
+
 # IDE
 .idea/
 .vscode/

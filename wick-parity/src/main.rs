@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use wick_parity::{
     RunArgs, RunOutput, default_cache_dir, first_divergence, run_ffi, run_kotlin_jna, run_rust,
+    run_swift_uniffi,
 };
 
 #[derive(Parser, Debug)]
@@ -43,16 +44,20 @@ enum Cmd {
     Dump {
         #[arg(long, value_enum)]
         via: Leg,
-        /// Path to the Kotlin runner fat jar
-        /// (`wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar`).
-        /// Required when `--via kotlin-jna`; passing this flag with
-        /// any other `--via` value is rejected as a misuse.
+        /// Path to a subprocess runner — either the Kotlin fat jar
+        /// (`wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar`)
+        /// or the Swift SPM binary
+        /// (`wick-parity/legs/swift/.build/release/WickParitySwift`).
+        /// Required when `--via kotlin-jna` or `--via swift-uniffi`;
+        /// passing this flag with any other `--via` value is rejected
+        /// as a misuse.
         #[arg(long)]
         runner: Option<PathBuf>,
         /// Directory containing `libwick_ffi.{so,dylib}`. Defaults to
-        /// `<workspace>/target/debug`. Used only by the `kotlin-jna`
-        /// leg (passed to JNA via `-Djna.library.path=...`); a no-op
-        /// for any other `--via` value.
+        /// `<workspace>/target/debug`. Used by the `kotlin-jna` leg
+        /// (passed to JNA via `-Djna.library.path=...`) and the
+        /// `swift-uniffi` leg (exported as `DYLD_LIBRARY_PATH`); a
+        /// no-op for any other `--via` value.
         #[arg(long)]
         lib_dir: Option<PathBuf>,
         #[command(flatten)]
@@ -68,12 +73,20 @@ enum Cmd {
 #[derive(Debug, Clone, ValueEnum)]
 enum Leg {
     /// `wick::WickEngine` directly.
+    #[value(name = "rust")]
     Rust,
     /// `wick_ffi::WickEngine` through its Rust public surface.
+    #[value(name = "ffi")]
     Ffi,
     /// Kotlin runner under `wick-parity/legs/kotlin/`, loading the
     /// generated UniFFI bindings + `libwick_ffi.{so,dylib}` via JNA.
+    #[value(name = "kotlin-jna")]
     KotlinJna,
+    /// Swift runner under `wick-parity/legs/swift/`, built via SPM,
+    /// loading the generated UniFFI Swift bindings + linked against
+    /// the wick-ffi cdylib at build time.
+    #[value(name = "swift-uniffi")]
+    SwiftUniffi,
 }
 
 impl Leg {
@@ -82,7 +95,12 @@ impl Leg {
             Leg::Rust => "rust",
             Leg::Ffi => "ffi",
             Leg::KotlinJna => "kotlin-jna",
+            Leg::SwiftUniffi => "swift-uniffi",
         }
+    }
+
+    fn needs_runner(&self) -> bool {
+        matches!(self, Leg::KotlinJna | Leg::SwiftUniffi)
     }
 }
 
@@ -131,9 +149,10 @@ fn run_leg(
     match leg {
         Leg::Rust => run_rust(args),
         Leg::Ffi => run_ffi(args),
-        Leg::KotlinJna => {
+        Leg::KotlinJna | Leg::SwiftUniffi => {
+            let leg_label = leg.label();
             let runner = runner.ok_or_else(|| {
-                anyhow::anyhow!("--runner <jar> is required for --via kotlin-jna")
+                anyhow::anyhow!("--runner <path> is required for --via {leg_label}")
             })?;
             let default_lib;
             let lib_dir = match lib_dir {
@@ -143,7 +162,11 @@ fn run_leg(
                     &default_lib
                 }
             };
-            run_kotlin_jna(args, runner, lib_dir)
+            match leg {
+                Leg::KotlinJna => run_kotlin_jna(args, runner, lib_dir),
+                Leg::SwiftUniffi => run_swift_uniffi(args, runner, lib_dir),
+                _ => unreachable!("outer match guarded the variants"),
+            }
         }
     }
 }
@@ -180,10 +203,11 @@ fn real_main() -> Result<ExitCode> {
             common,
         } => {
             // Surface the misuse early — `--runner` only matters for
-            // the kotlin leg; passing it without `--via kotlin-jna`
-            // probably means the user got the flag wrong.
-            if runner.is_some() && !matches!(via, Leg::KotlinJna) {
-                bail!("--runner is only valid with --via kotlin-jna");
+            // the subprocess legs (kotlin-jna / swift-uniffi); passing
+            // it with any other `--via` value probably means the user
+            // got the flag wrong.
+            if runner.is_some() && !via.needs_runner() {
+                bail!("--runner is only valid with --via kotlin-jna or --via swift-uniffi");
             }
             let cache = resolve_cache_dir(&common)?;
             let args = RunArgs {
