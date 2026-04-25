@@ -1846,9 +1846,11 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
     func capabilities()  -> ModalityCapabilities
     
     /**
-     * Decode token IDs back to text. Unknown / out-of-vocab IDs are
-     * rendered as the BPE substitution glyph (depends on the
-     * tokenizer's vocab).
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
      */
     func decodeTokens(tokens: [UInt32])  -> String
     
@@ -1894,8 +1896,11 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
     func specialTokenId(name: String)  -> UInt32?
     
     /**
-     * Total vocabulary size (number of distinct token IDs the model
-     * can emit / accept). Mirrors what's in [`ModelMetadata::vocab_size`].
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
      */
     func vocabSize()  -> UInt32
     
@@ -2098,9 +2103,11 @@ open func capabilities() -> ModalityCapabilities  {
 }
     
     /**
-     * Decode token IDs back to text. Unknown / out-of-vocab IDs are
-     * rendered as the BPE substitution glyph (depends on the
-     * tokenizer's vocab).
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
      */
 open func decodeTokens(tokens: [UInt32]) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2192,8 +2199,11 @@ open func specialTokenId(name: String) -> UInt32?  {
 }
     
     /**
-     * Total vocabulary size (number of distinct token IDs the model
-     * can emit / accept). Mirrors what's in [`ModelMetadata::vocab_size`].
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
      */
 open func vocabSize() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -2260,9 +2270,12 @@ public func FfiConverterTypeWickEngine_lower(_ value: WickEngine) -> UInt64 {
  *
  * `role` follows the OpenAI / chat-template convention — typically
  * one of `"system"`, `"user"`, `"assistant"`, occasionally
- * `"tool"`. The exact set of accepted roles depends on the model's
- * template; an unknown role raises a render error rather than
- * silently dropping the message.
+ * `"tool"`. wick-ffi doesn't validate the role string; whatever is
+ * passed flows directly into the Jinja template. Whether an
+ * unknown role errors or silently no-ops depends on the template's
+ * own logic — many templates have an explicit error path for
+ * unrecognized roles, but it's template-dependent rather than
+ * enforced by [`WickEngine::apply_chat_template`].
  */
 public struct ChatMessage: Equatable, Hashable {
     public var role: String
@@ -3683,7 +3696,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 53830) {
+    if (uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_encode_text() != 50577) {
@@ -3704,7 +3717,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 4418) {
+    if (uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566) {

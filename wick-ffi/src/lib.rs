@@ -374,9 +374,12 @@ impl From<wick::ModalityCapabilities> for ModalityCapabilities {
 ///
 /// `role` follows the OpenAI / chat-template convention — typically
 /// one of `"system"`, `"user"`, `"assistant"`, occasionally
-/// `"tool"`. The exact set of accepted roles depends on the model's
-/// template; an unknown role raises a render error rather than
-/// silently dropping the message.
+/// `"tool"`. wick-ffi doesn't validate the role string; whatever is
+/// passed flows directly into the Jinja template. Whether an
+/// unknown role errors or silently no-ops depends on the template's
+/// own logic — many templates have an explicit error path for
+/// unrecognized roles, but it's template-dependent rather than
+/// enforced by [`WickEngine::apply_chat_template`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatMessage {
     pub role: String,
@@ -610,17 +613,22 @@ impl WickEngine {
         self.inner.tokenizer().encode(&text)
     }
 
-    /// Decode token IDs back to text. Unknown / out-of-vocab IDs are
-    /// rendered as the BPE substitution glyph (depends on the
-    /// tokenizer's vocab).
+    /// Decode token IDs back to text. Out-of-vocab IDs are silently
+    /// skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+    /// only appends bytes for IDs it has in `vocab.get(id)`. No
+    /// substitution glyph, no error. Callers that want to detect
+    /// invalid IDs should validate against `vocab_size()` first.
     pub fn decode_tokens(&self, tokens: Vec<u32>) -> String {
         self.inner.tokenizer().decode(&tokens)
     }
 
-    /// Total vocabulary size (number of distinct token IDs the model
-    /// can emit / accept). Mirrors what's in [`ModelMetadata::vocab_size`].
+    /// Total vocabulary size — the number of distinct token IDs the
+    /// model can emit. Sourced from the model's config (matches
+    /// [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+    /// own count: in healthy models they match, but the model's
+    /// config is the authoritative range for valid logit indices.
     pub fn vocab_size(&self) -> u32 {
-        u32::try_from(self.inner.tokenizer().vocab_size()).unwrap_or(u32::MAX)
+        self.inner.metadata().vocab_size
     }
 
     /// Beginning-of-sequence token ID, if the model has one.

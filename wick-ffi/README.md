@@ -636,17 +636,22 @@ if engine.hasChatTemplate() {
 - Tokenizer methods are read-only — safe to call concurrently with
   `generate*` on a `Session` opened from the same engine.
 - Empty input to `encodeText` returns an empty vec.
-- Out-of-vocab token IDs in `decodeTokens` render as the BPE
-  substitution glyph (depends on the tokenizer's vocab); they don't
-  raise an error.
+- Out-of-vocab token IDs in `decodeTokens` are silently skipped
+  (omitted from the decoded output) — `BpeTokenizer::decode` only
+  appends bytes for IDs it has in its vocab. No substitution glyph,
+  no error. Validate against `vocabSize()` first if you need to
+  detect invalid IDs.
 - `applyChatTemplate` returns `FfiError::Backend` if the model has
   no chat template (check `hasChatTemplate()` first) or if the
-  template's Jinja2 fails against the supplied messages (typically
-  an unknown `role` value).
+  template's Jinja2 render fails against the supplied messages.
 - The `ChatMessage` `role` set depends on the model's template —
   typically `"system"`, `"user"`, `"assistant"`, occasionally
-  `"tool"` for function-calling. Templates raise a render error on
-  unknown roles rather than silently dropping the message.
+  `"tool"` for function-calling. wick-ffi doesn't validate the role
+  string; whatever you pass flows directly into the Jinja template.
+  Whether an unknown role errors or silently no-ops is up to the
+  template's own logic — many templates have an explicit error
+  path for unrecognized roles, but it's template-dependent rather
+  than enforced by `applyChatTemplate`.
 
 ## Design notes
 

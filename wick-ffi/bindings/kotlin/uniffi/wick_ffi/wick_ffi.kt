@@ -1421,7 +1421,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 53830.toShort()) {
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_encode_text() != 50577.toShort()) {
@@ -1442,7 +1442,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 4418.toShort()) {
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566.toShort()) {
@@ -3761,9 +3761,11 @@ public interface WickEngineInterface {
     fun `capabilities`(): ModalityCapabilities
 
     /**
-     * Decode token IDs back to text. Unknown / out-of-vocab IDs are
-     * rendered as the BPE substitution glyph (depends on the
-     * tokenizer's vocab).
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
      */
     fun `decodeTokens`(`tokens`: List<kotlin.UInt>): kotlin.String
 
@@ -3809,8 +3811,11 @@ public interface WickEngineInterface {
     fun `specialTokenId`(`name`: kotlin.String): kotlin.UInt?
 
     /**
-     * Total vocabulary size (number of distinct token IDs the model
-     * can emit / accept). Mirrors what's in [`ModelMetadata::vocab_size`].
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
      */
     fun `vocabSize`(): kotlin.UInt
 
@@ -3985,9 +3990,11 @@ open class WickEngine :
         )
 
     /**
-     * Decode token IDs back to text. Unknown / out-of-vocab IDs are
-     * rendered as the BPE substitution glyph (depends on the
-     * tokenizer's vocab).
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
      */
     override fun `decodeTokens`(`tokens`: List<kotlin.UInt>): kotlin.String =
         FfiConverterString.lift(
@@ -4107,8 +4114,11 @@ open class WickEngine :
         )
 
     /**
-     * Total vocabulary size (number of distinct token IDs the model
-     * can emit / accept). Mirrors what's in [`ModelMetadata::vocab_size`].
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
      */
     override fun `vocabSize`(): kotlin.UInt =
         FfiConverterUInt.lift(
@@ -4266,9 +4276,12 @@ public object FfiConverterTypeWickEngine : FfiConverter<WickEngine, Long> {
  *
  * `role` follows the OpenAI / chat-template convention — typically
  * one of `"system"`, `"user"`, `"assistant"`, occasionally
- * `"tool"`. The exact set of accepted roles depends on the model's
- * template; an unknown role raises a render error rather than
- * silently dropping the message.
+ * `"tool"`. wick-ffi doesn't validate the role string; whatever is
+ * passed flows directly into the Jinja template. Whether an
+ * unknown role errors or silently no-ops depends on the template's
+ * own logic — many templates have an explicit error path for
+ * unrecognized roles, but it's template-dependent rather than
+ * enforced by [`WickEngine::apply_chat_template`].
  */
 data class ChatMessage(
     var `role`: kotlin.String,
