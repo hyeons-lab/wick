@@ -362,8 +362,8 @@ jobs:
           import json, sys
           info = json.load(sys.stdin)
           libs = info["AvailableLibraries"]
-          if len(libs) != 2:
-              print(f"::error::expected 2 slices, got {len(libs)}", file=sys.stderr); sys.exit(1)
+          if len(libs) != 3:
+              print(f"::error::expected 3 slices, got {len(libs)}", file=sys.stderr); sys.exit(1)
           # Build a set of (platform, archs-sorted-tuple, variant) keys
           # and check both expected slices are present. (*archs,
           # variant) avoids a tuple-concat dance that earlier readers
