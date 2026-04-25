@@ -80,6 +80,37 @@ let configWithRepo = EngineConfig(contextSize: 0, backend: .cpu, bundleRepo: rep
 guard configWithRepo.bundleRepo != nil else { fail("EngineConfig.bundleRepo attach") }
 print("OK: BundleRepo + EngineConfig.bundleRepo attach")
 
+// 3c. BundleRepo.withProgress + DownloadProgressSink foreign trait
+// (PR 12). We don't trigger an actual download (would need network
+// + a real bundle), but constructing the repo + attaching the sink
+// proves the foreign-trait scaffolding wires correctly. The sink
+// itself isn't invoked here — coverage of the in-flight callback
+// path is in wick-core's `progressing_writer_throttles_callback`
+// unit test.
+// `nonisolated(unsafe)` on the mutable storage silences a Swift 6
+// Sendable warning. UniFFI marks foreign-trait objects as Sendable
+// (Send + Sync on the Rust side); a real consumer would put the
+// recording behind a lock or actor. This smoke test never invokes
+// the callback (it only verifies wiring), so unchecked is fine.
+final class CountingProgressSink: DownloadProgressSink {
+    nonisolated(unsafe) var calls: [(String, UInt64, UInt64?)] = []
+    func onProgress(url: String, bytesDownloaded: UInt64, totalBytes: UInt64?) {
+        calls.append((url, bytesDownloaded, totalBytes))
+    }
+}
+let sink = CountingProgressSink()
+let repoWithProgress = BundleRepo.withProgress(
+    storeDir: "/tmp/wick-ffi-swift-smoke-bundles-progress",
+    progress: sink
+)
+guard repoWithProgress.storeDir() == "/tmp/wick-ffi-swift-smoke-bundles-progress" else {
+    fail("BundleRepo.withProgress storeDir round-trip")
+}
+guard sink.calls.isEmpty else {
+    fail("sink should not have fired without an actual download")
+}
+print("OK: BundleRepo.withProgress + DownloadProgressSink wiring")
+
 // 4. Error type — try a constructor that we know will fail and
 // confirm we get a typed `FfiError` back, not a panic / abort.
 // `WickEngine.fromPath` on a nonexistent path should surface as

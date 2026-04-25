@@ -6,16 +6,14 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Remote loading + async.** Through PRs 2–9 `wick-ffi` built up a
-typed foreign-language surface (sync / streaming / async generate,
-typed errors, vendored Kotlin + Swift bindings) and the Android ABI
-+ Apple XCFramework distribution pipelines. PR 10 enabled the `wick`
-`remote` feature and exposed [`BundleRepo`] + `WickEngine::from_bundle_id`
-for runtime model downloads from LeapBundles. PR 11 adds the async
-twin `from_bundle_id_async` (via `tokio::task::spawn_blocking` +
-`AbortOnDrop`) so foreign async runtimes can chain the full pipeline
-— `fromBundleIdAsync` → `newSession` → `generateAsync` — without
-ever leaving their async context.
+**Download progress.** Through PRs 2–11 `wick-ffi` built up a typed
+foreign-language surface, the Android ABI + Apple XCFramework
+distribution pipelines, and remote model loading via `BundleRepo` +
+`from_bundle_id` / `from_bundle_id_async`. PR 12 closes the missing
+piece for mobile UX: a `DownloadProgressSink` foreign-trait callback
+attached at `BundleRepo::with_progress` construction, fired during
+cache-miss downloads at ~256 KB granularity plus a final 100% event.
+Drives a real progress bar in a Kotlin / Swift app without polling.
 
 | PR | Scope |
 |---|---|
@@ -30,7 +28,8 @@ ever leaving their async context.
 | 9 | Apple-platform XCFramework: arm64-only iOS device + iOS Simulator + native macOS slices, CI artifact |
 | 10 | `BundleRepo` remote loading (`remote` feature) + `WickEngine::from_bundle_id` |
 | 11 | `WickEngine::from_bundle_id_async` via `spawn_blocking` + `AbortOnDrop` |
-| 12+ | Parity harness, Maven publishing, download progress callbacks |
+| 12 | `DownloadProgressSink` foreign-trait callback + `BundleRepo::with_progress` |
+| 13+ | Parity harness, Maven publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -428,6 +427,83 @@ attempt resolves from the cache — bandwidth isn't wasted, just
 shifted. (`generateAsync`'s `Session::cancel` in-flight
 cancellation has no equivalent here because wick's download path
 uses `reqwest::blocking` without a cooperative cancel point.)
+
+### Download progress
+
+Mobile apps that show a progress bar during model download attach a
+`DownloadProgressSink` at `BundleRepo` construction time. The sink
+fires periodically during cache-miss downloads (every ~256 KB
+written + once at end-of-stream). Cache-hit resolves never fire.
+
+The same sink receives events for every URL the repo downloads —
+distinguish per-file UI (manifest first, then GGUF) by branching on
+the `url` argument inside the callback.
+
+**Kotlin:**
+
+```kotlin
+import uniffi.wick_ffi.*
+
+class ProgressTracker : DownloadProgressSink {
+    override fun onProgress(url: String, bytesDownloaded: ULong, totalBytes: ULong?) {
+        val pct = totalBytes?.let { (bytesDownloaded * 100u) / it }
+        // Marshal to UI thread; the callback fires from the
+        // download thread (caller's thread for `fromBundleId`,
+        // a tokio blocking worker for `fromBundleIdAsync`).
+        runOnUiThread {
+            progressBar.progress = pct?.toInt() ?: 0
+            statusText.text = "Downloading ${url.substringAfterLast('/')}"
+        }
+    }
+}
+
+val repo = BundleRepo.withProgress(
+    storeDir = context.filesDir.absolutePath + "/wick-bundles",
+    progress = ProgressTracker(),
+)
+val config = EngineConfig(contextSize = 0UL, backend = BackendPreference.AUTO, bundleRepo = repo)
+val engine = WickEngine.fromBundleIdAsync("LFM2-1.2B-GGUF", "Q4_0", config)
+```
+
+**Swift:**
+
+```swift
+import Foundation
+
+final class ProgressTracker: DownloadProgressSink {
+    func onProgress(url: String, bytesDownloaded: UInt64, totalBytes: UInt64?) {
+        let pct = totalBytes.map { Double(bytesDownloaded) / Double($0) * 100 }
+        DispatchQueue.main.async {
+            // update UI
+            print("[\(url.split(separator: "/").last ?? "?")] \(pct ?? 0)%")
+        }
+    }
+}
+
+let repo = BundleRepo.withProgress(
+    storeDir: appSupport.appendingPathComponent("wick-bundles").path,
+    progress: ProgressTracker()
+)
+let config = EngineConfig(contextSize: 0, backend: .auto, bundleRepo: repo)
+let engine = try await WickEngine.fromBundleIdAsync(
+    bundleId: "LFM2-1.2B-GGUF", quant: "Q4_0", config: config
+)
+```
+
+**Throttling.** wick-core caps the callback rate to one per ~256 KB
+written + one final at end-of-stream. At 10 MB/s download speed
+that's ~25 callbacks/second, comfortable for a 30 Hz UI repaint
+without overhead. Implementers don't need to dedupe.
+
+**`total_bytes` may be `None`** — the server didn't surface a
+`Content-Length` (chunked transfer, or HEAD didn't probe). UIs
+should display indeterminate progress in that case rather than
+divide by zero.
+
+**Cache hits don't fire.** A `from_bundle_id` against a fully
+cached bundle returns instantly without any sink invocation. UIs
+should handle the "nothing to download" case (call returned in
+under a second, sink wasn't called) gracefully.
 
 ### Per-platform cache-path recommendations
 

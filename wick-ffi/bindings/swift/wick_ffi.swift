@@ -560,7 +560,8 @@ public protocol BundleRepoProtocol: AnyObject, Sendable {
     
     /**
      * The directory this repo caches bundles under. Matches what was
-     * passed to [`BundleRepo::new`], useful for log / telemetry.
+     * passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
+     * useful for log / telemetry.
      */
     func storeDir()  -> String
     
@@ -647,11 +648,38 @@ public convenience init(storeDir: String) {
     }
 
     
+    /**
+     * Create a new repo rooted at `store_dir` with a foreign
+     * [`DownloadProgressSink`] attached. The sink fires periodically
+     * during cache-miss downloads (every ~256 KB written + once at
+     * end-of-stream). Cache-hit resolves don't fire any callbacks.
+     * The same sink receives events for every file the repo
+     * downloads — distinguish per-file progress by the `url`
+     * argument on each callback.
+     *
+     * Construction-time attachment (rather than per-call) matches
+     * how mobile apps drive a single download-progress UI across
+     * multiple files in one logical bundle (manifest + GGUF + …):
+     * one repo, one sink, one progress bar. If you need to tear
+     * down the sink mid-app-lifecycle, drop the repo + construct a
+     * new one — Arc-based, so all in-flight calls finish on the
+     * old sink and new calls go to the new one.
+     */
+public static func withProgress(storeDir: String, progress: DownloadProgressSink) -> BundleRepo  {
+    return try!  FfiConverterTypeBundleRepo_lift(try! rustCall() {
+    uniffi_wick_ffi_fn_constructor_bundlerepo_with_progress(
+        FfiConverterString.lower(storeDir),
+        FfiConverterTypeDownloadProgressSink_lower(progress),$0
+    )
+})
+}
+    
 
     
     /**
      * The directory this repo caches bundles under. Matches what was
-     * passed to [`BundleRepo::new`], useful for log / telemetry.
+     * passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
+     * useful for log / telemetry.
      */
 open func storeDir() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -704,6 +732,261 @@ public func FfiConverterTypeBundleRepo_lift(_ handle: UInt64) throws -> BundleRe
 #endif
 public func FfiConverterTypeBundleRepo_lower(_ value: BundleRepo) -> UInt64 {
     return FfiConverterTypeBundleRepo.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Foreign-trait callback for download progress events from
+ * [`BundleRepo::with_progress`]. Implementers (Kotlin class, Swift
+ * class, Python subclass) drive a progress UI from these events.
+ *
+ * All methods are required from foreign implementations (UniFFI
+ * 0.31 foreign traits don't carry Rust default-impl fallbacks).
+ *
+ * Threading: `on_progress` is invoked from the thread driving the
+ * download. For sync `from_bundle_id` that's the caller's thread;
+ * for `from_bundle_id_async` it's a tokio blocking worker. If your
+ * progress UI requires marshalling onto a UI thread (`@MainActor`,
+ * `runOnUiThread`, etc.), the implementer is responsible for the
+ * dispatch.
+ */
+public protocol DownloadProgressSink: AnyObject, Sendable {
+    
+    /**
+     * Called periodically during a download. `bytes_downloaded` is
+     * monotonic across the same call's stream; `total_bytes` is the
+     * `Content-Length` reported by the server (may be `None` for
+     * chunked-transfer responses or when HEAD didn't surface a
+     * length). Same `url` value across all calls for one download
+     * — pattern-match on it to drive a per-file UI within a
+     * multi-file bundle download.
+     *
+     * Throttled by `wick-core` to ~256 KB granularity + one final
+     * callback at end-of-stream so the consumer always sees the
+     * final byte count.
+     */
+    func onProgress(url: String, bytesDownloaded: UInt64, totalBytes: UInt64?) 
+    
+}
+/**
+ * Foreign-trait callback for download progress events from
+ * [`BundleRepo::with_progress`]. Implementers (Kotlin class, Swift
+ * class, Python subclass) drive a progress UI from these events.
+ *
+ * All methods are required from foreign implementations (UniFFI
+ * 0.31 foreign traits don't carry Rust default-impl fallbacks).
+ *
+ * Threading: `on_progress` is invoked from the thread driving the
+ * download. For sync `from_bundle_id` that's the caller's thread;
+ * for `from_bundle_id_async` it's a tokio blocking worker. If your
+ * progress UI requires marshalling onto a UI thread (`@MainActor`,
+ * `runOnUiThread`, etc.), the implementer is responsible for the
+ * dispatch.
+ */
+open class DownloadProgressSinkImpl: DownloadProgressSink, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_wick_ffi_fn_clone_downloadprogresssink(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_wick_ffi_fn_free_downloadprogresssink(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Called periodically during a download. `bytes_downloaded` is
+     * monotonic across the same call's stream; `total_bytes` is the
+     * `Content-Length` reported by the server (may be `None` for
+     * chunked-transfer responses or when HEAD didn't surface a
+     * length). Same `url` value across all calls for one download
+     * — pattern-match on it to drive a per-file UI within a
+     * multi-file bundle download.
+     *
+     * Throttled by `wick-core` to ~256 KB granularity + one final
+     * callback at end-of-stream so the consumer always sees the
+     * final byte count.
+     */
+open func onProgress(url: String, bytesDownloaded: UInt64, totalBytes: UInt64?)  {try! rustCall() {
+    uniffi_wick_ffi_fn_method_downloadprogresssink_on_progress(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),
+        FfiConverterUInt64.lower(bytesDownloaded),
+        FfiConverterOptionUInt64.lower(totalBytes),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceDownloadProgressSink {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceDownloadProgressSink = UniffiVTableCallbackInterfaceDownloadProgressSink(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeDownloadProgressSink.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface DownloadProgressSink: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeDownloadProgressSink.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface DownloadProgressSink: handle missing in uniffiClone")
+            }
+        },
+        onProgress: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            bytesDownloaded: UInt64,
+            totalBytes: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDownloadProgressSink.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onProgress(
+                     url: try FfiConverterString.lift(url),
+                     bytesDownloaded: try FfiConverterUInt64.lift(bytesDownloaded),
+                     totalBytes: try FfiConverterOptionUInt64.lift(totalBytes)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDownloadProgressSink> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDownloadProgressSink>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitDownloadProgressSink() {
+    uniffi_wick_ffi_fn_init_callback_vtable_downloadprogresssink(UniffiCallbackInterfaceDownloadProgressSink.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDownloadProgressSink: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<DownloadProgressSink>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = DownloadProgressSink
+
+    public static func lift(_ handle: UInt64) throws -> DownloadProgressSink {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return DownloadProgressSinkImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: DownloadProgressSink) -> UInt64 {
+         if let rustImpl = value as? DownloadProgressSinkImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DownloadProgressSink {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DownloadProgressSink, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDownloadProgressSink_lift(_ handle: UInt64) throws -> DownloadProgressSink {
+    return try FfiConverterTypeDownloadProgressSink.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgressSink) -> UInt64 {
+    return FfiConverterTypeDownloadProgressSink.lower(value)
 }
 
 
@@ -3079,7 +3362,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_func_wick_ffi_version() != 22410) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_method_bundlerepo_store_dir() != 15806) {
+    if (uniffi_wick_ffi_checksum_method_bundlerepo_store_dir() != 45004) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_downloadprogresssink_on_progress() != 24561) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_modalitysink_on_text_tokens() != 42733) {
@@ -3133,6 +3419,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wick_ffi_checksum_constructor_bundlerepo_with_progress() != 57692) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id() != 53217) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3143,6 +3432,7 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitDownloadProgressSink()
     uniffiCallbackInitModalitySink()
     return InitializationResult.ok
 }()

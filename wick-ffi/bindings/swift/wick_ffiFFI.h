@@ -243,6 +243,13 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DOWNLOAD_PROGRESS_SINK_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DOWNLOAD_PROGRESS_SINK_METHOD0
+typedef void (*UniffiCallbackInterfaceDownloadProgressSinkMethod0)(uint64_t, RustBuffer, uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD0
 typedef void (*UniffiCallbackInterfaceModalitySinkMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -262,6 +269,15 @@ typedef void (*UniffiCallbackInterfaceModalitySinkMethod1)(uint64_t, RustBuffer,
 typedef void (*UniffiCallbackInterfaceModalitySinkMethod2)(uint64_t, RustBuffer, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DOWNLOAD_PROGRESS_SINK
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DOWNLOAD_PROGRESS_SINK
+typedef struct UniffiVTableCallbackInterfaceDownloadProgressSink {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceDownloadProgressSinkMethod0 _Nonnull onProgress;
+} UniffiVTableCallbackInterfaceDownloadProgressSink;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_MODALITY_SINK
@@ -290,9 +306,34 @@ void uniffi_wick_ffi_fn_free_bundlerepo(uint64_t handle, RustCallStatus *_Nonnul
 uint64_t uniffi_wick_ffi_fn_constructor_bundlerepo_new(RustBuffer store_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_BUNDLEREPO_WITH_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CONSTRUCTOR_BUNDLEREPO_WITH_PROGRESS
+uint64_t uniffi_wick_ffi_fn_constructor_bundlerepo_with_progress(RustBuffer store_dir, uint64_t progress, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 RustBuffer uniffi_wick_ffi_fn_method_bundlerepo_store_dir(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_DOWNLOADPROGRESSSINK
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_DOWNLOADPROGRESSSINK
+uint64_t uniffi_wick_ffi_fn_clone_downloadprogresssink(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_DOWNLOADPROGRESSSINK
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_FREE_DOWNLOADPROGRESSSINK
+void uniffi_wick_ffi_fn_free_downloadprogresssink(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_INIT_CALLBACK_VTABLE_DOWNLOADPROGRESSSINK
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_INIT_CALLBACK_VTABLE_DOWNLOADPROGRESSSINK
+void uniffi_wick_ffi_fn_init_callback_vtable_downloadprogresssink(const UniffiVTableCallbackInterfaceDownloadProgressSink* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
+void uniffi_wick_ffi_fn_method_downloadprogresssink_on_progress(uint64_t ptr, RustBuffer url, uint64_t bytes_downloaded, RustBuffer total_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_CLONE_MODALITYSINK
@@ -703,6 +744,12 @@ uint16_t uniffi_wick_ffi_checksum_method_bundlerepo_store_dir(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
+uint16_t uniffi_wick_ffi_checksum_method_downloadprogresssink_on_progress(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 uint16_t uniffi_wick_ffi_checksum_method_modalitysink_on_text_tokens(void
@@ -802,6 +849,12 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_new_session(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
 uint16_t uniffi_wick_ffi_checksum_constructor_bundlerepo_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_WITH_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_WITH_PROGRESS
+uint16_t uniffi_wick_ffi_checksum_constructor_bundlerepo_with_progress(void
     
 );
 #endif
