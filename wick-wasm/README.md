@@ -103,7 +103,12 @@ session.appendText('Hello, what is the capital of France?');
 const opts = new GenerateOpts();
 opts.maxTokens = 64;
 opts.temperature = 0.0;
-opts.stopTokens = new Uint32Array([tok.eosToken]);  // honor model EOS
+// `tok.eosToken` is `number | undefined`. `new Uint32Array([undefined])`
+// silently coerces to `0` — which would stop decoding the moment
+// token 0 is produced. Always guard the lookup.
+if (tok.eosToken != null) {
+    opts.stopTokens = new Uint32Array([tok.eosToken]);
+}
 
 // Stream tokens as they decode. The callback fires per flush
 // boundary (every `flushEveryTokens` decoded tokens, OR every

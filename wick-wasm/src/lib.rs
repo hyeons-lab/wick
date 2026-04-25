@@ -428,11 +428,22 @@ impl GenerateSummary {
 
     /// Why decode ended. One of `"MaxTokens"`, `"Stop"`,
     /// `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` —
-    /// the `Error(...)` form preserves the inner string for JS
-    /// callers that want to log it without losing detail.
+    /// the `Error(...)` form preserves the inner string verbatim
+    /// (no surrounding quotes), so JS callers can log it directly.
     #[wasm_bindgen(getter, js_name = finishReason)]
     pub fn finish_reason(&self) -> String {
-        format!("{:?}", self.inner.finish_reason)
+        // `format!("{:?}", reason)` would render `Error(String)` as
+        // `Error("...")` (with the Debug-quoted inner string).
+        // Match each variant explicitly so the public shape matches
+        // the doc comment: `Error(plain inner message)` and bare
+        // names for the payload-free variants.
+        match &self.inner.finish_reason {
+            wick::FinishReason::MaxTokens => "MaxTokens".to_string(),
+            wick::FinishReason::Stop => "Stop".to_string(),
+            wick::FinishReason::Cancelled => "Cancelled".to_string(),
+            wick::FinishReason::ContextFull => "ContextFull".to_string(),
+            wick::FinishReason::Error(msg) => format!("Error({msg})"),
+        }
     }
 }
 
@@ -534,13 +545,17 @@ impl<'a> wick::ModalitySink for JsTextSink<'a> {
         // callers would hit randomly). Per-flush copy cost is
         // trivial relative to a forward pass.
         let array = js_sys::Uint32Array::from(tokens);
-        // Ignore the JS callback's return value + any thrown
-        // exception — wick's generate loop has no defined
-        // recovery path for sink errors. JS exceptions thrown
-        // from the callback surface as a panic on the wasm side,
-        // which propagates back to JS as a thrown error. That's
-        // the right behavior; document it on the public API.
-        let _ = self.on_text.call1(&JsValue::null(), &array);
+        // Treat any exception thrown by the JS callback as fatal:
+        // re-throw it across the wasm boundary so it lands in the
+        // JS caller's `try { ... } catch` around `session.generate`.
+        // `wasm_bindgen::throw_val` aborts the current Rust call
+        // immediately — wick's generate loop has no defined
+        // recovery path for sink errors anyway, so unwinding mid-
+        // decode is no worse than a `cancel()` (the KV cache is
+        // left in whatever state the partial decode produced).
+        if let Err(err) = self.on_text.call1(&JsValue::null(), &array) {
+            wasm_bindgen::throw_val(err);
+        }
     }
 
     fn on_done(&mut self, _reason: wick::FinishReason) {
