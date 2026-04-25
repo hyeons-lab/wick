@@ -23,6 +23,8 @@
 //!   attach via [`EngineConfig::bundle_repo`] for remote loading.
 //!   [`BundleRepo::with_progress`] takes a [`DownloadProgressSink`]
 //!   foreign-trait callback for download progress UI.
+//!   [`BundleRepo::cache_size`] / [`BundleRepo::clear_cache`] for
+//!   on-disk usage queries + cleanup.
 //! - [`EngineConfig`] + [`BackendPreference`] — load-time config.
 //! - [`ModelMetadata`] + [`ModalityCapabilities`] — model-level info.
 //!
@@ -461,6 +463,34 @@ impl BundleRepo {
     /// useful for log / telemetry.
     pub fn store_dir(&self) -> String {
         self.inner.store_dir().to_string_lossy().into_owned()
+    }
+
+    /// Total bytes currently held in the cache. Returns `0` if the
+    /// `store_dir` doesn't exist yet (no downloads have run).
+    /// O(n) over the cache contents; for a multi-GB cache it's a
+    /// real walk, not a constant-time query — UIs surfacing the
+    /// value should run it off the main thread (e.g. via
+    /// `withContext(Dispatchers.IO)` on Kotlin or
+    /// `Task.detached` on Swift).
+    ///
+    /// Mobile apps use this to drive a "Storage: X MB used" line in
+    /// settings or to gate a "Clear cache" button on actual
+    /// non-zero usage.
+    pub fn cache_size(&self) -> Result<u64, FfiError> {
+        Ok(self.inner.cache_size()?)
+    }
+
+    /// Wipe every file the repo has cached, leaving `store_dir`
+    /// itself in place so subsequent downloads land in the same
+    /// path. Idempotent — calling on an empty repo or non-existent
+    /// `store_dir` is a no-op success.
+    ///
+    /// Mobile apps trigger this from a "Clear downloaded models"
+    /// settings action. Caller is responsible for serializing
+    /// against in-flight downloads — typically trivial since the
+    /// action is user-driven.
+    pub fn clear_cache(&self) -> Result<(), FfiError> {
+        Ok(self.inner.clear_cache()?)
     }
 }
 
@@ -1512,6 +1542,38 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
         path
+    }
+
+    /// `cache_size` round-trips through the FFI wrapper. Builds a
+    /// small synthetic cache, verifies the FFI method returns the
+    /// same byte count as the wick-core method (which has its own
+    /// unit-test coverage in `wick/src/bundle/mod.rs`).
+    #[test]
+    fn bundle_repo_cache_size_forwards_to_wick_core() {
+        use std::fs;
+        let dir = unique_test_bundle_dir("size");
+        fs::create_dir_all(dir.join("huggingface.co/test")).unwrap();
+        fs::write(dir.join("huggingface.co/test/file"), vec![0u8; 2048]).unwrap();
+        let repo = BundleRepo::new(dir.to_string_lossy().into_owned());
+        assert_eq!(repo.cache_size().unwrap(), 2048);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `clear_cache` round-trips through the FFI wrapper. After the
+    /// clear, `cache_size` reports 0 and `store_dir` still exists
+    /// (subsequent downloads can land there).
+    #[test]
+    fn bundle_repo_clear_cache_wipes_files_via_ffi() {
+        use std::fs;
+        let dir = unique_test_bundle_dir("clear");
+        fs::create_dir_all(dir.join("huggingface.co/test")).unwrap();
+        fs::write(dir.join("huggingface.co/test/file"), vec![0u8; 512]).unwrap();
+        let repo = BundleRepo::new(dir.to_string_lossy().into_owned());
+        assert_eq!(repo.cache_size().unwrap(), 512);
+        repo.clear_cache().unwrap();
+        assert!(dir.exists(), "store_dir must survive clear_cache");
+        assert_eq!(repo.cache_size().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `BundleRepo::new` wraps a `wick::bundle::BundleRepo` without

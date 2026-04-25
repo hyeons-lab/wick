@@ -80,6 +80,18 @@ let configWithRepo = EngineConfig(contextSize: 0, backend: .cpu, bundleRepo: rep
 guard configWithRepo.bundleRepo != nil else { fail("EngineConfig.bundleRepo attach") }
 print("OK: BundleRepo + EngineConfig.bundleRepo attach")
 
+// 3b'. BundleRepo cache management (PR 14). cacheSize on a fresh
+// repo (no downloads yet) is 0; clearCache on the same is a no-op
+// success. Both methods round-trip through the FFI to wick-core.
+guard try repo.cacheSize() == 0 else {
+    fail("BundleRepo.cacheSize on fresh repo must be 0")
+}
+try repo.clearCache()
+guard try repo.cacheSize() == 0 else {
+    fail("BundleRepo.cacheSize after clearCache must remain 0")
+}
+print("OK: BundleRepo.cacheSize + clearCache (no downloads, no-op)")
+
 // 3c. BundleRepo.withProgress + DownloadProgressSink foreign trait
 // (PR 12). We don't trigger an actual download (would need network
 // + a real bundle), but constructing the repo + attaching the sink
