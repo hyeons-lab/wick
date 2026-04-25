@@ -130,7 +130,12 @@ jobs:
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wick-wasm npm package
-        run: wasm-pack build wick-wasm --target bundler --release
+        # `--scope hyeonslab` matches the package name advertised in
+        # wick-wasm/README.md (`@hyeonslab/wick-wasm`); without it
+        # the generated `package.json.name` would be a bare
+        # `wick-wasm` and downstream consumers would see two names
+        # for the same artifact.
+        run: wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
       - name: Report .wasm size
         run: |
           {

@@ -23,10 +23,12 @@ npm install /path/to/downloaded/pkg
 
 ## Usage
 
-```js
-import init, { wickVersion, Manifest } from '@hyeonslab/wick-wasm';
+This package is built with `wasm-pack --target bundler`, so the
+`.wasm` is loaded automatically by your bundler (webpack 5+, Vite,
+Rollup with `@rollup/plugin-wasm`). No manual `init()` call.
 
-await init();  // loads the .wasm
+```js
+import { wickVersion, Manifest } from '@hyeonslab/wick-wasm';
 
 console.log(wickVersion());  // e.g. "0.1.0"
 
@@ -39,9 +41,14 @@ console.log(manifest.modelUrl);        // "https://.../model.gguf"
 console.log(manifest.schemaVersion);   // "1.0.0"
 ```
 
-Required init pattern is bundler-specific; see the
-[`wasm-pack` book](https://rustwasm.github.io/docs/wasm-pack/)
-for webpack / Vite / Rollup loaders.
+Bundlers without native wasm support need a loader plugin; see the
+[`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
+for webpack / Rollup / Parcel specifics.
+
+If you need a no-bundler workflow (`<script type="module">` directly
+in the browser, or a Node script using `import`), wait for the
+follow-up `--target web` / `--target nodejs` builds — they'll ship as
+sibling packages.
 
 ## Building from source
 

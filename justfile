@@ -218,6 +218,11 @@ swift-smoke:
 # wasm-pack targets (`web`, `nodejs`) are trivial to add as additional
 # recipes once concrete consumers ask for them.
 #
+# `--scope hyeonslab` makes the generated `package.json.name`
+# `@hyeonslab/wick-wasm` so a published artifact lands under the
+# right npm scope. The publish workflow itself is a follow-up PR;
+# this just locks the name.
+#
 # Requires:
 #   - `wasm-pack`            (`cargo install wasm-pack`)
 #   - `wasm-opt` on PATH     (macOS: `brew install binaryen`,
@@ -229,7 +234,7 @@ swift-smoke:
 # `[package.metadata.wasm-pack.profile.release]` so this recipe and the
 # CI `wick-wasm-pack` job produce byte-identical output.
 wasm:
-    wasm-pack build wick-wasm --target bundler --release
+    wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
     @echo "--- wick-wasm/pkg/ ---"
     @ls -lh wick-wasm/pkg/
 
