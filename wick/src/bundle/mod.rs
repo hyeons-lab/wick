@@ -149,9 +149,10 @@ impl BundleRepo {
     /// query — the OS doesn't track per-directory totals. Callers
     /// surfacing the value in a UI should run it off the main thread.
     pub fn cache_size(&self) -> Result<u64, WickError> {
-        if !self.store_dir.exists() {
-            return Ok(0);
-        }
+        // No `exists()` pre-check — `walk_dir_size` already maps a
+        // missing root to `Ok(())` via `read_dir`'s `NotFound` arm,
+        // which leaves `total` at zero. Skipping the extra syscall
+        // also closes the same TOCTOU we close in `clear_cache`.
         let mut total = 0u64;
         Self::walk_dir_size(&self.store_dir, &mut total)?;
         Ok(total)
