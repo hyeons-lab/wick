@@ -125,6 +125,114 @@ jobs:
             exit 1
           fi
 
+  android-abis:
+    # Cross-compiles `wick-ffi` to every Android ABI supported by the
+    # Android NDK (arm64-v8a, armeabi-v7a, x86_64, x86). Verifies each
+    # `.so` is a valid ELF of the right architecture and uploads the
+    # release libraries as a CI artifact so consumers can grab a
+    # Jetpack-friendly `jniLibs/` layout from the action run without
+    # running the toolchain themselves.
+    #
+    # Matrix entry per ABI keeps the six-ish-minute cross-compile from
+    # being the critical path on a green CI run: all four run in
+    # parallel. Release profile mirrors the size target
+    # (~2.5 MB/.so vs ~75 MB for debug with embedded debuginfo).
+    name: Android ABI (${{ matrix.abi }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            rust_target: aarch64-linux-android
+          - abi: armeabi-v7a
+            rust_target: armv7-linux-androideabi
+          - abi: x86_64
+            rust_target: x86_64-linux-android
+          - abi: x86
+            rust_target: i686-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+      # Install NDK. Pin to r27c — a validated stable release the
+      # workspace builds against cleanly. Bumping is a one-line change:
+      # update this version string (and the matching note in
+      # wick-ffi/README.md) and re-run CI to confirm every ABI still
+      # builds. The `cargo ndk` flag shape is compatible across recent
+      # NDK majors so the pin is about toolchain + sysroot stability
+      # across runs, not a hard constraint.
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+      - name: Install cargo-ndk
+        # Pin to 4.x major — cargo-ndk 4.0 changed the flag shape
+        # (`--target <abi>` is the current form; earlier releases
+        # used `--platform` + `--arch`). Let cargo pick the latest
+        # 4.x patch so security-fix releases get picked up.
+        run: cargo install cargo-ndk --version '^4' --locked
+      - name: Cross-compile wick-ffi
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk --target ${{ matrix.abi }} build -p wick-ffi --release
+      - name: Verify ELF shape
+        # Catches a regression where `cargo build` succeeds but the
+        # cdylib rule silently produces a host-arch binary. Assert
+        # via `readelf -h`'s `Class:` + `Machine:` fields — those are
+        # machine-readable ELF header values that don't drift across
+        # distro versions the way `file(1)`'s human-readable string
+        # does. `file` is kept for diagnostic output only.
+        #
+        # Catch-all `*)` arm is deliberate: if someone extends the
+        # matrix with a new ABI and forgets to add an assertion
+        # branch, this step fails loudly instead of silently
+        # passing. Same pattern as exhaustive `match` on a Rust enum.
+        run: |
+          SO=target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          ls -la "$SO"
+          file "$SO"
+          HEADER=$(readelf -h "$SO")
+          printf '%s\n' "$HEADER"
+          case "${{ matrix.abi }}" in
+            arm64-v8a)
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Class:[[:space:]]*ELF64$'
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Machine:[[:space:]]*AArch64$'
+              ;;
+            armeabi-v7a)
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Class:[[:space:]]*ELF32$'
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Machine:[[:space:]]*ARM$'
+              ;;
+            x86_64)
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Class:[[:space:]]*ELF64$'
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Machine:[[:space:]]*Advanced Micro Devices X86-64$'
+              ;;
+            x86)
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Class:[[:space:]]*ELF32$'
+              printf '%s\n' "$HEADER" | grep -Eq '^[[:space:]]*Machine:[[:space:]]*Intel 80386$'
+              ;;
+            *)
+              echo "::error::Unexpected ABI for ELF verification: ${{ matrix.abi }} — extend the case branch above." >&2
+              exit 1
+              ;;
+          esac
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wick-ffi-android-${{ matrix.abi }}
+          path: target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          # Per-run artifact; 7-day retention is enough to copy into
+          # a consumer app's `src/main/jniLibs/<abi>/` for testing
+          # without keeping stale binaries around.
+          retention-days: 7
+
   integration-test:
     name: Integration Tests (gated)
     needs: check

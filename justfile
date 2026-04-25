@@ -89,6 +89,37 @@ bindings-check: bindings
         exit 1; \
     fi
 
+# Cross-compile `wick-ffi` as a `.so` for every Android ABI supported
+# by the Android NDK: arm64-v8a (modern devices), armeabi-v7a (older),
+# x86_64 (emulator on Intel hosts), x86 (emulator on legacy Intel hosts).
+# Produces `target/<triple>/release/libwick_ffi.so` per ABI.
+#
+# Requires `cargo-ndk` v4.x (`cargo install cargo-ndk --version '^4'
+# --locked` — pin the major because 4.0 changed the flag shape to
+# `--target <abi>`; earlier releases used `--arch` / `--platform`
+# and would fail against the recipes below) and the Rust targets:
+# `rustup target add aarch64-linux-android armv7-linux-androideabi
+# x86_64-linux-android i686-linux-android`. The NDK itself comes from
+# Android Studio (ndk/<version>/) or `sdkmanager --install ndk`.
+# `ANDROID_NDK_HOME` must point at the NDK root; CI sets it via the
+# `nttld/setup-ndk` action.
+#
+# Release profile for the size drop — debug builds are ~75 MB per .so
+# due to embedded debuginfo, release is ~2.5 MB with LTO + strip.
+android-all:
+    cargo ndk \
+        --target arm64-v8a \
+        --target armeabi-v7a \
+        --target x86_64 \
+        --target x86 \
+        build -p wick-ffi --release
+
+# Single-ABI variant — useful when iterating on one device architecture
+# and you don't need to rebuild all four every cycle. Picks arm64-v8a
+# as the default since it's what real Android phones ship with today.
+android-arm64:
+    cargo ndk --target arm64-v8a build -p wick-ffi --release
+
 # Clean build artifacts
 clean:
     cargo clean
