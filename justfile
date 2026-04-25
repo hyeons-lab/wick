@@ -207,6 +207,37 @@ swift-smoke:
         -o target/wick-swift-smoke
     target/wick-swift-smoke
 
+# Build the `wick-wasm` npm-shaped package via `wasm-pack`.
+#
+# Wraps `cargo build --target wasm32-unknown-unknown` + `wasm-bindgen-cli`
+# + `wasm-opt -O3` and writes the output to `wick-wasm/pkg/` (gitignored).
+# The result includes `package.json`, `wick_wasm.js`, `wick_wasm.d.ts`,
+# `wick_wasm_bg.wasm`, and the README — drop-in for `npm install ./pkg`.
+#
+# Target is `bundler` (webpack / Vite / Rollup-friendly ESM). Other
+# wasm-pack targets (`web`, `nodejs`) are trivial to add as additional
+# recipes once concrete consumers ask for them.
+#
+# `--scope hyeonslab` makes the generated `package.json.name`
+# `@hyeonslab/wick-wasm` so a published artifact lands under the
+# right npm scope. The publish workflow itself is a follow-up PR;
+# this just locks the name.
+#
+# Requires:
+#   - `wasm-pack`            (`cargo install wasm-pack`)
+#   - `wasm-opt` on PATH     (macOS: `brew install binaryen`,
+#                             linux: `apt-get install -y binaryen`)
+#   - `wasm32-unknown-unknown` rustup target
+#     (`rustup target add wasm32-unknown-unknown`)
+#
+# wasm-opt flags are pinned in `wick-wasm/Cargo.toml` under
+# `[package.metadata.wasm-pack.profile.release]` so this recipe and the
+# CI `wick-wasm-pack` job produce byte-identical output.
+wasm:
+    wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
+    @echo "--- wick-wasm/pkg/ ---"
+    @ls -lh wick-wasm/pkg/
+
 # Clean build artifacts
 clean:
     cargo clean

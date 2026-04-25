@@ -95,19 +95,28 @@ jobs:
       - name: Check wasm32 compile
         run: cargo check -p wick ${{ matrix.features }} --target wasm32-unknown-unknown
 
-  wick-wasm-build:
-    # Phase 3 PR 2 introduced the `wick-wasm` cdylib (browser/Node
-    # wasm-bindgen wrapper). Unlike the `wasm-build` job above which
-    # only `cargo check`s `wick` core, this job runs `cargo build`
-    # against the wrapper so the cdylib actually links — that's the
-    # artifact `wasm-bindgen-cli` post-processes downstream, and a
-    # check-only signal would let a broken link slip through. No
-    # matrix: `wick-wasm` consumes `wick` with
-    # `default-features = false` and has one viable build today.
-    name: Wick-Wasm Build
+  wick-wasm-pack:
+    # Phase 3 PR 3 — full npm-shaped artifact for `wick-wasm`.
+    # Replaces the earlier `wick-wasm-build` (`cargo build`-only) job:
+    # `wasm-pack build` runs cargo build internally plus the
+    # wasm-bindgen-cli post-processing and wasm-opt size pass that turn
+    # the raw cdylib into a `pkg/` an npm consumer can install. The
+    # `cargo build` regression check is preserved as a side-effect of
+    # the wasm-pack pipeline.
+    #
+    # `--target bundler`: ESM output for webpack / Vite / Rollup — the
+    # most common consumer shape. `--target web` and `--target nodejs`
+    # are trivial follow-up matrix entries; deferred until a concrete
+    # consumer asks.
+    #
+    # The `pkg/` directory is uploaded as a CI artifact so reviewers
+    # and downstream developers can `npm install ./pkg` directly from
+    # the workflow run — bridges the "PR landed, not yet on npm" gap
+    # before the publish workflow lands (Phase 3.x).
+    name: Wick-Wasm Pack
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
@@ -115,8 +124,32 @@ jobs:
           toolchain: nightly-2026-04-02
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Build wick-wasm cdylib
-        run: cargo build -p wick-wasm --target wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'v0.13.1'
+      - name: Install binaryen (provides wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Build wick-wasm npm package
+        # `--scope hyeonslab` matches the package name advertised in
+        # wick-wasm/README.md (`@hyeonslab/wick-wasm`); without it
+        # the generated `package.json.name` would be a bare
+        # `wick-wasm` and downstream consumers would see two names
+        # for the same artifact.
+        run: wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
+      - name: Report .wasm size
+        run: |
+          {
+            echo "## Wick-Wasm Pack output"
+            echo '```'
+            ls -lh wick-wasm/pkg/
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wick-wasm-pkg
+          path: wick-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 30
 
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under

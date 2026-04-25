@@ -33,3 +33,31 @@ anyhow.workspace = true
 # docs. Pin docs.rs to wasm32 so the wrapper surface actually
 # renders.
 targets = ["wasm32-unknown-unknown"]
+
+# wasm-pack profile config (consumed by `wasm-pack build --release`).
+#
+# `-O3` over `-Oz`: this is an inference engine, hot-loop perf matters
+# more than minimum download size, and `-Oz` can cost ~5% on tight
+# numerical loops. `-O3` still cuts the binary ~50% from the LTO-only
+# baseline.
+#
+# Feature flags enable wasm proposals that modern wasm-bindgen +
+# rustc emit by default:
+#   - `--enable-sign-ext`           — i32/i64 sign-extension ops
+#   - `--enable-bulk-memory`        — `memory.copy` / `memory.fill`
+#   - `--enable-mutable-globals`    — required by `getrandom/js`
+#   - `--enable-nontrapping-float-to-int` — saturating float→int
+#   - `--enable-reference-types`    — `externref` (used by JS interop)
+# All five are universally supported in browsers + Node since
+# late-2020 builds; without them, wasm-opt refuses the wasm-bindgen
+# input as "non-MVP". Pin them here so local + CI builds stay in
+# sync.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-O3',
+    '--enable-sign-ext',
+    '--enable-bulk-memory',
+    '--enable-mutable-globals',
+    '--enable-nontrapping-float-to-int',
+    '--enable-reference-types',
+]
