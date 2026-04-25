@@ -866,11 +866,27 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_method_session_reset(): Short
 
+    external fun uniffi_wick_ffi_checksum_method_wickengine_apply_chat_template(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_bos_token(): Short
+
     external fun uniffi_wick_ffi_checksum_method_wickengine_capabilities(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_decode_tokens(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_encode_text(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_eos_token(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_has_chat_template(): Short
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_metadata(): Short
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_new_session(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_special_token_id(): Short
+
+    external fun uniffi_wick_ffi_checksum_method_wickengine_vocab_size(): Short
 
     external fun uniffi_wick_ffi_checksum_constructor_bundlerepo_new(): Short
 
@@ -1071,10 +1087,44 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
+    external fun uniffi_wick_ffi_fn_method_wickengine_apply_chat_template(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        `addGenerationPrompt`: Byte,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_bos_token(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_wick_ffi_fn_method_wickengine_capabilities(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_decode_tokens(
+        `ptr`: Long,
+        `tokens`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_encode_text(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_eos_token(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
 
     external fun uniffi_wick_ffi_fn_method_wickengine_metadata(
         `ptr`: Long,
@@ -1086,6 +1136,17 @@ internal object UniffiLib {
         `config`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_special_token_id(
+        `ptr`: Long,
+        `name`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_vocab_size(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
 
     external fun uniffi_wick_ffi_fn_func_wick_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
@@ -1351,13 +1412,37 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wick_ffi_checksum_method_session_reset() != 57393.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_apply_chat_template() != 14291.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_bos_token() != 61480.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_encode_text() != 50577.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_eos_token() != 14438.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_has_chat_template() != 54268.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_metadata() != 60987.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_new_session() != 61697.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566.toShort()) {
@@ -3646,10 +3731,63 @@ public object FfiConverterTypeSession : FfiConverter<Session, Long> {
  */
 public interface WickEngineInterface {
     /**
+     * Render the model's chat template against a sequence of
+     * `ChatMessage`s. `add_generation_prompt = true` appends the
+     * model's "now it's the assistant's turn" suffix (typical when
+     * driving an interactive chat); `false` produces a transcript
+     * the model can keep continuing.
+     *
+     * Returns [`FfiError::Backend`] if the model has no chat
+     * template (check [`WickEngine::has_chat_template`] first) or
+     * if the template fails to render against the supplied messages.
+     */
+    fun `applyChatTemplate`(
+        `messages`: List<ChatMessage>,
+        `addGenerationPrompt`: kotlin.Boolean,
+    ): kotlin.String
+
+    /**
+     * Beginning-of-sequence token ID, if the model has one.
+     * LLaMA-family models typically do; some don't. Honor
+     * [`ModelMetadata::add_bos_token`] when deciding whether to
+     * prepend it manually to a prompt.
+     */
+    fun `bosToken`(): kotlin.UInt?
+
+    /**
      * What this model accepts as input / emits as output. Derived at
      * load time from the manifest's `inference_type`.
      */
     fun `capabilities`(): ModalityCapabilities
+
+    /**
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
+     */
+    fun `decodeTokens`(`tokens`: List<kotlin.UInt>): kotlin.String
+
+    /**
+     * Encode `text` into token IDs using the model's BPE tokenizer.
+     * Empty input returns an empty vec.
+     */
+    fun `encodeText`(`text`: kotlin.String): List<kotlin.UInt>
+
+    /**
+     * End-of-sequence / end-of-text token ID, if the model has one.
+     * Used as a default stop-token by the sampler; callers can also
+     * pass it explicitly in [`GenerateOpts::stop_tokens`].
+     */
+    fun `eosToken`(): kotlin.UInt?
+
+    /**
+     * `true` if the model's tokenizer carries a chat template (a
+     * minijinja string from GGUF metadata). Foreign callers should
+     * check this before calling [`WickEngine::apply_chat_template`].
+     */
+    fun `hasChatTemplate`(): kotlin.Boolean
 
     /**
      * Short summary of the loaded model (architecture, vocab size,
@@ -3664,6 +3802,22 @@ public interface WickEngineInterface {
      * out. Cheap — no model load, just config + state allocation.
      */
     fun `newSession`(`config`: SessionConfig): Session
+
+    /**
+     * Look up a special token by name (e.g. `<|im_start|>`,
+     * `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
+     * isn't defined in the tokenizer's vocab.
+     */
+    fun `specialTokenId`(`name`: kotlin.String): kotlin.UInt?
+
+    /**
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
+     */
+    fun `vocabSize`(): kotlin.UInt
 
     companion object
 }
@@ -3773,6 +3927,53 @@ open class WickEngine :
     }
 
     /**
+     * Render the model's chat template against a sequence of
+     * `ChatMessage`s. `add_generation_prompt = true` appends the
+     * model's "now it's the assistant's turn" suffix (typical when
+     * driving an interactive chat); `false` produces a transcript
+     * the model can keep continuing.
+     *
+     * Returns [`FfiError::Backend`] if the model has no chat
+     * template (check [`WickEngine::has_chat_template`] first) or
+     * if the template fails to render against the supplied messages.
+     */
+    @Throws(FfiException::class)
+    override fun `applyChatTemplate`(
+        `messages`: List<ChatMessage>,
+        `addGenerationPrompt`: kotlin.Boolean,
+    ): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_apply_chat_template(
+                        it,
+                        FfiConverterSequenceTypeChatMessage.lower(`messages`),
+                        FfiConverterBoolean.lower(`addGenerationPrompt`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Beginning-of-sequence token ID, if the model has one.
+     * LLaMA-family models typically do; some don't. Honor
+     * [`ModelMetadata::add_bos_token`] when deciding whether to
+     * prepend it manually to a prompt.
+     */
+    override fun `bosToken`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_bos_token(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * What this model accepts as input / emits as output. Derived at
      * load time from the manifest's `inference_type`.
      */
@@ -3781,6 +3982,77 @@ open class WickEngine :
             callWithHandle {
                 uniffiRustCall { _status ->
                     UniffiLib.uniffi_wick_ffi_fn_method_wickengine_capabilities(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
+     */
+    override fun `decodeTokens`(`tokens`: List<kotlin.UInt>): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_decode_tokens(
+                        it,
+                        FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Encode `text` into token IDs using the model's BPE tokenizer.
+     * Empty input returns an empty vec.
+     */
+    override fun `encodeText`(`text`: kotlin.String): List<kotlin.UInt> =
+        FfiConverterSequenceUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_encode_text(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * End-of-sequence / end-of-text token ID, if the model has one.
+     * Used as a default stop-token by the sampler; callers can also
+     * pass it explicitly in [`GenerateOpts::stop_tokens`].
+     */
+    override fun `eosToken`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_eos_token(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * `true` if the model's tokenizer carries a chat template (a
+     * minijinja string from GGUF metadata). Foreign callers should
+     * check this before calling [`WickEngine::apply_chat_template`].
+     */
+    override fun `hasChatTemplate`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
                         it,
                         _status,
                     )
@@ -3817,6 +4089,43 @@ open class WickEngine :
                     UniffiLib.uniffi_wick_ffi_fn_method_wickengine_new_session(
                         it,
                         FfiConverterTypeSessionConfig.lower(`config`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Look up a special token by name (e.g. `<|im_start|>`,
+     * `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
+     * isn't defined in the tokenizer's vocab.
+     */
+    override fun `specialTokenId`(`name`: kotlin.String): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_special_token_id(
+                        it,
+                        FfiConverterString.lower(`name`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
+     */
+    override fun `vocabSize`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_vocab_size(
+                        it,
                         _status,
                     )
                 }
@@ -3955,6 +4264,54 @@ public object FfiConverterTypeWickEngine : FfiConverter<WickEngine, Long> {
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
+    }
+}
+
+/**
+ * One message in a chat-template conversation. Mirrors
+ * [`wick::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
+ * [`WickEngine::apply_chat_template`] to render the model's
+ * chat-template (Jinja2 from GGUF metadata) into a prompt string
+ * ready to feed into [`Session::append_text`].
+ *
+ * `role` follows the OpenAI / chat-template convention — typically
+ * one of `"system"`, `"user"`, `"assistant"`, occasionally
+ * `"tool"`. wick-ffi doesn't validate the role string; whatever is
+ * passed flows directly into the Jinja template. Whether an
+ * unknown role errors or silently no-ops depends on the template's
+ * own logic — many templates have an explicit error path for
+ * unrecognized roles, but it's template-dependent rather than
+ * enforced by [`WickEngine::apply_chat_template`].
+ */
+data class ChatMessage(
+    var `role`: kotlin.String,
+    var `content`: kotlin.String,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeChatMessage : FfiConverterRustBuffer<ChatMessage> {
+    override fun read(buf: ByteBuffer): ChatMessage =
+        ChatMessage(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+
+    override fun allocationSize(value: ChatMessage) =
+        (
+            FfiConverterString.allocationSize(value.`role`) +
+                FfiConverterString.allocationSize(value.`content`)
+        )
+
+    override fun write(
+        value: ChatMessage,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`role`, buf)
+        FfiConverterString.write(value.`content`, buf)
     }
 }
 
@@ -5067,6 +5424,34 @@ public object FfiConverterSequenceFloat : FfiConverterRustBuffer<List<kotlin.Flo
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterFloat.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeChatMessage : FfiConverterRustBuffer<List<ChatMessage>> {
+    override fun read(buf: ByteBuffer): List<ChatMessage> {
+        val len = buf.getInt()
+        return List<ChatMessage>(len) {
+            FfiConverterTypeChatMessage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ChatMessage>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeChatMessage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<ChatMessage>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeChatMessage.write(it, buf)
         }
     }
 }

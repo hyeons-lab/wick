@@ -6,14 +6,17 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Download progress.** Through PRs 2–11 `wick-ffi` built up a typed
-foreign-language surface, the Android ABI + Apple XCFramework
-distribution pipelines, and remote model loading via `BundleRepo` +
-`from_bundle_id` / `from_bundle_id_async`. PR 12 closes the missing
-piece for mobile UX: a `DownloadProgressSink` foreign-trait callback
-attached at `BundleRepo::with_progress` construction, fired during
-cache-miss downloads at ~256 KB granularity plus a final 100% event.
-Drives a real progress bar in a Kotlin / Swift app without polling.
+**Tokenizer + chat templates.** Through PRs 2–12 `wick-ffi` built up
+a typed foreign-language surface, the Android ABI + Apple XCFramework
+distribution pipelines, runtime model loading via `BundleRepo` +
+`from_bundle_id[_async]`, and download-progress callbacks via
+`DownloadProgressSink`. PR 13 exposes the model's tokenizer +
+chat-template renderer to foreign callers: `WickEngine::encode_text` /
+`decode_tokens` for raw tokenization, `apply_chat_template` against
+a `Vec<ChatMessage>` to produce a prompt string ready for
+`Session::append_text`. Closes the gap where consumers building a
+chat UI had to either round-trip text through `append_text` (losing
+token-level visibility) or implement their own tokenizer.
 
 | PR | Scope |
 |---|---|
@@ -29,7 +32,8 @@ Drives a real progress bar in a Kotlin / Swift app without polling.
 | 10 | `BundleRepo` remote loading (`remote` feature) + `WickEngine::from_bundle_id` |
 | 11 | `WickEngine::from_bundle_id_async` via `spawn_blocking` + `AbortOnDrop` |
 | 12 | `DownloadProgressSink` foreign-trait callback + `BundleRepo::with_progress` |
-| 13+ | Parity harness, Maven publishing |
+| 13 | Tokenizer + chat-template surface on `WickEngine` (encode/decode, `ChatMessage`, `apply_chat_template`) |
+| 14+ | Parity harness, Maven publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -547,6 +551,107 @@ conformance across reference-type fields.
 
 Kotlin isn't affected (`data class` equality compiles against any
 field type, using reference-equality for object fields automatically).
+
+## Tokenizer + chat templates
+
+`WickEngine` exposes the model's BPE tokenizer + chat-template
+renderer so foreign callers can tokenize / detokenize / format
+messages without going through `Session::append_text`. Useful for:
+
+- Pre-counting prompt tokens before deciding whether to start a
+  session (context budgeting).
+- Manual prompt construction with explicit special tokens.
+- Decoding token IDs streamed back from `generate` when driving an
+  incremental UI (`generateStreaming` already returns text chunks
+  via `ModalitySink::on_text_tokens`, but consumers building a
+  per-token UI can decode IDs directly).
+- Rendering a chat template against a list of `ChatMessage`s to
+  produce the prompt string for `Session::append_text`.
+
+### Surface
+
+| Method | Purpose |
+|---|---|
+| `engine.encodeText(text)` → `Vec<u32>` | Tokenize a string. |
+| `engine.decodeTokens(tokens)` → `String` | Detokenize. |
+| `engine.vocabSize()` → `u32` | Total vocab size. |
+| `engine.bosToken()` / `engine.eosToken()` → `u32?` | Special tokens. |
+| `engine.specialTokenId(name)` → `u32?` | Lookup by name. |
+| `engine.hasChatTemplate()` → `Bool` | Check before render. |
+| `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
+
+### Kotlin example
+
+```kotlin
+val engine = WickEngine.fromPath("...", config)
+
+// Pre-count prompt tokens.
+val prompt = "Hello, world!"
+val tokens = engine.encodeText(prompt)
+println("prompt is ${tokens.size} tokens")
+
+// Render a chat template.
+if (engine.hasChatTemplate()) {
+    val rendered = engine.applyChatTemplate(
+        messages = listOf(
+            ChatMessage(role = "system", content = "You are helpful."),
+            ChatMessage(role = "user", content = "Hi!"),
+        ),
+        addGenerationPrompt = true,
+    )
+    val session = engine.newSession(SessionConfig.default())
+    session.appendText(rendered)
+    val out = session.generate(GenerateOpts.default())
+    val replyText = engine.decodeTokens(out.tokens)
+    println("Assistant: $replyText")
+}
+```
+
+### Swift example
+
+```swift
+let engine = try WickEngine.fromPath(path: "...", config: config)
+
+let tokens = engine.encodeText(text: "Hello, world!")
+print("prompt is \(tokens.count) tokens")
+
+if engine.hasChatTemplate() {
+    let rendered = try engine.applyChatTemplate(
+        messages: [
+            ChatMessage(role: "system", content: "You are helpful."),
+            ChatMessage(role: "user", content: "Hi!"),
+        ],
+        addGenerationPrompt: true
+    )
+    let session = engine.newSession(config: SessionConfig.default())
+    try session.appendText(text: rendered)
+    let out = try session.generate(opts: GenerateOpts.default())
+    let replyText = engine.decodeTokens(tokens: out.tokens)
+    print("Assistant: \(replyText)")
+}
+```
+
+### Notes
+
+- Tokenizer methods are read-only — safe to call concurrently with
+  `generate*` on a `Session` opened from the same engine.
+- Empty input to `encodeText` returns an empty vec.
+- Out-of-vocab token IDs in `decodeTokens` are silently skipped
+  (omitted from the decoded output) — `BpeTokenizer::decode` only
+  appends bytes for IDs it has in its vocab. No substitution glyph,
+  no error. Validate against `vocabSize()` first if you need to
+  detect invalid IDs.
+- `applyChatTemplate` returns `FfiError::Backend` if the model has
+  no chat template (check `hasChatTemplate()` first) or if the
+  template's Jinja2 render fails against the supplied messages.
+- The `ChatMessage` `role` set depends on the model's template —
+  typically `"system"`, `"user"`, `"assistant"`, occasionally
+  `"tool"` for function-calling. wick-ffi doesn't validate the role
+  string; whatever you pass flows directly into the Jinja template.
+  Whether an unknown role errors or silently no-ops is up to the
+  template's own logic — many templates have an explicit error
+  path for unrecognized roles, but it's template-dependent rather
+  than enforced by `applyChatTemplate`.
 
 ## Design notes
 

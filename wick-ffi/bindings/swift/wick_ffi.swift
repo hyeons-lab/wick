@@ -1819,10 +1819,60 @@ public func FfiConverterTypeSession_lower(_ value: Session) -> UInt64 {
 public protocol WickEngineProtocol: AnyObject, Sendable {
     
     /**
+     * Render the model's chat template against a sequence of
+     * `ChatMessage`s. `add_generation_prompt = true` appends the
+     * model's "now it's the assistant's turn" suffix (typical when
+     * driving an interactive chat); `false` produces a transcript
+     * the model can keep continuing.
+     *
+     * Returns [`FfiError::Backend`] if the model has no chat
+     * template (check [`WickEngine::has_chat_template`] first) or
+     * if the template fails to render against the supplied messages.
+     */
+    func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool) throws  -> String
+    
+    /**
+     * Beginning-of-sequence token ID, if the model has one.
+     * LLaMA-family models typically do; some don't. Honor
+     * [`ModelMetadata::add_bos_token`] when deciding whether to
+     * prepend it manually to a prompt.
+     */
+    func bosToken()  -> UInt32?
+    
+    /**
      * What this model accepts as input / emits as output. Derived at
      * load time from the manifest's `inference_type`.
      */
     func capabilities()  -> ModalityCapabilities
+    
+    /**
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
+     */
+    func decodeTokens(tokens: [UInt32])  -> String
+    
+    /**
+     * Encode `text` into token IDs using the model's BPE tokenizer.
+     * Empty input returns an empty vec.
+     */
+    func encodeText(text: String)  -> [UInt32]
+    
+    /**
+     * End-of-sequence / end-of-text token ID, if the model has one.
+     * Used as a default stop-token by the sampler; callers can also
+     * pass it explicitly in [`GenerateOpts::stop_tokens`].
+     */
+    func eosToken()  -> UInt32?
+    
+    /**
+     * `true` if the model's tokenizer carries a chat template (a
+     * minijinja string from GGUF metadata). Foreign callers should
+     * check this before calling [`WickEngine::apply_chat_template`].
+     */
+    func hasChatTemplate()  -> Bool
     
     /**
      * Short summary of the loaded model (architecture, vocab size,
@@ -1837,6 +1887,22 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
      * out. Cheap — no model load, just config + state allocation.
      */
     func newSession(config: SessionConfig)  -> Session
+    
+    /**
+     * Look up a special token by name (e.g. `<|im_start|>`,
+     * `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
+     * isn't defined in the tokenizer's vocab.
+     */
+    func specialTokenId(name: String)  -> UInt32?
+    
+    /**
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
+     */
+    func vocabSize()  -> UInt32
     
 }
 /**
@@ -1990,12 +2056,102 @@ public static func fromPath(path: String, config: EngineConfig)throws  -> WickEn
 
     
     /**
+     * Render the model's chat template against a sequence of
+     * `ChatMessage`s. `add_generation_prompt = true` appends the
+     * model's "now it's the assistant's turn" suffix (typical when
+     * driving an interactive chat); `false` produces a transcript
+     * the model can keep continuing.
+     *
+     * Returns [`FfiError::Backend`] if the model has no chat
+     * template (check [`WickEngine::has_chat_template`] first) or
+     * if the template fails to render against the supplied messages.
+     */
+open func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_method_wickengine_apply_chat_template(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeChatMessage.lower(messages),
+        FfiConverterBool.lower(addGenerationPrompt),$0
+    )
+})
+}
+    
+    /**
+     * Beginning-of-sequence token ID, if the model has one.
+     * LLaMA-family models typically do; some don't. Honor
+     * [`ModelMetadata::add_bos_token`] when deciding whether to
+     * prepend it manually to a prompt.
+     */
+open func bosToken() -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_bos_token(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * What this model accepts as input / emits as output. Derived at
      * load time from the manifest's `inference_type`.
      */
 open func capabilities() -> ModalityCapabilities  {
     return try!  FfiConverterTypeModalityCapabilities_lift(try! rustCall() {
     uniffi_wick_ffi_fn_method_wickengine_capabilities(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Decode token IDs back to text. Out-of-vocab IDs are silently
+     * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+     * only appends bytes for IDs it has in `vocab.get(id)`. No
+     * substitution glyph, no error. Callers that want to detect
+     * invalid IDs should validate against `vocab_size()` first.
+     */
+open func decodeTokens(tokens: [UInt32]) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_decode_tokens(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
+}
+    
+    /**
+     * Encode `text` into token IDs using the model's BPE tokenizer.
+     * Empty input returns an empty vec.
+     */
+open func encodeText(text: String) -> [UInt32]  {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_encode_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+    /**
+     * End-of-sequence / end-of-text token ID, if the model has one.
+     * Used as a default stop-token by the sampler; callers can also
+     * pass it explicitly in [`GenerateOpts::stop_tokens`].
+     */
+open func eosToken() -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_eos_token(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * `true` if the model's tokenizer carries a chat template (a
+     * minijinja string from GGUF metadata). Foreign callers should
+     * check this before calling [`WickEngine::apply_chat_template`].
+     */
+open func hasChatTemplate() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -2024,6 +2180,35 @@ open func newSession(config: SessionConfig) -> Session  {
     uniffi_wick_ffi_fn_method_wickengine_new_session(
             self.uniffiCloneHandle(),
         FfiConverterTypeSessionConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Look up a special token by name (e.g. `<|im_start|>`,
+     * `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
+     * isn't defined in the tokenizer's vocab.
+     */
+open func specialTokenId(name: String) -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_special_token_id(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * Total vocabulary size — the number of distinct token IDs the
+     * model can emit. Sourced from the model's config (matches
+     * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+     * own count: in healthy models they match, but the model's
+     * config is the authoritative range for valid logit indices.
+     */
+open func vocabSize() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_vocab_size(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -2074,6 +2259,76 @@ public func FfiConverterTypeWickEngine_lower(_ value: WickEngine) -> UInt64 {
 }
 
 
+
+
+/**
+ * One message in a chat-template conversation. Mirrors
+ * [`wick::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
+ * [`WickEngine::apply_chat_template`] to render the model's
+ * chat-template (Jinja2 from GGUF metadata) into a prompt string
+ * ready to feed into [`Session::append_text`].
+ *
+ * `role` follows the OpenAI / chat-template convention — typically
+ * one of `"system"`, `"user"`, `"assistant"`, occasionally
+ * `"tool"`. wick-ffi doesn't validate the role string; whatever is
+ * passed flows directly into the Jinja template. Whether an
+ * unknown role errors or silently no-ops depends on the template's
+ * own logic — many templates have an explicit error path for
+ * unrecognized roles, but it's template-dependent rather than
+ * enforced by [`WickEngine::apply_chat_template`].
+ */
+public struct ChatMessage: Equatable, Hashable {
+    public var role: String
+    public var content: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(role: String, content: String) {
+        self.role = role
+        self.content = content
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ChatMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChatMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChatMessage {
+        return
+            try ChatMessage(
+                role: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChatMessage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.role, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatMessage_lift(_ buf: RustBuffer) throws -> ChatMessage {
+    return try FfiConverterTypeChatMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatMessage_lower(_ value: ChatMessage) -> RustBuffer {
+    return FfiConverterTypeChatMessage.lower(value)
+}
 
 
 /**
@@ -3284,6 +3539,31 @@ fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
+    typealias SwiftType = [ChatMessage]
+
+    public static func write(_ value: [ChatMessage], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeChatMessage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ChatMessage] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ChatMessage]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeChatMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -3407,13 +3687,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_method_session_reset() != 57393) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wick_ffi_checksum_method_wickengine_apply_chat_template() != 14291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_bos_token() != 61480) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_encode_text() != 50577) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_eos_token() != 14438) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_has_chat_template() != 54268) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_metadata() != 60987) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_new_session() != 61697) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_constructor_bundlerepo_new() != 26566) {

@@ -9,11 +9,16 @@
 //! ## Current surface
 //!
 //! Engine-level:
-//! - [`WickEngine`] — model loader and session factory. Constructors:
-//!   [`WickEngine::from_path`] for a local GGUF, manifest, or
-//!   directory; [`WickEngine::from_bundle_id`] for LeapBundles-style
-//!   remote loading; [`WickEngine::from_bundle_id_async`] for the
-//!   tokio-async variant of the same.
+//! - [`WickEngine`] — model loader, session factory, and tokenizer
+//!   accessor. Constructors: [`WickEngine::from_path`] for a local
+//!   GGUF, manifest, or directory; [`WickEngine::from_bundle_id`]
+//!   for LeapBundles-style remote loading;
+//!   [`WickEngine::from_bundle_id_async`] for the tokio-async variant.
+//!   Tokenizer methods ([`WickEngine::encode_text`],
+//!   [`WickEngine::decode_tokens`],
+//!   [`WickEngine::apply_chat_template`]) let foreign callers
+//!   tokenize / detokenize / format messages without `Session`.
+//! - [`ChatMessage`] — input record for `apply_chat_template`.
 //! - [`BundleRepo`] — HTTP model cache; construct once per app and
 //!   attach via [`EngineConfig::bundle_repo`] for remote loading.
 //!   [`BundleRepo::with_progress`] takes a [`DownloadProgressSink`]
@@ -358,6 +363,39 @@ impl From<wick::ModalityCapabilities> for ModalityCapabilities {
 }
 
 // ---------------------------------------------------------------------------
+// ChatMessage (PR 13 — chat template input)
+// ---------------------------------------------------------------------------
+
+/// One message in a chat-template conversation. Mirrors
+/// [`wick::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
+/// [`WickEngine::apply_chat_template`] to render the model's
+/// chat-template (Jinja2 from GGUF metadata) into a prompt string
+/// ready to feed into [`Session::append_text`].
+///
+/// `role` follows the OpenAI / chat-template convention — typically
+/// one of `"system"`, `"user"`, `"assistant"`, occasionally
+/// `"tool"`. wick-ffi doesn't validate the role string; whatever is
+/// passed flows directly into the Jinja template. Whether an
+/// unknown role errors or silently no-ops depends on the template's
+/// own logic — many templates have an explicit error path for
+/// unrecognized roles, but it's template-dependent rather than
+/// enforced by [`WickEngine::apply_chat_template`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl From<ChatMessage> for wick::tokenizer::ChatMessage {
+    fn from(m: ChatMessage) -> Self {
+        wick::tokenizer::ChatMessage {
+            role: m.role,
+            content: m.content,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BundleRepo
 // ---------------------------------------------------------------------------
 
@@ -554,6 +592,98 @@ impl WickEngine {
     /// load time from the manifest's `inference_type`.
     pub fn capabilities(&self) -> ModalityCapabilities {
         self.inner.capabilities().into()
+    }
+
+    // ----- Tokenizer surface (PR 13) ---------------------------------
+    //
+    // Wraps `wick::tokenizer::BpeTokenizer` so foreign callers can
+    // tokenize / detokenize / introspect the model's vocab without
+    // going through `Session::append_text`. Useful for: pre-counting
+    // prompt tokens before deciding to start a session, manual prompt
+    // construction with explicit special tokens, decoding token IDs
+    // returned from `generate` for incremental UI display.
+    //
+    // Tokenizer is shared across all sessions opened from this engine
+    // (via Arc internally), so calling these methods concurrently with
+    // a `generate*` is safe — they only read.
+
+    /// Encode `text` into token IDs using the model's BPE tokenizer.
+    /// Empty input returns an empty vec.
+    pub fn encode_text(&self, text: String) -> Vec<u32> {
+        self.inner.tokenizer().encode(&text)
+    }
+
+    /// Decode token IDs back to text. Out-of-vocab IDs are silently
+    /// skipped (omitted from the decoded output) — `BpeTokenizer::decode`
+    /// only appends bytes for IDs it has in `vocab.get(id)`. No
+    /// substitution glyph, no error. Callers that want to detect
+    /// invalid IDs should validate against `vocab_size()` first.
+    pub fn decode_tokens(&self, tokens: Vec<u32>) -> String {
+        self.inner.tokenizer().decode(&tokens)
+    }
+
+    /// Total vocabulary size — the number of distinct token IDs the
+    /// model can emit. Sourced from the model's config (matches
+    /// [`ModelMetadata::vocab_size`]) rather than the tokenizer's
+    /// own count: in healthy models they match, but the model's
+    /// config is the authoritative range for valid logit indices.
+    pub fn vocab_size(&self) -> u32 {
+        self.inner.metadata().vocab_size
+    }
+
+    /// Beginning-of-sequence token ID, if the model has one.
+    /// LLaMA-family models typically do; some don't. Honor
+    /// [`ModelMetadata::add_bos_token`] when deciding whether to
+    /// prepend it manually to a prompt.
+    pub fn bos_token(&self) -> Option<u32> {
+        self.inner.tokenizer().bos_token()
+    }
+
+    /// End-of-sequence / end-of-text token ID, if the model has one.
+    /// Used as a default stop-token by the sampler; callers can also
+    /// pass it explicitly in [`GenerateOpts::stop_tokens`].
+    pub fn eos_token(&self) -> Option<u32> {
+        self.inner.tokenizer().eos_token()
+    }
+
+    /// Look up a special token by name (e.g. `<|im_start|>`,
+    /// `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
+    /// isn't defined in the tokenizer's vocab.
+    pub fn special_token_id(&self, name: String) -> Option<u32> {
+        self.inner.tokenizer().special_token_id(&name)
+    }
+
+    /// `true` if the model's tokenizer carries a chat template (a
+    /// minijinja string from GGUF metadata). Foreign callers should
+    /// check this before calling [`WickEngine::apply_chat_template`].
+    pub fn has_chat_template(&self) -> bool {
+        self.inner.tokenizer().chat_template().is_some()
+    }
+
+    /// Render the model's chat template against a sequence of
+    /// `ChatMessage`s. `add_generation_prompt = true` appends the
+    /// model's "now it's the assistant's turn" suffix (typical when
+    /// driving an interactive chat); `false` produces a transcript
+    /// the model can keep continuing.
+    ///
+    /// Returns [`FfiError::Backend`] if the model has no chat
+    /// template (check [`WickEngine::has_chat_template`] first) or
+    /// if the template fails to render against the supplied messages.
+    pub fn apply_chat_template(
+        &self,
+        messages: Vec<ChatMessage>,
+        add_generation_prompt: bool,
+    ) -> Result<String, FfiError> {
+        let core_messages: Vec<wick::tokenizer::ChatMessage> =
+            messages.into_iter().map(Into::into).collect();
+        wick::tokenizer::apply_chat_template(
+            self.inner.tokenizer(),
+            &core_messages,
+            add_generation_prompt,
+        )
+        .map_err(|e| FfiError::Backend {
+            detail: format!("apply_chat_template: {e}"),
+        })
     }
 }
 
@@ -1346,6 +1476,26 @@ mod tests {
         // bundle_repo defaults to None — foreign callers opt in by
         // attaching a BundleRepo before the try_into.
         assert!(core.bundle_repo.is_none());
+    }
+
+    /// `ChatMessage` round-trips its `role` + `content` fields
+    /// through the wick-core conversion. `From<ChatMessage> for
+    /// wick::tokenizer::ChatMessage` is a trivial field-copy; this
+    /// test pins the field shape so a future wick-core rename
+    /// breaks compilation here loudly instead of silently dropping
+    /// data on the FFI boundary.
+    #[test]
+    fn chat_message_converts_to_wick_core() {
+        let m = ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        };
+        let core: wick::tokenizer::ChatMessage = m.clone().into();
+        assert_eq!(core.role, "user");
+        assert_eq!(core.content, "hello");
+        // Original FFI value is unchanged (we cloned for the
+        // conversion); proves the From doesn't mutate by ref.
+        assert_eq!(m.role, "user");
     }
 
     /// Pick a temp path scoped to this process + test name so parallel
