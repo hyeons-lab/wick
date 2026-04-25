@@ -151,9 +151,14 @@ impl WickEngine {
         bytes: Vec<u8>,
         context_size: Option<u32>,
     ) -> Result<WickEngine, JsError> {
+        // Spread `..Default::default()` so the wrapper picks up any
+        // future EngineConfig fields (e.g. `bundle_repo` when the
+        // `remote` feature is on) without a compile break — only the
+        // two we actually want to override are spelled out.
         let cfg = wick::EngineConfig {
             context_size: context_size.unwrap_or(4096) as usize,
             backend: wick::BackendPreference::Cpu,
+            ..wick::EngineConfig::default()
         };
         wick::WickEngine::from_bytes(bytes, cfg)
             .map(|inner| WickEngine { inner })
@@ -188,14 +193,23 @@ impl WickEngine {
         self.inner.metadata().quantization.clone()
     }
 
-    /// `true` when the model ships an embedded Jinja chat template
-    /// (or the manifest override, when this engine was loaded via
-    /// a manifest path). JS callers can use this to decide whether
-    /// to render `Tokenizer.chatTemplate` themselves vs falling back
-    /// to a hard-coded prompt format.
+    /// `true` when the loaded GGUF carries an embedded Jinja chat
+    /// template. JS callers can use this to decide whether to render
+    /// `Tokenizer.chatTemplate` themselves vs falling back to a
+    /// hard-coded prompt format.
     #[wasm_bindgen(getter, js_name = hasChatTemplate)]
     pub fn has_chat_template(&self) -> bool {
         self.inner.metadata().has_chat_template
+    }
+
+    /// `true` when the GGUF declares `tokenizer.ggml.add_bos_token`.
+    /// Callers that hand-build a token sequence from `Tokenizer.encode`
+    /// should prepend `Tokenizer.bosToken` when this is `true` (and
+    /// the model has a BOS) — wick's encoder returns the raw tokens
+    /// without that prefix.
+    #[wasm_bindgen(getter, js_name = addBosToken)]
+    pub fn add_bos_token(&self) -> bool {
+        self.inner.metadata().add_bos_token
     }
 
     /// Returns a `Tokenizer` handle bound to this engine's vocab.

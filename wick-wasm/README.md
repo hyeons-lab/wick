@@ -59,8 +59,9 @@ const engine = WickEngine.fromGgufBytes(bytes, 2048);
 
 console.log(engine.architecture);     // "lfm2"
 console.log(engine.maxSeqLen);        // 4096
-console.log(engine.quantization);     // "Q4_0"
+console.log(engine.quantization);     // "Q4_0", "Q8_0", "BF16", etc.
 console.log(engine.hasChatTemplate);  // true / false
+console.log(engine.addBosToken);      // honor when hand-building token sequences
 
 // Tokenize a string.
 const tok = engine.tokenizer;
