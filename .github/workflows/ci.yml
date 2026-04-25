@@ -233,7 +233,7 @@ jobs:
           # without keeping stale binaries around.
           retention-days: 7
 
-  ios-xcframework:
+  apple-xcframework:
     # Cross-compiles wick-ffi to all three arm64-only Apple-platform
     # Rust targets and assembles `WickFFI.xcframework` ready for
     # Swift Package Manager / Xcode consumption. Three slices end up
@@ -251,7 +251,12 @@ jobs:
     # later, the structural change is reversible (bring back the
     # x86_64 rustup targets + lipo steps).
     #
-    # Runs on macos-latest because xcodebuild only ships with Xcode.
+    # Pinned to `macos-15` explicitly (Apple Silicon M1 runner image)
+    # rather than `macos-latest`: every artifact we produce is
+    # arm64-only, and `swiftc` on an Intel host would default to
+    # x86_64 and silently build a binary that fails to link against
+    # the aarch64 staticlib. An `uname -m` assertion below turns a
+    # future runner-image tier change into a loud early failure.
     # Single job (no matrix) — the cross-compile builds are serial
     # inside the recipe; matrix wouldn't help because the final
     # xcodebuild step needs every slice in one workspace.
@@ -262,9 +267,9 @@ jobs:
     # a CI runner's "native" CPU isn't a portable shipped-binary
     # baseline. Empty RUSTFLAGS forces the generic apple-darwin
     # baseline for distribution.
-    name: iOS XCFramework
+    name: Apple XCFramework
     needs: check
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
@@ -272,13 +277,28 @@ jobs:
           toolchain: nightly-2026-04-02
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Show Xcode version
-        # Diagnostic — pin tracking. macos-latest can shift Xcode
-        # majors between runner image versions; logging here means a
-        # silent xcodebuild behavior change shows up in the job log.
-        run: xcodebuild -version
+      - name: Show runner info
+        # Xcode version: diagnostic — the `macos-15` pin tracks an
+        # image version, not a frozen Xcode version, so logging
+        # catches silent xcodebuild behavior changes.
+        #
+        # `uname -m` assertion: every output of this job is arm64-
+        # only. If a future `macos-15` image tier adds an Intel
+        # host variant (or if we ever point back at `macos-latest`),
+        # this fails fast with an actionable error instead of
+        # silently producing a mislinked Swift binary against the
+        # aarch64 staticlib.
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          uname -m
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::expected arm64 host for arm64-only cross-compile, got '$ARCH' — pin runs-on to an Apple Silicon label" >&2
+            exit 1
+          fi
       - name: Build XCFramework
-        # Mirrors `just ios-xcframework` exactly. Inlined because the
+        # Mirrors `just apple-xcframework` exactly. Inlined because the
         # CI runner doesn't have `just` installed by default and
         # adding a setup-just step for a single-recipe job would be
         # more weight than the recipe itself.
@@ -388,7 +408,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wick-ffi-ios-xcframework
+          name: wick-ffi-apple-xcframework
           # Upload the directory (xcframework is a folder bundle on
           # disk); actions/upload-artifact zips it transparently.
           path: target/xcframework-build/WickFFI.xcframework

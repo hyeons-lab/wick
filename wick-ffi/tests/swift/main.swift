@@ -74,10 +74,14 @@ do {
     )
     fail("WickEngine.fromPath on bogus path unexpectedly succeeded")
 } catch let err as FfiError {
-    // Expected. Display should start with "io: " (matching wick's
-    // error format) for a not-found path. Be permissive — any
-    // non-empty FfiError is acceptable here; the goal is "the error
-    // round-tripped at all", not a specific match.
+    // Expected. The wrapper currently reports `Backend(detail: ...)`
+    // for this input because `WickEngine::from_path` validates the
+    // path shape (.gguf / .json / dir) before any io::Error can
+    // surface. The test is deliberately permissive — any `FfiError`
+    // variant is acceptable; the goal is "the typed error
+    // round-tripped through Swift at all", not a specific variant
+    // or message format. Variant-level assertions belong in Rust
+    // unit tests (see `wick-ffi/src/lib.rs`), not here.
     let msg = String(describing: err)
     print("OK: FfiError caught (\(msg))")
 } catch {

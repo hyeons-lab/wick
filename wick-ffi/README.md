@@ -190,10 +190,11 @@ and `i686-linux-android` sysroots should drop in cleanly.
 ## Apple platforms
 
 `wick-ffi` cross-compiles to a Swift Package Manager-ready
-`WickFFI.xcframework` via Xcode's `xcodebuild`. The `ios-xcframework`
-CI job builds the framework on `macos-latest` and uploads it as a
-CI artifact every PR; consumer iOS and native Apple Silicon Mac
-apps can drop the artifact straight into their SPM dependency graph.
+`WickFFI.xcframework` via Xcode's `xcodebuild`. The
+`apple-xcframework` CI job builds the framework on an Apple Silicon
+`macos-15` runner and uploads it as a CI artifact every PR; consumer
+iOS and native Apple Silicon Mac apps can drop the artifact straight
+into their SPM dependency graph.
 
 The framework ships three single-arch slices — **Apple Silicon
 only**:
@@ -224,7 +225,7 @@ rustup target add \
 
 # Then (Xcode + Command Line Tools must be installed for xcodebuild;
 # macOS only):
-just ios-xcframework
+just apple-xcframework
 just ios-arm64           # smoke test: device target only, no XCFramework
 ```
 
@@ -236,13 +237,15 @@ Cargo's `release` profile in this workspace runs
 `strip = "symbols"` on the staticlibs; further size trimming would
 need feature-gating out tokio / rustfft / similar heavyweight deps.
 
-`just ios-xcframework` overrides `RUSTFLAGS=""` for the
+`just apple-xcframework` runs `RUSTFLAGS=""` across all three cross-
+compiles for shape-consistency. It's strictly required only for the
 `aarch64-apple-darwin` slice — the workspace's `.cargo/config.toml`
 sets `target-cpu=native` for that triple (workstation dev
 convenience), and a build host's specific microarch isn't a portable
-shipped-binary baseline. The override forces the generic
-apple-darwin baseline so the artifact runs on every Apple Silicon
-Mac, not just yours.
+shipped-binary baseline. Applying the override to the iOS builds
+too is a no-op (iOS targets have no native flags in the config) but
+keeps the recipe shape uniform and forestalls an externally-set
+`RUSTFLAGS` contaminating any slice.
 
 ### XCFramework structure
 
@@ -292,17 +295,24 @@ the pattern is standard SPM.
 
 ### CI artifact
 
-The `ios-xcframework` CI job uploads `wick-ffi-ios-xcframework`
+The `apple-xcframework` CI job uploads `wick-ffi-apple-xcframework`
 (7-day retention). Each PR publishes a fresh XCFramework on the
 action run page; Mac-side consumers can grab the zip without
 installing Xcode or running the cross-compile themselves.
 
-### Xcode pin
+### Runner + Xcode pin
 
-CI uses whichever Xcode the `macos-latest` runner image ships. The
-job logs `xcodebuild -version` so a silent runner-image bump is
-visible in the build output. iOS Rust targets are pinned to whatever
-nightly the workspace uses; bumping requires a corresponding
+CI pins `runs-on: macos-15` (Apple Silicon) rather than
+`macos-latest`. Every artifact the job produces is arm64-only, and
+`swiftc` on an Intel host would default to x86_64 and silently build
+a Swift binary that fails to link against the aarch64 staticlib. The
+pin makes the host architecture deterministic; a `uname -m` check at
+the start of the job turns a future runner-image tier change into a
+loud early failure instead of a mislinked binary. Xcode version
+floats within the image; the job logs `xcodebuild -version` so
+silent runner-image bumps are visible in the build output. iOS Rust
+targets are pinned to whatever nightly the workspace uses; bumping
+requires a corresponding
 toolchain re-validation.
 
 ## Design notes

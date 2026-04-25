@@ -142,7 +142,7 @@ android-arm64:
 #
 # Output: `target/xcframework-build/WickFFI.xcframework` (~125 MB,
 # 42 MB per slice). CI uploads the same path as a per-run artifact.
-ios-xcframework:
+apple-xcframework:
     #!/usr/bin/env bash
     set -euo pipefail
     RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
@@ -165,14 +165,14 @@ ios-xcframework:
     echo "Built $OUT/WickFFI.xcframework"
 
 # Single-target iOS smoke test — verifies the device cross-compile
-# works without paying for the full ios-xcframework pipeline (3
+# works without paying for the full apple-xcframework pipeline (3
 # cross-compiles + xcodebuild → ~90s+; this single build → ~30s).
 # Output `.a` isn't directly usable in an iOS app (consumers need
 # the XCFramework or a custom SPM `linkedLibrary` wiring); this
 # recipe is mostly a "did the cross-compile break?" fast probe.
 # Assumes `aarch64-apple-ios` is rustup-installed.
 #
-# `RUSTFLAGS=""` mirrors the `ios-xcframework` + `swift-smoke`
+# `RUSTFLAGS=""` mirrors the `apple-xcframework` + `swift-smoke`
 # recipes for consistency. Strictly a no-op for iOS targets
 # (`.cargo/config.toml` only sets `target-cpu=native` on
 # apple-darwin), but the override forestalls an externally-set
