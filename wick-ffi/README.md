@@ -418,16 +418,16 @@ try session.appendText(text: "hello")
 let out = try await session.generateAsync(opts: GenerateOpts.default())
 ```
 
-Cancellation: dropping the `fromBundleIdAsync` future calls
-`JoinHandle::abort` on the spawned task. That cancels the task if
-it hasn't started yet (queued on the blocking pool); if it has
-started, abort is a no-op and the download / engine construction
-runs to completion. The downloaded bundle is cached, so the
-caller's next attempt resolves from the cache — bandwidth isn't
-wasted, just shifted. (`generateAsync`'s `Session::cancel`
-in-flight cancellation has no equivalent here because wick's
-download path uses `reqwest::blocking` without a cooperative
-cancel point.)
+Cancellation: dropping the `fromBundleIdAsync` future drops an
+internal `AbortOnDrop` guard which calls `AbortHandle::abort` on
+the spawned blocking task. That cancels the task if it hasn't
+started yet (queued on the blocking pool); if it has started,
+abort is a no-op and the download / engine construction runs to
+completion. The downloaded bundle is cached, so the caller's next
+attempt resolves from the cache — bandwidth isn't wasted, just
+shifted. (`generateAsync`'s `Session::cancel` in-flight
+cancellation has no equivalent here because wick's download path
+uses `reqwest::blocking` without a cooperative cancel point.)
 
 ### Per-platform cache-path recommendations
 

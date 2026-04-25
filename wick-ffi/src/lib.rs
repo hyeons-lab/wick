@@ -1027,11 +1027,13 @@ impl Drop for AsyncCancelGuard {
 /// and the `reqwest::blocking` download can't be cooperatively
 /// cancelled, so there's nothing like `Session::cancel` to call on
 /// drop. All we can do is abort the queued task before its closure
-/// runs — `JoinHandle::abort` on a queued `spawn_blocking` task is
-/// effective; on a running one it's a no-op and the download finishes
-/// to cache (which is arguably a feature: a dropped future's bandwidth
-/// isn't wasted, the next call finds the bundle cached and returns
-/// instantly).
+/// runs — `AbortHandle::abort` (taken from the task's `JoinHandle`
+/// via `JoinHandle::abort_handle()` so the guard doesn't fight the
+/// outer `.await` for ownership of the handle) on a queued
+/// `spawn_blocking` task is effective; on a running one it's a no-op
+/// and the download finishes to cache (which is arguably a feature:
+/// a dropped future's bandwidth isn't wasted, the next call finds
+/// the bundle cached and returns instantly).
 ///
 /// Drop logic is one conditional (`if armed { abort.abort() }`) —
 /// structurally identical to [`AsyncCancelGuard`]'s. The
@@ -1154,17 +1156,18 @@ impl WickEngine {
     /// directory and attach it to the config before calling.
     ///
     /// Cancellation semantics (weaker than [`Session::generate_async`]):
-    /// dropping the returned future calls `JoinHandle::abort` on the
-    /// spawned task. That cancels the task if it's still queued on
-    /// tokio's blocking pool, so a not-yet-started download never
-    /// runs. But if the task has started, abort is a no-op — the
-    /// download is a `reqwest::blocking` call with no cooperative
-    /// cancel point, and wick's engine-construction code (tokenizer
-    /// build, model load, KV alloc) also isn't interruptible. In
-    /// that case the task runs to completion and the engine is
-    /// constructed then dropped; the downloaded bundle stays cached,
-    /// so the caller's next attempt starts from that cache
-    /// hit. Bandwidth isn't wasted, it's just shifted.
+    /// dropping the returned future drops the [`AbortOnDrop`] guard,
+    /// which calls `AbortHandle::abort` on the spawned task. That
+    /// cancels the task if it's still queued on tokio's blocking
+    /// pool, so a not-yet-started download never runs. But if the
+    /// task has started, abort is a no-op — the download is a
+    /// `reqwest::blocking` call with no cooperative cancel point,
+    /// and wick's engine-construction code (tokenizer build, model
+    /// load, KV alloc) also isn't interruptible. In that case the
+    /// task runs to completion and the engine is constructed then
+    /// dropped; the downloaded bundle stays cached, so the caller's
+    /// next attempt starts from that cache hit. Bandwidth isn't
+    /// wasted, it's just shifted.
     ///
     /// `JoinError` from a panicking blocking closure surfaces as
     /// [`FfiError::Backend`] with a diagnostic prefix, same as
@@ -1189,12 +1192,11 @@ impl WickEngine {
         };
         let join_result = handle.await;
         guard.armed = false;
-        match join_result {
-            Ok(inner_result) => inner_result.map(|inner| Arc::new(Self { inner })),
-            Err(e) => Err(FfiError::Backend {
+        join_result
+            .map_err(|e| FfiError::Backend {
                 detail: format!("from_bundle_id_async join error: {e}"),
-            }),
-        }
+            })?
+            .map(|inner| Arc::new(Self { inner }))
     }
 }
 
