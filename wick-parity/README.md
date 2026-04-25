@@ -27,7 +27,7 @@ The harness is built around three constraints:
 | `rust` | `wick::WickEngine` directly (reference) | Shipped |
 | `ffi` | `wick_ffi::WickEngine` through its Rust public surface | Shipped |
 | `kotlin-jna` | Kotlin runner under `legs/kotlin/` loading `libwick_ffi.{so,dylib}` via JNA — first leg to actually cross the FFI boundary | Shipped (PR 16) |
-| `swift-uniffi` | Swift binding, native macOS / iOS Simulator | Pending (roadmap PR 17) |
+| `swift-uniffi` | Swift runner under `legs/swift/` (SPM), loading the generated UniFFI Swift bindings + `libwick_ffi.dylib` linked at build time. macOS-only. | Shipped (PR 17) |
 | `kotlin-aidl` | Cross-process via `wick-serviceapp` AIDL | Pending (Phase 4.5) |
 
 ## CLI
@@ -86,11 +86,42 @@ WICK_PARITY_RUN=1 \
 Set `WICK_PARITY_LIB_DIR=<path>` if `libwick_ffi` is somewhere
 other than `<workspace>/target/debug` (e.g. release build).
 
-CI runs both on push to `main` + manual `workflow_dispatch` only —
-not on PRs. See `.github/workflows/ci.yml` job `Parity Harness
-(gated)`. The cache is keyed
-`wick-parity-cache-lfm2-350m-q4_0-v1`; bump the `-vN` suffix when
-the bundle id or quant in either test changes.
+### `parity_swift` — rust ↔ swift-uniffi (macOS only)
+
+Build the Swift runner once, then run the test. Run from the
+workspace root; `WS=$(pwd)` keeps the absolute path stable across
+the subshell that builds the Swift package:
+
+```bash
+WS=$(pwd)
+cargo build -p wick-ffi   # produces $WS/target/debug/libwick_ffi.dylib
+swift build -c release \
+  --package-path "$WS/wick-parity/legs/swift" \
+  -Xlinker -L"$WS/target/debug"
+WICK_PARITY_RUN=1 \
+  WICK_PARITY_SWIFT_RUNNER="$WS/wick-parity/legs/swift/.build/release/WickParitySwift" \
+  cargo test -p wick-parity --test parity_swift -- --ignored
+```
+
+`-Xlinker -L<dir>` is the SPM-portable way to add a library search
+path; `LDFLAGS` is not honored consistently by `swift build`. The
+binary's install_name points at the absolute build-time location of
+`libwick_ffi.dylib` (under `target/debug/`), which works as long as
+the dylib stays put after build — fine for CI / local dev. Set
+`WICK_PARITY_LIB_DIR=<path>` if you need to override the
+`DYLD_LIBRARY_PATH` the runner sees.
+
+CI runs the gated tests on push to `main` + manual
+`workflow_dispatch` only — not on PRs:
+- `Parity Harness (gated)` (`.github/workflows/ci.yml`) runs on
+  Ubuntu and exercises `parity` + `parity_kotlin`.
+- `Parity Harness Swift (gated)` runs on `macos-15` and exercises
+  `parity_swift`.
+
+Both jobs use the cache key `wick-parity-cache-lfm2-350m-q4_0-v1`;
+GitHub's cache pools are OS-segregated so each OS downloads the
+fixture once. Bump the `-vN` suffix when the bundle id or quant in
+either test changes.
 
 ## Adding a new leg
 
@@ -117,10 +148,21 @@ For a subprocess leg (Kotlin via JNA, Swift via UniFFI):
 3. Add a CI step that builds the leg's wrapper before the
    `Run parity harness` step.
 
-`legs/kotlin/` is the worked example: Gradle subproject + Shadow
-plugin → fat jar; vendored binding via `sourceSets.main.kotlin.srcDirs`
-so the file isn't duplicated; `Main.kt` reads stdin / writes stdout
-in the contract shape; `wick_parity::run_kotlin_jna` spawns it.
+Two worked examples ship today:
+
+- `legs/kotlin/` — Gradle subproject + Shadow plugin → fat jar;
+  vendored binding via `sourceSets.main.kotlin.srcDirs` so the file
+  isn't duplicated; `Main.kt` reads stdin / writes stdout in the
+  contract shape; `wick_parity::run_kotlin_jna` spawns it.
+- `legs/swift/` — SPM Package with two targets: `wick_ffiFFI`
+  (`.systemLibrary` exposing the generated C FFI header via
+  `module.modulemap` — name MUST match what the generated
+  `wick_ffi.swift` `canImport`s) and `WickParitySwift`
+  (`.executableTarget` consuming the bindings + linking against
+  the wick-ffi cdylib via `-Xlinker -L`). Bindings vendored via
+  symlinks so `just bindings` regenerations are picked up
+  automatically; `wick_parity::run_swift_uniffi` spawns the
+  built binary with `DYLD_LIBRARY_PATH` set.
 
 The token-stream contract is the only thing the harness assumes —
 how a leg gets there (in-process, subprocess, IPC) is up to the leg.

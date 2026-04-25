@@ -473,9 +473,9 @@ jobs:
     # Same gating shape as `integration-test`: main-branch pushes +
     # manual dispatch only. PR runs would pay a 200 MB cold-cache
     # download for a regression check the FFI unit tests already
-    # cover; the parity harness's value lives at the rust↔kotlin /
-    # rust↔swift boundary that the Kotlin leg shipped as PR 16
-    # exercises (and a future Swift leg will exercise on macOS).
+    # cover; this job's value lives at the rust↔kotlin boundary that
+    # the Kotlin leg (PR 16) exercises. The Swift leg runs in the
+    # parallel `parity-test-swift` job below on a macOS runner.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -502,7 +502,8 @@ jobs:
           # Distinct from `wick-test-models` so a fixture rotation in
           # one suite doesn't invalidate the other. Bump the key suffix
           # when the bundle id / quant in `wick-parity/tests/parity.rs`
-          # changes.
+          # changes. The macOS swift parity job uses the same key
+          # value but lives in a separate (OS-segregated) cache pool.
           path: target/tmp/wick-parity-cache
           key: wick-parity-cache-lfm2-350m-q4_0-v1
       # The Kotlin leg loads `libwick_ffi.so` through JNA. Build the
@@ -516,13 +517,86 @@ jobs:
       - name: Build kotlin-jna runner
         working-directory: wick-parity/legs/kotlin
         run: ./gradlew --no-daemon shadowJar
-      # Runs both `parity` (rust↔ffi sanity check) and `parity_kotlin`
-      # (real FFI-boundary check via JNA). The shared cache stanza
-      # above means the model downloads at most once per CI run even
-      # though both tests reference it.
+      # Runs `parity` (rust↔ffi sanity check) and `parity_kotlin`
+      # (real FFI-boundary check via JNA). `parity_swift` is also
+      # bundled by `--tests` but skips silently here because
+      # `WICK_PARITY_SWIFT_RUNNER` is unset — that test runs in
+      # `parity-test-swift` on macOS where the swift toolchain is
+      # the natural fit.
       - name: Run parity harness
         env:
           WICK_PARITY_RUN: "1"
           WICK_PARITY_KOTLIN_RUNNER: ${{ github.workspace }}/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar
           WICK_PARITY_LIB_DIR: ${{ github.workspace }}/target/debug
         run: cargo test -p wick-parity --tests -- --ignored
+
+  parity-test-swift:
+    name: Parity Harness Swift (gated)
+    needs: check
+    # Same gating shape as `parity-test`: main-branch pushes + manual
+    # dispatch only. Apple runners are billed at higher per-minute
+    # rates, so this gate is doubly worth it on macOS.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # macos-26 = Apple Silicon Tahoe runner image. Swift on macOS is
+    # the natural toolchain; Swift on Linux works too but the
+    # toolchain weight isn't worth the marginal coverage — the
+    # kotlin leg already exercises the FFI surface on Ubuntu.
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache downloaded parity fixtures
+        uses: actions/cache@v4
+        with:
+          # Same key as `parity-test`'s ubuntu run; GitHub's cache
+          # is OS-segregated so they live in separate pools and the
+          # 210 MB fixture downloads at most once per OS per run.
+          path: target/tmp/wick-parity-cache
+          key: wick-parity-cache-lfm2-350m-q4_0-v1
+      # SPM build cache. Keyed on Package.swift + the two binding
+      # files (which are git-tracked symlinks but their content
+      # hashes change when `just bindings` regenerates upstream).
+      # Cold `swift build` takes 10-30s on macos-26; cache hits
+      # drop the runner-build step to <1s.
+      - name: Cache SPM build artifacts
+        uses: actions/cache@v4
+        with:
+          path: wick-parity/legs/swift/.build
+          key: wick-parity-swift-spm-${{ hashFiles('wick-parity/legs/swift/Package.swift', 'wick-ffi/bindings/swift/wick_ffi.swift', 'wick-ffi/bindings/swift/wick_ffiFFI.h') }}
+      # The Swift leg links against `libwick_ffi.dylib` at build time.
+      # The binary records an absolute install_name pointing at the
+      # cdylib's build-time location under `target/debug/` in this
+      # same checkout, so dyld can find the dylib by that path alone.
+      # We also export `DYLD_LIBRARY_PATH` at run time as a robustness
+      # measure — dyld checks it before falling through to install_name
+      # lookup, so a moved-or-renamed cdylib still resolves as long
+      # as a same-basename match exists in `WICK_PARITY_LIB_DIR`.
+      # Build the cdylib first so the `swift build -Xlinker -L<dir>`
+      # step has something to link against.
+      - name: Build wick-ffi cdylib (debug)
+        run: cargo build -p wick-ffi
+      # `swift build -c release -Xlinker -L<dir>` produces
+      # `.build/release/WickParitySwift`. `-Xlinker -L<dir>` is the
+      # SPM-portable way to add a library search path; `LDFLAGS` is
+      # not honored consistently by `swift build`.
+      - name: Build swift-uniffi runner
+        working-directory: wick-parity/legs/swift
+        run: |
+          swift build -c release \
+            -Xlinker -L${{ github.workspace }}/target/debug
+      # Targeted to the swift parity test binary only.
+      # `--tests -- --ignored` would also sweep `parity` (no-op
+      # without env vars on the kotlin side) and `parity_kotlin`
+      # (would fail because no kotlin runner here); explicit
+      # `--test parity_swift` keeps the run focused.
+      - name: Run parity harness
+        env:
+          WICK_PARITY_RUN: "1"
+          WICK_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/wick-parity/legs/swift/.build/release/WickParitySwift
+          WICK_PARITY_LIB_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          cargo test -p wick-parity --test parity_swift -- --ignored

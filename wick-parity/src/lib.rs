@@ -5,19 +5,22 @@
 //! UniFFI, …) and byte-compares the resulting greedy-decoded token
 //! streams. Divergence points to a marshalling bug at the FFI layer.
 //!
-//! Three legs ship today: `run_rust` (calls `wick::WickEngine`
+//! Four legs ship today: `run_rust` (calls `wick::WickEngine`
 //! directly), `run_ffi` (calls `wick_ffi::WickEngine` through its
-//! Rust public surface), and `run_kotlin_jna` (spawns a vendored
-//! Kotlin runner that loads the generated `wick_ffi.kt` bindings and
-//! `libwick_ffi.{so,dylib}` through JNA). The first two paths produce
-//! identical output by construction — the wick-ffi wrapper is a thin
-//! Rust adapter — so they form a construction-path sanity check; the
-//! Kotlin leg is the first to actually cross the FFI boundary, where
+//! Rust public surface), `run_kotlin_jna` (spawns a vendored Kotlin
+//! runner that loads the generated `wick_ffi.kt` bindings and
+//! `libwick_ffi.{so,dylib}` through JNA), and `run_swift_uniffi`
+//! (spawns a vendored Swift runner built via SPM that loads the
+//! generated `wick_ffi.swift` bindings and `libwick_ffi.dylib`
+//! linked at build time). The first two paths produce identical
+//! output by construction — the wick-ffi wrapper is a thin Rust
+//! adapter — so they form a construction-path sanity check; the
+//! Kotlin and Swift legs actually cross the UniFFI boundary, where
 //! marshalling bugs would surface as token-stream divergence.
 //!
-//! Public surface kept narrow on purpose: a future Swift leg only
-//! needs to produce a `Vec<u32>` from the same `RunArgs` — the
-//! harness binary does the diffing.
+//! Public surface kept narrow on purpose: any future leg only needs
+//! to produce a `Vec<u32>` from the same `RunArgs` — the harness
+//! binary does the diffing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -126,11 +129,17 @@ pub fn default_cache_dir() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Single source of truth for the harness's run-time settings. Both
-/// legs read these constants — adding a knob in one place but
-/// forgetting the other would manifest as a false parity failure
-/// instead of an obvious compile error, so we centralize first and
-/// build the per-API option records around them.
+/// Single source of truth for the harness's run-time settings *for
+/// the Rust-side legs* (`run_rust`, `run_ffi`). Subprocess legs
+/// duplicate these constants in their own language: `Settings` in
+/// `wick-parity/legs/kotlin/.../Main.kt` and
+/// `wick-parity/legs/swift/Sources/WickParitySwift/main.swift`. There
+/// is no shared schema across the three; drift in either subprocess
+/// leg surfaces as token divergence in the env-gated parity tests
+/// (`parity_kotlin.rs`, `parity_swift.rs`) rather than at compile
+/// time. A future N-leg expansion would multiply this manual-sync
+/// cost; tracking that as future work in the FFI multi-target
+/// initiative rather than solving with a code-gen step today.
 mod settings {
     /// 256-token KV cap keeps the parity test cheap. Greedy decode of
     /// 16 tokens off a short prompt fits comfortably under this.
@@ -344,6 +353,101 @@ pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> 
         let stderr = String::from_utf8_lossy(&output.stderr);
         format!(
             "parse kotlin-jna RunOutput JSON; stderr was: {}",
+            stderr.trim()
+        )
+    })?;
+    Ok(response.tokens)
+}
+
+/// Run the prompt through the Swift runner under
+/// `wick-parity/legs/swift/`. Spawns the SPM-built executable
+/// (`.build/release/WickParitySwift`), feeds it a `RunArgsOwned`-shaped
+/// JSON request on stdin, parses a `RunOutput` JSON document from
+/// stdout, and returns the token list.
+///
+/// `runner_path` is the SPM build artifact. `lib_dir` is the
+/// directory containing `libwick_ffi.dylib`.
+///
+/// **dyld lookup, the honest version**: at build time, `swift build`
+/// records the cdylib's absolute install_name into the binary (the
+/// path under `<workspace>/target/debug/` where cargo placed
+/// `libwick_ffi.dylib` for the linker), and dyld can resolve via
+/// that path alone if the file is still there. We *also* export
+/// `DYLD_LIBRARY_PATH=<lib_dir>` because dyld consults it first for
+/// matching basenames — so a moved-or-renamed cdylib still resolves
+/// as long as a same-basename match lives at `lib_dir`. The two
+/// mechanisms are complementary; either one alone is enough on a
+/// fresh CI build, but together they survive small path drift
+/// between build + run. `DYLD_LIBRARY_PATH` (not the `_FALLBACK_`
+/// variant) is intentional: matches Java's `-Djna.library.path`
+/// semantics. macOS SIP strips `DYLD_*` from system-protected
+/// binaries; `.build/release/` artifacts aren't protected.
+pub fn run_swift_uniffi(
+    args: &RunArgs<'_>,
+    runner_path: &Path,
+    lib_dir: &Path,
+) -> Result<Vec<u32>> {
+    // Validate UTF-8 up front for the same reason `run_ffi` and
+    // `run_kotlin_jna` do: the Swift runner deserializes `cache_dir`
+    // as a `String` (JSON strings are UTF-8 by spec), and
+    // `serde_json::to_vec` on a non-UTF-8 `PathBuf` would surface as
+    // an opaque encoding error instead of a tailored "cache_dir must
+    // be valid UTF-8" message.
+    args.cache_dir.to_str().with_context(|| {
+        format!(
+            "cache_dir {} is not valid UTF-8 (swift-uniffi leg requires String over JSON)",
+            args.cache_dir.display()
+        )
+    })?;
+
+    let owned = RunArgsOwned {
+        bundle: args.bundle.to_string(),
+        quant: args.quant.to_string(),
+        prompt: args.prompt.to_string(),
+        max_tokens: args.max_tokens,
+        seed: args.seed,
+        cache_dir: args.cache_dir.to_path_buf(),
+    };
+    let request_json = serde_json::to_vec(&owned)?;
+
+    let mut child = Command::new(runner_path)
+        .env("DYLD_LIBRARY_PATH", lib_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn swift runner {}", runner_path.display()))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("swift-uniffi runner stdin unavailable")?;
+        stdin
+            .write_all(&request_json)
+            .context("write request JSON to swift-uniffi stdin")?;
+    }
+    // Drop stdin handle so the child sees EOF on its read. Without
+    // this the child blocks forever on
+    // `FileHandle.standardInput.readDataToEndOfFile()`.
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .context("wait for swift-uniffi runner to exit")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "swift-uniffi runner failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+
+    let response: RunOutput = serde_json::from_slice(&output.stdout).with_context(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        format!(
+            "parse swift-uniffi RunOutput JSON; stderr was: {}",
             stderr.trim()
         )
     })?;
