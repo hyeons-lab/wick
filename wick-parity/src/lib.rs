@@ -123,28 +123,60 @@ pub fn default_cache_dir() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Greedy-decoding generation options. Fixed across both Rust legs so
-/// the only thing varying between runs is the construction path. CPU
-/// backend, temperature 0, top_k 1 — fully deterministic regardless
-/// of the underlying sampler's RNG state.
+/// Single source of truth for the harness's run-time settings. Both
+/// legs read these constants — adding a knob in one place but
+/// forgetting the other would manifest as a false parity failure
+/// instead of an obvious compile error, so we centralize first and
+/// build the per-API option records around them.
+mod settings {
+    /// 256-token KV cap keeps the parity test cheap. Greedy decode of
+    /// 16 tokens off a short prompt fits comfortably under this.
+    pub const CONTEXT_SIZE: u64 = 256;
+    pub const TEMPERATURE: f32 = 0.0;
+    pub const TOP_P: f32 = 1.0;
+    pub const TOP_K: u32 = 1;
+    pub const REPETITION_PENALTY: f32 = 1.0;
+    pub const FLUSH_EVERY_TOKENS: u32 = 1;
+    pub const FLUSH_EVERY_MS: u32 = 0;
+}
+
+/// Greedy-decoding generation options against the wick-core API.
+/// Constructed from the shared `settings` constants so the
+/// wick-core ↔ wick-ffi pair can't drift on a knob change.
 fn greedy_opts(max_tokens: u32) -> wick::GenerateOpts {
     wick::GenerateOpts {
         max_tokens,
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 1,
-        repetition_penalty: 1.0,
+        temperature: settings::TEMPERATURE,
+        top_p: settings::TOP_P,
+        top_k: settings::TOP_K,
+        repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
-        flush_every_tokens: 1,
-        flush_every_ms: 0,
+        flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
+        flush_every_ms: settings::FLUSH_EVERY_MS,
+    }
+}
+
+/// Same options, expressed against the wick-ffi record. Sister
+/// constructor to [`greedy_opts`] — both must change together.
+fn greedy_opts_ffi(max_tokens: u32) -> wick_ffi::GenerateOpts {
+    wick_ffi::GenerateOpts {
+        max_tokens,
+        temperature: settings::TEMPERATURE,
+        top_p: settings::TOP_P,
+        top_k: settings::TOP_K,
+        repetition_penalty: settings::REPETITION_PENALTY,
+        stop_tokens: Vec::new(),
+        flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
+        flush_every_ms: settings::FLUSH_EVERY_MS,
     }
 }
 
 fn engine_config_with_repo(cache_dir: &Path) -> wick::EngineConfig {
     wick::EngineConfig {
-        // 256-token KV cap keeps the parity test cheap. Greedy decode
-        // of 16 tokens off a short prompt fits in well under this.
-        context_size: 256,
+        // `as usize`: `CONTEXT_SIZE` is the FFI wire-width (`u64`); the
+        // wick-core API stores it as `usize`. Lossless because the
+        // constant value is well below `u32::MAX`.
+        context_size: settings::CONTEXT_SIZE as usize,
         backend: wick::BackendPreference::Cpu,
         bundle_repo: Some(wick::bundle::BundleRepo::new(cache_dir)),
     }
@@ -188,9 +220,21 @@ pub fn run_rust(args: &RunArgs<'_>) -> Result<Vec<u32>> {
 /// `RecordType <-> wick::Type` adapters round-trip without dropping
 /// or reordering anything that affects token output.
 pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
-    let repo = wick_ffi::BundleRepo::new(args.cache_dir.to_string_lossy().into_owned());
+    // wick-ffi's `BundleRepo::new` takes a `String` (UniFFI marshals
+    // strings, not `Path`). Validating UTF-8 here means a non-UTF-8
+    // cache dir errors out loudly instead of silently mangling into a
+    // different filesystem path than the wick-core leg sees, which
+    // would cause downloads to land in two separate caches and surface
+    // as a flake on filesystems that allow non-UTF-8 paths (Linux).
+    let cache_dir_str = args.cache_dir.to_str().with_context(|| {
+        format!(
+            "cache_dir {} is not valid UTF-8 (wick-ffi requires String)",
+            args.cache_dir.display()
+        )
+    })?;
+    let repo = wick_ffi::BundleRepo::new(cache_dir_str.to_owned());
     let cfg = wick_ffi::EngineConfig {
-        context_size: 256,
+        context_size: settings::CONTEXT_SIZE,
         backend: wick_ffi::BackendPreference::Cpu,
         bundle_repo: Some(repo),
     };
@@ -210,17 +254,9 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
             .context("append prompt (ffi)")?;
     }
 
-    let opts = wick_ffi::GenerateOpts {
-        max_tokens: args.max_tokens,
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 1,
-        repetition_penalty: 1.0,
-        stop_tokens: Vec::new(),
-        flush_every_tokens: 1,
-        flush_every_ms: 0,
-    };
-    let output = session.generate(opts).context("generate (ffi)")?;
+    let output = session
+        .generate(greedy_opts_ffi(args.max_tokens))
+        .context("generate (ffi)")?;
     Ok(output.tokens)
 }
 

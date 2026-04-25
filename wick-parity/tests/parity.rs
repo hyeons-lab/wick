@@ -1,7 +1,7 @@
 //! Real-model parity check.
 //!
 //! Downloads `LFM2-350M-Extract-GGUF/Q4_0` (~200 MB) on first run via
-//! `BundleRepo::from_bundle_id`, caches it under
+//! `WickEngine::from_bundle_id`, caches it under
 //! `target/tmp/wick-parity-cache/`, and asserts that running the same
 //! prompt through `wick::WickEngine` (the rust leg) and through
 //! `wick_ffi::WickEngine` (the ffi leg) yields byte-identical greedy
@@ -48,11 +48,18 @@ fn rust_and_ffi_produce_identical_tokens() {
     // `RecordType -> wick::Type` adapter is dropping or reordering
     // something that influences sampling (seed, temperature, top_k).
     if let Some(idx) = wick_parity::first_divergence(&rust, &ffi) {
-        let window = idx.saturating_sub(2)..idx.saturating_add(3);
+        // Clamp each window to its own slice's length so a tail
+        // divergence (where one leg ran out first) still prints the
+        // surrounding tokens instead of returning `None` from
+        // `slice.get(range)`.
+        let start = idx.saturating_sub(2);
+        let end = idx.saturating_add(3);
+        let rust_window = start..end.min(rust.len());
+        let ffi_window = start..end.min(ffi.len());
+        let rust_dump = format!("{:?}", &rust[rust_window.clone()]);
+        let ffi_dump = format!("{:?}", &ffi[ffi_window.clone()]);
         panic!(
-            "rust ↔ ffi diverged at index {idx}\n  rust[{window:?}] = {:?}\n  ffi [{window:?}] = {:?}\n  rust.len() = {}, ffi.len() = {}",
-            rust.get(window.clone()),
-            ffi.get(window.clone()),
+            "rust ↔ ffi diverged at index {idx}\n  rust[{rust_window:?}] = {rust_dump}\n  ffi [{ffi_window:?}] = {ffi_dump}\n  rust.len() = {}, ffi.len() = {}",
             rust.len(),
             ffi.len(),
         );

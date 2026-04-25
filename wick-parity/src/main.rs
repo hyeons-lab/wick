@@ -172,9 +172,18 @@ fn real_main() -> Result<ExitCode> {
                         "FAIL: rust ↔ ffi diverged at index {idx} (bundle={} quant={})",
                         args.bundle, args.quant
                     );
-                    let window = idx.saturating_sub(2)..idx.saturating_add(3);
-                    eprintln!("  rust[{window:?}] = {:?}", &rust.get(window.clone()));
-                    eprintln!("  ffi [{window:?}] = {:?}", &ffi.get(window.clone()));
+                    // Clamp each window to the slice's own length —
+                    // when divergence is at the tail (e.g. one leg
+                    // returned fewer tokens), an unclamped end goes
+                    // out of bounds and `slice[range]` panics; even
+                    // `get()` returns `None`, hiding the surrounding
+                    // tokens that are the whole point of the dump.
+                    let start = idx.saturating_sub(2);
+                    let end = idx.saturating_add(3);
+                    let rust_window = start..end.min(rust.len());
+                    let ffi_window = start..end.min(ffi.len());
+                    eprintln!("  rust[{rust_window:?}] = {:?}", &rust[rust_window.clone()]);
+                    eprintln!("  ffi [{ffi_window:?}] = {:?}", &ffi[ffi_window.clone()]);
                     eprintln!("  rust.len() = {}, ffi.len() = {}", rust.len(), ffi.len());
                     Ok(ExitCode::from(1))
                 }

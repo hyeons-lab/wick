@@ -17,7 +17,7 @@ The harness is built around three constraints:
 3. **Real model, real download.** Synthetic GGUFs would short-circuit
    the manifest resolution path that's the whole point of the FFI
    surface. We pull `LFM2-350M-Extract-GGUF/Q4_0` (~200 MB) from the
-   `LiquidAI/LeapBundles` HF repo via [`BundleRepo::from_bundle_id`]
+   `LiquidAI/LeapBundles` HF repo via [`WickEngine::from_bundle_id`]
    on first run and cache it locally.
 
 ## Status
