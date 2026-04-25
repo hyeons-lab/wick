@@ -58,6 +58,43 @@ jobs:
       - name: Build release
         run: cargo build --workspace --release
 
+  wasm-build:
+    # Phase 3 of the FFI multi-target plan is `wick-wasm` (browser/Node
+    # via wasm-bindgen, not UniFFI). Before any of that lands the
+    # foundation needs to hold: `wick` core has to compile for
+    # `wasm32-unknown-unknown` across the feature combos that the
+    # wasm-bindgen wrapper crate (Phase 3.2) might enable. Phase 1.3
+    # (PR #32) made `parallel`, `mmap`, `std-fs`, `disk-cache`,
+    # `remote` opt-in for exactly this reason; this job is a
+    # regression check that catches the moment something in core adds
+    # a non-target-conditional `std::thread`, `std::fs`, sync
+    # primitive, etc. that breaks the wasm32 build under any of the
+    # supported feature combos.
+    #
+    # `remote` is intentionally NOT in the matrix — `reqwest` doesn't
+    # link on wasm32-unknown-unknown; wick-wasm will have its own
+    # `fetch`-based adapter (Phase 3.x).
+    name: Wasm Build (${{ matrix.features }})
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features parallel,std-fs,disk-cache"
+          - "--no-default-features --features mmap"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check wasm32 compile
+        run: cargo check -p wick ${{ matrix.features }} --target wasm32-unknown-unknown
+
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under
     # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`

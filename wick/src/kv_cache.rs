@@ -3,9 +3,10 @@ use std::collections::HashMap;
 #[cfg(feature = "disk-cache")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::model::{BlockType, ModelConfig};
+use crate::time::Instant;
+
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
     TurboQuantConfig,

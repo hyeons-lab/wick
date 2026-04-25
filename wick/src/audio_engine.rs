@@ -1,7 +1,5 @@
 //! Audio-aware generation loop with text ↔ audio modality switching.
 
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
 
 use crate::kv_cache::InferenceState;
@@ -11,6 +9,7 @@ use crate::model::audio_decoder::{
     detokenize_to_spectrum, embed_audio_token, istft_to_pcm, sample_audio_frame,
 };
 use crate::sampler::{Sampler, SamplerConfig};
+use crate::time::{Duration, Instant};
 use crate::tokenizer::BpeTokenizer;
 
 /// Audio generation configuration.
