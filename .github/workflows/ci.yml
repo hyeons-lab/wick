@@ -472,7 +472,8 @@ jobs:
     # manual dispatch only. PR runs would pay a 200 MB cold-cache
     # download for a regression check the FFI unit tests already
     # cover; the parity harness's value lives at the rust↔kotlin /
-    # rust↔swift boundary that later PRs will add as additional legs.
+    # rust↔swift boundary that the Kotlin leg shipped as PR 16
+    # exercises (and a future Swift leg will exercise on macOS).
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -482,6 +483,17 @@ jobs:
         with:
           toolchain: nightly-2026-04-02
       - uses: Swatinem/rust-cache@v2
+      # JDK 21 (Temurin) for the Kotlin runner. The wick ecosystem
+      # baselines on JDK 21 (per the user's global CLAUDE.md note that
+      # the SDKMAN current may drift to a newer Java that breaks
+      # plugins). Using `setup-java`'s built-in Gradle caching lets the
+      # second-and-later runs skip the dependency download.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
       - name: Cache downloaded parity fixtures
         uses: actions/cache@v4
         with:
@@ -491,10 +503,24 @@ jobs:
           # changes.
           path: target/tmp/wick-parity-cache
           key: wick-parity-cache-lfm2-350m-q4_0-v1
+      # The Kotlin leg loads `libwick_ffi.so` through JNA. Build the
+      # cdylib first so JNA's `-Djna.library.path` (set by the rust
+      # harness from `WICK_PARITY_LIB_DIR`) finds something to load.
+      - name: Build wick-ffi cdylib (debug)
+        run: cargo build -p wick-ffi
+      # Build the Kotlin runner fat jar. `--no-daemon` is the right
+      # default for CI (single-shot invocation; daemon adds startup
+      # cost and disk usage that doesn't pay off across runs).
+      - name: Build kotlin-jna runner
+        working-directory: wick-parity/legs/kotlin
+        run: ./gradlew --no-daemon shadowJar
+      # Runs both `parity` (rust↔ffi sanity check) and `parity_kotlin`
+      # (real FFI-boundary check via JNA). The shared cache stanza
+      # above means the model downloads at most once per CI run even
+      # though both tests reference it.
       - name: Run parity harness
         env:
           WICK_PARITY_RUN: "1"
-        # `--test parity` keeps the run scoped to the env-gated
-        # rust↔ffi check; future Kotlin/Swift legs add additional
-        # `--test` targets here.
-        run: cargo test -p wick-parity --test parity -- --ignored
+          WICK_PARITY_KOTLIN_RUNNER: ${{ github.workspace }}/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar
+          WICK_PARITY_LIB_DIR: ${{ github.workspace }}/target/debug
+        run: cargo test -p wick-parity --tests -- --ignored

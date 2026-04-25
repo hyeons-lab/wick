@@ -3,6 +3,12 @@
 **/*.rs.bk
 Cargo.lock
 
+# Gradle / Kotlin (wick-parity Kotlin leg + any future Gradle subprojects)
+**/.gradle/
+**/.kotlin/
+**/build/
+!**/src/**/build/
+
 # IDE
 .idea/
 .vscode/
