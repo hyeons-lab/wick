@@ -348,11 +348,24 @@ impl WickEngine {
         let add_bos_token = gguf
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(false);
+        // Extract `general.file_type` BEFORE `load_text_model` consumes
+        // the gguf — that's the only place this metadata exists, and
+        // we need it for the metadata's quantization label.
+        let quantization = gguf
+            .get_u32("general.file_type")
+            .map(ftype_label)
+            .unwrap_or_else(|| "unknown".to_string());
         // `load_text_model` returns `Box<dyn Model>`; convert to `Arc`
         // at the engine boundary. `Arc::from(Box<T>)` is documented on
         // `Arc` for exactly this sizing dance (including `T: ?Sized`).
         let model: Arc<dyn Model> = Arc::from(load_text_model(gguf, path, &cfg)?);
-        let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, add_bos_token);
+        let metadata = build_metadata(
+            model.as_ref(),
+            &tokenizer,
+            &manifest,
+            add_bos_token,
+            quantization,
+        );
         Ok(Self {
             manifest,
             model,
@@ -910,6 +923,7 @@ fn build_metadata(
     tokenizer: &BpeTokenizer,
     manifest: &Manifest,
     add_bos_token: bool,
+    quantization: String,
 ) -> ModelMetadata {
     let cfg = model.config();
     // Reflect the effective template availability: a manifest override
@@ -922,11 +936,56 @@ fn build_metadata(
         max_seq_len: cfg.max_seq_len as u32,
         vocab_size: cfg.vocab_size as u32,
         has_chat_template,
-        // `quantization` field follow-up: GGUF's `general.file_type`
-        // encodes this but it's not wired through today. Leave
-        // "unknown" for v1; UniFFI bindings don't gate on it.
-        quantization: "unknown".into(),
+        quantization,
         add_bos_token,
+    }
+}
+
+/// Map a GGUF `general.file_type` value (the llama.cpp `LLAMA_FTYPE_*`
+/// enum) to the canonical short label used in filenames and tooling
+/// (`Q4_0`, `Q4_K_M`, `BF16`, etc.). Falls back to `ftype:N` for
+/// unrecognized values rather than dropping information — when a new
+/// quantization scheme appears, the number itself is enough for a
+/// human to look up. Returns `"unknown"` when the GGUF doesn't carry
+/// the field at all.
+///
+/// List mirrors llama.cpp's enum as of early 2026; extend as new
+/// quants ship upstream.
+fn ftype_label(ftype: u32) -> String {
+    match ftype {
+        0 => "F32".into(),
+        1 => "F16".into(),
+        2 => "Q4_0".into(),
+        3 => "Q4_1".into(),
+        7 => "Q8_0".into(),
+        8 => "Q5_0".into(),
+        9 => "Q5_1".into(),
+        10 => "Q2_K".into(),
+        11 => "Q3_K_S".into(),
+        12 => "Q3_K_M".into(),
+        13 => "Q3_K_L".into(),
+        14 => "Q4_K_S".into(),
+        15 => "Q4_K_M".into(),
+        16 => "Q5_K_S".into(),
+        17 => "Q5_K_M".into(),
+        18 => "Q6_K".into(),
+        19 => "IQ2_XXS".into(),
+        20 => "IQ2_XS".into(),
+        21 => "Q2_K_S".into(),
+        22 => "IQ3_XS".into(),
+        23 => "IQ3_XXS".into(),
+        24 => "IQ1_S".into(),
+        25 => "IQ4_NL".into(),
+        26 => "IQ3_S".into(),
+        27 => "IQ3_M".into(),
+        28 => "IQ2_S".into(),
+        29 => "IQ2_M".into(),
+        30 => "IQ4_XS".into(),
+        31 => "IQ1_M".into(),
+        32 => "BF16".into(),
+        36 => "TQ1_0".into(),
+        37 => "TQ2_0".into(),
+        other => format!("ftype:{other}"),
     }
 }
 

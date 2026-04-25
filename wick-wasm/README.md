@@ -3,9 +3,9 @@
 `wasm-bindgen` browser / Node bindings for the
 [wick](https://github.com/hyeons-lab/wick) inference engine.
 
-> Status: pre-1.0 skeleton. The current surface is intentionally small
-> (`wickVersion()` + `Manifest` parse). Full engine, session, and
-> tokenizer wrappers land in subsequent releases.
+> Status: pre-1.0. Today's surface covers manifest parsing, model
+> loading (CPU-only), metadata access, and tokenizer encode/decode.
+> `Session` / streaming generation lands in a follow-up release.
 
 ## Install
 
@@ -27,6 +27,8 @@ This package is built with `wasm-pack --target bundler`, so the
 `.wasm` is loaded automatically by your bundler (webpack 5+, Vite,
 Rollup with `@rollup/plugin-wasm`). No manual `init()` call.
 
+### Manifest parsing
+
 ```js
 import { wickVersion, Manifest } from '@hyeonslab/wick-wasm';
 
@@ -40,6 +42,52 @@ console.log(manifest.inferenceType);   // "llama.cpp/text-to-text"
 console.log(manifest.modelUrl);        // "https://.../model.gguf"
 console.log(manifest.schemaVersion);   // "1.0.0"
 ```
+
+### Loading a model + tokenizing
+
+```js
+import { WickEngine } from '@hyeonslab/wick-wasm';
+
+// Fetch the GGUF (use the `modelUrl` from a parsed manifest, or a
+// direct URL).
+const res = await fetch('/path/to/model.gguf');
+const bytes = new Uint8Array(await res.arrayBuffer());
+
+// Construct the engine. Optional `contextSize` defaults to 4096.
+// Backend is forced to CPU on wasm.
+const engine = WickEngine.fromGgufBytes(bytes, 2048);
+
+console.log(engine.architecture);     // "lfm2"
+console.log(engine.maxSeqLen);        // 4096
+console.log(engine.quantization);     // "Q4_0", "Q8_0", "BF16", etc.
+console.log(engine.hasChatTemplate);  // true / false
+console.log(engine.addBosToken);      // honor when hand-building token sequences
+
+// Tokenize a string.
+const tok = engine.tokenizer;
+const ids = tok.encode('hello world');  // Uint32Array
+console.log(ids);
+console.log(tok.decode(ids));           // round-trips to "hello world"
+
+// Optional: render a chat template (use a JS Jinja runtime like
+// `nunjucks` to apply `tok.chatTemplate` against your message list).
+console.log(tok.chatTemplate);
+
+// Release the model bytes from wasm memory when done.
+engine.free();
+```
+
+> **Memory note:** `WickEngine` keeps the entire GGUF resident in
+> wasm linear memory. Always `engine.free()` (or use the
+> `[Symbol.dispose]()` pattern with `using` in TC39 explicit
+> resource management) when you're done — otherwise the model
+> stays alive until the page unloads.
+
+`Session` (the actual `generate(...)` call with token streaming) is
+**not yet exposed** — that surface needs an async-streaming design
+that lands in a follow-up release. For now this package is useful
+for: client-side token counting, chat-template rendering before an
+API call, and inspecting model metadata before deciding to download.
 
 Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
