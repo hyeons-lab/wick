@@ -23,6 +23,7 @@ pub mod quant;
 pub mod sampler;
 pub mod session;
 pub mod tensor;
+pub mod time;
 pub mod tokenizer;
 pub mod turboquant;
 

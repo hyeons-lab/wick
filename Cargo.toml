@@ -45,6 +45,19 @@ sha2 = "0.10"
 # UniFFI for multi-language bindings (wick-ffi crate). Version pinned to
 # a 0.31.x series — bindings are ABI-stable within a minor.
 uniffi = "0.31"
+# wasm32-unknown-unknown portability deps (Phase 3 of the FFI multi-target
+# initiative). Pinned to versions paired with the corresponding native
+# transitive deps:
+#   - `getrandom 0.2` is what `rand 0.8` (above) pulls in. The `js` feature
+#     routes wasm builds through `crypto.getRandomValues`. Bumping `rand`
+#     to 0.9+ requires bumping this to `getrandom 0.3` and using the
+#     `wasm_js` feature instead — they're not interchangeable.
+#   - `web-time 1` is the standard `std::time::{Instant, Duration}` shim
+#     for wasm32-unknown-unknown (where `std::time::Instant` compiles
+#     since Rust 1.74 but panics at runtime). Used by `wick::time` to
+#     give the lib a single Instant type that works on both targets.
+getrandom = "0.2"
+web-time = "1"
 
 [profile.release]
 lto = "thin"

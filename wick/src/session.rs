@@ -14,9 +14,10 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
 
 use thiserror::Error;
+
+use crate::time::Instant;
 
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;

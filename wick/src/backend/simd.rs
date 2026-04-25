@@ -6,6 +6,10 @@
 #[cfg(target_arch = "aarch64")]
 use crate::quant::BlockQ6K;
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
+// `half::f16` is consumed only by the NEON / AVX2 kernels below; on wasm32
+// (and any other unsupported arch) neither cfg block compiles, leaving the
+// import unused.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use half::f16;
 
 // ── aarch64 NEON ────────────────────────────────────────────────────────────

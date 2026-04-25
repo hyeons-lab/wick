@@ -39,6 +39,27 @@ accelerate-src = { workspace = true, optional = true }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 openblas-src = { workspace = true, optional = true }
 
+# wasm32-unknown-unknown portability deps. Reasons for each:
+#
+# - `getrandom` is a transitive dep pulled by `rand 0.8` above. On wasm32
+#   it refuses to compile without an explicit entropy backend; the `js`
+#   feature routes it through the browser's `crypto.getRandomValues`.
+#   wick code never references `getrandom` directly — this is the
+#   "fake dep" pattern: the dep exists purely to enable the cargo
+#   feature on the transitive copy. **The version is coupled to
+#   `rand 0.8` upstream**: a future `rand 0.9+` bump moves to
+#   `getrandom 0.3`, where the wasm feature is renamed to `wasm_js`.
+#   Update both together if/when that happens.
+#
+# - `web-time` re-exports `std::time::{Instant, Duration}` on native and
+#   provides wasm-bindgen-backed equivalents on wasm32. Re-exported by
+#   `wick::time` (see `src/time.rs`); the lib uses `crate::time::Instant`
+#   everywhere `std::time::Instant` would otherwise panic at runtime on
+#   wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+web-time.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
