@@ -180,13 +180,22 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
 ///
 /// `progress`, when `Some`, is called periodically during the byte
 /// stream — at most once per ~256 KB written, plus one final
-/// callback at end-of-stream with the total bytes written. `None`
-/// makes downloads silent (and skips the writer-wrapping overhead).
+/// callback at end-of-stream with the total bytes written (skipped
+/// when the in-loop callback already reported the same value, which
+/// happens for files whose size is an exact multiple of 256 KB).
+/// `None` makes downloads silent (and skips the writer-wrapping
+/// overhead).
+///
+/// `total_bytes_hint` lets the caller plumb a known total (e.g. from
+/// a HEAD probe's `x-linked-size`) to the progress callback even
+/// when the GET response omits `Content-Length` (some chunked-transfer
+/// CDNs do). Falls back to `resp.content_length()` when `None`.
 pub(crate) fn download_to(
     client: &Client,
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
+    total_bytes_hint: Option<u64>,
     progress: Option<&dyn crate::bundle::DownloadProgress>,
 ) -> Result<(), WickError> {
     let mut resp = client
@@ -197,9 +206,11 @@ pub(crate) fn download_to(
         .error_for_status()
         .map_err(|e| WickError::Backend(format!("GET {url}: {e}")))?;
 
-    // Capture before consuming the response into io::copy; `progress`
-    // wants this in every call so the consumer can compute a percent.
-    let total_bytes = resp.content_length();
+    // Prefer the caller's hint (typically from a HEAD probe), then
+    // fall back to the GET response's Content-Length. Either may be
+    // None if neither path surfaced a size — consumers should display
+    // indeterminate progress in that case.
+    let total_bytes = total_bytes_hint.or_else(|| resp.content_length());
 
     // Server-side hash fallback when the caller didn't pin one.
     let server_hash = extract_linked_sha256(resp.headers());
@@ -237,19 +248,27 @@ pub(crate) fn download_to(
         // wrapper is essentially a thin forwarder; the per-write
         // overhead is one Option-check + a u64 add. Scoped so the
         // mutable borrow on `hashing` ends before we finalize the
-        // hasher + emit the end-of-stream callback below.
-        let final_bytes = {
+        // hasher + emit the end-of-stream callback below. We capture
+        // both the final byte count AND the writer's last in-loop
+        // callback position — the end-of-stream callback below skips
+        // when those match, avoiding a duplicate fire at exact-256KB
+        // file sizes.
+        let (final_bytes, last_in_loop_callback_at) = {
             let mut counting = ProgressingWriter::new(&mut hashing, progress, url, total_bytes);
             io::copy(&mut resp, &mut counting)
                 .map_err(|e| WickError::Backend(format!("write {}: {e}", partial.display())))?;
-            counting.bytes_written
+            (counting.bytes_written, counting.last_callback_at)
         };
-        if let Some(p) = progress {
+        if let Some(p) = progress
+            && final_bytes != last_in_loop_callback_at
+        {
             // Final 100% callback so consumers can flip a UI from
             // "downloading" to "verifying" / "done" deterministically.
             // The throttled in-loop callbacks may stop at e.g.
             // bytes - 256KB; this guarantees the last reported value
-            // matches the actual stream length.
+            // matches the actual stream length. Skipped when the
+            // in-loop callback already fired with `final_bytes`
+            // (de-dupe).
             p.on_progress(url, final_bytes, total_bytes);
         }
         let digest = hashing.hasher.finalize();
@@ -467,6 +486,60 @@ mod tests {
 
         // bytes_written reflects everything written.
         assert_eq!(writer.bytes_written, (1 + 300 + 1) * 1024);
+    }
+
+    /// Verifies the end-of-stream de-dup logic in `download_to`:
+    /// after the throttled in-loop callback fires, `last_callback_at`
+    /// equals `bytes_written`. The download_to caller checks
+    /// `final_bytes != last_in_loop_callback_at` before firing the
+    /// end-of-stream callback. Without this guard, a file whose size
+    /// is an exact multiple of `PROGRESS_THROTTLE_BYTES` would emit
+    /// two callbacks at the same byte count.
+    #[test]
+    fn progressing_writer_last_callback_at_equals_bytes_at_threshold_boundary() {
+        use crate::bundle::DownloadProgress;
+        use std::io::Write as _;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct Recorder {
+            calls: Mutex<Vec<u64>>,
+        }
+        impl DownloadProgress for Recorder {
+            fn on_progress(&self, _: &str, b: u64, _: Option<u64>) {
+                self.calls.lock().unwrap().push(b);
+            }
+        }
+
+        let recorder = Recorder::default();
+        let mut sink = std::io::sink();
+        let mut writer = ProgressingWriter::new(
+            &mut sink,
+            Some(&recorder as &dyn DownloadProgress),
+            "https://example.com/exact.bin",
+            Some(PROGRESS_THROTTLE_BYTES),
+        );
+        // Single write that exactly hits the throttle threshold.
+        writer
+            .write_all(&vec![0u8; PROGRESS_THROTTLE_BYTES as usize])
+            .unwrap();
+        // In-loop callback fired; bytes_written == last_callback_at.
+        assert_eq!(writer.bytes_written, PROGRESS_THROTTLE_BYTES);
+        assert_eq!(writer.last_callback_at, PROGRESS_THROTTLE_BYTES);
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one in-loop callback at the boundary"
+        );
+        assert_eq!(calls[0], PROGRESS_THROTTLE_BYTES);
+        // The download_to caller's de-dup guard
+        // (`final_bytes != last_in_loop_callback_at`) sees
+        // 256K == 256K and skips the end-of-stream callback. That's
+        // not exercised here directly (it's in download_to's body,
+        // which we'd need a real http response to drive); this test
+        // proves the writer exposes the `last_callback_at` field
+        // correctly for that guard to work.
     }
 
     /// `progress = None` → ProgressingWriter is a thin forwarder, no

@@ -220,6 +220,12 @@ impl BundleRepo {
             url,
             &dest,
             download_hash.as_deref(),
+            // HEAD probe captures `x-linked-size` from HF's no-redirect
+            // response. The GET path's CDN response usually echoes
+            // `Content-Length` too, but defensively prefer the HEAD-
+            // probed value so the progress callback gets a reliable
+            // total even when the CDN omits the header.
+            head.content_length,
             self.progress.as_deref(),
         )?;
         Ok(dest)
