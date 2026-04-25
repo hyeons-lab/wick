@@ -418,13 +418,20 @@ jobs:
     name: Integration Tests (gated)
     needs: check
     # Only run on main-branch pushes and manual dispatch. Skipping PR runs
-    # keeps PR cycle latency low — these tests download ~700 MB and are
+    # keeps PR cycle latency low — these tests download ~210 MB and are
     # meant as a correctness backstop, not per-PR regression guardrail.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Cap at 15 min: a healthy run is ~2 min; a stuck download or
-    # runaway prefill should fail loudly rather than consume CI minutes.
-    timeout-minutes: 15
+    # Cap at 30 min. PR #58's fixture swap (LFM2-1.2B → 350M-Extract)
+    # cut bundle_download from 31s → 11s and bundle_from_id stays sub-
+    # second, but `shift_real_model` does ~457 tokens of prefill across
+    # 16 attention layers + the post-shift K re-rotation work, which
+    # ran ~14 min on the 2-core Ubuntu runner with `ubatch_size:0`
+    # (vs ~32s locally on M-class arm64). 30 min gives comfortable
+    # headroom while still catching a true hang. Real perf fixes
+    # (chunked prefill in the test, BLAS-on-CI, AVX2-tightened Q4_0
+    # kernel) are tracked separately.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
