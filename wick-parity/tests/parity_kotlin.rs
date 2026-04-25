@@ -79,8 +79,10 @@ fn rust_and_kotlin_jna_produce_identical_tokens() {
         cache_dir: &cache,
     };
 
-    let rust = wick_parity::run_rust(&args).expect("rust path");
-    let kotlin = wick_parity::run_kotlin_jna(&args, &runner, &lib_dir).expect("kotlin-jna path");
+    let (rust, rust_ms) = wick_parity::run_rust(&args).expect("rust path");
+    let (kotlin, kotlin_ms) =
+        wick_parity::run_kotlin_jna(&args, &runner, &lib_dir).expect("kotlin-jna path");
+    eprintln!("perf: rust={rust_ms:?} kotlin-jna={kotlin_ms:?}");
 
     if let Some(idx) = wick_parity::first_divergence(&rust, &kotlin) {
         let start = idx.saturating_sub(2);

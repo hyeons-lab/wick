@@ -90,8 +90,10 @@ fn rust_and_swift_uniffi_produce_identical_tokens() {
         cache_dir: &cache,
     };
 
-    let rust = wick_parity::run_rust(&args).expect("rust path");
-    let swift = wick_parity::run_swift_uniffi(&args, &runner, &lib_dir).expect("swift-uniffi path");
+    let (rust, rust_ms) = wick_parity::run_rust(&args).expect("rust path");
+    let (swift, swift_ms) =
+        wick_parity::run_swift_uniffi(&args, &runner, &lib_dir).expect("swift-uniffi path");
+    eprintln!("perf: rust={rust_ms:?} swift-uniffi={swift_ms:?}");
 
     if let Some(idx) = wick_parity::first_divergence(&rust, &swift) {
         let start = idx.saturating_sub(2);

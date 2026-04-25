@@ -1,22 +1,31 @@
 //! Parity harness CLI.
 //!
 //! ```text
-//! wick-parity dump --via {rust|ffi} --bundle <id> --quant <q> \
-//!     --prompt <text> [--max-tokens 16] [--seed 0]
+//! wick-parity dump --via {rust|ffi|kotlin-jna|swift-uniffi} \
+//!     --bundle <id> --quant <q> --prompt <text> \
+//!     [--max-tokens 16] [--seed 0] \
+//!     [--runner <jar-or-bin>] [--lib-dir <dir>]
 //!
 //! wick-parity check --bundle <id> --quant <q> --prompt <text> \
-//!     [--max-tokens 16] [--seed 0]
+//!     [--max-tokens 16] [--seed 0] \
+//!     [--kotlin-runner <jar>] [--swift-runner <bin>] [--lib-dir <dir>] \
+//!     [--max-slowdown 2.0] [--fail-on-slowdown]
 //! ```
 //!
-//! `dump` runs one leg and emits a [`RunOutput`] as JSON to stdout.
-//! `check` runs every Rust-side leg, diffs token-by-token, exits 0
-//! on match or 1 with a diff summary on mismatch.
+//! `dump` runs one leg and emits a [`RunOutput`] (token vec + wall-clock
+//! latency) as JSON to stdout.
 //!
-//! Future binding legs (Kotlin via JNA, Swift via UniFFI) plug in by
-//! shelling out to their own `dump`-equivalent binary and feeding the
-//! resulting JSON into `check`'s diff. The contract is intentionally
-//! minimal: produce a `Vec<u32>` from the same `RunArgs` and emit it
-//! as `RunOutput.tokens`.
+//! `check` always runs rust + ffi; if `--kotlin-runner` / `--swift-runner`
+//! are supplied, those legs are added. Token streams are diffed against
+//! rust (the reference). Wall-clock latency per leg is printed alongside
+//! a `non_rust_ms / rust_ms` ratio. Default `--max-slowdown 2.0` prints
+//! `WARN` on breach but exits 0; flip `--fail-on-slowdown` to make the
+//! threshold load-bearing.
+//!
+//! Future binding legs plug in by shelling out to their own
+//! `dump`-equivalent binary that emits a [`RunOutput`] (with the
+//! `wall_clock_ms` field populated by the runner so subprocess startup
+//! cost doesn't pollute the FFI overhead measurement).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -63,8 +72,44 @@ enum Cmd {
         #[command(flatten)]
         common: CommonArgs,
     },
-    /// Run every Rust-side leg and diff the outputs.
+    /// Run rust + ffi (and optionally kotlin-jna / swift-uniffi if
+    /// runner paths are provided) and diff token streams +
+    /// wall-clock latency. Always runs rust + ffi; subprocess legs
+    /// are opt-in via `--kotlin-runner` and `--swift-runner`.
     Check {
+        /// Path to the kotlin-jna runner fat jar
+        /// (`wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar`).
+        /// If set, the kotlin-jna leg runs alongside rust + ffi and
+        /// feeds into the perf threshold check below.
+        #[arg(long)]
+        kotlin_runner: Option<PathBuf>,
+        /// Path to the swift-uniffi runner binary
+        /// (`wick-parity/legs/swift/.build/release/WickParitySwift`).
+        /// If set, the swift-uniffi leg runs alongside rust + ffi.
+        #[arg(long)]
+        swift_runner: Option<PathBuf>,
+        /// Directory containing `libwick_ffi.{so,dylib}`. Defaults
+        /// to `<workspace>/target/debug`. Used by both subprocess
+        /// legs; ignored if neither `--kotlin-runner` nor
+        /// `--swift-runner` is set.
+        #[arg(long)]
+        lib_dir: Option<PathBuf>,
+        /// Performance threshold — `non_rust_ms / rust_ms` ratio.
+        /// Default `2.0`: a non-rust leg taking >2× the rust
+        /// reference's wall clock prints a `WARN`. Set to a smaller
+        /// value to tighten the alarm; set to a very large number
+        /// (e.g. `1e9`) to disable the perf check entirely. Must be
+        /// strictly positive — `0` and negative values are rejected
+        /// at parse time since the threshold logic only makes sense
+        /// for a positive multiplier.
+        #[arg(long, default_value_t = 2.0, value_parser = parse_positive_f64)]
+        max_slowdown: f64,
+        /// Make perf threshold breaches exit non-zero (default is
+        /// warn-only). Off by default to avoid CI flakiness from
+        /// runner-load variance; flip on once the threshold has
+        /// been validated against real CI variance.
+        #[arg(long, default_value_t = false)]
+        fail_on_slowdown: bool,
         #[command(flatten)]
         common: CommonArgs,
     },
@@ -102,6 +147,22 @@ impl Leg {
     fn needs_runner(&self) -> bool {
         matches!(self, Leg::KotlinJna | Leg::SwiftUniffi)
     }
+}
+
+/// Clap value parser for `--max-slowdown`. Rejects non-finite and
+/// non-positive values at parse time so the perf threshold logic
+/// downstream doesn't have to defend against `0` (every leg would
+/// breach), negatives (every leg appears under threshold), or NaN
+/// / infinity (comparison semantics get weird).
+fn parse_positive_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if !v.is_finite() {
+        return Err(format!("must be finite, got {v}"));
+    }
+    if v <= 0.0 {
+        return Err(format!("must be > 0, got {v}"));
+    }
+    Ok(v)
 }
 
 fn default_lib_dir() -> PathBuf {
@@ -145,7 +206,7 @@ fn run_leg(
     args: &RunArgs<'_>,
     runner: Option<&Path>,
     lib_dir: Option<&Path>,
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Option<u64>)> {
     match leg {
         Leg::Rust => run_rust(args),
         Leg::Ffi => run_ffi(args),
@@ -171,7 +232,12 @@ fn run_leg(
     }
 }
 
-fn build_output(via: &str, args: &RunArgs<'_>, tokens: Vec<u32>) -> RunOutput {
+fn build_output(
+    via: &str,
+    args: &RunArgs<'_>,
+    tokens: Vec<u32>,
+    wall_clock_ms: Option<u64>,
+) -> RunOutput {
     RunOutput {
         via: via.to_string(),
         bundle: args.bundle.to_string(),
@@ -180,6 +246,7 @@ fn build_output(via: &str, args: &RunArgs<'_>, tokens: Vec<u32>) -> RunOutput {
         max_tokens: args.max_tokens,
         seed: args.seed,
         tokens,
+        wall_clock_ms,
     }
 }
 
@@ -218,15 +285,23 @@ fn real_main() -> Result<ExitCode> {
                 seed: common.seed,
                 cache_dir: &cache,
             };
-            let tokens = run_leg(&via, &args, runner.as_deref(), lib_dir.as_deref())?;
-            let out = build_output(via.label(), &args, tokens);
+            let (tokens, wall_clock_ms) =
+                run_leg(&via, &args, runner.as_deref(), lib_dir.as_deref())?;
+            let out = build_output(via.label(), &args, tokens, wall_clock_ms);
             // Pretty JSON makes the diff readable when a human inspects
             // the dump; one-line JSON would be friendlier for piping
             // into `jq` but the dump is human-driven, not pipeline-fed.
             println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Check { common } => {
+        Cmd::Check {
+            kotlin_runner,
+            swift_runner,
+            lib_dir,
+            max_slowdown,
+            fail_on_slowdown,
+            common,
+        } => {
             let cache = resolve_cache_dir(&common)?;
             let args = RunArgs {
                 bundle: &common.bundle,
@@ -236,41 +311,177 @@ fn real_main() -> Result<ExitCode> {
                 seed: common.seed,
                 cache_dir: &cache,
             };
-            let rust = run_rust(&args)?;
-            let ffi = run_ffi(&args)?;
-            match first_divergence(&rust, &ffi) {
-                None => {
-                    eprintln!(
-                        "OK: rust ↔ ffi parity (bundle={} quant={} tokens={})",
-                        args.bundle,
-                        args.quant,
-                        rust.len()
-                    );
-                    Ok(ExitCode::SUCCESS)
-                }
-                Some(idx) => {
-                    eprintln!(
-                        "FAIL: rust ↔ ffi diverged at index {idx} (bundle={} quant={})",
-                        args.bundle, args.quant
-                    );
-                    // Clamp each window to the slice's own length —
-                    // when divergence is at the tail (e.g. one leg
-                    // returned fewer tokens), an unclamped end goes
-                    // out of bounds and `slice[range]` panics; even
-                    // `get()` returns `None`, hiding the surrounding
-                    // tokens that are the whole point of the dump.
-                    let start = idx.saturating_sub(2);
-                    let end = idx.saturating_add(3);
-                    let rust_window = start..end.min(rust.len());
-                    let ffi_window = start..end.min(ffi.len());
-                    eprintln!("  rust[{rust_window:?}] = {:?}", &rust[rust_window.clone()]);
-                    eprintln!("  ffi [{ffi_window:?}] = {:?}", &ffi[ffi_window.clone()]);
-                    eprintln!("  rust.len() = {}, ffi.len() = {}", rust.len(), ffi.len());
-                    Ok(ExitCode::from(1))
-                }
-            }
+            run_check(
+                &args,
+                kotlin_runner.as_deref(),
+                swift_runner.as_deref(),
+                lib_dir.as_deref(),
+                max_slowdown,
+                fail_on_slowdown,
+            )
         }
     }
+}
+
+/// Resolved per-leg result for `Cmd::Check`. `wall_clock_ms` is
+/// `Option<u64>` to honestly represent legs whose runner predates
+/// the timing field — printing `n/a` and skipping the ratio check
+/// beats reporting `0 ms` and a bogus `0.00×` that would mask a
+/// real regression.
+struct LegResult {
+    label: &'static str,
+    tokens: Vec<u32>,
+    wall_clock_ms: Option<u64>,
+}
+
+/// Format a wall-clock measurement for the right-aligned `ms`
+/// column of the perf table. `None` → `n/a`.
+fn fmt_ms(ms: Option<u64>) -> String {
+    match ms {
+        Some(v) => format!("{v:>6} ms"),
+        None => format!("{:>9}", "n/a"),
+    }
+}
+
+fn run_check(
+    args: &RunArgs<'_>,
+    kotlin_runner: Option<&Path>,
+    swift_runner: Option<&Path>,
+    lib_dir: Option<&Path>,
+    max_slowdown: f64,
+    fail_on_slowdown: bool,
+) -> Result<ExitCode> {
+    // Resolve lib_dir once if either subprocess leg needs it. The
+    // closure-style dispatch in `run_leg` would re-resolve per call;
+    // doing it here keeps the side-channel for the `--lib-dir` arg
+    // explicit + lets us reuse the resolved path.
+    let resolved_lib_dir;
+    let lib_dir_resolved = match lib_dir {
+        Some(p) => p,
+        None => {
+            resolved_lib_dir = default_lib_dir();
+            &resolved_lib_dir
+        }
+    };
+
+    let mut results: Vec<LegResult> = Vec::with_capacity(4);
+
+    let (rust_tokens, rust_ms) = run_rust(args).context("rust leg")?;
+    results.push(LegResult {
+        label: "rust",
+        tokens: rust_tokens,
+        wall_clock_ms: rust_ms,
+    });
+
+    let (ffi_tokens, ffi_ms) = run_ffi(args).context("ffi leg")?;
+    results.push(LegResult {
+        label: "ffi",
+        tokens: ffi_tokens,
+        wall_clock_ms: ffi_ms,
+    });
+
+    if let Some(jar) = kotlin_runner {
+        let (tokens, ms) = run_kotlin_jna(args, jar, lib_dir_resolved).context("kotlin-jna leg")?;
+        results.push(LegResult {
+            label: "kotlin-jna",
+            tokens,
+            wall_clock_ms: ms,
+        });
+    }
+    if let Some(bin) = swift_runner {
+        let (tokens, ms) =
+            run_swift_uniffi(args, bin, lib_dir_resolved).context("swift-uniffi leg")?;
+        results.push(LegResult {
+            label: "swift-uniffi",
+            tokens,
+            wall_clock_ms: ms,
+        });
+    }
+
+    // Token diff: every non-rust leg is compared against rust.
+    // `split_first` is safe — we always push rust first.
+    let (rust_result, rest) = results.split_first().expect("rust leg always pushed first");
+    let rust_label = rust_result.label;
+    let rust_tokens = &rust_result.tokens;
+    let rust_ms = rust_result.wall_clock_ms;
+
+    let mut diff_failure = false;
+    for r in rest {
+        if let Some(idx) = first_divergence(rust_tokens, &r.tokens) {
+            eprintln!(
+                "FAIL: {rust_label} ↔ {} diverged at index {idx} (bundle={} quant={})",
+                r.label, args.bundle, args.quant
+            );
+            let start = idx.saturating_sub(2);
+            let end = idx.saturating_add(3);
+            let rl_window = start..end.min(rust_tokens.len());
+            let rr_window = start..end.min(r.tokens.len());
+            eprintln!(
+                "  {rust_label}[{rl_window:?}] = {:?}",
+                &rust_tokens[rl_window.clone()]
+            );
+            eprintln!(
+                "  {:>w$}[{rr_window:?}] = {:?}",
+                r.label,
+                &r.tokens[rr_window.clone()],
+                w = rust_label.len()
+            );
+            eprintln!(
+                "  {rust_label}.len() = {}, {}.len() = {}",
+                rust_tokens.len(),
+                r.label,
+                r.tokens.len()
+            );
+            diff_failure = true;
+        }
+    }
+
+    // Always print per-leg timing + ratio vs rust. Even when there's
+    // no token divergence, this is the visible signal users want when
+    // debugging "why is parity_kotlin slow today".
+    eprintln!();
+    eprintln!("perf (max-slowdown threshold = {max_slowdown:.2}×):");
+    eprintln!("  {:<14} {}  (reference)", rust_label, fmt_ms(rust_ms));
+    let mut perf_failure = false;
+    for r in rest {
+        // Ratio is meaningful only when both sides measured AND the
+        // reference is non-zero (sub-millisecond rust on a tiny
+        // fixture + hot cache would otherwise give `inf×`). Anything
+        // else collapses to `(n/a)`, no breach. Honest about what we
+        // know — better than printing `(0.00×)` or `(nan×)` and
+        // pretending the threshold logic ran.
+        let (ratio_display, breached) = match (r.wall_clock_ms, rust_ms) {
+            (Some(leg_ms), Some(ref_ms)) if ref_ms > 0 => {
+                let ratio = leg_ms as f64 / ref_ms as f64;
+                (format!("({ratio:.2}×)"), ratio > max_slowdown)
+            }
+            _ => ("(n/a)".to_string(), false),
+        };
+        let marker = if breached { " WARN" } else { "" };
+        eprintln!(
+            "  {:<14} {}  {ratio_display}{marker}",
+            r.label,
+            fmt_ms(r.wall_clock_ms)
+        );
+        if breached {
+            perf_failure = true;
+        }
+    }
+
+    if diff_failure {
+        return Ok(ExitCode::from(1));
+    }
+    if perf_failure && fail_on_slowdown {
+        return Ok(ExitCode::from(1));
+    }
+    eprintln!(
+        "\nOK: {} legs, all token streams match (bundle={} quant={} tokens={})",
+        results.len(),
+        args.bundle,
+        args.quant,
+        rust_tokens.len()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -328,9 +539,53 @@ mod tests {
         ])
         .expect("parse check");
         match cli.cmd {
-            Cmd::Check { common } => {
+            Cmd::Check {
+                kotlin_runner: None,
+                swift_runner: None,
+                lib_dir: None,
+                max_slowdown,
+                fail_on_slowdown: false,
+                common,
+            } => {
                 assert_eq!(common.max_tokens, 32);
                 assert_eq!(common.seed, 7);
+                assert!((max_slowdown - 2.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_check_with_perf_flags() {
+        let cli = Cli::try_parse_from([
+            "wick-parity",
+            "check",
+            "--bundle",
+            "B",
+            "--quant",
+            "Q",
+            "--prompt",
+            "p",
+            "--kotlin-runner",
+            "/tmp/r.jar",
+            "--swift-runner",
+            "/tmp/r",
+            "--max-slowdown",
+            "1.5",
+            "--fail-on-slowdown",
+        ])
+        .expect("parse check perf flags");
+        match cli.cmd {
+            Cmd::Check {
+                kotlin_runner: Some(j),
+                swift_runner: Some(s),
+                max_slowdown,
+                fail_on_slowdown: true,
+                ..
+            } => {
+                assert_eq!(j, std::path::PathBuf::from("/tmp/r.jar"));
+                assert_eq!(s, std::path::PathBuf::from("/tmp/r"));
+                assert!((max_slowdown - 1.5).abs() < f64::EPSILON);
             }
             other => panic!("unexpected cmd: {other:?}"),
         }
@@ -346,9 +601,25 @@ mod tests {
             seed: 0,
             cache_dir: std::path::Path::new("/tmp"),
         };
-        let out = build_output("rust", &args, vec![1, 2, 3]);
+        let out = build_output("rust", &args, vec![1, 2, 3], Some(42));
         assert_eq!(out.via, "rust");
         assert_eq!(out.bundle, "B");
         assert_eq!(out.tokens, vec![1, 2, 3]);
+        assert_eq!(out.wall_clock_ms, Some(42));
+    }
+
+    #[test]
+    fn parse_positive_f64_accepts_positive() {
+        assert!((parse_positive_f64("2.0").unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((parse_positive_f64("0.5").unwrap() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_positive_f64_rejects_zero_negative_nan_inf() {
+        assert!(parse_positive_f64("0").is_err());
+        assert!(parse_positive_f64("-1.5").is_err());
+        assert!(parse_positive_f64("nan").is_err());
+        assert!(parse_positive_f64("inf").is_err());
+        assert!(parse_positive_f64("not-a-number").is_err());
     }
 }

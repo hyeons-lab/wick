@@ -41,6 +41,13 @@ struct RunOutput: Codable {
     let maxTokens: UInt32
     let seed: UInt64
     let tokens: [UInt32]
+    // Wall-clock latency of `runOnce` only — excludes Swift binary
+    // cold-start (~50ms) so the rust harness can compute
+    // apples-to-apples ratios against the in-process rust leg's
+    // `Instant::now()` measurement. Optional to mirror
+    // `RunOutput.wall_clock_ms: Option<u64>` on the Rust side, for
+    // forward compat with older harness versions that ignore it.
+    let wallClockMs: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case via
@@ -50,6 +57,7 @@ struct RunOutput: Codable {
         case maxTokens = "max_tokens"
         case seed
         case tokens
+        case wallClockMs = "wall_clock_ms"
     }
 }
 
@@ -117,7 +125,13 @@ func main() {
     do {
         let stdinData = FileHandle.standardInput.readDataToEndOfFile()
         let request = try JSONDecoder().decode(RunArgsOwned.self, from: stdinData)
+        // Bracket only `runOnce` so the timing excludes JSON
+        // decode + framework load; rust harness pairs it against
+        // `Instant::now()` deltas around `run_rust`'s engine +
+        // session work.
+        let started = DispatchTime.now()
         let tokens = try runOnce(request)
+        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
         let response = RunOutput(
             via: "swift-uniffi",
             bundle: request.bundle,
@@ -125,7 +139,8 @@ func main() {
             prompt: request.prompt,
             maxTokens: request.maxTokens,
             seed: request.seed,
-            tokens: tokens
+            tokens: tokens,
+            wallClockMs: elapsedMs
         )
         let encoder = JSONEncoder()
         // Pretty-print mirrors the Rust `dump` subcommand's output.

@@ -39,8 +39,9 @@ fn rust_and_ffi_produce_identical_tokens() {
         cache_dir: &cache,
     };
 
-    let rust = wick_parity::run_rust(&args).expect("rust path");
-    let ffi = wick_parity::run_ffi(&args).expect("ffi path");
+    let (rust, rust_ms) = wick_parity::run_rust(&args).expect("rust path");
+    let (ffi, ffi_ms) = wick_parity::run_ffi(&args).expect("ffi path");
+    eprintln!("perf: rust={rust_ms:?} ffi={ffi_ms:?}");
 
     // Greedy decoding is deterministic across runs; the rust and ffi
     // legs share the same library underneath so they MUST agree
