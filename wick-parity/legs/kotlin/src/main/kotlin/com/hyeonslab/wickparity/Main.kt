@@ -43,6 +43,13 @@ data class RunOutput(
     @SerialName("max_tokens") val maxTokens: UInt,
     val seed: ULong,
     val tokens: List<UInt>,
+    // Wall-clock latency of `runOnce` only — excludes JVM startup
+    // (~500ms on a cold JVM) so the rust harness can compute
+    // apples-to-apples ratios against the in-process rust leg's
+    // `Instant::now()` measurement. Nullable to mirror
+    // `RunOutput.wall_clock_ms: Option<u64>` on the Rust side, for
+    // forward compat with older harness versions that ignore it.
+    @SerialName("wall_clock_ms") val wallClockMs: ULong? = null,
 )
 
 // Mirror of `wick_parity::settings`. Manual copy (no shared schema)
@@ -67,7 +74,13 @@ private val json = Json {
 fun main() {
     try {
         val request = json.decodeFromString<RunArgsOwned>(System.`in`.readBytes().toString(Charsets.UTF_8))
+        // Bracket only `runOnce` so the timing excludes JSON
+        // decode + class-loading prelude; rust harness pairs it
+        // against `Instant::now()` deltas around `run_rust`'s
+        // engine + session work.
+        val started = System.nanoTime()
         val tokens = runOnce(request)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000L
         val response = RunOutput(
             via = "kotlin-jna",
             bundle = request.bundle,
@@ -76,6 +89,7 @@ fun main() {
             maxTokens = request.maxTokens,
             seed = request.seed,
             tokens = tokens,
+            wallClockMs = elapsedMs.toULong(),
         )
         // Pretty-print for parity with the Rust `dump` subcommand.
         // The Rust harness parses with `serde_json` either way.

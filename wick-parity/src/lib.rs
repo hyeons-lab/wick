@@ -25,6 +25,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,15 @@ pub struct RunOutput {
     /// Greedy-decoded token IDs in emission order. Excludes prompt
     /// tokens and the `<bos>` (if added by the tokenizer).
     pub tokens: Vec<u32>,
+    /// Wall-clock latency of the leg's actual work (BundleRepo +
+    /// engine load + prefill + decode), in milliseconds.
+    /// Subprocess legs measure inside their `runOnce` body so JVM
+    /// startup / Swift cold-start is excluded — those are harness
+    /// artifacts, not FFI overhead. `None` means the runner
+    /// predates this field (forward compat for older vendored
+    /// kotlin/swift runners).
+    #[serde(default)]
+    pub wall_clock_ms: Option<u64>,
 }
 
 /// Default cache root for harness runs. Resolved as
@@ -195,8 +205,15 @@ fn engine_config_with_repo(cache_dir: &Path) -> wick::EngineConfig {
 }
 
 /// Run the prompt through `wick::WickEngine` directly. Reference leg —
-/// every other leg's output is diffed against this.
-pub fn run_rust(args: &RunArgs<'_>) -> Result<Vec<u32>> {
+/// every other leg's output is diffed against this. Returns
+/// `(tokens, wall_clock_ms)` where the timing covers the full
+/// engine-load + prefill + decode body (excludes the lightweight
+/// `Instant::now()` bracketing itself). The timing is `Option<u64>`
+/// for symmetry with the subprocess legs (which can return `None`
+/// when the runner predates the field); in-process Rust legs always
+/// return `Some`.
+pub fn run_rust(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
+    let started = Instant::now();
     let cfg = engine_config_with_repo(args.cache_dir);
     let engine = wick::WickEngine::from_bundle_id(args.bundle, args.quant, cfg)
         .with_context(|| format!("load bundle {}/{} (rust)", args.bundle, args.quant))?;
@@ -224,14 +241,17 @@ pub fn run_rust(args: &RunArgs<'_>) -> Result<Vec<u32>> {
     session
         .generate(&greedy_opts(args.max_tokens), &mut sink)
         .context("generate (rust)")?;
-    Ok(sink.0)
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok((sink.0, Some(elapsed_ms)))
 }
 
 /// Run the prompt through `wick_ffi::WickEngine`'s Rust public
 /// surface. Same library underneath — this leg verifies the
 /// `RecordType <-> wick::Type` adapters round-trip without dropping
-/// or reordering anything that affects token output.
-pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
+/// or reordering anything that affects token output. Returns
+/// `(tokens, wall_clock_ms)` — same shape as [`run_rust`]; the
+/// `Option<u64>` is always `Some` for this in-process leg.
+pub fn run_ffi(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
     // wick-ffi's `BundleRepo::new` takes a `String` (UniFFI marshals
     // strings, not `Path`). Validating UTF-8 here means a non-UTF-8
     // cache dir errors out loudly instead of silently mangling into a
@@ -244,6 +264,7 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
             args.cache_dir.display()
         )
     })?;
+    let started = Instant::now();
     let repo = wick_ffi::BundleRepo::new(cache_dir_str.to_owned());
     let cfg = wick_ffi::EngineConfig {
         context_size: settings::CONTEXT_SIZE,
@@ -269,7 +290,8 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
     let output = session
         .generate(greedy_opts_ffi(args.max_tokens))
         .context("generate (ffi)")?;
-    Ok(output.tokens)
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok((output.tokens, Some(elapsed_ms)))
 }
 
 /// Run the prompt through the Kotlin runner under
@@ -288,7 +310,19 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<Vec<u32>> {
 /// JDK 21 emits a warning every time JNA calls `System.load` without
 /// it (a JEP-472 forward-compat nudge), and the cleaner stderr makes
 /// it easier to spot a real error in the test output.
-pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> Result<Vec<u32>> {
+///
+/// Returns `(tokens, wall_clock_ms)`. The timing is the runner's own
+/// `runOnce` measurement (from its stdout JSON), so JVM startup
+/// (~500ms) doesn't get charged against the FFI overhead. `None` if
+/// the runner predates the field — propagates honestly so callers
+/// can render `n/a` and skip ratio/threshold checks rather than
+/// reporting `0` (which would print `0 ms` and a bogus `0.00×`
+/// ratio that masks real perf changes).
+pub fn run_kotlin_jna(
+    args: &RunArgs<'_>,
+    runner_jar: &Path,
+    lib_dir: &Path,
+) -> Result<(Vec<u32>, Option<u64>)> {
     // Validate UTF-8 up front for the same reason `run_ffi` does:
     // the Kotlin runner deserializes `cache_dir` as a `String` (JSON
     // strings are UTF-8 by spec), and `serde_json::to_vec` on a
@@ -356,7 +390,7 @@ pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> 
             stderr.trim()
         )
     })?;
-    Ok(response.tokens)
+    Ok((response.tokens, response.wall_clock_ms))
 }
 
 /// Run the prompt through the Swift runner under
@@ -382,11 +416,18 @@ pub fn run_kotlin_jna(args: &RunArgs<'_>, runner_jar: &Path, lib_dir: &Path) -> 
 /// variant) is intentional: matches Java's `-Djna.library.path`
 /// semantics. macOS SIP strips `DYLD_*` from system-protected
 /// binaries; `.build/release/` artifacts aren't protected.
+///
+/// Returns `(tokens, wall_clock_ms)`. The timing is the runner's own
+/// `runOnce` measurement (from its stdout JSON), so swift binary
+/// cold-start (~50ms) doesn't get charged against the FFI overhead.
+/// `None` if the runner predates the field — propagates honestly so
+/// callers can render `n/a` and skip ratio/threshold checks rather
+/// than reporting `0`.
 pub fn run_swift_uniffi(
     args: &RunArgs<'_>,
     runner_path: &Path,
     lib_dir: &Path,
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Option<u64>)> {
     // Validate UTF-8 up front for the same reason `run_ffi` and
     // `run_kotlin_jna` do: the Swift runner deserializes `cache_dir`
     // as a `String` (JSON strings are UTF-8 by spec), and
@@ -451,7 +492,7 @@ pub fn run_swift_uniffi(
             stderr.trim()
         )
     })?;
-    Ok(response.tokens)
+    Ok((response.tokens, response.wall_clock_ms))
 }
 
 /// First index where `a` and `b` differ, or `None` if they're equal.

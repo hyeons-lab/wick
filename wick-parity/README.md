@@ -33,24 +33,61 @@ The harness is built around three constraints:
 ## CLI
 
 ```bash
-# Run one leg, emit JSON to stdout
+# Run one leg, emit JSON to stdout (includes wall_clock_ms field)
 cargo run -p wick-parity -- dump --via rust \
     --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
     --prompt "The capital of France is" \
     --max-tokens 16
 
-# Run every Rust-side leg and diff token-by-token
+# Run rust + ffi (always) plus optional kotlin/swift legs, then
+# diff tokens + wall-clock latency
 cargo run -p wick-parity -- check \
     --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
     --prompt "The capital of France is" \
-    --max-tokens 16
-# OK: rust ↔ ffi parity (bundle=LFM2-350M-Extract-GGUF quant=Q4_0 tokens=16)
+    --max-tokens 16 \
+    --kotlin-runner $(pwd)/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar \
+    --swift-runner  $(pwd)/wick-parity/legs/swift/.build/release/WickParitySwift
+#
+# perf (max-slowdown threshold = 2.00×):
+#   rust              582 ms  (reference)
+#   ffi               549 ms  (0.94×)
+#   kotlin-jna       7173 ms  (12.32×) WARN
+#   swift-uniffi     6359 ms  (10.93×) WARN
+#
+# OK: 4 legs, all token streams match (bundle=LFM2-350M-Extract-GGUF quant=Q4_0 tokens=16)
 ```
 
-`check` exits 0 on match, 1 with a windowed diff summary on
-mismatch, 2 on any other error (load failure, network error, …).
-The cache directory survives across `dump` ↔ `check` invocations so
-the model downloads once.
+`check` exits 0 on token match (regardless of perf threshold breach
+unless `--fail-on-slowdown` is set), 1 with a windowed diff summary
+on token mismatch, 2 on any other error (load failure, network error,
+…). The cache directory survives across `dump` ↔ `check` invocations
+so the model downloads once.
+
+### Performance parity
+
+`check` measures wall-clock latency per leg and reports the
+`non_rust_ms / rust_ms` ratio. Subprocess legs (`kotlin-jna`,
+`swift-uniffi`) measure inside their `runOnce` body and emit the
+result via `RunOutput.wall_clock_ms`, so JVM startup (~500ms) and
+Swift cold-start (~50ms) don't pollute the FFI overhead measurement.
+
+**Threshold tuning.** Default `--max-slowdown 2.0` is appropriate
+for in-process legs (rust ↔ ffi). Subprocess legs see fundamental
+overhead from spawn + fresh-process mmap (no shared OS page cache
+with rust), typically running 5-15× the rust reference on a fresh
+fixture. To gate CI on subprocess perf, set a higher ceiling tuned
+to your runner's actual variance:
+
+```bash
+cargo run -p wick-parity -- check ... \
+    --kotlin-runner ... --swift-runner ... \
+    --max-slowdown 15.0 --fail-on-slowdown
+```
+
+`--fail-on-slowdown` is opt-in (default warn-only) so a noisy CI
+runner doesn't block merges on a single bad measurement. Once
+you've watched the variance for a few runs and picked a stable
+threshold, flip it on.
 
 ### Cache root
 
