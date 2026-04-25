@@ -7,14 +7,18 @@ engine to Kotlin, Swift, Python, and every other language
 ## Status
 
 **Phase 2.1 progression** — the Rust FFI surface + binding generation +
-Android ABI cross-compile pipeline. `WickEngine` + `Session` + sync,
+mobile cross-compile pipelines. `WickEngine` + `Session` + sync,
 streaming, and async `generate` surfaced through PRs 2–5. PR 6
 vendored the Kotlin + Swift bindings with a CI drift check. PR 7
-typed the `FfiError` enum. PR 8 added Android ABI cross-compile:
-`wick-ffi` now builds for `arm64-v8a`, `armeabi-v7a`, `x86_64`, and
-`x86` in CI, each `.so` is ELF-shape-verified, and the release
-libraries are published as per-ABI CI artifacts so consumer Android
-apps can grab them without running the NDK toolchain themselves.
+typed the `FfiError` enum. PR 8 added Android ABI cross-compile +
+per-ABI artifacts. PR 9 adds the Apple-platform counterpart:
+`wick-ffi` now cross-compiles to `aarch64-apple-ios` (real iPhones),
+`aarch64-apple-ios-sim` (Apple Silicon Mac iOS Simulator), and
+`aarch64-apple-darwin` (native Apple Silicon Macs); assembles a
+3-slice `WickFFI.xcframework`; and publishes it as a CI artifact
+ready for Swift Package Manager / Xcode consumption. Apple Silicon
+only — x86_64 slices are deliberately omitted (Apple stopped selling
+Intel Macs in 2023).
 
 | PR | Scope |
 |---|---|
@@ -26,7 +30,8 @@ apps can grab them without running the NDK toolchain themselves.
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI drift check; UniFFI 0.28 → 0.31.1 |
 | 7 | Typed `FfiError` variants mirroring `wick::WickError` |
 | 8 | Android ABI cross-compile + CI matrix + per-ABI artifact upload |
-| 9+ | `BundleRepo` remote loading (`remote` feature), parity harness, iOS XCFramework packaging |
+| 9 | Apple-platform XCFramework: arm64-only iOS device + iOS Simulator + native macOS slices, CI artifact |
+| 10+ | `BundleRepo` remote loading (`remote` feature), parity harness, Maven publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -181,6 +186,134 @@ The `cargo ndk` flag shape is compatible across recent NDK majors so
 the pin is mostly about toolchain + sysroot stability across runs,
 not a hard constraint — later NDKs that keep the `armv7-linux-androideabi`
 and `i686-linux-android` sysroots should drop in cleanly.
+
+## Apple platforms
+
+`wick-ffi` cross-compiles to a Swift Package Manager-ready
+`WickFFI.xcframework` via Xcode's `xcodebuild`. The
+`apple-xcframework` CI job builds the framework on an Apple Silicon
+`macos-15` runner and uploads it as a CI artifact every PR; consumer
+iOS and native Apple Silicon Mac apps can drop the artifact straight
+into their SPM dependency graph.
+
+The framework ships three single-arch slices — **Apple Silicon
+only**:
+
+- `ios-arm64` — real iPhones / iPads (`aarch64-apple-ios`).
+- `ios-arm64-simulator` — iOS Simulator on Apple Silicon Macs (`aarch64-apple-ios-sim`).
+- `macos-arm64` — native Apple Silicon Macs (`aarch64-apple-darwin`).
+
+x86_64 slices are deliberately omitted: Apple stopped selling Intel
+Macs in 2023 and modern consumer apps don't need to ship for them.
+Dropping the fat-binary `lipo` step keeps the pipeline simple and
+the framework smaller (~125 MB total instead of ~211 MB with x86_64
+fat slices).
+
+Other Apple platforms (Mac Catalyst, watchOS, tvOS, visionOS) aren't
+included yet — adding them is structurally identical (more rustup
+targets + more `-library` flags on `xcodebuild -create-xcframework`).
+
+The vendored Swift bindings under `wick-ffi/bindings/swift/` provide
+the C header + module map that the framework wraps.
+
+### Local setup
+
+```bash
+# One-time:
+rustup target add \
+    aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+
+# Then (Xcode + Command Line Tools must be installed for xcodebuild;
+# macOS only):
+just apple-xcframework
+just ios-arm64           # smoke test: device target only, no XCFramework
+```
+
+Output lands at `target/xcframework-build/WickFFI.xcframework`
+(~125 MB on disk: 42 MB per slice × 3 slices + small headers).
+Consumer apps embed exactly one slice per build configuration, so
+the per-target cost added to a shipped `.ipa` / `.app` is ~42 MB.
+Cargo's `release` profile in this workspace runs
+`strip = "symbols"` on the staticlibs; further size trimming would
+need feature-gating out tokio / rustfft / similar heavyweight deps.
+
+`just apple-xcframework` runs `RUSTFLAGS=""` across all three cross-
+compiles for shape-consistency. It's strictly required only for the
+`aarch64-apple-darwin` slice — the workspace's `.cargo/config.toml`
+sets `target-cpu=native` for that triple (workstation dev
+convenience), and a build host's specific microarch isn't a portable
+shipped-binary baseline. Applying the override to the iOS builds
+too is a no-op (iOS targets have no native flags in the config) but
+keeps the recipe shape uniform and forestalls an externally-set
+`RUSTFLAGS` contaminating any slice.
+
+### XCFramework structure
+
+```
+WickFFI.xcframework/
+├── Info.plist
+├── ios-arm64/
+│   ├── libwick_ffi.a       # iOS device staticlib (aarch64-apple-ios)
+│   └── Headers/{wick_ffiFFI.h, module.modulemap}
+├── ios-arm64-simulator/
+│   ├── libwick_ffi.a       # iOS Simulator staticlib (aarch64-apple-ios-sim)
+│   └── Headers/{wick_ffiFFI.h, module.modulemap}
+└── macos-arm64/
+    ├── libwick_ffi.a       # native macOS staticlib (aarch64-apple-darwin)
+    └── Headers/{wick_ffiFFI.h, module.modulemap}
+```
+
+### Swift Package Manager consumption
+
+Drop the `WickFFI.xcframework` into your SPM package alongside the
+generated Swift binding (`wick_ffi.swift` from
+`wick-ffi/bindings/swift/`):
+
+```swift
+// Package.swift
+let package = Package(
+    name: "MyApp",
+    targets: [
+        .target(
+            name: "WickFFISwift",
+            dependencies: [.target(name: "WickFFI")],
+            path: "Sources/WickFFISwift",
+            // wick_ffi.swift goes here.
+        ),
+        .binaryTarget(
+            name: "WickFFI",
+            path: "Frameworks/WickFFI.xcframework"
+        ),
+    ]
+)
+```
+
+For a remote-pulled XCFramework via SPM, package the framework into
+a zip + checksum it (`swift package compute-checksum`) and reference
+the URL in your `Package.swift` — out of scope for this crate but
+the pattern is standard SPM.
+
+### CI artifact
+
+The `apple-xcframework` CI job uploads `wick-ffi-apple-xcframework`
+(7-day retention). Each PR publishes a fresh XCFramework on the
+action run page; Mac-side consumers can grab the zip without
+installing Xcode or running the cross-compile themselves.
+
+### Runner + Xcode pin
+
+CI pins `runs-on: macos-15` (Apple Silicon) rather than
+`macos-latest`. Every artifact the job produces is arm64-only, and
+`swiftc` on an Intel host would default to x86_64 and silently build
+a Swift binary that fails to link against the aarch64 staticlib. The
+pin makes the host architecture deterministic; a `uname -m` check at
+the start of the job turns a future runner-image tier change into a
+loud early failure instead of a mislinked binary. Xcode version
+floats within the image; the job logs `xcodebuild -version` so
+silent runner-image bumps are visible in the build output. iOS Rust
+targets are pinned to whatever nightly the workspace uses; bumping
+requires a corresponding
+toolchain re-validation.
 
 ## Design notes
 

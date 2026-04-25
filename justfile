@@ -120,6 +120,93 @@ android-all:
 android-arm64:
     cargo ndk --target arm64-v8a build -p wick-ffi --release
 
+# Cross-compile `wick-ffi` to all three arm64-only Apple-platform
+# targets and assemble a `WickFFI.xcframework` ready for Swift
+# Package Manager / Xcode consumption. Three single-arch slices:
+# real iPhones (`ios-arm64`), Apple Silicon Mac iOS Simulator
+# (`ios-arm64-simulator`), and native Apple Silicon Macs
+# (`macos-arm64`). x86_64 is deliberately omitted — Apple stopped
+# selling Intel Macs in 2023 and modern consumer apps drop support.
+#
+# Requires Xcode (for `xcodebuild`) + the rustup targets:
+# `rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+# aarch64-apple-darwin`. `RUSTFLAGS=""` overrides the workspace's
+# `target-cpu=native` for the apple-darwin slice so the shipped
+# staticlib is portable across Apple Silicon Macs (otherwise the
+# build host's specific microarch leaks into the binary).
+#
+# The vendored Swift bindings under `wick-ffi/bindings/swift/`
+# provide the headers + module map; CI regenerates them via the
+# `ffi-bindings-drift` job so they stay locked to the current Rust
+# surface.
+#
+# Output: `target/xcframework-build/WickFFI.xcframework` (~125 MB,
+# 42 MB per slice). CI uploads the same path as a per-run artifact.
+apple-xcframework:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
+    OUT=target/xcframework-build
+    rm -rf "$OUT"
+    mkdir -p "$OUT/headers"
+    # Stage the headers + module map next to where xcodebuild will
+    # look. UniFFI-generated `wick_ffiFFI.modulemap` is renamed to
+    # `module.modulemap` on the way in — Xcode's framework conventions
+    # require that exact filename inside a `Headers/` directory.
+    cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
+    cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+    xcodebuild -create-xcframework \
+        -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
+        -library target/aarch64-apple-ios-sim/release/libwick_ffi.a -headers "$OUT/headers" \
+        -library target/aarch64-apple-darwin/release/libwick_ffi.a -headers "$OUT/headers" \
+        -output "$OUT/WickFFI.xcframework"
+    echo "Built $OUT/WickFFI.xcframework"
+
+# Single-target iOS smoke test — verifies the device cross-compile
+# works without paying for the full apple-xcframework pipeline (3
+# cross-compiles + xcodebuild → ~90s+; this single build → ~30s).
+# Output `.a` isn't directly usable in an iOS app (consumers need
+# the XCFramework or a custom SPM `linkedLibrary` wiring); this
+# recipe is mostly a "did the cross-compile break?" fast probe.
+# Assumes `aarch64-apple-ios` is rustup-installed.
+#
+# `RUSTFLAGS=""` mirrors the `apple-xcframework` + `swift-smoke`
+# recipes for consistency. Strictly a no-op for iOS targets
+# (`.cargo/config.toml` only sets `target-cpu=native` on
+# apple-darwin), but the override forestalls an externally-set
+# RUSTFLAGS environment variable from contaminating this smoke build.
+ios-arm64:
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
+
+# End-to-end Swift integration test against the macOS slice. Compiles
+# `wick-ffi/tests/swift/main.swift` together with the vendored Swift
+# binding, links against the freshly-built `aarch64-apple-darwin`
+# staticlib, runs the resulting binary. Exercises function calls,
+# enum + record marshaling, and FfiError round-trip end-to-end.
+#
+# Why macOS-only smoke: the Rust FFI is identical across iOS device,
+# iOS Simulator, and native macOS — same Swift binding, same C ABI,
+# same staticlib. Validating macOS proves the integration; iOS
+# device + Simulator share the same code path so the test covers
+# them by proxy.
+#
+# Requires Xcode (`swiftc`) + `aarch64-apple-darwin` rustup target.
+# Builds the staticlib first if it isn't already cached.
+swift-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
+    swiftc \
+        wick-ffi/tests/swift/main.swift \
+        wick-ffi/bindings/swift/wick_ffi.swift \
+        -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+        -L target/aarch64-apple-darwin/release \
+        -lwick_ffi \
+        -o target/wick-swift-smoke
+    target/wick-swift-smoke
+
 # Clean build artifacts
 clean:
     cargo clean

@@ -233,6 +233,187 @@ jobs:
           # without keeping stale binaries around.
           retention-days: 7
 
+  apple-xcframework:
+    # Cross-compiles wick-ffi to all three arm64-only Apple-platform
+    # Rust targets and assembles `WickFFI.xcframework` ready for
+    # Swift Package Manager / Xcode consumption. Three slices end up
+    # in the framework:
+    #   - ios-arm64           (real iPhones / iPads)
+    #   - ios-arm64-simulator (Apple Silicon Mac iOS Simulator)
+    #   - macos-arm64         (native Apple Silicon Macs)
+    #
+    # x86_64 slices are deliberately omitted: Apple stopped selling
+    # Intel Macs in 2023 and modern consumer apps don't need to ship
+    # for them. Drops the framework size from ~211 MB (with fat
+    # slices) to ~125 MB and removes the `lipo -create` step entirely
+    # — each slice is a single-arch staticlib piped straight into
+    # xcodebuild. If an Intel-Mac consumer ever needs to be added
+    # later, the structural change is reversible (bring back the
+    # x86_64 rustup targets + lipo steps).
+    #
+    # Pinned to `macos-15` explicitly (Apple Silicon M1 runner image)
+    # rather than `macos-latest`: every artifact we produce is
+    # arm64-only, and `swiftc` on an Intel host would default to
+    # x86_64 and silently build a binary that fails to link against
+    # the aarch64 staticlib. An `uname -m` assertion below turns a
+    # future runner-image tier change into a loud early failure.
+    # Single job (no matrix) — the cross-compile builds are serial
+    # inside the recipe; matrix wouldn't help because the final
+    # xcodebuild step needs every slice in one workspace.
+    #
+    # The workflow-level `RUSTFLAGS: ""` env override is critical for
+    # the macOS slice: `.cargo/config.toml` sets target-cpu=native
+    # for the apple-darwin triple (workstation dev convenience), but
+    # a CI runner's "native" CPU isn't a portable shipped-binary
+    # baseline. Empty RUSTFLAGS forces the generic apple-darwin
+    # baseline for distribution.
+    name: Apple XCFramework
+    needs: check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Show runner info
+        # Xcode version: diagnostic — the `macos-15` pin tracks an
+        # image version, not a frozen Xcode version, so logging
+        # catches silent xcodebuild behavior changes.
+        #
+        # `uname -m` assertion: every output of this job is arm64-
+        # only. If a future `macos-15` image tier adds an Intel
+        # host variant (or if we ever point back at `macos-latest`),
+        # this fails fast with an actionable error instead of
+        # silently producing a mislinked Swift binary against the
+        # aarch64 staticlib.
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          uname -m
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::expected arm64 host for arm64-only cross-compile, got '$ARCH' — pin runs-on to an Apple Silicon label" >&2
+            exit 1
+          fi
+      - name: Build XCFramework
+        # Mirrors `just apple-xcframework` exactly. Inlined because the
+        # CI runner doesn't have `just` installed by default and
+        # adding a setup-just step for a single-recipe job would be
+        # more weight than the recipe itself.
+        run: |
+          set -euo pipefail
+          cargo build -p wick-ffi --target aarch64-apple-ios --release
+          cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
+          cargo build -p wick-ffi --target aarch64-apple-darwin --release
+          OUT=target/xcframework-build
+          rm -rf "$OUT"
+          mkdir -p "$OUT/headers"
+          cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
+          cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+          xcodebuild -create-xcframework \
+              -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-ios-sim/release/libwick_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-darwin/release/libwick_ffi.a -headers "$OUT/headers" \
+              -output "$OUT/WickFFI.xcframework"
+      - name: Log XCFramework size
+        # Logs the per-slice + total size so a future regression where
+        # debuginfo slips back in (or a heavyweight dep accidentally
+        # gets feature-gated on) shows up as a number in the build
+        # log. No hard threshold — adjust when intentional size
+        # changes happen.
+        run: |
+          set -euo pipefail
+          XCF=target/xcframework-build/WickFFI.xcframework
+          du -sh "$XCF"
+          du -sh "$XCF"/*/libwick_ffi*.a
+      - name: Swift smoke test (macOS)
+        # Validates the entire pipeline end-to-end: compiles a small
+        # Swift program against the freshly-built macOS staticlib +
+        # the vendored Swift binding, runs it, asserts every surface
+        # area we expect to work works (function call, enum
+        # marshaling, record construction, error round-trip).
+        #
+        # Why macOS only: the Rust FFI surface is identical across
+        # iOS device, iOS Simulator, and native macOS — same
+        # generated Swift binding, same C ABI, same staticlib code
+        # path. Running a native macOS test exercises the entire
+        # cross-language integration without paying for an iOS
+        # simulator boot. A regression that broke iOS specifically
+        # (e.g., a platform-conditional staticlib symbol) wouldn't
+        # be caught here, but those have not been a real failure
+        # mode for UniFFI 0.31.
+        #
+        # `-import-objc-header` exposes the C declarations from
+        # `wick_ffiFFI.h` without needing a separate module map +
+        # SPM ceremony for a single-binary test. Foundation auto-
+        # links on Apple platforms.
+        run: |
+          set -euo pipefail
+          swiftc \
+              wick-ffi/tests/swift/main.swift \
+              wick-ffi/bindings/swift/wick_ffi.swift \
+              -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+              -L target/aarch64-apple-darwin/release \
+              -lwick_ffi \
+              -o /tmp/wick-swift-smoke
+          /tmp/wick-swift-smoke
+      - name: Verify XCFramework slices
+        # Catches a regression where one slice silently has the wrong
+        # architecture or platform — `Info.plist` advertises
+        # `SupportedPlatform` + `SupportedPlatformVariant` +
+        # `SupportedArchitectures`, all three must match what we
+        # intended to build. Same exhaustive-check discipline as the
+        # Android ABI matrix's `readelf` assertion.
+        #
+        # `SupportedPlatform == "ios"` is a critical guard: without
+        # it, a misconfigured cross-compile that produced a macOS
+        # staticlib (`aarch64-apple-darwin`) could still satisfy the
+        # arch + variant checks since macOS arm64 staticlibs declare
+        # the same architecture. The `==` on platform forces the
+        # iOS-specific path.
+        run: |
+          set -euo pipefail
+          XCF=target/xcframework-build/WickFFI.xcframework
+          test -d "$XCF" || { echo "::error::xcframework not built"; exit 1; }
+          plutil -p "$XCF/Info.plist"
+          plutil -convert json -o - "$XCF/Info.plist" | python3 -c '
+          import json, sys
+          info = json.load(sys.stdin)
+          libs = info["AvailableLibraries"]
+          if len(libs) != 3:
+              print(f"::error::expected 3 slices, got {len(libs)}", file=sys.stderr); sys.exit(1)
+          # Build a set of (platform, archs-sorted-tuple, variant) keys
+          # and check both expected slices are present. (*archs,
+          # variant) avoids a tuple-concat dance that earlier readers
+          # misread as a syntax bug.
+          actual = {(l["SupportedPlatform"], *sorted(l["SupportedArchitectures"]), l.get("SupportedPlatformVariant", "")) for l in libs}
+          expected = {
+              ("ios",   "arm64", ""),          # iOS device
+              ("ios",   "arm64", "simulator"), # iOS Simulator (Apple Silicon Mac host)
+              ("macos", "arm64", ""),          # native Apple Silicon Mac
+          }
+          missing = expected - actual
+          extra = actual - expected
+          if missing or extra:
+              print(f"::error::xcframework slices mismatch", file=sys.stderr)
+              print(f"  expected: {expected}", file=sys.stderr)
+              print(f"  actual:   {actual}", file=sys.stderr)
+              if missing: print(f"  missing:  {missing}", file=sys.stderr)
+              if extra:   print(f"  extra:    {extra}", file=sys.stderr)
+              sys.exit(1)
+          print("xcframework slices OK: ios-arm64 + ios-arm64-simulator + macos-arm64")
+          '
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wick-ffi-apple-xcframework
+          # Upload the directory (xcframework is a folder bundle on
+          # disk); actions/upload-artifact zips it transparently.
+          path: target/xcframework-build/WickFFI.xcframework
+          retention-days: 7
+
   integration-test:
     name: Integration Tests (gated)
     needs: check
