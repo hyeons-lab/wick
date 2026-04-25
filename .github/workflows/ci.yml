@@ -95,6 +95,29 @@ jobs:
       - name: Check wasm32 compile
         run: cargo check -p wick ${{ matrix.features }} --target wasm32-unknown-unknown
 
+  wick-wasm-build:
+    # Phase 3 PR 2 introduced the `wick-wasm` cdylib (browser/Node
+    # wasm-bindgen wrapper). Unlike the `wasm-build` job above which
+    # only `cargo check`s `wick` core, this job runs `cargo build`
+    # against the wrapper so the cdylib actually links — that's the
+    # artifact `wasm-bindgen-cli` post-processes downstream, and a
+    # check-only signal would let a broken link slip through. No
+    # matrix: `wick-wasm` consumes `wick` with
+    # `default-features = false` and has one viable build today.
+    name: Wick-Wasm Build
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build wick-wasm cdylib
+        run: cargo build -p wick-wasm --target wasm32-unknown-unknown
+
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under
     # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`

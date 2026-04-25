@@ -3,6 +3,12 @@
     feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch)
 )]
 
+/// Crate version, sourced from `Cargo.toml` at compile time. Useful
+/// for FFI / wrapper crates that want to surface the core lib version
+/// to their consumers (e.g. `wick-wasm::wickVersion()`) without
+/// re-reading the manifest themselves.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod audio_engine;
 pub mod backend;
 #[cfg(feature = "remote")]
