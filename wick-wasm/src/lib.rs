@@ -222,6 +222,21 @@ impl WickEngine {
             inner: self.inner.tokenizer_arc(),
         }
     }
+
+    /// Construct a new `Session` for this engine, using the default
+    /// `SessionConfig` (no `n_keep`, no KV compression, model's own
+    /// `max_seq_len`). Customizable per-field session config will land
+    /// when concrete consumers ask.
+    ///
+    /// The returned `Session` keeps its own `Arc` clones of the
+    /// engine's model and tokenizer, so freeing the engine doesn't
+    /// invalidate any in-flight sessions.
+    #[wasm_bindgen(js_name = newSession)]
+    pub fn new_session(&self) -> Session {
+        Session {
+            inner: self.inner.new_session(wick::SessionConfig::default()),
+        }
+    }
 }
 
 /// BPE tokenizer wrapper. Constructed via `WickEngine.tokenizer`;
@@ -280,5 +295,272 @@ impl Tokenizer {
     #[wasm_bindgen(getter, js_name = chatTemplate)]
     pub fn chat_template(&self) -> Option<String> {
         self.inner.chat_template().map(str::to_owned)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session + generate
+// ---------------------------------------------------------------------------
+
+/// Per-call generation options. Constructed via `new GenerateOpts()`
+/// in JS (returns the wick defaults: `maxTokens=256`,
+/// `temperature=0.7`, `topP=0.9`, `topK=40`, no stop tokens, flush
+/// every 16 tokens or 50 ms).
+///
+/// `repetitionPenalty` is read-only — wick's sampler does not yet
+/// honor it (deferred); exposing the setter would let JS callers pass
+/// values that silently no-op.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct GenerateOpts {
+    inner: wick::GenerateOpts,
+}
+
+#[wasm_bindgen]
+impl GenerateOpts {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[wasm_bindgen(getter, js_name = maxTokens)]
+    pub fn max_tokens(&self) -> u32 {
+        self.inner.max_tokens
+    }
+    #[wasm_bindgen(setter, js_name = maxTokens)]
+    pub fn set_max_tokens(&mut self, v: u32) {
+        self.inner.max_tokens = v;
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn temperature(&self) -> f32 {
+        self.inner.temperature
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_temperature(&mut self, v: f32) {
+        self.inner.temperature = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = topP)]
+    pub fn top_p(&self) -> f32 {
+        self.inner.top_p
+    }
+    #[wasm_bindgen(setter, js_name = topP)]
+    pub fn set_top_p(&mut self, v: f32) {
+        self.inner.top_p = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = topK)]
+    pub fn top_k(&self) -> u32 {
+        self.inner.top_k
+    }
+    #[wasm_bindgen(setter, js_name = topK)]
+    pub fn set_top_k(&mut self, v: u32) {
+        self.inner.top_k = v;
+    }
+
+    /// Read-only — wick's sampler doesn't yet honor this field.
+    /// Surfaced as a getter so JS callers can read the default
+    /// (`1.0`); the setter is intentionally absent so callers don't
+    /// pass values that silently no-op.
+    #[wasm_bindgen(getter, js_name = repetitionPenalty)]
+    pub fn repetition_penalty(&self) -> f32 {
+        self.inner.repetition_penalty
+    }
+
+    /// Token IDs that, if produced, end decoding with
+    /// `finishReason = "Stop"`. Empty by default.
+    #[wasm_bindgen(getter, js_name = stopTokens)]
+    pub fn stop_tokens(&self) -> Vec<u32> {
+        self.inner.stop_tokens.clone()
+    }
+    #[wasm_bindgen(setter, js_name = stopTokens)]
+    pub fn set_stop_tokens(&mut self, v: Vec<u32>) {
+        self.inner.stop_tokens = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = flushEveryTokens)]
+    pub fn flush_every_tokens(&self) -> u32 {
+        self.inner.flush_every_tokens
+    }
+    #[wasm_bindgen(setter, js_name = flushEveryTokens)]
+    pub fn set_flush_every_tokens(&mut self, v: u32) {
+        self.inner.flush_every_tokens = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = flushEveryMs)]
+    pub fn flush_every_ms(&self) -> u32 {
+        self.inner.flush_every_ms
+    }
+    #[wasm_bindgen(setter, js_name = flushEveryMs)]
+    pub fn set_flush_every_ms(&mut self, v: u32) {
+        self.inner.flush_every_ms = v;
+    }
+}
+
+/// Summary returned from a completed `Session.generate` call.
+#[wasm_bindgen]
+pub struct GenerateSummary {
+    inner: wick::GenerateSummary,
+}
+
+#[wasm_bindgen]
+impl GenerateSummary {
+    #[wasm_bindgen(getter, js_name = tokensGenerated)]
+    pub fn tokens_generated(&self) -> u32 {
+        self.inner.tokens_generated
+    }
+
+    #[wasm_bindgen(getter, js_name = promptEvalTokens)]
+    pub fn prompt_eval_tokens(&self) -> u32 {
+        self.inner.prompt_eval_tokens
+    }
+
+    #[wasm_bindgen(getter, js_name = promptEvalMs)]
+    pub fn prompt_eval_ms(&self) -> u32 {
+        self.inner.prompt_eval_ms
+    }
+
+    #[wasm_bindgen(getter, js_name = decodeMs)]
+    pub fn decode_ms(&self) -> u32 {
+        self.inner.decode_ms
+    }
+
+    /// Why decode ended. One of `"MaxTokens"`, `"Stop"`,
+    /// `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` —
+    /// the `Error(...)` form preserves the inner string verbatim
+    /// (no surrounding quotes), so JS callers can log it directly.
+    #[wasm_bindgen(getter, js_name = finishReason)]
+    pub fn finish_reason(&self) -> String {
+        // `format!("{:?}", reason)` would render `Error(String)` as
+        // `Error("...")` (with the Debug-quoted inner string).
+        // Match each variant explicitly so the public shape matches
+        // the doc comment: `Error(plain inner message)` and bare
+        // names for the payload-free variants.
+        match &self.inner.finish_reason {
+            wick::FinishReason::MaxTokens => "MaxTokens".to_string(),
+            wick::FinishReason::Stop => "Stop".to_string(),
+            wick::FinishReason::Cancelled => "Cancelled".to_string(),
+            wick::FinishReason::ContextFull => "ContextFull".to_string(),
+            wick::FinishReason::Error(msg) => format!("Error({msg})"),
+        }
+    }
+}
+
+/// Stateful generation handle. Built via `WickEngine.newSession()`.
+///
+/// JS callers seed the conversation by calling `appendText` /
+/// `appendTokens` and then drive decode with `generate(opts, cb)`.
+/// The callback fires once per flush boundary (every
+/// `flushEveryTokens` decoded tokens, or `flushEveryMs` ms,
+/// whichever comes first) with the new tokens.
+///
+/// **Worker note:** `generate` is synchronous and will block the
+/// thread it runs on for the duration of decode (potentially
+/// seconds). On the browser main thread that freezes the page —
+/// always call from a Web Worker. On Node it's fine to run
+/// directly since the generate call only blocks the main script,
+/// not the libuv event loop's I/O.
+#[wasm_bindgen]
+pub struct Session {
+    inner: wick::Session,
+}
+
+#[wasm_bindgen]
+impl Session {
+    /// Tokenize `text` using the session's tokenizer and append the
+    /// result to the KV cache. Equivalent to
+    /// `appendTokens(tokenizer.encode(text))` but avoids the round
+    /// trip through JS for the encoded buffer.
+    #[wasm_bindgen(js_name = appendText)]
+    pub fn append_text(&mut self, text: &str) -> Result<(), JsError> {
+        self.inner.append_text(text).map_err(map_wick_err)
+    }
+
+    /// Append already-tokenized IDs to the KV cache. Use when you
+    /// need control over BOS/EOS framing or you've cached tokens
+    /// from a previous encode.
+    #[wasm_bindgen(js_name = appendTokens)]
+    pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), JsError> {
+        self.inner.append_tokens(tokens).map_err(map_wick_err)
+    }
+
+    /// Current KV cache position (number of tokens currently held).
+    #[wasm_bindgen(getter)]
+    pub fn position(&self) -> u32 {
+        self.inner.position()
+    }
+
+    /// Flip the cancel atomic, requesting that any in-flight
+    /// `generate` call exit at its next checkpoint with
+    /// `finishReason = "Cancelled"`. Safe to call from any thread
+    /// (including a Worker that owns this session — though wasm
+    /// without SharedArrayBuffer makes cross-thread sharing
+    /// unusual).
+    #[wasm_bindgen]
+    pub fn cancel(&self) {
+        self.inner.cancel()
+    }
+
+    /// Decode tokens until `opts.maxTokens`, a stop token, EOS, or
+    /// `cancel()` fires. The `onTextTokens` callback is invoked once
+    /// per flush boundary with a `Uint32Array` of the latest tokens
+    /// (*not* the cumulative buffer — concatenate yourself if you
+    /// want the full sequence).
+    ///
+    /// Returns the `GenerateSummary` once decode finishes. Throws
+    /// `JsError` on backend failure (the summary's `finishReason`
+    /// already covers logical end conditions like `"Stop"` or
+    /// `"ContextFull"`).
+    #[wasm_bindgen]
+    pub fn generate(
+        &mut self,
+        opts: &GenerateOpts,
+        on_text_tokens: &js_sys::Function,
+    ) -> Result<GenerateSummary, JsError> {
+        let mut sink = JsTextSink {
+            on_text: on_text_tokens,
+        };
+        self.inner
+            .generate(&opts.inner, &mut sink)
+            .map(|inner| GenerateSummary { inner })
+            .map_err(map_wick_err)
+    }
+}
+
+/// Internal `ModalitySink` implementation that trampolines text
+/// tokens to a JS callback. Audio frames are dropped (text-only
+/// flow); a separate `JsAudioSink` will land alongside the audio
+/// engine wrapper in a future PR.
+struct JsTextSink<'a> {
+    on_text: &'a js_sys::Function,
+}
+
+impl<'a> wick::ModalitySink for JsTextSink<'a> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        // `Uint32Array::from(&[u32])` allocates JS-owned memory and
+        // copies the slice in. We *could* use `Uint32Array::view`
+        // for zero-copy, but the resulting view becomes invalid the
+        // moment Rust grows linear memory mid-call (a footgun JS
+        // callers would hit randomly). Per-flush copy cost is
+        // trivial relative to a forward pass.
+        let array = js_sys::Uint32Array::from(tokens);
+        // Treat any exception thrown by the JS callback as fatal:
+        // re-throw it across the wasm boundary so it lands in the
+        // JS caller's `try { ... } catch` around `session.generate`.
+        // `wasm_bindgen::throw_val` aborts the current Rust call
+        // immediately — wick's generate loop has no defined
+        // recovery path for sink errors anyway, so unwinding mid-
+        // decode is no worse than a `cancel()` (the KV cache is
+        // left in whatever state the partial decode produced).
+        if let Err(err) = self.on_text.call1(&JsValue::null(), &array) {
+            wasm_bindgen::throw_val(err);
+        }
+    }
+
+    fn on_done(&mut self, _reason: wick::FinishReason) {
+        // The `GenerateSummary` already carries the finish reason;
+        // no need to re-emit it through the sink. JS callers see it
+        // via `summary.finishReason` after `generate` returns.
     }
 }
