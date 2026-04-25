@@ -1641,6 +1641,50 @@ public static func fromBundleId(bundleId: String, quant: String, config: EngineC
 }
     
     /**
+     * Async variant of [`WickEngine::from_bundle_id`] — offloads the
+     * manifest + GGUF download and the engine construction onto a
+     * tokio blocking worker so the caller's async context isn't
+     * stalled. Foreign async runtimes (Kotlin coroutines, Swift
+     * `async`, Python `asyncio`) `.await` it directly.
+     *
+     * `config.bundle_repo` must be set (same constraint as the sync
+     * twin); construct a [`BundleRepo`] rooted at a persistent cache
+     * directory and attach it to the config before calling.
+     *
+     * Cancellation semantics (weaker than [`Session::generate_async`]):
+     * dropping the returned future drops the [`AbortOnDrop`] guard,
+     * which calls `AbortHandle::abort` on the spawned task. That
+     * cancels the task if it's still queued on tokio's blocking
+     * pool, so a not-yet-started download never runs. But if the
+     * task has started, abort is a no-op — the download is a
+     * `reqwest::blocking` call with no cooperative cancel point,
+     * and wick's engine-construction code (tokenizer build, model
+     * load, KV alloc) also isn't interruptible. In that case the
+     * task runs to completion and the engine is constructed then
+     * dropped; the downloaded bundle stays cached, so the caller's
+     * next attempt starts from that cache hit. Bandwidth isn't
+     * wasted, it's just shifted.
+     *
+     * `JoinError` from a panicking blocking closure surfaces as
+     * [`FfiError::Backend`] with a diagnostic prefix, same as
+     * [`Session::generate_async`].
+     */
+public static func fromBundleIdAsync(bundleId: String, quant: String, config: EngineConfig)async throws  -> WickEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id_async(FfiConverterString.lower(bundleId),FfiConverterString.lower(quant),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_wick_ffi_rust_future_poll_u64,
+            completeFunc: ffi_wick_ffi_rust_future_complete_u64,
+            freeFunc: ffi_wick_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeWickEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Load a model from a local filesystem path. Accepts the same
      * inputs as the native [`wick::WickEngine::from_path`]: a bare
      * `.gguf`, a LeapBundles `.json` manifest, or a directory
@@ -3090,6 +3134,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id() != 53217) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async() != 65129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_constructor_wickengine_from_path() != 10247) {

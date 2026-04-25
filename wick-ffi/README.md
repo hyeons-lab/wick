@@ -6,14 +6,16 @@ engine to Kotlin, Swift, Python, and every other language
 
 ## Status
 
-**Remote loading.** Through PRs 2–9 `wick-ffi` built up a typed
-foreign-language surface (sync / streaming / async generate, typed
-errors, vendored Kotlin + Swift bindings) and the Android ABI +
-Apple XCFramework distribution pipelines. PR 10 enables the `wick`
-`remote` feature and exposes [`BundleRepo`] + `WickEngine::from_bundle_id`
-to foreign callers: a mobile app can now download a LeapBundles model
-by HF ID at runtime — e.g. `"LFM2-1.2B-GGUF" + "Q4_0"` — into a
-persistent cache directory, without bundling the GGUF in the app.
+**Remote loading + async.** Through PRs 2–9 `wick-ffi` built up a
+typed foreign-language surface (sync / streaming / async generate,
+typed errors, vendored Kotlin + Swift bindings) and the Android ABI
++ Apple XCFramework distribution pipelines. PR 10 enabled the `wick`
+`remote` feature and exposed [`BundleRepo`] + `WickEngine::from_bundle_id`
+for runtime model downloads from LeapBundles. PR 11 adds the async
+twin `from_bundle_id_async` (via `tokio::task::spawn_blocking` +
+`AbortOnDrop`) so foreign async runtimes can chain the full pipeline
+— `fromBundleIdAsync` → `newSession` → `generateAsync` — without
+ever leaving their async context.
 
 | PR | Scope |
 |---|---|
@@ -27,7 +29,8 @@ persistent cache directory, without bundling the GGUF in the app.
 | 8 | Android ABI cross-compile + CI matrix + per-ABI artifact upload |
 | 9 | Apple-platform XCFramework: arm64-only iOS device + iOS Simulator + native macOS slices, CI artifact |
 | 10 | `BundleRepo` remote loading (`remote` feature) + `WickEngine::from_bundle_id` |
-| 11+ | Parity harness, Maven publishing, async `from_bundle_id` |
+| 11 | `WickEngine::from_bundle_id_async` via `spawn_blocking` + `AbortOnDrop` |
+| 12+ | Parity harness, Maven publishing, download progress callbacks |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -384,16 +387,47 @@ verification: caller-supplied SHA-256 when available (manifest per-
 file hashes once they land upstream), otherwise HF's `X-Linked-Etag`
 or a `Content-Length` size check.
 
-### Blocking semantics + async
+### Blocking + async variants
 
-`from_bundle_id` is **synchronous**; the first call blocks on the
+`fromBundleId` is **synchronous**; the first call blocks on the
 download over the network (potentially minutes for a multi-GB
-model). Foreign async runtimes should wrap the call in
-`spawn_blocking` / `withContext(Dispatchers.IO)` / `asyncio.to_thread`
-to avoid stalling the async worker pool. A native async
-counterpart matching `generate_async`'s pattern is a reasonable
-PR 11+ follow-up; it'd share the same `BundleRepo` + drop a
-blocking-context requirement on the caller.
+model). Use it from sync code paths (CLI tools, Rust-side
+consumers, simple Mac apps).
+
+`fromBundleIdAsync` (PR 11) is the async twin — same args, returns
+a future. Internally `spawn_blocking`s the sync logic onto tokio's
+blocking pool so the caller's async context isn't stalled. Pair
+with `generateAsync` / `generateStreamingAsync` for an end-to-end
+async workflow:
+
+```kotlin
+// Kotlin coroutine
+val engine = WickEngine.fromBundleIdAsync("LFM2-1.2B-GGUF", "Q4_0", config)
+val session = engine.newSession(SessionConfig.default())
+session.appendText("hello")
+val out = session.generateAsync(GenerateOpts.default())
+```
+
+```swift
+// Swift async
+let engine = try await WickEngine.fromBundleIdAsync(
+    bundleId: "LFM2-1.2B-GGUF", quant: "Q4_0", config: config
+)
+let session = engine.newSession(config: SessionConfig.default())
+try session.appendText(text: "hello")
+let out = try await session.generateAsync(opts: GenerateOpts.default())
+```
+
+Cancellation: dropping the `fromBundleIdAsync` future drops an
+internal `AbortOnDrop` guard which calls `AbortHandle::abort` on
+the spawned blocking task. That cancels the task if it hasn't
+started yet (queued on the blocking pool); if it has started,
+abort is a no-op and the download / engine construction runs to
+completion. The downloaded bundle is cached, so the caller's next
+attempt resolves from the cache — bandwidth isn't wasted, just
+shifted. (`generateAsync`'s `Session::cancel` in-flight
+cancellation has no equivalent here because wick's download path
+uses `reqwest::blocking` without a cooperative cancel point.)
 
 ### Per-platform cache-path recommendations
 

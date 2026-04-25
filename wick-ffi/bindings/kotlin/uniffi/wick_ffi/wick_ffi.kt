@@ -843,6 +843,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id(): Short
 
+    external fun uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async(): Short
+
     external fun uniffi_wick_ffi_checksum_constructor_wickengine_from_path(): Short
 
     external fun ffi_wick_ffi_uniffi_contract_version(): Int
@@ -991,6 +993,12 @@ internal object UniffiLib {
         `quant`: RustBuffer.ByValue,
         `config`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id_async(
+        `bundleId`: RustBuffer.ByValue,
+        `quant`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
     ): Long
 
     external fun uniffi_wick_ffi_fn_constructor_wickengine_from_path(
@@ -1289,6 +1297,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id() != 53217.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_constructor_wickengine_from_bundle_id_async() != 65129.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_constructor_wickengine_from_path() != 10247.toShort()) {
@@ -3379,6 +3390,57 @@ open class WickEngine :
                         _status,
                     )
                 },
+            )
+
+        /**
+         * Async variant of [`WickEngine::from_bundle_id`] — offloads the
+         * manifest + GGUF download and the engine construction onto a
+         * tokio blocking worker so the caller's async context isn't
+         * stalled. Foreign async runtimes (Kotlin coroutines, Swift
+         * `async`, Python `asyncio`) `.await` it directly.
+         *
+         * `config.bundle_repo` must be set (same constraint as the sync
+         * twin); construct a [`BundleRepo`] rooted at a persistent cache
+         * directory and attach it to the config before calling.
+         *
+         * Cancellation semantics (weaker than [`Session::generate_async`]):
+         * dropping the returned future drops the [`AbortOnDrop`] guard,
+         * which calls `AbortHandle::abort` on the spawned task. That
+         * cancels the task if it's still queued on tokio's blocking
+         * pool, so a not-yet-started download never runs. But if the
+         * task has started, abort is a no-op — the download is a
+         * `reqwest::blocking` call with no cooperative cancel point,
+         * and wick's engine-construction code (tokenizer build, model
+         * load, KV alloc) also isn't interruptible. In that case the
+         * task runs to completion and the engine is constructed then
+         * dropped; the downloaded bundle stays cached, so the caller's
+         * next attempt starts from that cache hit. Bandwidth isn't
+         * wasted, it's just shifted.
+         *
+         * `JoinError` from a panicking blocking closure surfaces as
+         * [`FfiError::Backend`] with a diagnostic prefix, same as
+         * [`Session::generate_async`].
+         */
+        @Throws(FfiException::class)
+        @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+        suspend fun `fromBundleIdAsync`(
+            `bundleId`: kotlin.String,
+            `quant`: kotlin.String,
+            `config`: EngineConfig,
+        ): WickEngine =
+            uniffiRustCallAsync(
+                UniffiLib.uniffi_wick_ffi_fn_constructor_wickengine_from_bundle_id_async(
+                    FfiConverterString.lower(`bundleId`),
+                    FfiConverterString.lower(`quant`),
+                    FfiConverterTypeEngineConfig.lower(`config`),
+                ),
+                { future, callback, continuation -> UniffiLib.ffi_wick_ffi_rust_future_poll_u64(future, callback, continuation) },
+                { future, continuation -> UniffiLib.ffi_wick_ffi_rust_future_complete_u64(future, continuation) },
+                { future -> UniffiLib.ffi_wick_ffi_rust_future_free_u64(future) },
+                // lift function
+                { FfiConverterTypeWickEngine.lift(it) },
+                // Error FFI converter
+                FfiException.ErrorHandler,
             )
 
         /**

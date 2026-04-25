@@ -9,10 +9,11 @@
 //! ## Current surface
 //!
 //! Engine-level:
-//! - [`WickEngine`] — model loader and session factory. Two
-//!   constructors: [`WickEngine::from_path`] for a local GGUF,
-//!   manifest, or directory; [`WickEngine::from_bundle_id`] for
-//!   LeapBundles-style remote loading.
+//! - [`WickEngine`] — model loader and session factory. Constructors:
+//!   [`WickEngine::from_path`] for a local GGUF, manifest, or
+//!   directory; [`WickEngine::from_bundle_id`] for LeapBundles-style
+//!   remote loading; [`WickEngine::from_bundle_id_async`] for the
+//!   tokio-async variant of the same.
 //! - [`BundleRepo`] — HTTP model cache; construct once per app and
 //!   attach via [`EngineConfig::bundle_repo`] for remote loading.
 //! - [`EngineConfig`] + [`BackendPreference`] — load-time config.
@@ -1019,6 +1020,43 @@ impl Drop for AsyncCancelGuard {
     }
 }
 
+/// Lighter-weight sibling of [`AsyncCancelGuard`] for `spawn_blocking`
+/// tasks that don't share mutable state with anything the caller can
+/// signal. Used by [`WickEngine::from_bundle_id_async`]: the underlying
+/// `wick::WickEngine::from_bundle_id` holds no cross-thread cancel flag
+/// and the `reqwest::blocking` download can't be cooperatively
+/// cancelled, so there's nothing like `Session::cancel` to call on
+/// drop. All we can do is abort the queued task before its closure
+/// runs — `AbortHandle::abort` (taken from the task's `JoinHandle`
+/// via `JoinHandle::abort_handle()` so the guard doesn't fight the
+/// outer `.await` for ownership of the handle) on a queued
+/// `spawn_blocking` task is effective; on a running one it's a no-op
+/// and the download finishes to cache (which is arguably a feature:
+/// a dropped future's bandwidth isn't wasted, the next call finds
+/// the bundle cached and returns instantly).
+///
+/// Drop logic is one conditional (`if armed { abort.abort() }`) —
+/// structurally identical to [`AsyncCancelGuard`]'s. The
+/// `async_cancel_guard_drop_fires_when_armed_only` ProbeGuard test in
+/// the test module already exercises that exact branch shape; a
+/// duplicate test for AbortOnDrop would add no coverage. End-to-end
+/// "abort actually cancels a queued tokio task" is upstream tokio's
+/// behavior to test, not ours.
+struct AbortOnDrop {
+    abort: tokio::task::AbortHandle,
+    /// Set to `false` once the outer `.await` resolves; prevents
+    /// `abort()` from running on a task that already completed.
+    armed: bool,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort.abort();
+        }
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Session {
     /// Async variant of [`Session::generate`] — runs buffered decode
@@ -1101,6 +1139,64 @@ impl Session {
         join_result.map_err(|e| FfiError::Backend {
             detail: format!("generate_streaming_async join error: {e}"),
         })?
+    }
+}
+
+// Async WickEngine constructors (PR 11).
+#[uniffi::export(async_runtime = "tokio")]
+impl WickEngine {
+    /// Async variant of [`WickEngine::from_bundle_id`] — offloads the
+    /// manifest + GGUF download and the engine construction onto a
+    /// tokio blocking worker so the caller's async context isn't
+    /// stalled. Foreign async runtimes (Kotlin coroutines, Swift
+    /// `async`, Python `asyncio`) `.await` it directly.
+    ///
+    /// `config.bundle_repo` must be set (same constraint as the sync
+    /// twin); construct a [`BundleRepo`] rooted at a persistent cache
+    /// directory and attach it to the config before calling.
+    ///
+    /// Cancellation semantics (weaker than [`Session::generate_async`]):
+    /// dropping the returned future drops the [`AbortOnDrop`] guard,
+    /// which calls `AbortHandle::abort` on the spawned task. That
+    /// cancels the task if it's still queued on tokio's blocking
+    /// pool, so a not-yet-started download never runs. But if the
+    /// task has started, abort is a no-op — the download is a
+    /// `reqwest::blocking` call with no cooperative cancel point,
+    /// and wick's engine-construction code (tokenizer build, model
+    /// load, KV alloc) also isn't interruptible. In that case the
+    /// task runs to completion and the engine is constructed then
+    /// dropped; the downloaded bundle stays cached, so the caller's
+    /// next attempt starts from that cache hit. Bandwidth isn't
+    /// wasted, it's just shifted.
+    ///
+    /// `JoinError` from a panicking blocking closure surfaces as
+    /// [`FfiError::Backend`] with a diagnostic prefix, same as
+    /// [`Session::generate_async`].
+    #[uniffi::constructor]
+    pub async fn from_bundle_id_async(
+        bundle_id: String,
+        quant: String,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        // Convert the config synchronously. Any `TryFrom` error
+        // (e.g. 32-bit `u64 → usize` overflow on the context size)
+        // fails fast without spawning a blocking task.
+        let wick_config: wick::EngineConfig = config.try_into()?;
+        let handle = tokio::task::spawn_blocking(move || {
+            wick::WickEngine::from_bundle_id(&bundle_id, &quant, wick_config)
+                .map_err(FfiError::from)
+        });
+        let mut guard = AbortOnDrop {
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result
+            .map_err(|e| FfiError::Backend {
+                detail: format!("from_bundle_id_async join error: {e}"),
+            })?
+            .map(|inner| Arc::new(Self { inner }))
     }
 }
 
