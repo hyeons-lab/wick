@@ -436,7 +436,11 @@ jobs:
         with:
           path: target/tmp/wick-test-models
           # Bump the key suffix to invalidate after model-file changes.
-          key: wick-test-models-lfm2-1.2b-q4_0-v1
+          # `v2`: switched fixture to LFM2-350M-Extract Q4_0 (~210 MB)
+          # from LFM2-1.2B Q4_0 (~700 MB) — the 1.2B was timing out the
+          # job's 15-minute cap on Ubuntu CPU runners (~13 min runtime
+          # for `shift_real_model` alone).
+          key: wick-test-models-lfm2-350m-extract-q4_0-v2
       # NOTE: targeted to the download-gated test binaries only.
       # `cargo test -- --ignored` without `--test` would sweep every
       # #[ignore]'d test in the workspace (Metal microbenchmarks,

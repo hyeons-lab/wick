@@ -27,7 +27,7 @@ use wick::bundle::BundleRepo;
 use wick::engine::{BackendPreference, EngineConfig, WickEngine};
 
 #[test]
-#[ignore = "downloads ~700 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+#[ignore = "downloads ~210 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
 fn from_bundle_id_loads_lfm2_q4_0() {
     if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
         eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
@@ -36,7 +36,7 @@ fn from_bundle_id_loads_lfm2_q4_0() {
 
     let repo = BundleRepo::new(common::download::cache_dir());
     let engine = WickEngine::from_bundle_id(
-        "LFM2-1.2B-GGUF",
+        "LFM2-350M-Extract-GGUF",
         "Q4_0",
         EngineConfig {
             context_size: 128,
@@ -66,7 +66,7 @@ fn from_bundle_id_fails_without_bundle_repo() {
     // Can't use `.expect_err()` because `WickEngine` holds a
     // `Box<dyn Model>` and therefore doesn't derive `Debug`.
     let result = WickEngine::from_bundle_id(
-        "LFM2-1.2B-GGUF",
+        "LFM2-350M-Extract-GGUF",
         "Q4_0",
         EngineConfig {
             context_size: 128,
