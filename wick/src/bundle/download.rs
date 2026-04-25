@@ -183,8 +183,10 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
 /// callback at end-of-stream with the total bytes written (skipped
 /// when the in-loop callback already reported the same value, which
 /// happens for files whose size is an exact multiple of 256 KB).
-/// `None` makes downloads silent (and skips the writer-wrapping
-/// overhead).
+/// `None` makes downloads silent. The writer is still wrapped in
+/// the `ProgressingWriter` either way (one Option-check + a `u64`
+/// add per `Write::write` call, well below noise floor of disk +
+/// network I/O), but no callback dispatch happens when `None`.
 ///
 /// `total_bytes_hint` lets the caller plumb a known total (e.g. from
 /// a HEAD probe's `x-linked-size`) to the progress callback even
