@@ -50,10 +50,27 @@ pub(crate) mod download;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use reqwest::blocking::Client;
 
 use crate::session::WickError;
+
+/// Callback receiver for download progress events. Implementations
+/// must be `Send + Sync` because downloads run on whatever thread
+/// the caller drove them from (often a `spawn_blocking` worker).
+///
+/// Throttling: `download::download_to` calls `on_progress` at most
+/// once per ~256 KB written + once at end-of-stream. Implementers
+/// don't need to dedupe or rate-limit on their side.
+pub trait DownloadProgress: Send + Sync + std::fmt::Debug {
+    /// Called periodically during a download. `bytes_downloaded` is
+    /// monotonic across the same call's stream; `total_bytes` is the
+    /// `Content-Length` reported by the server (may be `None` for
+    /// chunked-transfer responses or when HEAD didn't surface a
+    /// length). Same `url` value across all calls for one download.
+    fn on_progress(&self, url: &str, bytes_downloaded: u64, total_bytes: Option<u64>);
+}
 
 /// Repository for remote bundle files cached to a caller-chosen
 /// directory. Construction is cheap — create one per `WickEngine` at
@@ -72,6 +89,11 @@ pub struct BundleRepo {
     store_dir: PathBuf,
     http_client: Client,
     head_client: Client,
+    /// Optional progress callback fired during cache-miss downloads.
+    /// `None` for `BundleRepo::new`; populated by `with_progress`.
+    /// Cache-hit resolves don't fire any callbacks since there's no
+    /// streaming work to report on.
+    progress: Option<Arc<dyn DownloadProgress>>,
 }
 
 impl BundleRepo {
@@ -93,7 +115,22 @@ impl BundleRepo {
             store_dir: store_dir.into(),
             http_client: Client::new(),
             head_client,
+            progress: None,
         }
+    }
+
+    /// Variant of [`BundleRepo::new`] that attaches a progress
+    /// callback. The callback fires during cache-miss downloads only
+    /// (cache hits return without streaming I/O). Same callback gets
+    /// called for every URL the repo downloads — implementers can
+    /// branch on the `url` argument to drive a per-file UI.
+    pub fn with_progress(
+        store_dir: impl Into<PathBuf>,
+        progress: Arc<dyn DownloadProgress>,
+    ) -> Self {
+        let mut repo = Self::new(store_dir);
+        repo.progress = Some(progress);
+        repo
     }
 
     /// Root directory backing this repo.
@@ -178,7 +215,19 @@ impl BundleRepo {
             },
             "downloading bundle file"
         );
-        download::download_to(&self.http_client, url, &dest, download_hash.as_deref())?;
+        download::download_to(
+            &self.http_client,
+            url,
+            &dest,
+            download_hash.as_deref(),
+            // HEAD probe captures `x-linked-size` from HF's no-redirect
+            // response. The GET path's CDN response usually echoes
+            // `Content-Length` too, but defensively prefer the HEAD-
+            // probed value so the progress callback gets a reliable
+            // total even when the CDN omits the header.
+            head.content_length,
+            self.progress.as_deref(),
+        )?;
         Ok(dest)
     }
 

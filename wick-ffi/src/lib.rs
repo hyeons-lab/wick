@@ -16,6 +16,8 @@
 //!   tokio-async variant of the same.
 //! - [`BundleRepo`] — HTTP model cache; construct once per app and
 //!   attach via [`EngineConfig::bundle_repo`] for remote loading.
+//!   [`BundleRepo::with_progress`] takes a [`DownloadProgressSink`]
+//!   foreign-trait callback for download progress UI.
 //! - [`EngineConfig`] + [`BackendPreference`] — load-time config.
 //! - [`ModelMetadata`] + [`ModalityCapabilities`] — model-level info.
 //!
@@ -392,10 +394,98 @@ impl BundleRepo {
         })
     }
 
+    /// Create a new repo rooted at `store_dir` with a foreign
+    /// [`DownloadProgressSink`] attached. The sink fires periodically
+    /// during cache-miss downloads (every ~256 KB written + once at
+    /// end-of-stream). Cache-hit resolves don't fire any callbacks.
+    /// The same sink receives events for every file the repo
+    /// downloads — distinguish per-file progress by the `url`
+    /// argument on each callback.
+    ///
+    /// Construction-time attachment (rather than per-call) matches
+    /// how mobile apps drive a single download-progress UI across
+    /// multiple files in one logical bundle (manifest + GGUF + …):
+    /// one repo, one sink, one progress bar. If you need to tear
+    /// down the sink mid-app-lifecycle, drop the repo + construct a
+    /// new one — Arc-based, so all in-flight calls finish on the
+    /// old sink and new calls go to the new one.
+    #[uniffi::constructor]
+    pub fn with_progress(store_dir: String, progress: Arc<dyn DownloadProgressSink>) -> Arc<Self> {
+        let adapter: Arc<dyn wick::bundle::DownloadProgress> =
+            Arc::new(DownloadProgressAdapter { inner: progress });
+        Arc::new(Self {
+            inner: wick::bundle::BundleRepo::with_progress(store_dir, adapter),
+        })
+    }
+
     /// The directory this repo caches bundles under. Matches what was
-    /// passed to [`BundleRepo::new`], useful for log / telemetry.
+    /// passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
+    /// useful for log / telemetry.
     pub fn store_dir(&self) -> String {
         self.inner.store_dir().to_string_lossy().into_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DownloadProgressSink (foreign trait — PR 12)
+// ---------------------------------------------------------------------------
+
+/// Foreign-trait callback for download progress events from
+/// [`BundleRepo::with_progress`]. Implementers (Kotlin class, Swift
+/// class, Python subclass) drive a progress UI from these events.
+///
+/// All methods are required from foreign implementations (UniFFI
+/// 0.31 foreign traits don't carry Rust default-impl fallbacks).
+///
+/// Threading: `on_progress` is invoked from the thread driving the
+/// download. For sync `from_bundle_id` that's the caller's thread;
+/// for `from_bundle_id_async` it's a tokio blocking worker. If your
+/// progress UI requires marshalling onto a UI thread (`@MainActor`,
+/// `runOnUiThread`, etc.), the implementer is responsible for the
+/// dispatch.
+#[uniffi::export(with_foreign)]
+pub trait DownloadProgressSink: Send + Sync {
+    /// Called periodically during a download. `bytes_downloaded` is
+    /// monotonic across the same call's stream; `total_bytes` is the
+    /// `Content-Length` reported by the server (may be `None` for
+    /// chunked-transfer responses or when HEAD didn't surface a
+    /// length). Same `url` value across all calls for one download
+    /// — pattern-match on it to drive a per-file UI within a
+    /// multi-file bundle download.
+    ///
+    /// Throttled by `wick-core` to ~256 KB granularity + one final
+    /// callback at end-of-stream so the consumer always sees the
+    /// final byte count.
+    fn on_progress(&self, url: String, bytes_downloaded: u64, total_bytes: Option<u64>);
+}
+
+/// Adapter from the UniFFI foreign trait to wick-core's
+/// [`wick::bundle::DownloadProgress`]. Same shape as
+/// [`ForeignSinkAdapter`] for `ModalitySink` (PR 4): the foreign
+/// arg's `&str` becomes an owned `String` because UniFFI can't
+/// marshal a borrowed slice across the boundary.
+struct DownloadProgressAdapter {
+    inner: Arc<dyn DownloadProgressSink>,
+}
+
+// Manual Debug impl because `dyn DownloadProgressSink` is a UniFFI
+// foreign-trait object — the foreign side (Kotlin / Swift / Python
+// implementations) has no Rust Debug, so we can't blanket-derive.
+// `wick::bundle::DownloadProgress` requires Debug for `BundleRepo`'s
+// own derived Debug to work; printing the adapter as a typed handle
+// is sufficient for any Rust-side log line that touches it.
+impl std::fmt::Debug for DownloadProgressAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadProgressAdapter")
+            .field("inner", &"<foreign DownloadProgressSink>")
+            .finish()
+    }
+}
+
+impl wick::bundle::DownloadProgress for DownloadProgressAdapter {
+    fn on_progress(&self, url: &str, bytes_downloaded: u64, total_bytes: Option<u64>) {
+        self.inner
+            .on_progress(url.to_string(), bytes_downloaded, total_bytes);
     }
 }
 
@@ -1307,6 +1397,46 @@ mod tests {
         let core: wick::EngineConfig = ffi.try_into().unwrap();
         let core_repo = core.bundle_repo.expect("bundle_repo must be Some");
         assert_eq!(core_repo.store_dir(), repo.inner.store_dir());
+    }
+
+    /// `DownloadProgressAdapter` forwards `on_progress` calls from
+    /// wick-core to a foreign-trait implementation (impl'd here as a
+    /// recording Rust struct that mirrors how UniFFI codegens the
+    /// foreign side). Verifies the URL / bytes / total round-trip
+    /// without dropping data.
+    #[test]
+    fn download_progress_adapter_forwards() {
+        use std::sync::Mutex;
+        use wick::bundle::DownloadProgress as _;
+
+        #[derive(Debug, Default)]
+        struct Recorder {
+            calls: Mutex<Vec<(String, u64, Option<u64>)>>,
+        }
+        impl DownloadProgressSink for Recorder {
+            fn on_progress(&self, url: String, bytes: u64, total: Option<u64>) {
+                self.calls.lock().unwrap().push((url, bytes, total));
+            }
+        }
+
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let adapter = DownloadProgressAdapter {
+            inner: recorder.clone() as Arc<dyn DownloadProgressSink>,
+        };
+
+        // Drive the adapter as wick-core's download_to would.
+        adapter.on_progress("https://example.com/a.gguf", 1024, Some(2048));
+        adapter.on_progress("https://example.com/a.gguf", 2048, Some(2048));
+        adapter.on_progress("https://example.com/no-length", 512, None);
+
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "https://example.com/a.gguf");
+        assert_eq!(calls[0].1, 1024);
+        assert_eq!(calls[0].2, Some(2048));
+        assert_eq!(calls[2].0, "https://example.com/no-length");
+        assert_eq!(calls[2].1, 512);
+        assert_eq!(calls[2].2, None);
     }
 
     #[test]
