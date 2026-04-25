@@ -11,12 +11,14 @@ mobile cross-compile pipelines. `WickEngine` + `Session` + sync,
 streaming, and async `generate` surfaced through PRs 2–5. PR 6
 vendored the Kotlin + Swift bindings with a CI drift check. PR 7
 typed the `FfiError` enum. PR 8 added Android ABI cross-compile +
-per-ABI artifacts. PR 9 adds the iOS counterpart: `wick-ffi` now
-cross-compiles to `aarch64-apple-ios` (devices),
-`aarch64-apple-ios-sim`, and `x86_64-apple-ios` (simulator), assembles
-a `WickFFI.xcframework` (device slice + fat simulator slice), and
-publishes it as a CI artifact ready for Swift Package Manager / Xcode
-consumption.
+per-ABI artifacts. PR 9 adds the Apple-platform counterpart:
+`wick-ffi` now cross-compiles to `aarch64-apple-ios` (real iPhones),
+`aarch64-apple-ios-sim` (Apple Silicon Mac iOS Simulator), and
+`aarch64-apple-darwin` (native Apple Silicon Macs); assembles a
+3-slice `WickFFI.xcframework`; and publishes it as a CI artifact
+ready for Swift Package Manager / Xcode consumption. Apple Silicon
+only — x86_64 slices are deliberately omitted (Apple stopped selling
+Intel Macs in 2023).
 
 | PR | Scope |
 |---|---|
@@ -28,7 +30,7 @@ consumption.
 | 6 | Kotlin + Swift binding generation + vendored outputs + CI drift check; UniFFI 0.28 → 0.31.1 |
 | 7 | Typed `FfiError` variants mirroring `wick::WickError` |
 | 8 | Android ABI cross-compile + CI matrix + per-ABI artifact upload |
-| 9 | iOS XCFramework: device + fat-simulator slices, `xcodebuild -create-xcframework`, CI artifact |
+| 9 | Apple-platform XCFramework: arm64-only iOS device + iOS Simulator + native macOS slices, CI artifact |
 | 10+ | `BundleRepo` remote loading (`remote` feature), parity harness, Maven publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
@@ -185,48 +187,62 @@ the pin is mostly about toolchain + sysroot stability across runs,
 not a hard constraint — later NDKs that keep the `armv7-linux-androideabi`
 and `i686-linux-android` sysroots should drop in cleanly.
 
-## iOS
+## Apple platforms
 
 `wick-ffi` cross-compiles to a Swift Package Manager-ready
-`WickFFI.xcframework` via Xcode's `xcodebuild` + `lipo`. The
-`ios-xcframework` CI job builds the framework on `macos-latest` and
-uploads it as a CI artifact every PR; consumer iOS / macOS apps can
-drop the artifact straight into their SPM dependency graph.
+`WickFFI.xcframework` via Xcode's `xcodebuild`. The `ios-xcframework`
+CI job builds the framework on `macos-latest` and uploads it as a
+CI artifact every PR; consumer iOS and native Apple Silicon Mac
+apps can drop the artifact straight into their SPM dependency graph.
 
-Three iOS Rust targets feed the framework:
+The framework ships three single-arch slices — **Apple Silicon
+only**:
 
-- `aarch64-apple-ios` — real iPhones / iPads.
-- `aarch64-apple-ios-sim` — iOS Simulator on Apple Silicon Macs.
-- `x86_64-apple-ios` — iOS Simulator on Intel Macs.
+- `ios-arm64` — real iPhones / iPads (`aarch64-apple-ios`).
+- `ios-arm64-simulator` — iOS Simulator on Apple Silicon Macs (`aarch64-apple-ios-sim`).
+- `macos-arm64` — native Apple Silicon Macs (`aarch64-apple-darwin`).
 
-`lipo -create` fuses the two simulator targets into a single fat
-`.a` so one XCFramework slice (`ios-arm64_x86_64-simulator`) covers
-both Mac host architectures. The device slice (`ios-arm64`) stays
-single-arch since iPhones never run x86_64. The vendored Swift
-bindings under `wick-ffi/bindings/swift/` provide the C header +
-module map that the framework wraps.
+x86_64 slices are deliberately omitted: Apple stopped selling Intel
+Macs in 2023 and modern consumer apps don't need to ship for them.
+Dropping the fat-binary `lipo` step keeps the pipeline simple and
+the framework smaller (~125 MB total instead of ~211 MB with x86_64
+fat slices).
+
+Other Apple platforms (Mac Catalyst, watchOS, tvOS, visionOS) aren't
+included yet — adding them is structurally identical (more rustup
+targets + more `-library` flags on `xcodebuild -create-xcframework`).
+
+The vendored Swift bindings under `wick-ffi/bindings/swift/` provide
+the C header + module map that the framework wraps.
 
 ### Local setup
 
 ```bash
 # One-time:
 rustup target add \
-    aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+    aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
 
-# Then (Xcode + Command Line Tools must be installed for xcodebuild
-# and lipo; macOS only):
+# Then (Xcode + Command Line Tools must be installed for xcodebuild;
+# macOS only):
 just ios-xcframework
-just ios-arm64           # device-only, fast iteration (no XCFramework)
+just ios-arm64           # smoke test: device target only, no XCFramework
 ```
 
 Output lands at `target/xcframework-build/WickFFI.xcframework`
-(~125 MB on disk: a 42 MB device-arm64 staticlib + an 84 MB fat
-arm64+x86_64 simulator staticlib + small headers per slice). Consumer
-apps only embed one slice per device, so the per-device cost added
-to a real-iPhone `.ipa` is ~42 MB. Cargo's `release` profile in this
-workspace runs `strip = "symbols"` on the staticlibs; further size
-trimming would need feature-gating out tokio / rustfft / similar
-heavyweight deps.
+(~125 MB on disk: 42 MB per slice × 3 slices + small headers).
+Consumer apps embed exactly one slice per build configuration, so
+the per-target cost added to a shipped `.ipa` / `.app` is ~42 MB.
+Cargo's `release` profile in this workspace runs
+`strip = "symbols"` on the staticlibs; further size trimming would
+need feature-gating out tokio / rustfft / similar heavyweight deps.
+
+`just ios-xcframework` overrides `RUSTFLAGS=""` for the
+`aarch64-apple-darwin` slice — the workspace's `.cargo/config.toml`
+sets `target-cpu=native` for that triple (workstation dev
+convenience), and a build host's specific microarch isn't a portable
+shipped-binary baseline. The override forces the generic
+apple-darwin baseline so the artifact runs on every Apple Silicon
+Mac, not just yours.
 
 ### XCFramework structure
 
@@ -234,15 +250,14 @@ heavyweight deps.
 WickFFI.xcframework/
 ├── Info.plist
 ├── ios-arm64/
-│   ├── libwick_ffi.a              # device staticlib
-│   └── Headers/
-│       ├── wick_ffiFFI.h
-│       └── module.modulemap
-└── ios-arm64_x86_64-simulator/
-    ├── libwick_ffi-sim.a          # fat: arm64 + x86_64
-    └── Headers/
-        ├── wick_ffiFFI.h
-        └── module.modulemap
+│   ├── libwick_ffi.a       # iOS device staticlib (aarch64-apple-ios)
+│   └── Headers/{wick_ffiFFI.h, module.modulemap}
+├── ios-arm64-simulator/
+│   ├── libwick_ffi.a       # iOS Simulator staticlib (aarch64-apple-ios-sim)
+│   └── Headers/{wick_ffiFFI.h, module.modulemap}
+└── macos-arm64/
+    ├── libwick_ffi.a       # native macOS staticlib (aarch64-apple-darwin)
+    └── Headers/{wick_ffiFFI.h, module.modulemap}
 ```
 
 ### Swift Package Manager consumption

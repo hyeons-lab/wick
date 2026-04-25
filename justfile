@@ -120,28 +120,34 @@ android-all:
 android-arm64:
     cargo ndk --target arm64-v8a build -p wick-ffi --release
 
-# Cross-compile `wick-ffi` to all three iOS targets and assemble a
-# `WickFFI.xcframework` ready for Swift Package Manager / Xcode
-# consumption. Pairs the device-arm64 staticlib with a fat
-# (arm64 + x86_64) simulator staticlib in two slices of one
-# `.xcframework` so consumer apps work on both real iPhones and the
-# simulator on Apple Silicon and Intel Macs alike.
+# Cross-compile `wick-ffi` to all three arm64-only Apple-platform
+# targets and assemble a `WickFFI.xcframework` ready for Swift
+# Package Manager / Xcode consumption. Three single-arch slices:
+# real iPhones (`ios-arm64`), Apple Silicon Mac iOS Simulator
+# (`ios-arm64-simulator`), and native Apple Silicon Macs
+# (`macos-arm64`). x86_64 is deliberately omitted — Apple stopped
+# selling Intel Macs in 2023 and modern consumer apps drop support.
 #
-# Requires Xcode (for `xcodebuild` + `lipo`) plus the rustup targets:
+# Requires Xcode (for `xcodebuild`) + the rustup targets:
 # `rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-# x86_64-apple-ios`. The vendored Swift bindings under
-# `wick-ffi/bindings/swift/` provide the headers + module map; CI
-# regenerates them via the `ffi-bindings-drift` job so they stay
-# locked to the current Rust surface.
+# aarch64-apple-darwin`. `RUSTFLAGS=""` overrides the workspace's
+# `target-cpu=native` for the apple-darwin slice so the shipped
+# staticlib is portable across Apple Silicon Macs (otherwise the
+# build host's specific microarch leaks into the binary).
 #
-# Output: `target/xcframework-build/WickFFI.xcframework`. CI uploads
-# the same path as a per-run artifact.
+# The vendored Swift bindings under `wick-ffi/bindings/swift/`
+# provide the headers + module map; CI regenerates them via the
+# `ffi-bindings-drift` job so they stay locked to the current Rust
+# surface.
+#
+# Output: `target/xcframework-build/WickFFI.xcframework` (~125 MB,
+# 42 MB per slice). CI uploads the same path as a per-run artifact.
 ios-xcframework:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p wick-ffi --target aarch64-apple-ios --release
-    cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
-    cargo build -p wick-ffi --target x86_64-apple-ios --release
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
+    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
     OUT=target/xcframework-build
     rm -rf "$OUT"
     mkdir -p "$OUT/headers"
@@ -151,16 +157,10 @@ ios-xcframework:
     # require that exact filename inside a `Headers/` directory.
     cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
     cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
-    # Fat simulator slice: arm64 + x86_64 in a single .a so one
-    # XCFramework slice covers both Apple Silicon and Intel Mac
-    # simulator hosts.
-    lipo -create \
-        target/aarch64-apple-ios-sim/release/libwick_ffi.a \
-        target/x86_64-apple-ios/release/libwick_ffi.a \
-        -output "$OUT/libwick_ffi-sim.a"
     xcodebuild -create-xcframework \
         -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
-        -library "$OUT/libwick_ffi-sim.a" -headers "$OUT/headers" \
+        -library target/aarch64-apple-ios-sim/release/libwick_ffi.a -headers "$OUT/headers" \
+        -library target/aarch64-apple-darwin/release/libwick_ffi.a -headers "$OUT/headers" \
         -output "$OUT/WickFFI.xcframework"
     echo "Built $OUT/WickFFI.xcframework"
 
