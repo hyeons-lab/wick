@@ -233,6 +233,89 @@ jobs:
           # without keeping stale binaries around.
           retention-days: 7
 
+  ios-xcframework:
+    # Cross-compiles wick-ffi to all three iOS targets and assembles
+    # `WickFFI.xcframework` ready for Swift Package Manager / Xcode
+    # consumption. Pairs the device-arm64 staticlib with a fat
+    # (arm64 + x86_64) simulator staticlib so consumer apps work on
+    # real iPhones plus simulators on both Apple Silicon and Intel
+    # Mac hosts.
+    #
+    # Runs on macos-latest because xcodebuild + lipo only ship with
+    # Xcode. Single job (no matrix) — the three target builds are
+    # serial inside the recipe; matrix wouldn't help because the final
+    # xcodebuild step needs every slice in one workspace.
+    name: iOS XCFramework
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          # All three iOS targets up-front; rustup-target-add doesn't
+          # cost much and avoids per-step add calls.
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Show Xcode version
+        # Diagnostic — pin tracking. macos-latest can shift Xcode
+        # majors between runner image versions; logging here means a
+        # silent xcodebuild behavior change shows up in the job log.
+        run: xcodebuild -version
+      - name: Build XCFramework
+        # Mirrors `just ios-xcframework` exactly. Inlined because the
+        # CI runner doesn't have `just` installed by default and
+        # adding a setup-just step for a single-recipe job would be
+        # more weight than the recipe itself.
+        run: |
+          set -euo pipefail
+          cargo build -p wick-ffi --target aarch64-apple-ios --release
+          cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
+          cargo build -p wick-ffi --target x86_64-apple-ios --release
+          OUT=target/xcframework-build
+          rm -rf "$OUT"
+          mkdir -p "$OUT/headers"
+          cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
+          cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+          lipo -create \
+              target/aarch64-apple-ios-sim/release/libwick_ffi.a \
+              target/x86_64-apple-ios/release/libwick_ffi.a \
+              -output "$OUT/libwick_ffi-sim.a"
+          xcodebuild -create-xcframework \
+              -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
+              -library "$OUT/libwick_ffi-sim.a" -headers "$OUT/headers" \
+              -output "$OUT/WickFFI.xcframework"
+      - name: Verify XCFramework slices
+        # Catches a regression where one slice silently has the wrong
+        # architecture — `Info.plist` advertises supported archs +
+        # platform variants, both must match what we built. Same
+        # exhaustive-check discipline as the Android ABI matrix.
+        run: |
+          set -euo pipefail
+          XCF=target/xcframework-build/WickFFI.xcframework
+          test -d "$XCF" || { echo "::error::xcframework not built"; exit 1; }
+          plutil -p "$XCF/Info.plist"
+          # Device slice: arm64 only, platform=ios, no variant.
+          plutil -convert json -o - "$XCF/Info.plist" | python3 -c '
+          import json, sys
+          info = json.load(sys.stdin)
+          libs = info["AvailableLibraries"]
+          if len(libs) != 2:
+              print(f"::error::expected 2 slices, got {len(libs)}", file=sys.stderr); sys.exit(1)
+          slices = {tuple(sorted(l["SupportedArchitectures"])) + (l.get("SupportedPlatformVariant", ""),): l for l in libs}
+          assert (("arm64",) + ("",)) in slices, "missing ios-arm64 device slice"
+          assert (("arm64", "x86_64") + ("simulator",)) in slices, "missing ios-arm64+x86_64 simulator slice"
+          print("xcframework slices OK")
+          '
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wick-ffi-ios-xcframework
+          # Upload the directory (xcframework is a folder bundle on
+          # disk); actions/upload-artifact zips it transparently.
+          path: target/xcframework-build/WickFFI.xcframework
+          retention-days: 7
+
   integration-test:
     name: Integration Tests (gated)
     needs: check

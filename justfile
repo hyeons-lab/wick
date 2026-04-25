@@ -120,6 +120,55 @@ android-all:
 android-arm64:
     cargo ndk --target arm64-v8a build -p wick-ffi --release
 
+# Cross-compile `wick-ffi` to all three iOS targets and assemble a
+# `WickFFI.xcframework` ready for Swift Package Manager / Xcode
+# consumption. Pairs the device-arm64 staticlib with a fat
+# (arm64 + x86_64) simulator staticlib in two slices of one
+# `.xcframework` so consumer apps work on both real iPhones and the
+# simulator on Apple Silicon and Intel Macs alike.
+#
+# Requires Xcode (for `xcodebuild` + `lipo`) plus the rustup targets:
+# `rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+# x86_64-apple-ios`. The vendored Swift bindings under
+# `wick-ffi/bindings/swift/` provide the headers + module map; CI
+# regenerates them via the `ffi-bindings-drift` job so they stay
+# locked to the current Rust surface.
+#
+# Output: `target/xcframework-build/WickFFI.xcframework`. CI uploads
+# the same path as a per-run artifact.
+ios-xcframework:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p wick-ffi --target aarch64-apple-ios --release
+    cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
+    cargo build -p wick-ffi --target x86_64-apple-ios --release
+    OUT=target/xcframework-build
+    rm -rf "$OUT"
+    mkdir -p "$OUT/headers"
+    # Stage the headers + module map next to where xcodebuild will
+    # look. UniFFI-generated `wick_ffiFFI.modulemap` is renamed to
+    # `module.modulemap` on the way in — Xcode's framework conventions
+    # require that exact filename inside a `Headers/` directory.
+    cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
+    cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+    # Fat simulator slice: arm64 + x86_64 in a single .a so one
+    # XCFramework slice covers both Apple Silicon and Intel Mac
+    # simulator hosts.
+    lipo -create \
+        target/aarch64-apple-ios-sim/release/libwick_ffi.a \
+        target/x86_64-apple-ios/release/libwick_ffi.a \
+        -output "$OUT/libwick_ffi-sim.a"
+    xcodebuild -create-xcframework \
+        -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
+        -library "$OUT/libwick_ffi-sim.a" -headers "$OUT/headers" \
+        -output "$OUT/WickFFI.xcframework"
+    echo "Built $OUT/WickFFI.xcframework"
+
+# Single-target iOS variant for fast device-only iteration.
+# Skips the simulator slice + xcframework assembly.
+ios-arm64:
+    cargo build -p wick-ffi --target aarch64-apple-ios --release
+
 # Clean build artifacts
 clean:
     cargo clean
