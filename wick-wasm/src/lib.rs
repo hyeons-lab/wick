@@ -458,9 +458,19 @@ impl GenerateSummary {
 /// **Worker note:** `generate` is synchronous and will block the
 /// thread it runs on for the duration of decode (potentially
 /// seconds). On the browser main thread that freezes the page —
-/// always call from a Web Worker. On Node it's fine to run
-/// directly since the generate call only blocks the main script,
-/// not the libuv event loop's I/O.
+/// always call from a Web Worker. On Node it also blocks the JS
+/// event loop (libuv's background I/O thread pool keeps running,
+/// but JS callbacks queue): use `worker_threads` for server
+/// processes that need to handle other requests during inference;
+/// one-off scripts are fine to run sync.
+///
+/// **Cancellation:** since the worker thread is blocked inside
+/// `generate`, the worker's own `onmessage` handler can't run —
+/// incoming `postMessage({kind:'cancel'})` queues but doesn't
+/// dispatch. Wire cancellation through a flag set by the message
+/// handler (or by a check inside the token callback), then call
+/// `session.cancel()` from inside the token callback. See
+/// `wick-wasm/README.md` for the full pattern.
 #[wasm_bindgen]
 pub struct Session {
     inner: wick::Session,
