@@ -422,7 +422,7 @@ impl Tokenizer {
     /// tokens with type `3` (control) or type `4` (user-defined);
     /// regular vocab entries are not reachable via this method
     /// even though their names exist in `tokenizer.ggml.tokens`.
-    /// Names returned here are the literal vocab strings indexed
+    /// Names accepted here are the literal vocab strings indexed
     /// by the special token's ID.
     ///
     /// Useful for constructing prompts with specific control
