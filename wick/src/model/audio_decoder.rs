@@ -58,7 +58,7 @@ pub struct F32Weight {
 }
 
 impl F32Weight {
-    fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
+    pub fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
         let tensor = gguf.get_tensor(name)?;
         let shape = tensor.shape();
         let (rows, cols) = match shape.len() {
