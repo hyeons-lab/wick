@@ -207,12 +207,16 @@ swift-smoke:
         -o target/wick-swift-smoke
     target/wick-swift-smoke
 
-# Build the `wick-wasm` npm-shaped package via `wasm-pack`.
+# Build the `wick-wasm` npm-shaped package via `wasm-pack`
+# (bundler target — see `wasm-web` / `wasm-node` for siblings).
 #
 # Wraps `cargo build --target wasm32-unknown-unknown` + `wasm-bindgen-cli`
-# + `wasm-opt -O3` and writes the output to `wick-wasm/pkg/` (gitignored).
-# The result includes `package.json`, `wick_wasm.js`, `wick_wasm.d.ts`,
-# `wick_wasm_bg.wasm`, and the README — drop-in for `npm install ./pkg`.
+# + `wasm-opt -O3` and writes the output to `wick-wasm/pkg-bundler/`
+# (gitignored — the matrix layout uses `pkg-<target>` to keep the
+# three target outputs from colliding). The result includes
+# `package.json`, `wick_wasm.js`, `wick_wasm.d.ts`,
+# `wick_wasm_bg.wasm`, and the README — drop-in for
+# `npm install ./wick-wasm/pkg-bundler`.
 #
 # Target is `bundler` (webpack / Vite / Rollup-friendly ESM). Use
 # `just wasm-web` for direct browser ESM (`<script type="module">`)

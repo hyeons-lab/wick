@@ -36,11 +36,13 @@ npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 
 ## Usage
 
-The examples below assume the **`bundler`** target. Bundler-less
-(`web`) or CommonJS (`nodejs`) consumers need a one-time
-`init()` call before the first export — see the
+The examples below assume the **`bundler`** target. The `web`
+target also needs a one-time `await init()` call before the first
+export — see the
 [wasm-pack docs](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
-for the per-target init pattern.
+for the init pattern. The `nodejs` target does **not** need an
+explicit init: `require('@hyeonslab/wick-wasm')` returns a ready
+module (the entry self-loads the wasm via `fs.readFileSync`).
 
 ### Manifest parsing
 
@@ -296,10 +298,11 @@ Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
 for webpack / Rollup / Parcel specifics.
 
-If you need a no-bundler workflow (`<script type="module">` directly
-in the browser, or a Node script using `import`), wait for the
-follow-up `--target web` / `--target nodejs` builds — they'll ship as
-sibling packages.
+For no-bundler workflows (`<script type="module">` directly in the
+browser, or `require('@hyeonslab/wick-wasm')` from CommonJS Node),
+download the `wick-wasm-pkg-web` or `wick-wasm-pkg-nodejs` artifact
+instead — see the `Install` section above for the per-target
+table.
 
 ## Building from source
 
