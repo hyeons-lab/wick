@@ -1053,6 +1053,44 @@ impl Session {
         Ok(())
     }
 
+    /// Append PCM audio samples (mono `f32`, normalized to roughly
+    /// `[-1.0, 1.0]`) at `sample_rate` Hz.
+    ///
+    /// **Status: placeholder.** The FFI shape is wired through to
+    /// `wick::Session::append_audio`, but the wick core method is
+    /// currently a scaffold — for any model it always errors,
+    /// either with `UnsupportedModality` (text-only LLMs) or with
+    /// `Backend("...not yet implemented...")` (audio-capable
+    /// models, awaiting Session-side audio-tokenizer wiring). This
+    /// FFI export exists so consumers can lock in the symbol /
+    /// signature now and the bindings-drift CI catches any future
+    /// shape changes; it does **not** yet decode and append audio
+    /// tokens. Use `wick::audio_engine::generate_audio` directly
+    /// (Rust-side) until the Session wiring lands.
+    ///
+    /// **Marshaling cost (relevant when the real impl lands)**:
+    /// UniFFI maps `Vec<f32>` to `List<Float>` in Kotlin and
+    /// `[Float]` in Swift. The Kotlin side boxes each `Float` to
+    /// `java.lang.Float`, a ~4× memory overhead vs the underlying
+    /// `f32` wire bytes — negligible for O(seconds × sample-rate)
+    /// chunks but worth knowing if you're streaming continuous
+    /// audio in tight loops.
+    ///
+    /// Errors today:
+    /// - `EmptyInput` if `samples` is empty (fast-fail, enforced
+    ///   here for parity with `append_text` / `append_tokens`).
+    /// - `UnsupportedModality` if the loaded model's
+    ///   [`ModalityCapabilities::audio_in`] is `false`.
+    /// - `Backend(...)` for audio-capable models — placeholder
+    ///   until the real implementation lands.
+    pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError> {
+        if samples.is_empty() {
+            return Err(FfiError::EmptyInput);
+        }
+        self.lock_inner()?.append_audio(&samples, sample_rate)?;
+        Ok(())
+    }
+
     /// Run autoregressive decode and return all emitted tokens +
     /// a summary. Synchronous — the call blocks until the decode
     /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
