@@ -13,6 +13,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 /// Returns the version of the `wick` core library this binding wraps.
@@ -288,14 +289,75 @@ impl Tokenizer {
         self.inner.eos_token()
     }
 
-    /// Embedded Jinja chat template, if the GGUF metadata carries
-    /// one. Apply it yourself with a Jinja runtime (e.g.
-    /// `nunjucks`) to convert a chat-message list into the
-    /// model's expected prompt string.
+    /// Raw embedded Jinja chat template from the GGUF metadata, if
+    /// any. Most callers should use [`applyChatTemplate`] instead —
+    /// this getter is for inspection or for callers who want to
+    /// render with a different Jinja runtime.
     #[wasm_bindgen(getter, js_name = chatTemplate)]
     pub fn chat_template(&self) -> Option<String> {
         self.inner.chat_template().map(str::to_owned)
     }
+
+    /// Render the model's embedded Jinja chat template against a
+    /// `[{ role, content }, ...]` array, returning the prompt
+    /// string ready for `Tokenizer.encode` + `Session.appendTokens`.
+    ///
+    /// `addGenerationPrompt` defaults to `true` (the common case
+    /// when sending to the model expecting a response). Set to
+    /// `false` when you only want the conversation rendered without
+    /// the trailing assistant-prompt suffix.
+    ///
+    /// Throws `JsError` on:
+    /// - the model not carrying a chat template
+    ///   (`engine.hasChatTemplate === false`),
+    /// - malformed `messages` (not an array, or entries missing
+    ///   `role`/`content` strings),
+    /// - a Jinja render failure (template references an undefined
+    ///   variable, etc.).
+    #[wasm_bindgen(js_name = applyChatTemplate)]
+    pub fn apply_chat_template(
+        &self,
+        messages: JsValue,
+        add_generation_prompt: Option<bool>,
+    ) -> Result<String, JsError> {
+        let msgs = parse_chat_messages(&messages)?;
+        wick::tokenizer::apply_chat_template(
+            &self.inner,
+            &msgs,
+            add_generation_prompt.unwrap_or(true),
+        )
+        .map_err(map_err)
+    }
+}
+
+/// Parse a JS-side `[{ role, content }, ...]` array into the wick
+/// core type, using `js_sys::Reflect` directly rather than going
+/// through `serde-wasm-bindgen`. The former adds ~800 KB to the
+/// wasm bundle (full serde monomorphization + a JsValue
+/// deserialiser); for two flat string fields the manual lookup is
+/// trivial and keeps the binary lean. If a future surface needs
+/// rich nested deserialisation, revisit and add the dep then.
+fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessage>, JsError> {
+    let array = value
+        .dyn_ref::<js_sys::Array>()
+        .ok_or_else(|| JsError::new("messages must be an array"))?;
+    let len = array.length() as usize;
+    let mut msgs = Vec::with_capacity(len);
+    let role_key = JsValue::from_str("role");
+    let content_key = JsValue::from_str("content");
+    for i in 0..array.length() {
+        let entry = array.get(i);
+        let role = js_sys::Reflect::get(&entry, &role_key)
+            .map_err(|_| JsError::new(&format!("messages[{i}] missing role")))?
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("messages[{i}].role must be a string")))?;
+        let content = js_sys::Reflect::get(&entry, &content_key)
+            .map_err(|_| JsError::new(&format!("messages[{i}] missing content")))?
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("messages[{i}].content must be a string")))?;
+        msgs.push(wick::tokenizer::ChatMessage { role, content });
+    }
+    Ok(msgs)
 }
 
 // ---------------------------------------------------------------------------

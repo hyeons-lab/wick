@@ -6,6 +6,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.85"  # minimum; edition 2024 requires 1.85+
 license = "Apache-2.0 OR MIT"
+repository = "https://github.com/hyeons-lab/wick"
 
 [workspace.dependencies]
 anyhow = "1"
