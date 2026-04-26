@@ -26,6 +26,7 @@ pub mod manifest;
 pub mod model;
 pub mod par;
 pub mod quant;
+pub mod safetensors;
 pub mod sampler;
 pub mod session;
 pub mod tensor;
