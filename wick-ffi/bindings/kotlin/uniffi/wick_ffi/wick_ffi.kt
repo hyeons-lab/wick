@@ -1478,7 +1478,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wick_ffi_checksum_method_wickengine_context_size() != 54599.toShort()) {
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_context_size() != 42065.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245.toShort()) {
@@ -4040,18 +4040,21 @@ public interface WickEngineInterface {
     fun `capabilities`(): ModalityCapabilities
 
     /**
-     * Effective context-window size (KV cache cap) the engine was
+     * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
-     * resolved through wick's defaulting rules (a `0` request
-     * becomes the model's `max_seq_len`).
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
      *
-     * Useful for "show effective KV cap" UIs and diagnostic
-     * logging when the caller didn't keep the original
-     * `EngineConfig` around. Note this is the *requested* cap —
-     * the actual per-session KV is `min(context_size, model.max_seq_len)`,
-     * surfaced via `metadata().max_seq_len` if the caller needs
-     * the per-session ceiling.
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
      */
     fun `contextSize`(): kotlin.ULong
 
@@ -4299,18 +4302,21 @@ open class WickEngine :
         )
 
     /**
-     * Effective context-window size (KV cache cap) the engine was
+     * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
-     * resolved through wick's defaulting rules (a `0` request
-     * becomes the model's `max_seq_len`).
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
      *
-     * Useful for "show effective KV cap" UIs and diagnostic
-     * logging when the caller didn't keep the original
-     * `EngineConfig` around. Note this is the *requested* cap —
-     * the actual per-session KV is `min(context_size, model.max_seq_len)`,
-     * surfaced via `metadata().max_seq_len` if the caller needs
-     * the per-session ceiling.
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
      */
     override fun `contextSize`(): kotlin.ULong =
         FfiConverterULong.lift(

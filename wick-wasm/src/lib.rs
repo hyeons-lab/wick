@@ -323,20 +323,22 @@ impl WickEngine {
         capabilities_to_js(self.inner.capabilities())
     }
 
-    /// Effective context-window size (KV cache cap) the engine was
+    /// Requested context-window size (KV cache cap) the engine was
     /// configured with. Mirrors what `fromGgufBytes(bytes,
     /// contextSize)` resolved to — i.e. the value of `contextSize`
     /// you passed in, or `4096` if you omitted it. Unlike
     /// `wick-ffi`'s `EngineConfig::try_from`, the wasm load path
-    /// doesn't treat `0` specially; it's passed straight through
-    /// to wick core (and capped at `maxSeqLen` per session).
+    /// has no `0` → `maxSeqLen` translation: a `contextSize` of `0`
+    /// trips wick core's `context_size > 0` load assertion and
+    /// `fromGgufBytes` throws.
     ///
-    /// Useful for "show effective KV cap" UIs and diagnostic
-    /// logging when JS callers didn't keep the original
-    /// `contextSize` value around. Note this is the *requested* cap
-    /// — the actual per-session KV is `min(contextSize, maxSeqLen)`,
-    /// so use `Math.min(engine.contextSize, engine.maxSeqLen)` if
-    /// you need the per-session ceiling.
+    /// Note this is the **engine-level requested** cap, not a
+    /// per-session ceiling. wick core clamps the model's
+    /// `maxSeqLen` at load time to `min(contextSize,
+    /// gguf_max_seq_len)`, so `engine.maxSeqLen` is already the
+    /// effective ceiling — `contextSize` is informational ("what
+    /// cap did I load with?") rather than a value to `Math.min`
+    /// against `maxSeqLen` at call sites.
     #[wasm_bindgen(getter, js_name = contextSize)]
     pub fn context_size(&self) -> u32 {
         self.inner.config().context_size as u32
