@@ -5086,10 +5086,11 @@ sealed class FfiException : kotlin.Exception() {
      * so the next call can proceed.
      *
      * `generate` reports cancellation via a different path: the
-     * call still returns `Ok(GenerateOutput)`, with `finish_reason`
-     * set to `Cancelled` on the summary. Two paths because chunked
-     * prefill has nothing useful to return on cancel (no decoded
-     * tokens) while decode has accumulated tokens worth preserving.
+     * call still returns `Ok` with a [`GenerateOutput`] whose
+     * `finish_reason` is set to `Cancelled`. Two paths because
+     * chunked prefill has nothing useful to return on cancel (no
+     * decoded tokens) while decode has accumulated tokens worth
+     * preserving.
      */
     class Cancelled : FfiException() {
         override val message
