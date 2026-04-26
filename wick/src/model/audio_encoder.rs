@@ -394,6 +394,87 @@ fn load_vec_f32(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
     Ok(tensor.to_f32_vec())
 }
 
+// ── Conformer block forward — sub-block kernels ─────────────────────
+
+/// Run one Conformer "Macaron" feed-forward sub-block on a
+/// `[t × n_embd]` time-major sequence, accumulating with a 0.5
+/// residual scale (the half-step convention each Conformer block
+/// uses around its self-attention).
+///
+/// Algorithm (mirrors `conformer.cpp` lines 75-83 / 192-199 in the
+/// llama.cpp `mtmd` code):
+///
+/// ```text
+/// pre_norm = LayerNorm(x; norm_w, norm_b)
+/// up_out   = up_w   @ pre_norm + up_b      // [t × n_ff]
+/// silu_out = SiLU(up_out)
+/// down_out = down_w @ silu_out + down_b    // [t × n_embd]
+/// x       += 0.5 * down_out                // accumulate into x
+/// ```
+///
+/// Iterates timestep-by-timestep — encoder runs once per audio
+/// chunk so per-chunk throughput dominates over per-frame latency.
+/// Two scratch buffers (`scratch_pre_norm`, `scratch_ff`) keep the
+/// hot loop allocation-free; the caller sizes them once outside.
+///
+/// Used twice per Conformer block: once before attention (FFN-1
+/// using `ffn_norm` / `ffn_up` / `ffn_down`) and once after the
+/// conv module (FFN-2 using `ffn_norm_1` / `ffn_up_1` /
+/// `ffn_down_1`). The same function handles both — only the
+/// weights differ at the call site.
+#[allow(clippy::too_many_arguments)]
+pub fn conformer_ffn_forward(
+    x: &mut [f32],
+    norm_w: &[f32],
+    norm_b: &[f32],
+    up_w: &F32Weight,
+    up_b: &[f32],
+    down_w: &F32Weight,
+    down_b: &[f32],
+    n_embd: usize,
+    n_ff: usize,
+    t: usize,
+    eps: f32,
+    scratch_pre_norm: &mut [f32],
+    scratch_ff: &mut [f32],
+) {
+    debug_assert_eq!(x.len(), t * n_embd);
+    debug_assert_eq!(norm_w.len(), n_embd);
+    debug_assert_eq!(norm_b.len(), n_embd);
+    debug_assert_eq!(up_b.len(), n_ff);
+    debug_assert_eq!(down_b.len(), n_embd);
+    debug_assert_eq!(scratch_pre_norm.len(), n_embd);
+    debug_assert_eq!(scratch_ff.len(), n_ff);
+
+    for ti in 0..t {
+        let row_start = ti * n_embd;
+        let row = &x[row_start..row_start + n_embd];
+
+        // pre_norm = LayerNorm(x[t]; norm_w, norm_b)
+        scratch_pre_norm.copy_from_slice(row);
+        crate::backend::cpu::layer_norm_inplace(scratch_pre_norm, norm_w, norm_b, eps);
+
+        // up_out = up_w @ pre_norm + up_b
+        up_w.gemv(scratch_pre_norm, scratch_ff);
+        crate::backend::cpu::add_inplace(scratch_ff, up_b);
+
+        // SiLU activation
+        crate::backend::cpu::silu_inplace(scratch_ff);
+
+        // down_out = down_w @ silu_out + down_b — written into
+        // scratch_pre_norm (same shape as the FFN's [n_embd]
+        // output, reuses the buffer).
+        down_w.gemv(scratch_ff, scratch_pre_norm);
+        crate::backend::cpu::add_inplace(scratch_pre_norm, down_b);
+
+        // Accumulate with 0.5 residual scale into x[t].
+        let row_mut = &mut x[row_start..row_start + n_embd];
+        for (xv, &dv) in row_mut.iter_mut().zip(scratch_pre_norm.iter()) {
+            *xv += 0.5 * dv;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +509,86 @@ mod tests {
                 assert!(
                     msg.contains("clip.audio.block_count"),
                     "expected missing-key error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `conformer_ffn_forward` with identity-shaped weights should
+    /// reduce to `x += 0.5 * SiLU(LayerNorm(x))`. Pick weights /
+    /// inputs so the algebra is hand-verifiable and verify against
+    /// a manual scalar reference.
+    #[test]
+    fn conformer_ffn_forward_matches_scalar_reference() {
+        // Smallest non-trivial shape: t=2, n_embd=4, n_ff=4.
+        // Identity up/down weights with zero bias = pure SiLU on
+        // the LayerNorm output.
+        let n_embd = 4;
+        let n_ff = 4;
+        let t = 2;
+
+        let mut x: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let original_x = x.clone();
+
+        let norm_w = vec![1.0; n_embd];
+        let norm_b = vec![0.0; n_embd];
+
+        // Identity matrix for both up and down (in F32Weight's
+        // [rows, cols] = [n_ff, n_embd] layout, row-major).
+        let identity = vec![
+            1.0, 0.0, 0.0, 0.0, // row 0
+            0.0, 1.0, 0.0, 0.0, // row 1
+            0.0, 0.0, 1.0, 0.0, // row 2
+            0.0, 0.0, 0.0, 1.0, // row 3
+        ];
+        let up_w = F32Weight {
+            data: identity.clone(),
+            rows: n_ff,
+            cols: n_embd,
+        };
+        let up_b = vec![0.0; n_ff];
+        let down_w = F32Weight {
+            data: identity,
+            rows: n_embd,
+            cols: n_ff,
+        };
+        let down_b = vec![0.0; n_embd];
+
+        let mut scratch_pre_norm = vec![0.0; n_embd];
+        let mut scratch_ff = vec![0.0; n_ff];
+
+        conformer_ffn_forward(
+            &mut x,
+            &norm_w,
+            &norm_b,
+            &up_w,
+            &up_b,
+            &down_w,
+            &down_b,
+            n_embd,
+            n_ff,
+            t,
+            1e-5,
+            &mut scratch_pre_norm,
+            &mut scratch_ff,
+        );
+
+        // Manual reference: for each timestep, compute
+        //   ln_t = LayerNorm(orig[t]; w=1, b=0)
+        //   silu_ln = SiLU(ln_t)        // identity FFN reduces to this
+        //   expected[t] = orig[t] + 0.5 * silu_ln
+        for ti in 0..t {
+            let orig = &original_x[ti * n_embd..(ti + 1) * n_embd];
+            let mut ln = orig.to_vec();
+            crate::backend::cpu::layer_norm_inplace(&mut ln, &norm_w, &norm_b, 1e-5);
+            let mut silu = ln;
+            crate::backend::cpu::silu_inplace(&mut silu);
+            for c in 0..n_embd {
+                let expected = orig[c] + 0.5 * silu[c];
+                let actual = x[ti * n_embd + c];
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "t={ti}, c={c}: got {actual}, expected {expected}"
                 );
             }
         }
