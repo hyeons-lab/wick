@@ -197,18 +197,25 @@ on Node `worker_threads`.
 const sab = new SharedArrayBuffer(4);
 const cancelFlag = new Int32Array(sab);
 worker.postMessage({ kind: 'init', cancelFlag });
+worker.postMessage({ kind: 'generate', opts });
 // later, to cancel:
 Atomics.store(cancelFlag, 0, 1);
 
-// worker.js
+// worker.js — generate() is invoked from inside the message
+// handler so `cancelFlag` is guaranteed initialized first; running
+// generate at top-level would race with `init` and crash on
+// `Atomics.load(undefined, 0)`.
 let cancelFlag;
 self.onmessage = (ev) => {
-    if (ev.data.kind === 'init') cancelFlag = ev.data.cancelFlag;
+    if (ev.data.kind === 'init') {
+        cancelFlag = ev.data.cancelFlag;
+    } else if (ev.data.kind === 'generate') {
+        session.generate(ev.data.opts, (toks) => {
+            self.postMessage({ kind: 'tokens', toks });
+            if (Atomics.load(cancelFlag, 0) !== 0) session.cancel();
+        });
+    }
 };
-session.generate(opts, (toks) => {
-    self.postMessage({ kind: 'tokens', toks });
-    if (Atomics.load(cancelFlag, 0) !== 0) session.cancel();
-});
 ```
 
 A pure `postMessage`-flag pattern only works if the cancel arrives
