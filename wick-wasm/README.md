@@ -164,27 +164,57 @@ at the next checkpoint.
 The catch: JS workers (web + `worker_threads`) are single-threaded.
 While `generate()` is blocking, the worker's own message handlers
 **cannot run** — a `postMessage({ kind: 'cancel' })` from the main
-thread queues but doesn't dispatch until generate returns. So the
-useful place to call `session.cancel()` is **from inside the token
-callback** (the only JS code that runs during a blocking generate):
+thread queues but doesn't dispatch until generate returns. So a
+plain JS flag set by an `onmessage` handler can't be updated
+mid-decode.
+
+Two patterns that actually work:
+
+**1. Cancel from inside the token callback** based on state the
+callback can observe directly (elapsed time, accumulated content,
+token budget beyond `opts.maxTokens`):
 
 ```js
-let cancelRequested = false;
-// Receive a cancel signal from outside the generate call …
-self.addEventListener('message', (ev) => {
-    if (ev.data.kind === 'cancel') cancelRequested = true;
-});
-
+const startMs = performance.now();
 session.generate(opts, (toks) => {
     self.postMessage({ kind: 'tokens', toks });
-    if (cancelRequested) session.cancel();
+    if (performance.now() - startMs > 30_000) {
+        session.cancel();  // 30-second budget
+    }
 });
 ```
 
-Out-of-thread cancellation (truly async, no callback round-trip)
-needs `SharedArrayBuffer` + `Atomics.store` from another thread,
-which requires cross-origin isolation in browsers. Not exposed by
-this package today.
+**2. `SharedArrayBuffer` + `Atomics`** for true cross-thread
+signalling. Allocate an `Int32Array` on a `SharedArrayBuffer`,
+poll it from inside the callback with `Atomics.load`, set it from
+the main thread with `Atomics.store`. **Requires cross-origin
+isolation** in browsers (`Cross-Origin-Opener-Policy: same-origin`
++ `Cross-Origin-Embedder-Policy: require-corp` headers); transparent
+on Node `worker_threads`.
+
+```js
+// main thread
+const sab = new SharedArrayBuffer(4);
+const cancelFlag = new Int32Array(sab);
+worker.postMessage({ kind: 'init', cancelFlag });
+// later, to cancel:
+Atomics.store(cancelFlag, 0, 1);
+
+// worker.js
+let cancelFlag;
+self.onmessage = (ev) => {
+    if (ev.data.kind === 'init') cancelFlag = ev.data.cancelFlag;
+};
+session.generate(opts, (toks) => {
+    self.postMessage({ kind: 'tokens', toks });
+    if (Atomics.load(cancelFlag, 0) !== 0) session.cancel();
+});
+```
+
+A pure `postMessage`-flag pattern only works if the cancel arrives
+before generate is called (the listener runs during the gap
+between message receipt and the next generate). It's unreliable
+for in-flight cancellation; use one of the two patterns above.
 
 Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)

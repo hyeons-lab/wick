@@ -467,10 +467,15 @@ impl GenerateSummary {
 /// **Cancellation:** since the worker thread is blocked inside
 /// `generate`, the worker's own `onmessage` handler can't run —
 /// incoming `postMessage({kind:'cancel'})` queues but doesn't
-/// dispatch. Wire cancellation through a flag set by the message
-/// handler (or by a check inside the token callback), then call
-/// `session.cancel()` from inside the token callback. See
-/// `wick-wasm/README.md` for the full pattern.
+/// dispatch until generate returns, so a flag set by that
+/// handler can't be updated mid-decode. To cancel during a
+/// running generate, either call `session.cancel()` from inside
+/// the token callback based on state it can observe directly
+/// (elapsed time, token budget, accumulated content), or use
+/// cross-thread shared memory signalling (`SharedArrayBuffer` +
+/// `Atomics`) — see `wick-wasm/README.md` for the full
+/// `SharedArrayBuffer` pattern, which requires cross-origin
+/// isolation in browsers.
 #[wasm_bindgen]
 pub struct Session {
     inner: wick::Session,
