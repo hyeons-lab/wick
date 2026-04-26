@@ -918,6 +918,52 @@ impl Session {
         self.inner.append_tokens(tokens).map_err(map_wick_err)
     }
 
+    /// Append PCM audio samples (mono `f32`, normalized to roughly
+    /// `[-1.0, 1.0]`) at `sample_rate` Hz.
+    ///
+    /// **Status: placeholder.** The wasm shape is wired through to
+    /// `wick::Session::append_audio`, but the wick core method is
+    /// currently a scaffold — for any model it errors, either with
+    /// the `UnsupportedModality` variant (text-only LLMs) or with
+    /// a `Backend(...)` variant (audio-capable models, awaiting
+    /// Session-side audio-tokenizer wiring). This export exists so
+    /// JS / TS consumers can lock in the symbol + signature now and
+    /// the wasm-pack `.d.ts` artifact catches any future shape
+    /// changes; it does **not** yet decode and append audio tokens.
+    /// Mirrors the same placeholder framing that wick-ffi shipped
+    /// in PR #78.
+    ///
+    /// `samples` arrives as `Float32Array` on the JS side. The
+    /// wasm-bindgen boundary copies the typed-array contents into
+    /// wasm linear memory once — there's no per-element boxing
+    /// (contrast with Kotlin's `List<Float>` 4× memory overhead
+    /// flagged in PR #78). The `&[f32]` Rust signature matches
+    /// `appendTokens(&[u32])` and avoids the per-call `Vec`
+    /// allocation that an owned parameter would require.
+    ///
+    /// Errors today are thrown as JS `Error`s; the message string
+    /// is the underlying `wick::WickError::Display` text (same as
+    /// `appendText` / `appendTokens` produce):
+    /// - `"empty input"` if `samples.length === 0` — fast-fail at
+    ///   the wasm boundary, parity with `appendText` /
+    ///   `appendTokens` empty-input rejection.
+    /// - `"modality not supported by this model"` for text-only
+    ///   models (`session.capabilities.audioIn === false` —
+    ///   currently always `false` under the synthetic-text
+    ///   loader; see `WickEngine.capabilities` doc).
+    /// - `"backend: Session::append_audio is not yet implemented for audio-capable models — ..."`
+    ///   for audio-capable models — placeholder string until the
+    ///   real implementation lands.
+    #[wasm_bindgen(js_name = appendAudio)]
+    pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
+        if samples.is_empty() {
+            return Err(map_wick_err(wick::WickError::EmptyInput));
+        }
+        self.inner
+            .append_audio(samples, sample_rate)
+            .map_err(map_wick_err)
+    }
+
     /// Current KV cache position (number of tokens currently held).
     #[wasm_bindgen(getter)]
     pub fn position(&self) -> u32 {
