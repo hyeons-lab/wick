@@ -652,23 +652,30 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
 
 /// Sigmoid activation in-place: `x = 1 / (1 + exp(-x))`. Uses
 /// `ggml_expf` for the inner exponential to match the SiLU /
-/// softmax precision pattern. Used by the Conformer audio
-/// encoder's GLU split (`glu_split_inplace`).
+/// softmax precision pattern.
 pub fn sigmoid_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = 1.0 / (1.0 + ggml_expf(-*v));
     }
 }
 
-/// Gated Linear Unit split-and-gate in-place. Reads a 2N-element
-/// `input`; writes the N-element result `output[i] = a[i] *
-/// sigmoid(b[i])` where `a = input[..N]` and `b = input[N..]`.
+/// Gated Linear Unit split-and-gate. Reads a 2N-element `input`;
+/// writes the N-element result `output[i] = a[i] * sigmoid(b[i])`
+/// where `a = input[..N]` and `b = input[N..]`. Writes to a
+/// separate `output` buffer (not in-place over `input`) — name
+/// omits the `_inplace` suffix to reflect that, matching the
+/// `conv1d` precedent in this file.
 ///
-/// The Conformer audio encoder's per-block conv module starts with
-/// `conv_pw1` projecting to `2 * channels`, then this GLU gate
-/// halves it back to `channels`. Output channel count = input
-/// channel count / 2.
-pub fn glu_split_inplace(input: &[f32], output: &mut [f32]) {
+/// Inlines the sigmoid rather than calling `sigmoid_inplace` so
+/// the gate fuses with the multiply in one pass over each
+/// element — same shape `silu_mul_inplace` uses for the SiLU
+/// gate.
+///
+/// The Conformer audio encoder's per-block conv module starts
+/// with `conv_pw1` projecting to `2 * channels`, then this GLU
+/// gate halves it back to `channels`. Output channel count =
+/// input channel count / 2.
+pub fn glu_split(input: &[f32], output: &mut [f32]) {
     debug_assert_eq!(input.len() % 2, 0);
     let half = input.len() / 2;
     debug_assert_eq!(output.len(), half);
@@ -1943,7 +1950,7 @@ mod tests {
         // b1 = large → sigmoid = ~1.
         let input = vec![3.0, 7.0, 0.0, 100.0];
         let mut output = vec![0.0; 2];
-        glu_split_inplace(&input, &mut output);
+        glu_split(&input, &mut output);
         assert!((output[0] - 1.5).abs() < 1e-5, "got {}", output[0]); // 3 * 0.5
         assert!((output[1] - 7.0).abs() < 1e-3, "got {}", output[1]); // 7 * ~1
     }
