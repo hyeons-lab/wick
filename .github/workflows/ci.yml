@@ -96,27 +96,34 @@ jobs:
         run: cargo check -p wick ${{ matrix.features }} --target wasm32-unknown-unknown
 
   wick-wasm-pack:
-    # Phase 3 PR 3 — full npm-shaped artifact for `wick-wasm`.
-    # Replaces the earlier `wick-wasm-build` (`cargo build`-only) job:
-    # `wasm-pack build` runs cargo build internally plus the
-    # wasm-bindgen-cli post-processing and wasm-opt size pass that turn
-    # the raw cdylib into a `pkg/` an npm consumer can install. The
+    # Multi-target wasm-pack build. Each matrix entry produces one
+    # consumer shape:
+    #   - `bundler`: ESM with bundler-only `import * as wasm from
+    #     "...wasm"` magic (webpack 5+, Vite, Rollup with the
+    #     wasm plugin). Most common.
+    #   - `web`: direct browser ESM that callers `init()` themselves
+    #     before use. Right shape for `<script type="module">` and
+    #     loaders without bundler-side wasm support.
+    #   - `nodejs`: CommonJS for Node — `require('@hyeonslab/wick-wasm')`
+    #     without the experimental-wasm-modules dance.
+    #
+    # Three artifacts are uploaded so reviewers / downstream devs can
+    # download whichever shape matches their consumer. The publish
+    # workflow (deferred) will need to differentiate the npm package
+    # names per target since wasm-pack writes the same scoped name
+    # into all three pkg-*/package.json files today.
+    #
     # `cargo build` regression check is preserved as a side-effect of
-    # the wasm-pack pipeline.
-    #
-    # `--target bundler`: ESM output for webpack / Vite / Rollup — the
-    # most common consumer shape. `--target web` and `--target nodejs`
-    # are trivial follow-up matrix entries; deferred until a concrete
-    # consumer asks.
-    #
-    # The `pkg/` directory is uploaded as a CI artifact so reviewers
-    # and downstream developers can `npm install ./pkg` directly from
-    # the workflow run — bridges the "PR landed, not yet on npm" gap
-    # before the publish workflow lands (Phase 3.x).
-    name: Wick-Wasm Pack
+    # the wasm-pack pipeline (any of the three matrix entries failing
+    # would catch a wick core regression).
+    name: Wick-Wasm Pack (${{ matrix.target }})
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [bundler, web, nodejs]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
@@ -131,11 +138,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wick-wasm npm package
         # `--scope hyeonslab` matches the package name advertised in
-        # wick-wasm/README.md (`@hyeonslab/wick-wasm`); without it
-        # the generated `package.json.name` would be a bare
-        # `wick-wasm` and downstream consumers would see two names
-        # for the same artifact.
-        run: wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
+        # wick-wasm/README.md (`@hyeonslab/wick-wasm`). `--out-dir`
+        # gives each matrix entry its own directory so the artifact
+        # uploads don't collide.
+        run: |
+          wasm-pack build wick-wasm \
+            --target ${{ matrix.target }} \
+            --release \
+            --scope hyeonslab \
+            --out-dir pkg-${{ matrix.target }}
       - name: Check .wasm size budget
         # Hard cap on the post-wasm-opt cdylib size. Catches the
         # next time something bloats the bundle silently. Crossing
@@ -145,7 +156,11 @@ jobs:
         # Don't let a passing CI become a license to grow the wasm
         # without scrutiny.
         #
-        # Current floor (post wasm-opt -O3, --target bundler):
+        # All three targets share the same wasm body (only the JS
+        # glue differs); the gate fires per-target so any future
+        # target-specific size regression surfaces immediately.
+        #
+        # Current floor (post wasm-opt -O3):
         #   PR #67 (manifest only):              174 KB
         #   PR #69 (engine + tokenizer):         1.2 MB  (+1.0 MB minijinja + LFM2)
         #   PR #70 (Session + generate):         1.2 MB  (~unchanged)
@@ -157,7 +172,8 @@ jobs:
         # where contributors will sanity-check it locally.
         run: |
           set -euo pipefail
-          WASM=wick-wasm/pkg/wick_wasm_bg.wasm
+          PKG=wick-wasm/pkg-${{ matrix.target }}
+          WASM=$PKG/wick_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
           BUDGET_KB=2560  # 2.5 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
@@ -171,26 +187,26 @@ jobs:
           # otherwise abort on the redirect.
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
-            echo "## Wick-Wasm Pack output"
+            echo "## Wick-Wasm Pack output (${{ matrix.target }})"
             echo
             echo "**\`$WASM\`: ${SIZE_KB} KB / ${BUDGET_KB} KB budget**"
             echo
             echo '```'
-            ls -lh wick-wasm/pkg/
+            ls -lh "$PKG/"
             echo '```'
           } >> "$SUMMARY"
           # Compare in bytes so the gate is a true hard cap; comparing
           # in KB would let a file overshoot by up to 1023 bytes
           # before failing.
           if [ "$SIZE_BYTES" -gt "$BUDGET_BYTES" ]; then
-            echo "::error file=.github/workflows/ci.yml::wick_wasm_bg.wasm is ${SIZE_KB} KB (${SIZE_BYTES} B), over the ${BUDGET_KB} KB (${BUDGET_BYTES} B) budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
+            echo "::error file=.github/workflows/ci.yml::$WASM is ${SIZE_KB} KB (${SIZE_BYTES} B), over the ${BUDGET_KB} KB (${BUDGET_BYTES} B) budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
             exit 1
           fi
-          echo "wick_wasm_bg.wasm: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
+          echo "$WASM: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
       - uses: actions/upload-artifact@v4
         with:
-          name: wick-wasm-pkg
-          path: wick-wasm/pkg/
+          name: wick-wasm-pkg-${{ matrix.target }}
+          path: wick-wasm/pkg-${{ matrix.target }}/
           if-no-files-found: error
           retention-days: 30
 

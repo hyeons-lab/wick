@@ -13,19 +13,36 @@
 npm install @hyeonslab/wick-wasm  # not yet published
 ```
 
-For now, download the latest `pkg/` artifact from the
-[CI run](https://github.com/hyeons-lab/wick/actions/workflows/ci.yml)
-on the most recent `main` build and install it locally:
+For now, download the artifact matching your consumer shape from
+the latest [CI run](https://github.com/hyeons-lab/wick/actions/workflows/ci.yml)
+on `main` — three are produced per build:
+
+| Artifact | wasm-pack target | When to use |
+|---|---|---|
+| `wick-wasm-pkg-bundler` | `bundler` | webpack 5+, Vite, Rollup (with wasm plugin), Parcel — the typical app build |
+| `wick-wasm-pkg-web` | `web` | `<script type="module">` direct in the browser, or any bundler-less ESM workflow |
+| `wick-wasm-pkg-nodejs` | `nodejs` | `require('@hyeonslab/wick-wasm')` from CommonJS Node, or older Node without ESM `import` |
 
 ```sh
-npm install /path/to/downloaded/pkg
+npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 ```
+
+> **One npm package, three target shapes:** all three artifacts
+> ship `package.json.name` = `@hyeonslab/wick-wasm` today. The
+> publish workflow (deferred) will resolve the collision before
+> shipping to the registry — likely by publishing each target as
+> a separate scoped package (`@hyeonslab/wick-wasm`,
+> `@hyeonslab/wick-wasm-web`, `@hyeonslab/wick-wasm-nodejs`).
 
 ## Usage
 
-This package is built with `wasm-pack --target bundler`, so the
-`.wasm` is loaded automatically by your bundler (webpack 5+, Vite,
-Rollup with `@rollup/plugin-wasm`). No manual `init()` call.
+The examples below assume the **`bundler`** target. The `web`
+target also needs a one-time `await init()` call before the first
+export — see the
+[wasm-pack docs](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
+for the init pattern. The `nodejs` target does **not** need an
+explicit init: `require('@hyeonslab/wick-wasm')` returns a ready
+module (the entry self-loads the wasm via `fs.readFileSync`).
 
 ### Manifest parsing
 
@@ -281,15 +298,18 @@ Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
 for webpack / Rollup / Parcel specifics.
 
-If you need a no-bundler workflow (`<script type="module">` directly
-in the browser, or a Node script using `import`), wait for the
-follow-up `--target web` / `--target nodejs` builds — they'll ship as
-sibling packages.
+For no-bundler workflows (`<script type="module">` directly in the
+browser, or `require('@hyeonslab/wick-wasm')` from CommonJS Node),
+download the `wick-wasm-pkg-web` or `wick-wasm-pkg-nodejs` artifact
+instead — see the `Install` section above for the per-target
+table.
 
 ## Building from source
 
 ```sh
-just wasm  # produces wick-wasm/pkg/
+just wasm        # bundler target → wick-wasm/pkg-bundler/
+just wasm-web    # browser ESM    → wick-wasm/pkg-web/
+just wasm-node   # CommonJS Node  → wick-wasm/pkg-nodejs/
 ```
 
 Requires `wasm-pack` (`cargo install wasm-pack`) and `wasm-opt`

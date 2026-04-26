@@ -1,6 +1,9 @@
-# wasm-pack output. Regenerated on every `just wasm` / CI run; never
-# committed (npm-publish workflow will pull a fresh build).
+# wasm-pack output. Regenerated on every `just wasm*` / CI run;
+# never committed (npm-publish workflow will pull fresh builds).
+# `pkg/` covers a wasm-pack default-out invocation; `pkg-*/` covers
+# the per-target builds (`pkg-bundler`, `pkg-web`, `pkg-nodejs`).
 pkg/
+pkg-*/
 
 # Local-only build dirs in case someone runs cargo / npm inside this
 # crate folder.
