@@ -93,11 +93,14 @@ engine.free();
 ### Inference (text)
 
 ```js
-import { WickEngine, GenerateOpts } from '@hyeonslab/wick-wasm';
+import { WickEngine, SessionConfig, GenerateOpts } from '@hyeonslab/wick-wasm';
 
 const engine = WickEngine.fromGgufBytes(gguf, 2048);
 const tok = engine.tokenizer;
-const session = engine.newSession();
+// `newSession` requires a SessionConfig. Pass `new SessionConfig()`
+// for the wick defaults (random sampler seed, no n_keep pin, etc).
+// See "Reproducibility (seeded sampler)" below for the knob list.
+const session = engine.newSession(new SessionConfig());
 
 // Seed the conversation. Use `session.appendText(prompt)` for the
 // common case (tokenizer is invoked internally), or
@@ -149,7 +152,12 @@ const cfg = new SessionConfig();
 cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 
 // You can also tune:
-//   cfg.maxSeqLen = 1024;   // override the model's KV cap
+//   cfg.maxSeqLen = 1024;   // further lower the KV cap below the
+//                           // engine's effective max
+//                           // (= min(engine.contextSize, model.maxSeqLen)).
+//                           // Setting a value above that effective max
+//                           // does NOT raise it — re-construct the engine
+//                           // with a larger contextSize for that.
 //   cfg.nKeep = 16;         // pin the first 16 tokens across context shifts
 //                           // (useful for keeping a system prompt resident)
 //   cfg.ubatchSize = 256;   // smaller chunked-prefill batches give finer
@@ -172,10 +180,10 @@ session.generate(opts, (toks) => out.push(...toks));
 >
 > ```js
 > // worker.js
-> import { WickEngine, GenerateOpts } from '@hyeonslab/wick-wasm';
+> import { WickEngine, SessionConfig, GenerateOpts } from '@hyeonslab/wick-wasm';
 > self.onmessage = async (ev) => {
 >     const engine = WickEngine.fromGgufBytes(ev.data.gguf);
->     const session = engine.newSession();
+>     const session = engine.newSession(new SessionConfig());
 >     session.appendText(ev.data.prompt);
 >     const opts = new GenerateOpts();
 >     opts.maxTokens = 128;

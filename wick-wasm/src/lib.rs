@@ -224,24 +224,30 @@ impl WickEngine {
         }
     }
 
-    /// Construct a new `Session` for this engine. Pass a
-    /// [`SessionConfig`] to override per-session knobs
-    /// (sampler `seed`, `n_keep` pinned-prefix size,
-    /// `ubatch_size` chunked-prefill batch, `max_seq_len`
-    /// KV cap); omit / pass `null` for the wick defaults
-    /// (`max_seq_len = model's max`, `n_keep = 0`,
-    /// `seed = null`, `ubatch_size = 512`).
+    /// Construct a new `Session` for this engine. The `config`
+    /// freezes per-session knobs — sampler `seed`, `n_keep`
+    /// pinned-prefix size, `ubatch_size` chunked-prefill batch,
+    /// `max_seq_len` KV cap. For the wick defaults
+    /// (`max_seq_len = null` → engine's effective cap, i.e.
+    /// `min(engine.contextSize, model.maxSeqLen)`; `n_keep = 0`,
+    /// `seed = null`, `ubatch_size = 512`), pass a freshly-
+    /// constructed `new SessionConfig()`.
+    ///
+    /// `config` is **borrowed**, not consumed — JS callers can
+    /// reuse the same `SessionConfig` across multiple `newSession`
+    /// calls. Inner state is cloned per-session at the boundary.
+    /// This mirrors how `Session.generate` borrows `GenerateOpts`.
+    /// (wasm-bindgen doesn't support `Option<&T>` for wrapper
+    /// types, so a default-config caller passes
+    /// `new SessionConfig()` rather than omitting the arg.)
     ///
     /// The returned `Session` keeps its own `Arc` clones of the
     /// engine's model and tokenizer, so freeing the engine doesn't
     /// invalidate any in-flight sessions.
     #[wasm_bindgen(js_name = newSession)]
-    pub fn new_session(&self, config: Option<SessionConfig>) -> Session {
-        let cfg = config
-            .map(|c| c.inner)
-            .unwrap_or_else(wick::SessionConfig::default);
+    pub fn new_session(&self, config: &SessionConfig) -> Session {
         Session {
-            inner: self.inner.new_session(cfg),
+            inner: self.inner.new_session(config.inner.clone()),
         }
     }
 }
@@ -413,7 +419,7 @@ fn read_string_field(
 /// per-layer seed) that deserves a dedicated design pass. v1 of
 /// `SessionConfig` ships without compression knobs.
 #[wasm_bindgen]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SessionConfig {
     inner: wick::SessionConfig,
 }
@@ -425,8 +431,11 @@ impl SessionConfig {
         Self::default()
     }
 
-    /// Cap on total tokens held in KV. `null` defers to the model's
-    /// own `max_seq_len` (the common case).
+    /// Cap on total tokens held in KV. `null` (the common case)
+    /// defers to the engine's effective max — i.e.
+    /// `min(engine.contextSize, model.maxSeqLen)`. Set to a
+    /// smaller value here to further lower the cap; values larger
+    /// than the engine's effective max are still capped at it.
     #[wasm_bindgen(getter, js_name = maxSeqLen)]
     pub fn max_seq_len(&self) -> Option<u32> {
         self.inner.max_seq_len
@@ -620,7 +629,7 @@ impl GenerateSummary {
     }
 }
 
-/// Stateful generation handle. Built via `WickEngine.newSession()`.
+/// Stateful generation handle. Built via `WickEngine.newSession(config)`.
 ///
 /// JS callers seed the conversation by calling `appendText` /
 /// `appendTokens` and then drive decode with `generate(opts, cb)`.
