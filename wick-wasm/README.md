@@ -193,26 +193,36 @@ isolation** in browsers (`Cross-Origin-Opener-Policy: same-origin`
 on Node `worker_threads`.
 
 ```js
-// main thread
+// main thread — only structured-cloneable data crosses the
+// postMessage boundary. wasm-bindgen objects (GenerateOpts,
+// Session, etc.) live inside wasm linear memory and would throw
+// on postMessage; pass plain params and construct the object on
+// the worker side.
 const sab = new SharedArrayBuffer(4);
 const cancelFlag = new Int32Array(sab);
 worker.postMessage({ kind: 'init', cancelFlag });
-worker.postMessage({ kind: 'generate', opts });
+worker.postMessage({ kind: 'generate', params: { maxTokens: 64 } });
 // later, to cancel:
 Atomics.store(cancelFlag, 0, 1);
 
 // worker.js — generate() is invoked from inside the message
 // handler so `cancelFlag` is guaranteed initialized first; running
 // generate at top-level would race with `init` and crash on
-// `Atomics.load(undefined, 0)`.
+// `Atomics.load(undefined, 0)`. The cancelFlag null check guards
+// against `generate` arriving before `init` (out-of-order
+// messages).
 let cancelFlag;
 self.onmessage = (ev) => {
     if (ev.data.kind === 'init') {
         cancelFlag = ev.data.cancelFlag;
     } else if (ev.data.kind === 'generate') {
-        session.generate(ev.data.opts, (toks) => {
+        const opts = new GenerateOpts();
+        Object.assign(opts, ev.data.params);  // setters fire per field
+        session.generate(opts, (toks) => {
             self.postMessage({ kind: 'tokens', toks });
-            if (Atomics.load(cancelFlag, 0) !== 0) session.cancel();
+            if (cancelFlag && Atomics.load(cancelFlag, 0) !== 0) {
+                session.cancel();
+            }
         });
     }
 };
