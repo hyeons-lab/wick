@@ -967,8 +967,18 @@ impl Session {
     ///
     /// Engine-level disk prefix cache (when configured on
     /// `WickEngine`) is not touched — those entries are
-    /// engine-scoped, not session-scoped. Cancellation safety
-    /// matches `cancel`: safe to call from any thread.
+    /// engine-scoped, not session-scoped.
+    ///
+    /// **Threading:** unlike `cancel()` (which only flips an
+    /// atomic and is safe to call concurrently with anything),
+    /// `reset()` takes `&mut self` and rebuilds non-atomic
+    /// internal state (KV cache, sampler). Must be called on
+    /// the owning thread, with no in-flight `generate` /
+    /// `appendText` / `appendTokens` running. The wasm-bindgen
+    /// borrow check enforces this within a single Worker; if
+    /// you share a `Session` across Workers via
+    /// `SharedArrayBuffer`-style schemes, it's on you to
+    /// serialize calls.
     #[wasm_bindgen]
     pub fn reset(&mut self) {
         self.inner.reset();
