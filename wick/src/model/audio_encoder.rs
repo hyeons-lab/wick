@@ -238,7 +238,9 @@ impl AudioEncoderWeights {
         let n_head = gguf
             .get_u32(KEY_N_HEAD)
             .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
-        let eps = gguf.get_f32(KEY_LN_EPS).unwrap_or(1e-5);
+        let eps = gguf
+            .get_f32(KEY_LN_EPS)
+            .with_context(|| format!("missing `{KEY_LN_EPS}`"))?;
         let n_mel_bins =
             gguf.get_u32(KEY_N_MEL_BINS)
                 .with_context(|| format!("missing `{KEY_N_MEL_BINS}`"))? as usize;

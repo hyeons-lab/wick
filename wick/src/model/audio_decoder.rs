@@ -58,7 +58,10 @@ pub struct F32Weight {
 }
 
 impl F32Weight {
-    pub fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
+    /// `pub(crate)` rather than `pub` — only used by sibling
+    /// modules in `wick::model` (e.g. `audio_encoder`); not part
+    /// of the crate's external API surface.
+    pub(crate) fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
         let tensor = gguf.get_tensor(name)?;
         let shape = tensor.shape();
         let (rows, cols) = match shape.len() {
