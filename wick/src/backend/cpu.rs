@@ -757,15 +757,17 @@ fn erff(x: f32) -> f32 {
 /// Generic enough to cover standard, depthwise, and grouped conv1d
 /// via the `groups` argument:
 ///
-/// - `groups = 1`: every output channel sees every input channel
-///   (standard conv).
-/// - `groups > 1, out_channels = in_channels`: depthwise conv, one
-///   kernel per channel.
-/// - `groups > 1, out_channels = in_channels × M` for some integer
-///   multiplier `M`: depthwise with channel multiplier (each input
-///   channel maps to `M` output channels).
-/// - Other `groups` values that divide both `in_channels` and
-///   `out_channels`: grouped conv.
+/// - `groups = 1`: standard conv — every output channel sees every
+///   input channel.
+/// - `groups = in_channels` and `out_channels = in_channels`: pure
+///   depthwise conv — one kernel per channel, no cross-channel
+///   mixing.
+/// - `groups = in_channels` and `out_channels = in_channels × M`
+///   for some integer multiplier `M`: depthwise with channel
+///   multiplier (each input channel produces `M` output channels).
+/// - Any other `groups` value that divides both `in_channels` and
+///   `out_channels`: grouped conv — each group sees
+///   `in_channels / groups` input channels.
 ///
 /// Layout:
 /// - `input`:  `[in_channels × t_in]`, row-major (channel-major).
