@@ -394,6 +394,90 @@ fn load_vec_f32(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
     Ok(tensor.to_f32_vec())
 }
 
+// ── Relative positional embeddings ─────────────────────────────────
+
+/// Inner dimension of the LFM2A relative-position embedding before
+/// the per-block `linear_pos` projection. Hardcoded by the upstream
+/// LFM2A preprocessor; matches the column dimension of every
+/// per-block `linear_pos` weight (`[n_embd, POS_EMB_DIM]`).
+pub const POS_EMB_DIM: usize = 512;
+
+/// Build the sinusoidal relative-position embedding the Conformer
+/// attention layers consume. Returns a row-major `[seq_len ×
+/// POS_EMB_DIM]` buffer where `seq_len = 2 * n_frames - 1`
+/// (relative shifts from `+(n_frames - 1)` at `pos = 0` down to
+/// `-(n_frames - 1)` at `pos = seq_len - 1`).
+///
+/// Per-row layout is the standard interleaved sin/cos pair:
+///
+/// ```text
+/// row[2i]   = sin(rel_pos * inv_freq[i])
+/// row[2i+1] = cos(rel_pos * inv_freq[i])
+/// inv_freq[i] = 10000 ^ (-2i / POS_EMB_DIM)
+/// rel_pos     = n_frames - pos - 1
+/// ```
+///
+/// Mirrors `clip.cpp:3326-3346` in llama.cpp's `mtmd` setup
+/// (`PROJECTOR_TYPE_LFM2A` branch). The `inv_freq` accumulation
+/// is in `f64` to match the upstream's precision before the final
+/// `f32` cast.
+///
+/// Caller passes `n_frames` = the encoder's effective sequence
+/// length **after** the conv subsampling stem. The output then
+/// feeds every per-block `linear_pos` projection.
+pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
+    assert!(n_frames > 0, "n_frames must be > 0");
+    // Use checked arithmetic for the size math: on 32-bit targets a
+    // pathologically large `n_frames` could otherwise wrap silently
+    // and produce a wrongly-sized buffer. (On 64-bit the bound is
+    // astronomical, but the checks compile away to the same
+    // assembly when LLVM proves the inputs sane.)
+    let two_n = n_frames
+        .checked_mul(2)
+        .expect("relative_pos_emb: 2 * n_frames overflowed usize");
+    let seq_len = two_n
+        .checked_sub(1)
+        .expect("relative_pos_emb: 2 * n_frames - 1 underflowed");
+    let total = POS_EMB_DIM
+        .checked_mul(seq_len)
+        .expect("relative_pos_emb: POS_EMB_DIM * seq_len overflowed usize");
+    let mut pos_emb = vec![0.0f32; total];
+
+    let inv_freq = inv_freq_cached();
+    let n_frames_f = n_frames as f64;
+
+    for (pos, row) in pos_emb.chunks_exact_mut(POS_EMB_DIM).enumerate() {
+        // Signed relative shift: pos=0 → max-positive,
+        // pos=seq_len-1 → max-negative. Computed in f64 directly
+        // rather than via i64 cast so the math doesn't wrap on
+        // unusual `pos` values.
+        let rel_pos = n_frames_f - pos as f64 - 1.0;
+        for (i, pair) in row.chunks_exact_mut(2).enumerate() {
+            let (sin, cos) = ((rel_pos * inv_freq[i]) as f32).sin_cos();
+            pair[0] = sin;
+            pair[1] = cos;
+        }
+    }
+    pos_emb
+}
+
+/// `inv_freq[i] = 10000^(-2i / POS_EMB_DIM)` for `i in 0..POS_EMB_DIM/2`.
+///
+/// Cached in a `OnceLock` because the result is purely a function
+/// of the compile-time `POS_EMB_DIM` constant — no point recomputing
+/// 256 `exp()`s every time `relative_pos_emb` runs (which happens
+/// once per audio chunk).
+fn inv_freq_cached() -> &'static [f64] {
+    static CACHE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let log_10000 = (10000.0_f64).ln();
+        let half_dim = POS_EMB_DIM / 2;
+        (0..half_dim)
+            .map(|i| (-(log_10000 / POS_EMB_DIM as f64) * (2.0 * i as f64)).exp())
+            .collect()
+    })
+}
+
 // ── Conformer block forward — sub-block kernels ─────────────────────
 
 /// Run one Conformer "Macaron" feed-forward sub-block on a
@@ -889,6 +973,74 @@ mod tests {
                     "t={ti}, c={c}: got {actual}, expected {expected}"
                 );
             }
+        }
+    }
+
+    /// `n_frames=1` is the trivial case: `seq_len = 2*1 - 1 = 1`,
+    /// `rel_pos = 1 - 0 - 1 = 0` for the single row → all sins are
+    /// `sin(0) = 0`, all cosines `cos(0) = 1`. Easy boundary check.
+    #[test]
+    fn relative_pos_emb_n_frames_1_is_zero_sin_one_cos() {
+        let pe = relative_pos_emb(1);
+        assert_eq!(pe.len(), POS_EMB_DIM);
+        for i in 0..POS_EMB_DIM / 2 {
+            assert!(pe[2 * i].abs() < 1e-6, "sin slot {} = {}", 2 * i, pe[2 * i]);
+            assert!(
+                (pe[2 * i + 1] - 1.0).abs() < 1e-6,
+                "cos slot {} = {}",
+                2 * i + 1,
+                pe[2 * i + 1]
+            );
+        }
+    }
+
+    /// `n_frames=2` produces 3 rows. Verify the first / second / last
+    /// rows' sin / cos slot 0 (which uses `inv_freq[0] = 1.0`):
+    /// row 0 → rel_pos = +1 → sin(1), cos(1)
+    /// row 1 → rel_pos =  0 → 0, 1
+    /// row 2 → rel_pos = -1 → sin(-1) = -sin(1), cos(-1) = cos(1)
+    #[test]
+    fn relative_pos_emb_n_frames_2_first_freq_known_values() {
+        let pe = relative_pos_emb(2);
+        assert_eq!(pe.len(), 3 * POS_EMB_DIM);
+
+        let sin_1: f32 = 1.0_f32.sin();
+        let cos_1: f32 = 1.0_f32.cos();
+
+        // Row 0: rel_pos = +1
+        assert!((pe[0] - sin_1).abs() < 1e-6, "row 0 sin[0] = {}", pe[0]);
+        assert!((pe[1] - cos_1).abs() < 1e-6, "row 0 cos[0] = {}", pe[1]);
+        // Row 1: rel_pos = 0
+        assert!(
+            pe[POS_EMB_DIM].abs() < 1e-6,
+            "row 1 sin[0] = {}",
+            pe[POS_EMB_DIM]
+        );
+        assert!(
+            (pe[POS_EMB_DIM + 1] - 1.0).abs() < 1e-6,
+            "row 1 cos[0] = {}",
+            pe[POS_EMB_DIM + 1]
+        );
+        // Row 2: rel_pos = -1
+        assert!(
+            (pe[2 * POS_EMB_DIM] + sin_1).abs() < 1e-6,
+            "row 2 sin[0] = {}",
+            pe[2 * POS_EMB_DIM]
+        );
+        assert!(
+            (pe[2 * POS_EMB_DIM + 1] - cos_1).abs() < 1e-6,
+            "row 2 cos[0] = {}",
+            pe[2 * POS_EMB_DIM + 1]
+        );
+    }
+
+    /// Length sanity: every supported `n_frames` produces
+    /// `(2 * n_frames - 1) × POS_EMB_DIM` floats.
+    #[test]
+    fn relative_pos_emb_length() {
+        for &n in &[1usize, 2, 5, 100] {
+            let pe = relative_pos_emb(n);
+            assert_eq!(pe.len(), (2 * n - 1) * POS_EMB_DIM, "n_frames={n}");
         }
     }
 }
