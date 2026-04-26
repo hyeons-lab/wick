@@ -475,6 +475,160 @@ pub fn conformer_ffn_forward(
     }
 }
 
+/// Run one Conformer convolution sub-block on a `[t × n_embd]`
+/// time-major sequence, accumulating with a full residual scale
+/// (`x += conv_out`, no 0.5 factor — that's only on the FFN
+/// macarons).
+///
+/// **Caller responsibility:** input `x` must already be the
+/// pre-norm-applied output (LayerNorm with `norm_conv` weights
+/// happens upstream in the block orchestrator). This function is
+/// the conv module proper, not the surrounding norm.
+///
+/// Algorithm (mirrors `conformer.cpp` lines 158-188 in the
+/// llama.cpp `mtmd` code):
+///
+/// ```text
+/// pw1 = pw1_w @ x + pw1_b                       // [t × 2*n_embd]
+/// glu = pw1[:, :n_embd] * sigmoid(pw1[:, n_embd:])  // [t × n_embd]
+/// dw  = causal_depthwise_conv1d(glu, conv_dw_w, conv_dw_b, k)
+/// out = silu(dw * conv_norm_w + conv_norm_b)    // affine, NOT a norm
+/// x  += pw2_w @ out + pw2_b
+/// ```
+///
+/// Notes that don't fit the diagram:
+///
+/// - **`conv_norm` is per-channel affine, not LayerNorm.** Despite
+///   the name, the C++ reference does `x = x * w + b` with `w` /
+///   `b` shaped `[n_embd]` (broadcast across time). No mean / var
+///   computation. Same shape BatchNorm-after-stats has.
+/// - **Causal depthwise conv** with `kernel_size = 9` for LFM2A
+///   (per the C++'s `pad(4)` + `roll(4)` + `pad(4)` pattern that
+///   pre-pads input to length `t + k - 1` before `ggml_ssm_conv`'s
+///   "valid" conv). Here we just zero-pad input on the left by
+///   `kernel_size - 1` and call the existing `conv1d` with `pad =
+///   0`, `groups = n_embd` (true depthwise). Output length =
+///   `(t + k - 1) - k + 1 = t`.
+///
+/// Allocates ~5 scratch `Vec<f32>`s per call. The encoder runs
+/// once per audio chunk (not per token), so the allocation
+/// overhead is negligible relative to the FLOPs; pre-allocated
+/// scratch buffers can be threaded through later if profiling
+/// shows otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn conformer_conv_module_forward(
+    x: &mut [f32],
+    pw1_w: &F32Weight,
+    pw1_b: &[f32],
+    conv_dw_w: &[f32],
+    conv_dw_b: &[f32],
+    conv_norm_w: &[f32],
+    conv_norm_b: &[f32],
+    pw2_w: &F32Weight,
+    pw2_b: &[f32],
+    n_embd: usize,
+    t: usize,
+    kernel_size: usize,
+) {
+    let n_2embd = 2 * n_embd;
+    debug_assert_eq!(x.len(), t * n_embd);
+    debug_assert_eq!(pw1_w.rows, n_2embd);
+    debug_assert_eq!(pw1_w.cols, n_embd);
+    debug_assert_eq!(pw1_b.len(), n_2embd);
+    debug_assert_eq!(conv_dw_w.len(), n_embd * kernel_size);
+    debug_assert_eq!(conv_dw_b.len(), n_embd);
+    debug_assert_eq!(conv_norm_w.len(), n_embd);
+    debug_assert_eq!(conv_norm_b.len(), n_embd);
+    debug_assert_eq!(pw2_w.rows, n_embd);
+    debug_assert_eq!(pw2_w.cols, n_embd);
+    debug_assert_eq!(pw2_b.len(), n_embd);
+
+    // ── Step 1+2: pw1 → GLU. Both done per-timestep so we don't
+    //    pay the 2×n_embd memory footprint for a full sequence
+    //    pw1 buffer; only one timestep's worth at a time. ──
+    let mut glu_time_major = vec![0.0f32; t * n_embd];
+    let mut pw1_out = vec![0.0f32; n_2embd];
+    for ti in 0..t {
+        let in_row = &x[ti * n_embd..(ti + 1) * n_embd];
+        pw1_w.gemv(in_row, &mut pw1_out);
+        crate::backend::cpu::add_inplace(&mut pw1_out, pw1_b);
+        let out_row = &mut glu_time_major[ti * n_embd..(ti + 1) * n_embd];
+        crate::backend::cpu::glu_split(&pw1_out, out_row);
+    }
+
+    // ── Step 3: transpose glu_time_major [t × n_embd] →
+    //    glu_ch_major [n_embd × t] for depthwise conv1d.
+    //    `conv1d` is channel-major; the tensor naturally lands
+    //    that way after this transpose. ──
+    let mut glu_ch_major = vec![0.0f32; n_embd * t];
+    for ti in 0..t {
+        for c in 0..n_embd {
+            glu_ch_major[c * t + ti] = glu_time_major[ti * n_embd + c];
+        }
+    }
+
+    // ── Step 4: causal depthwise conv1d. Pre-pad input on the
+    //    left by `kernel_size - 1` zeros so `conv1d` with `pad=0`
+    //    produces a length-`t` output that only sees current +
+    //    past inputs at each output position. ──
+    let pad = kernel_size - 1;
+    let mut padded = vec![0.0f32; n_embd * (t + pad)];
+    for c in 0..n_embd {
+        // Channel-major: `c * (t + pad) + pad..c * (t + pad) + pad + t` is
+        // the slot for original input; first `pad` slots are zero.
+        let dst = &mut padded[c * (t + pad) + pad..c * (t + pad) + pad + t];
+        dst.copy_from_slice(&glu_ch_major[c * t..(c + 1) * t]);
+    }
+
+    let mut conv_out = vec![0.0f32; n_embd * t];
+    crate::backend::cpu::conv1d(
+        &padded,
+        conv_dw_w,
+        Some(conv_dw_b),
+        &mut conv_out,
+        n_embd,  // in_channels
+        n_embd,  // out_channels
+        t + pad, // t_in (after pre-padding)
+        kernel_size,
+        1,      // stride
+        0,      // explicit pad already applied above
+        n_embd, // groups = in_channels → true depthwise
+    );
+
+    // ── Step 5: conv_norm affine (per-channel mul+add, broadcast
+    //    across time), SiLU. Walk channel-by-channel for the
+    //    contiguous per-channel slice access pattern. ──
+    for c in 0..n_embd {
+        let row = &mut conv_out[c * t..(c + 1) * t];
+        let w = conv_norm_w[c];
+        let b = conv_norm_b[c];
+        for v in row.iter_mut() {
+            *v = *v * w + b;
+        }
+        crate::backend::cpu::silu_inplace(row);
+    }
+
+    // ── Step 6: transpose back ch-major → time-major before pw2.
+    //    pw2 is a per-timestep linear, so it expects each row to
+    //    be a [n_embd] vector. ──
+    let mut silu_time_major = vec![0.0f32; t * n_embd];
+    for c in 0..n_embd {
+        for ti in 0..t {
+            silu_time_major[ti * n_embd + c] = conv_out[c * t + ti];
+        }
+    }
+
+    // ── Step 7: pw2 + bias, accumulate into x as full residual. ──
+    let mut pw2_out = vec![0.0f32; n_embd];
+    for ti in 0..t {
+        let in_row = &silu_time_major[ti * n_embd..(ti + 1) * n_embd];
+        pw2_w.gemv(in_row, &mut pw2_out);
+        crate::backend::cpu::add_inplace(&mut pw2_out, pw2_b);
+        let res = &mut x[ti * n_embd..(ti + 1) * n_embd];
+        crate::backend::cpu::add_inplace(res, &pw2_out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +665,98 @@ mod tests {
                     "expected missing-key error, got: {msg}"
                 );
             }
+        }
+    }
+
+    /// `conformer_conv_module_forward` with identity / pass-through
+    /// weights should reduce the conv module to a known-shape
+    /// transform of the input that we can verify against a manual
+    /// scalar reference. Specifically:
+    ///
+    /// - `pw1_w`: shape `[2*n_embd × n_embd]`. Top half = identity
+    ///   (so the GLU's "value" arm passes through the input), bottom
+    ///   half = zeros (so the GLU's "gate" arm is `sigmoid(0) = 0.5`).
+    ///   Net effect: GLU output = 0.5 × input.
+    /// - `conv_dw_w`: shape `[n_embd × kernel]`. Kernel `[0, …, 1]`
+    ///   (last tap = 1, others = 0). With `kernel_size = 3` and
+    ///   left-only causal padding by 2 zeros, output = input
+    ///   (the last tap reads the current position; previous taps
+    ///   read past positions which are 0 / earlier values).
+    ///   Net effect: conv output = GLU output (identity).
+    /// - `conv_norm_w` = 1, `conv_norm_b` = 0: affine = identity.
+    /// - `pw2_w` = identity: pw2 = SiLU(input).
+    ///
+    /// Net residual: `x += SiLU(0.5 × x)`.
+    #[test]
+    fn conformer_conv_module_forward_identity_weights() {
+        let n_embd = 4;
+        let t = 5;
+        let kernel_size = 3;
+
+        let original_x: Vec<f32> = (0..t * n_embd).map(|i| (i as f32) * 0.1 + 0.05).collect();
+        let mut x = original_x.clone();
+
+        // pw1_w [2*n_embd × n_embd]: top half identity, bottom half zeros.
+        let mut pw1_w_data = vec![0.0f32; 2 * n_embd * n_embd];
+        for i in 0..n_embd {
+            pw1_w_data[i * n_embd + i] = 1.0;
+        }
+        let pw1_w = F32Weight {
+            data: pw1_w_data,
+            rows: 2 * n_embd,
+            cols: n_embd,
+        };
+        let pw1_b = vec![0.0; 2 * n_embd];
+
+        // conv_dw_w [n_embd × kernel]: per-channel kernel [0, 0, 1].
+        // Last tap reads current position; previous taps read past
+        // (zero-padded for the first 2 timesteps).
+        let mut conv_dw_w = vec![0.0f32; n_embd * kernel_size];
+        for c in 0..n_embd {
+            conv_dw_w[c * kernel_size + (kernel_size - 1)] = 1.0;
+        }
+        let conv_dw_b = vec![0.0; n_embd];
+        let conv_norm_w = vec![1.0; n_embd];
+        let conv_norm_b = vec![0.0; n_embd];
+
+        // pw2_w [n_embd × n_embd] identity.
+        let mut pw2_w_data = vec![0.0f32; n_embd * n_embd];
+        for i in 0..n_embd {
+            pw2_w_data[i * n_embd + i] = 1.0;
+        }
+        let pw2_w = F32Weight {
+            data: pw2_w_data,
+            rows: n_embd,
+            cols: n_embd,
+        };
+        let pw2_b = vec![0.0; n_embd];
+
+        conformer_conv_module_forward(
+            &mut x,
+            &pw1_w,
+            &pw1_b,
+            &conv_dw_w,
+            &conv_dw_b,
+            &conv_norm_w,
+            &conv_norm_b,
+            &pw2_w,
+            &pw2_b,
+            n_embd,
+            t,
+            kernel_size,
+        );
+
+        // Reference: x_new[i] = x_orig[i] + SiLU(0.5 * x_orig[i]).
+        for i in 0..t * n_embd {
+            let half = 0.5 * original_x[i];
+            // Inline SiLU: half / (1 + exp(-half)).
+            let silu = half / (1.0 + (-half).exp());
+            let expected = original_x[i] + silu;
+            let actual = x[i];
+            assert!(
+                (actual - expected).abs() < 5e-3,
+                "i={i}: got {actual}, expected {expected}"
+            );
         }
     }
 
