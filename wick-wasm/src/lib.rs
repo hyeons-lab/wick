@@ -13,6 +13,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 /// Returns the version of the `wick` core library this binding wraps.
@@ -288,14 +289,108 @@ impl Tokenizer {
         self.inner.eos_token()
     }
 
-    /// Embedded Jinja chat template, if the GGUF metadata carries
-    /// one. Apply it yourself with a Jinja runtime (e.g.
-    /// `nunjucks`) to convert a chat-message list into the
-    /// model's expected prompt string.
+    /// Raw embedded Jinja chat template from the GGUF metadata, if
+    /// any. Most callers should use [`Self::apply_chat_template`]
+    /// (`applyChatTemplate` in JS) instead — this getter is for
+    /// inspection or for callers who want to render with a
+    /// different Jinja runtime.
     #[wasm_bindgen(getter, js_name = chatTemplate)]
     pub fn chat_template(&self) -> Option<String> {
         self.inner.chat_template().map(str::to_owned)
     }
+
+    /// Render the model's embedded Jinja chat template against a
+    /// `[{ role, content }, ...]` array, returning the prompt
+    /// string ready for `Tokenizer.encode` + `Session.appendTokens`.
+    ///
+    /// `addGenerationPrompt` defaults to `true` (the common case
+    /// when sending to the model expecting a response). Set to
+    /// `false` when you only want the conversation rendered without
+    /// the trailing assistant-prompt suffix.
+    ///
+    /// Throws `JsError` on:
+    /// - the model not carrying a chat template
+    ///   (`engine.hasChatTemplate === false`),
+    /// - malformed `messages` (not an array, or entries missing
+    ///   `role`/`content` strings),
+    /// - a Jinja render failure (template references an undefined
+    ///   variable, etc.).
+    #[wasm_bindgen(js_name = applyChatTemplate)]
+    pub fn apply_chat_template(
+        &self,
+        messages: JsValue,
+        add_generation_prompt: Option<bool>,
+    ) -> Result<String, JsError> {
+        let msgs = parse_chat_messages(&messages)?;
+        wick::tokenizer::apply_chat_template(
+            &self.inner,
+            &msgs,
+            add_generation_prompt.unwrap_or(true),
+        )
+        .map_err(map_err)
+    }
+}
+
+/// Parse a JS-side `[{ role, content }, ...]` array into the wick
+/// core type, using `js_sys::Reflect` directly rather than going
+/// through `serde-wasm-bindgen`. Both approaches were measured —
+/// they produce **the same wasm size** (the size growth from
+/// `apply_chat_template` is dominated by minijinja's render path,
+/// not the deserialiser). The manual `Reflect` walk is preferred
+/// here because it keeps the dep graph smaller (one less crate to
+/// audit + faster cold builds) for two flat string fields. If a
+/// future surface needs rich nested deserialisation, revisit and
+/// add `serde-wasm-bindgen` then.
+fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessage>, JsError> {
+    let array = value
+        .dyn_ref::<js_sys::Array>()
+        .ok_or_else(|| JsError::new("messages must be an array"))?;
+    // `js_sys::Array::length` returns `u32` and that's the index
+    // type `Array::get` takes — keep `len` in `u32` for the loop
+    // and only widen to `usize` at the `Vec::with_capacity` call.
+    let len = array.length();
+    let mut msgs = Vec::with_capacity(len as usize);
+    let role_key = JsValue::from_str("role");
+    let content_key = JsValue::from_str("content");
+    for i in 0..len {
+        let entry = array.get(i);
+        msgs.push(wick::tokenizer::ChatMessage {
+            role: read_string_field(&entry, &role_key, "role", i)?,
+            content: read_string_field(&entry, &content_key, "content", i)?,
+        });
+    }
+    Ok(msgs)
+}
+
+/// Read a string-typed field off a JS object, distinguishing the
+/// three failure modes a JS caller will commonly hit so the thrown
+/// `JsError` actually points at the bug:
+///   - `entry` is not an object (`Reflect::get` errors)
+///   - the field is missing (`Reflect::get` returns `undefined`)
+///   - the field is present but not a string
+///
+/// `js_sys::Reflect::get` only `Err`s on the first case (proxy
+/// throws, target not Object); missing-property-on-an-Object
+/// returns `Ok(JsValue::UNDEFINED)`, which would otherwise
+/// silently fall through to a misleading "must be a string"
+/// message. Splitting the cases keeps `messages[i].role missing`
+/// distinguishable from `messages[i].role must be a string`.
+fn read_string_field(
+    entry: &JsValue,
+    key: &JsValue,
+    field_name: &str,
+    index: u32,
+) -> Result<String, JsError> {
+    let value = js_sys::Reflect::get(entry, key)
+        .map_err(|_| JsError::new(&format!("messages[{index}] is not an object")))?;
+    if value.is_undefined() {
+        return Err(JsError::new(&format!(
+            "messages[{index}] missing '{field_name}' field"
+        )));
+    }
+    value
+        .as_string()
+        .ok_or_else(|| JsError::new(&format!("messages[{index}].{field_name} must be a string")))
 }
 
 // ---------------------------------------------------------------------------

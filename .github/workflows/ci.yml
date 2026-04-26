@@ -126,7 +126,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: 'v0.13.1'
+          version: 'v0.14.0'
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wick-wasm npm package

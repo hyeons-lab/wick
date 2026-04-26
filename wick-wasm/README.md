@@ -69,9 +69,16 @@ const ids = tok.encode('hello world');  // Uint32Array
 console.log(ids);
 console.log(tok.decode(ids));           // round-trips to "hello world"
 
-// Optional: render a chat template (use a JS Jinja runtime like
-// `nunjucks` to apply `tok.chatTemplate` against your message list).
-console.log(tok.chatTemplate);
+// Render the GGUF-embedded Jinja chat template against a message
+// list. `addGenerationPrompt` defaults to `true` for the
+// "send-to-model-and-await-response" case.
+if (engine.hasChatTemplate) {
+    const prompt = tok.applyChatTemplate([
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user',   content: 'Hello!' },
+    ]);
+    console.log(prompt);
+}
 
 // Release the model bytes from wasm memory when done.
 engine.free();
