@@ -411,19 +411,25 @@ impl Tokenizer {
         self.inner.eos_token()
     }
 
-    /// Look up a special token ID by its registered name (e.g.
+    /// Look up a special-token ID by its literal name (e.g.
     /// `"<|im_start|>"`, `"<|tool_calls_section_begin|>"`).
-    /// Returns `undefined` when the model's vocab has no entry
-    /// for that name. Names come from the GGUF metadata's
-    /// `tokenizer.ggml.tokens` + the `tokenizer.ggml.added_tokens`
-    /// list — pass the literal token string as it appears in the
-    /// vocab.
+    /// Returns `undefined` when no entry exists for that name in
+    /// the model's special-token registry.
+    ///
+    /// Lookup scope: only tokens flagged as control or
+    /// user-defined in the GGUF metadata are registered for this
+    /// lookup. wick reads `tokenizer.ggml.token_type` and admits
+    /// tokens with type `3` (control) or type `4` (user-defined);
+    /// regular vocab entries are not reachable via this method
+    /// even though their names exist in `tokenizer.ggml.tokens`.
+    /// Names returned here are the literal vocab strings indexed
+    /// by the special token's ID.
     ///
     /// Useful for constructing prompts with specific control
     /// tokens directly (chat-template-like flows) without
-    /// round-tripping through `applyChatTemplate`. For the most
-    /// common cases prefer `bosToken` / `eosToken` (named getters
-    /// that don't risk a typo in the lookup string).
+    /// round-tripping through `applyChatTemplate`. For BOS / EOS
+    /// prefer `bosToken` / `eosToken` (named getters that don't
+    /// risk a typo in the lookup string).
     ///
     /// Mirrors `WickEngine.specialTokenId` from wick-ffi (where
     /// it lives engine-side); wick-wasm hangs it off `Tokenizer`
