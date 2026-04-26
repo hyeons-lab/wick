@@ -510,11 +510,12 @@ pub fn conformer_ffn_forward(
 ///   0`, `groups = n_embd` (true depthwise). Output length =
 ///   `(t + k - 1) - k + 1 = t`.
 ///
-/// Allocates ~5 scratch `Vec<f32>`s per call. The encoder runs
-/// once per audio chunk (not per token), so the allocation
-/// overhead is negligible relative to the FLOPs; pre-allocated
-/// scratch buffers can be threaded through later if profiling
-/// shows otherwise.
+/// Allocates a handful of scratch `Vec<f32>`s per call (currently
+/// 6: `glu_time_major`, `pw1_out`, `padded`, `conv_out`,
+/// `pw2_in`, `pw2_out`). The encoder runs once per audio chunk
+/// (not per token), so the allocation overhead is negligible
+/// relative to the FLOPs; pre-allocated scratch buffers can be
+/// threaded through later if profiling shows otherwise.
 #[allow(clippy::too_many_arguments)]
 pub fn conformer_conv_module_forward(
     x: &mut [f32],
@@ -530,6 +531,15 @@ pub fn conformer_conv_module_forward(
     t: usize,
     kernel_size: usize,
 ) {
+    // `kernel_size > 0` is required: pad = kernel_size - 1
+    // would underflow otherwise. `t > 0` is required: an empty
+    // sequence makes the inner loops no-ops but the conv1d call
+    // would hit `t_in = pad < kernel_size` and underflow inside.
+    // Both surface as release-mode panics today; turn them into
+    // explicit assertions so the failure points at the cause.
+    assert!(kernel_size > 0, "kernel_size must be > 0");
+    assert!(t > 0, "t must be > 0");
+
     let n_2embd = 2 * n_embd;
     debug_assert_eq!(x.len(), t * n_embd);
     debug_assert_eq!(pw1_w.rows, n_2embd);
@@ -559,29 +569,26 @@ pub fn conformer_conv_module_forward(
     // ── Step 3: transpose glu_time_major [t × n_embd] →
     //    glu_ch_major [n_embd × t] for depthwise conv1d.
     //    `conv1d` is channel-major; the tensor naturally lands
-    //    that way after this transpose. ──
-    let mut glu_ch_major = vec![0.0f32; n_embd * t];
-    for ti in 0..t {
-        for c in 0..n_embd {
-            glu_ch_major[c * t + ti] = glu_time_major[ti * n_embd + c];
-        }
-    }
+    //    that way after this transpose. Fused with the left-zero-pad
+    //    in the next step so we don't allocate a separate
+    //    `glu_ch_major` intermediate. ──
 
     // ── Step 4: causal depthwise conv1d. Pre-pad input on the
     //    left by `kernel_size - 1` zeros so `conv1d` with `pad=0`
     //    produces a length-`t` output that only sees current +
-    //    past inputs at each output position. ──
+    //    past inputs at each output position. The input write
+    //    fuses the time-major → channel-major transpose into the
+    //    pad layout (writes directly at the post-pad offset). ──
     let pad = kernel_size - 1;
     let mut padded = vec![0.0f32; n_embd * (t + pad)];
-    for c in 0..n_embd {
-        // Channel-major: `c * (t + pad) + pad..c * (t + pad) + pad + t` is
-        // the slot for original input; first `pad` slots are zero.
-        let dst = &mut padded[c * (t + pad) + pad..c * (t + pad) + pad + t];
-        dst.copy_from_slice(&glu_ch_major[c * t..(c + 1) * t]);
+    for ti in 0..t {
+        for c in 0..n_embd {
+            padded[c * (t + pad) + pad + ti] = glu_time_major[ti * n_embd + c];
+        }
     }
 
     let mut conv_out = vec![0.0f32; n_embd * t];
-    crate::backend::cpu::conv1d(
+    let t_out = crate::backend::cpu::conv1d(
         &padded,
         conv_dw_w,
         Some(conv_dw_b),
@@ -594,6 +601,7 @@ pub fn conformer_conv_module_forward(
         0,      // explicit pad already applied above
         n_embd, // groups = in_channels → true depthwise
     );
+    debug_assert_eq!(t_out, t, "causal pad math drifted: t_out={t_out} != t={t}");
 
     // ── Step 5: conv_norm affine (per-channel mul+add, broadcast
     //    across time), SiLU. Walk channel-by-channel for the
@@ -608,21 +616,17 @@ pub fn conformer_conv_module_forward(
         crate::backend::cpu::silu_inplace(row);
     }
 
-    // ── Step 6: transpose back ch-major → time-major before pw2.
-    //    pw2 is a per-timestep linear, so it expects each row to
-    //    be a [n_embd] vector. ──
-    let mut silu_time_major = vec![0.0f32; t * n_embd];
-    for c in 0..n_embd {
-        for ti in 0..t {
-            silu_time_major[ti * n_embd + c] = conv_out[c * t + ti];
-        }
-    }
-
-    // ── Step 7: pw2 + bias, accumulate into x as full residual. ──
+    // ── Step 6+7: pw2 + bias, accumulate into x as full residual.
+    //    Gathers per-timestep values from the channel-major
+    //    `conv_out` into a small `pw2_in` buffer rather than
+    //    allocating a full transpose intermediate. ──
+    let mut pw2_in = vec![0.0f32; n_embd];
     let mut pw2_out = vec![0.0f32; n_embd];
     for ti in 0..t {
-        let in_row = &silu_time_major[ti * n_embd..(ti + 1) * n_embd];
-        pw2_w.gemv(in_row, &mut pw2_out);
+        for c in 0..n_embd {
+            pw2_in[c] = conv_out[c * t + ti];
+        }
+        pw2_w.gemv(&pw2_in, &mut pw2_out);
         crate::backend::cpu::add_inplace(&mut pw2_out, pw2_b);
         let res = &mut x[ti * n_embd..(ti + 1) * n_embd];
         crate::backend::cpu::add_inplace(res, &pw2_out);
