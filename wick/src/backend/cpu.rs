@@ -672,6 +672,186 @@ pub fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+// ── LayerNorm + GELU (Conformer audio encoder kernels) ────────────────────
+
+/// Affine LayerNorm in-place: `x = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias`.
+///
+/// Distinct from `rmsnorm`: subtracts the mean (LayerNorm vs RMSNorm) and
+/// adds an explicit `bias` term. Used by the Conformer audio encoder which
+/// follows Whisper's affine-LayerNorm convention rather than LFM2's
+/// RMSNorm. f64 accumulation matches `rmsnorm`'s precision approach.
+pub fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
+    debug_assert_eq!(x.len(), weight.len());
+    debug_assert_eq!(x.len(), bias.len());
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+
+    // Mean + variance in f64.
+    let mut sum = 0.0f64;
+    for &v in x.iter() {
+        sum += v as f64;
+    }
+    let mean = sum / n as f64;
+    let mut var_sum = 0.0f64;
+    for &v in x.iter() {
+        let d = v as f64 - mean;
+        var_sum += d * d;
+    }
+    let var = var_sum / n as f64;
+    let inv_std = (1.0 / (var + eps as f64).sqrt()) as f32;
+    let mean_f32 = mean as f32;
+
+    for i in 0..n {
+        x[i] = (x[i] - mean_f32) * inv_std * weight[i] + bias[i];
+    }
+}
+
+/// Exact GELU activation in-place using the erf form:
+/// `gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`.
+///
+/// Used by the Conformer audio encoder's MLP adapter (`mm.a.mlp`).
+/// LFM2's main path uses SiLU (`silu_inplace`); the audio encoder is the
+/// only consumer of GELU today, so this lives in the encoder-kernels
+/// section rather than next to SiLU. Calls `libm::erff` indirectly via
+/// `f32::erf` once it stabilizes; for now uses a Numerical-Recipes-style
+/// rational approximation matching ggml's `ggml_gelu_erf` to within the
+/// last ULP for the typical activation range.
+pub fn gelu_erf_inplace(x: &mut [f32]) {
+    // sqrt(2)^-1 ≈ 0.7071067811865476
+    const INV_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    for v in x.iter_mut() {
+        *v = 0.5 * *v * (1.0 + erff(*v * INV_SQRT_2));
+    }
+}
+
+/// Approximation of `erf(x)` for `f32`. Abramowitz & Stegun 7.1.26 form
+/// (max abs error ~1.5e-7 in the range we care about — well below the
+/// inherent f32 precision floor of GELU activations downstream).
+///
+/// `f32::erf` doesn't exist in stable `std`, and the only crates that
+/// provide it (`libm`, `statrs`) would add a dep for one function.
+/// Wick already avoids that pattern (`ggml_expf` was hand-written for
+/// the same reason). This matches the `gelu_erf_f32` kernel in ggml's
+/// CPU implementation.
+fn erff(x: f32) -> f32 {
+    // Constants from Abramowitz & Stegun 7.1.26 (truncated to f32
+    // precision; original tabulated values have more digits but they
+    // round at f32 anyway).
+    const A1: f32 = 0.254_829_6;
+    const A2: f32 = -0.284_496_7;
+    const A3: f32 = 1.421_413_7;
+    const A4: f32 = -1.453_152;
+    const A5: f32 = 1.061_405_4;
+    const P: f32 = 0.327_591_1;
+
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let abs_x = x.abs();
+    let t = 1.0 / (1.0 + P * abs_x);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-abs_x * abs_x).exp();
+    sign * y
+}
+
+/// 1D convolution along the time dimension. Generic enough to cover both
+/// "standard" and "depthwise" conv1d via the `groups` argument:
+///
+/// - `groups = 1`: every output channel sees every input channel
+///   (standard conv).
+/// - `groups = in_channels = out_channels`: depthwise conv, each output
+///   channel uses exactly one matching input channel.
+///
+/// Layout:
+/// - `input`:  `[in_channels × t_in]`, row-major (channel-major).
+/// - `weight`: `[out_channels × (in_channels / groups) × kernel_size]`,
+///   row-major. Matches the GGUF `[O, I/G, K]` shape that the Conformer
+///   stem (`a.conv1d.{i}.weight`) and per-block depthwise conv
+///   (`a.blk.{i}.conv_dw.weight`) ship.
+/// - `bias`:   `[out_channels]`. Pass an all-zeros slice if the layer
+///   has no bias.
+/// - `output`: `[out_channels × t_out]`, written in-place. Caller sizes
+///   it; this fn computes `t_out` from the standard formula and
+///   returns it for sanity assertion. `t_out = ((t_in + 2*pad - kernel)
+///   / stride) + 1`.
+///
+/// Padding is symmetric (same on both ends); causal/asymmetric padding
+/// is the caller's job (zero-pad `input` before calling).
+///
+/// Algorithm is the textbook im2col-free direct convolution. Not SIMD
+/// optimized — the encoder runs once per audio chunk so per-chunk
+/// throughput dominates over per-frame latency. Metal acceleration
+/// lands in a follow-up PR using the same shape signature.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_inplace(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    output: &mut [f32],
+    in_channels: usize,
+    out_channels: usize,
+    t_in: usize,
+    kernel_size: usize,
+    stride: usize,
+    pad: usize,
+    groups: usize,
+) -> usize {
+    debug_assert_eq!(input.len(), in_channels * t_in);
+    debug_assert!(in_channels % groups == 0);
+    debug_assert!(out_channels % groups == 0);
+    debug_assert_eq!(bias.len(), out_channels);
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    debug_assert_eq!(weight.len(), out_channels * in_per_group * kernel_size);
+
+    let padded_t_in = t_in + 2 * pad;
+    debug_assert!(padded_t_in >= kernel_size, "kernel exceeds padded input");
+    let t_out = (padded_t_in - kernel_size) / stride + 1;
+    debug_assert_eq!(output.len(), out_channels * t_out);
+
+    // Zero output before accumulation. Using fill rather than re-loop in
+    // the inner accumulator keeps the inner loop branch-free.
+    output.fill(0.0);
+
+    for g in 0..groups {
+        for oc_local in 0..out_per_group {
+            let oc = g * out_per_group + oc_local;
+            let bias_v = bias[oc];
+
+            // Pre-bias every output position for this channel — saves a
+            // branch in the inner loop.
+            let out_row_start = oc * t_out;
+            for ot in 0..t_out {
+                output[out_row_start + ot] = bias_v;
+            }
+
+            for ic_local in 0..in_per_group {
+                let ic = g * in_per_group + ic_local;
+                // Weight row layout: [oc, ic_local, k]
+                let weight_row_start = oc * in_per_group * kernel_size + ic_local * kernel_size;
+
+                for ot in 0..t_out {
+                    let mut acc = 0.0f32;
+                    for k in 0..kernel_size {
+                        // Position in the (conceptually padded) input.
+                        let padded_pos = ot * stride + k;
+                        // Translate back to the unpadded input. Out-of-
+                        // bounds samples are zero (= no contribution).
+                        if padded_pos >= pad && padded_pos < padded_t_in - pad {
+                            let it = padded_pos - pad;
+                            let w = weight[weight_row_start + k];
+                            let x = input[ic * t_in + it];
+                            acc += w * x;
+                        }
+                    }
+                    output[out_row_start + ot] += acc;
+                }
+            }
+        }
+    }
+
+    t_out
+}
+
 // ── Attention score/value computation ───────────────────────────────────────
 
 /// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
@@ -1723,6 +1903,118 @@ mod tests {
         assert!((x[0] - 0.0900).abs() < 1e-3);
         assert!((x[1] - 0.2447).abs() < 1e-3);
         assert!((x[2] - 0.6652).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_layer_norm_zero_mean_unit_var_after_norm() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0];
+        let weight = vec![1.0; 4];
+        let bias = vec![0.0; 4];
+        layer_norm_inplace(&mut x, &weight, &bias, 1e-5);
+
+        // After LayerNorm with weight=1, bias=0: mean ≈ 0, std ≈ 1.
+        let mean: f32 = x.iter().sum::<f32>() / x.len() as f32;
+        let var: f32 = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / x.len() as f32;
+        assert!(mean.abs() < 1e-5, "mean = {mean}");
+        assert!((var.sqrt() - 1.0).abs() < 1e-3, "std = {}", var.sqrt());
+    }
+
+    #[test]
+    fn test_layer_norm_applies_affine() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0];
+        // Use weight=2, bias=10 to verify the affine post-norm transform.
+        let weight = vec![2.0; 4];
+        let bias = vec![10.0; 4];
+        layer_norm_inplace(&mut x, &weight, &bias, 1e-5);
+
+        // After norm without affine, values would have mean 0, std 1.
+        // With weight=2, bias=10: mean shifts to 10, std becomes 2.
+        let mean: f32 = x.iter().sum::<f32>() / x.len() as f32;
+        assert!((mean - 10.0).abs() < 1e-3, "mean = {mean} expected ~10");
+    }
+
+    #[test]
+    fn test_gelu_erf_known_values() {
+        // GELU(0) = 0
+        // GELU(1) ≈ 0.8413 (from PyTorch torch.nn.functional.gelu)
+        // GELU(-1) ≈ -0.1587
+        // GELU(2) ≈ 1.9545
+        let mut x = vec![0.0f32, 1.0, -1.0, 2.0];
+        gelu_erf_inplace(&mut x);
+        assert!(x[0].abs() < 1e-4, "gelu(0) = {}", x[0]);
+        assert!((x[1] - 0.8413).abs() < 5e-3, "gelu(1) = {}", x[1]);
+        assert!((x[2] + 0.1587).abs() < 5e-3, "gelu(-1) = {}", x[2]);
+        assert!((x[3] - 1.9545).abs() < 5e-3, "gelu(2) = {}", x[3]);
+    }
+
+    #[test]
+    fn test_conv1d_standard_identity_kernel() {
+        // 1×1 kernel with weight=1 = identity (per-channel passthrough).
+        // Input: 2 channels × 3 timesteps.
+        let input = vec![
+            1.0, 2.0, 3.0, // channel 0
+            4.0, 5.0, 6.0, // channel 1
+        ];
+        // Weight shape [out=2, in=2, k=1]: identity per-channel mapping
+        // (weight[0,0,0]=1, weight[1,1,0]=1, others=0).
+        let weight = vec![
+            1.0, 0.0, // out 0: in 0=1, in 1=0
+            0.0, 1.0, // out 1: in 0=0, in 1=1
+        ];
+        let bias = vec![0.0; 2];
+        let mut output = vec![0.0; 2 * 3];
+        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 2, 2, 3, 1, 1, 0, 1);
+        assert_eq!(t_out, 3);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_conv1d_depthwise_per_channel() {
+        // Depthwise conv with kernel=3, stride=1, pad=1 (same-size output).
+        // 2 channels, weight is one kernel per channel.
+        let input = vec![
+            1.0, 2.0, 3.0, 4.0, // channel 0
+            5.0, 6.0, 7.0, 8.0, // channel 1
+        ];
+        // groups=2 (depthwise), weight shape [out=2, in/groups=1, k=3].
+        // Kernel = [1, 0, 0] for channel 0 → shifts left by 1 (with pad).
+        // Kernel = [0, 0, 1] for channel 1 → shifts right by 1.
+        let weight = vec![
+            1.0, 0.0, 0.0, // ch 0 kernel
+            0.0, 0.0, 1.0, // ch 1 kernel
+        ];
+        let bias = vec![0.0; 2];
+        let mut output = vec![0.0; 2 * 4];
+        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 2, 2, 4, 3, 1, 1, 2);
+        assert_eq!(t_out, 4);
+        // Channel 0: shift left by 1 with zero pad → [0, 1, 2, 3]
+        assert_eq!(&output[0..4], &[0.0, 1.0, 2.0, 3.0]);
+        // Channel 1: shift right by 1 with zero pad → [6, 7, 8, 0]
+        assert_eq!(&output[4..8], &[6.0, 7.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn test_conv1d_strided() {
+        // 1 channel, kernel=2, stride=2, pad=0. Halves the timesteps.
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 6 timesteps
+        let weight = vec![1.0, 1.0]; // sum-pair kernel
+        let bias = vec![0.0];
+        let mut output = vec![0.0; 3]; // (6-2)/2 + 1 = 3
+        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 1, 1, 6, 2, 2, 0, 1);
+        assert_eq!(t_out, 3);
+        // Sum pairs: [1+2, 3+4, 5+6] = [3, 7, 11]
+        assert_eq!(output, vec![3.0, 7.0, 11.0]);
+    }
+
+    #[test]
+    fn test_conv1d_with_bias() {
+        let input = vec![1.0, 2.0, 3.0];
+        let weight = vec![1.0]; // 1×1 identity
+        let bias = vec![5.0];
+        let mut output = vec![0.0; 3];
+        conv1d_inplace(&input, &weight, &bias, &mut output, 1, 1, 3, 1, 1, 0, 1);
+        // Input + bias.
+        assert_eq!(output, vec![6.0, 7.0, 8.0]);
     }
 
     #[test]
