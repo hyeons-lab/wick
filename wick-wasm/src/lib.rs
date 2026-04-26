@@ -225,12 +225,12 @@ impl WickEngine {
     }
 
     /// Construct a new `Session` for this engine. The `config`
-    /// freezes per-session knobs — sampler `seed`, `n_keep`
-    /// pinned-prefix size, `ubatch_size` chunked-prefill batch,
-    /// `max_seq_len` KV cap. For the wick defaults
-    /// (`max_seq_len = null` → engine's effective cap, i.e.
-    /// `min(engine.contextSize, model.maxSeqLen)`; `n_keep = 0`,
-    /// `seed = null`, `ubatch_size = 512`), pass a freshly-
+    /// freezes per-session knobs — sampler `seed`, `nKeep`
+    /// pinned-prefix size, `ubatchSize` chunked-prefill batch,
+    /// `maxSeqLen` KV cap. For the wick defaults
+    /// (`maxSeqLen = null` → engine's effective cap, i.e.
+    /// `min(engine.contextSize, model.maxSeqLen)`; `nKeep = 0`,
+    /// `seed = null`, `ubatchSize = 512`), pass a freshly-
     /// constructed `new SessionConfig()`.
     ///
     /// `config` is **borrowed**, not consumed — JS callers can
@@ -411,7 +411,7 @@ fn read_string_field(
 
 /// Per-session knobs frozen at `WickEngine.newSession(config)` time.
 /// Constructed via `new SessionConfig()` in JS (returns the wick
-/// defaults: `maxSeqLen=null` → model's own max, `nKeep=0`,
+/// defaults: `maxSeqLen=null` → engine's effective max, `nKeep=0`,
 /// `seed=null`, `ubatchSize=512`).
 ///
 /// `kvCompression` (TurboQuant) is intentionally not exposed yet —
