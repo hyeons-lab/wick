@@ -180,6 +180,16 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //   cfg.ubatchSize = 256;   // smaller chunked-prefill batches give finer
 //                           // session.cancel() checkpoints during long prompts
 
+// Optional: turn on TurboQuant KV compression. Compresses keys to
+// ~3 bits/elem and values to ~2 bits/elem (plus f16 norms per
+// block). Pass an explicit seed so the per-layer Hadamard
+// rotations are reproducible — paired with `cfg.seed` above this
+// keeps the whole session bitwise-identical across runs.
+import { TurboQuantConfig } from '@hyeonslab/wick-wasm';
+const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true
+// tq.keys = false;  // flip per-side toggles for debugging
+cfg.kvCompression = tq;  // setter consumes `tq` — read back via getter to inspect
+
 const session = engine.newSession(cfg);
 session.appendText('once upon a time');
 const opts = new GenerateOpts();

@@ -451,12 +451,11 @@ fn read_string_field(
 /// Per-session knobs frozen at `WickEngine.newSession(config)` time.
 /// Constructed via `new SessionConfig()` in JS (returns the wick
 /// defaults: `maxSeqLen=null` → engine's effective max, `nKeep=0`,
-/// `seed=null`, `ubatchSize=512`).
+/// `seed=null`, `ubatchSize=512`, `kvCompression=null`).
 ///
-/// `kvCompression` (TurboQuant) is intentionally not exposed yet —
-/// its variant has its own nested config (keys/values toggles +
-/// per-layer seed) that deserves a dedicated design pass. v1 of
-/// `SessionConfig` ships without compression knobs.
+/// Set `kvCompression` to a [`TurboQuantConfig`] to compress the
+/// KV cache (~3 bits/elem for keys, ~2 bits/elem for values).
+/// See the per-property doc for trade-offs.
 #[wasm_bindgen]
 #[derive(Default, Clone)]
 pub struct SessionConfig {
@@ -520,6 +519,115 @@ impl SessionConfig {
     #[wasm_bindgen(setter, js_name = ubatchSize)]
     pub fn set_ubatch_size(&mut self, v: u32) {
         self.inner.ubatch_size = v;
+    }
+
+    /// KV cache compression configuration. `null` (default) stores
+    /// keys and values as f32 — best fidelity, biggest memory
+    /// footprint. Set to a [`TurboQuantConfig`] to enable
+    /// TurboQuant compression — keys to ~3 bits/elem, values to
+    /// ~2 bits/elem (plus f16 norms per block); the same `seed`
+    /// reproduces the same per-layer Hadamard rotations
+    /// deterministically.
+    ///
+    /// Setting this consumes the JS-side `TurboQuantConfig`
+    /// handle (wasm-bindgen's `Option<T>` parameter shape). Read
+    /// back via the getter — which returns a fresh handle — if
+    /// you need to inspect the current config.
+    #[wasm_bindgen(getter, js_name = kvCompression)]
+    pub fn kv_compression(&self) -> Option<TurboQuantConfig> {
+        match &self.inner.kv_compression {
+            wick::kv_cache::KvCompression::None => None,
+            wick::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
+                Some(TurboQuantConfig {
+                    seed: *seed,
+                    keys: *keys,
+                    values: *values,
+                })
+            }
+        }
+    }
+    #[wasm_bindgen(setter, js_name = kvCompression)]
+    pub fn set_kv_compression(&mut self, v: Option<TurboQuantConfig>) {
+        self.inner.kv_compression = match v {
+            None => wick::kv_cache::KvCompression::None,
+            Some(tqc) => wick::kv_cache::KvCompression::TurboQuant {
+                seed: tqc.seed,
+                keys: tqc.keys,
+                values: tqc.values,
+            },
+        };
+    }
+}
+
+/// TurboQuant KV-cache compression configuration. Construct via
+/// `new TurboQuantConfig(seed)` for the common production setup
+/// (both `keys` and `values` compressed); flip the per-side
+/// toggles for debugging (e.g. to isolate how much drift each
+/// side contributes).
+///
+/// - **Keys**: 2-bit PolarQuant + 1-bit QJL residual
+///   (3 bits/elem + f16 norms per block).
+/// - **Values**: 2-bit PolarQuant only (2 bits/elem + f16 norms
+///   per block).
+///
+/// `seed` drives the per-layer randomized Hadamard rotations —
+/// the same seed produces the same rotations deterministically,
+/// so a seeded session with TurboQuant on stays bitwise-
+/// reproducible across runs.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct TurboQuantConfig {
+    seed: u64,
+    keys: bool,
+    values: bool,
+}
+
+#[wasm_bindgen]
+impl TurboQuantConfig {
+    /// Construct with the common production setup: both keys and
+    /// values compressed. Pass an explicit `seed` so the per-layer
+    /// rotations are reproducible.
+    #[wasm_bindgen(constructor)]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            keys: true,
+            values: true,
+        }
+    }
+
+    /// Hadamard-rotation seed. Same seed → same rotations →
+    /// reproducible KV cache contents (necessary for bitwise-
+    /// identical replay across sessions).
+    #[wasm_bindgen(getter)]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_seed(&mut self, v: u64) {
+        self.seed = v;
+    }
+
+    /// Compress the K side of the KV cache. Default `true`.
+    /// Useful to flip off when debugging quality regressions to
+    /// isolate K-side vs V-side contribution.
+    #[wasm_bindgen(getter)]
+    pub fn keys(&self) -> bool {
+        self.keys
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_keys(&mut self, v: bool) {
+        self.keys = v;
+    }
+
+    /// Compress the V side of the KV cache. Default `true`.
+    #[wasm_bindgen(getter)]
+    pub fn values(&self) -> bool {
+        self.values
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_values(&mut self, v: bool) {
+        self.values = v;
     }
 }
 
