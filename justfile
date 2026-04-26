@@ -214,9 +214,9 @@ swift-smoke:
 # The result includes `package.json`, `wick_wasm.js`, `wick_wasm.d.ts`,
 # `wick_wasm_bg.wasm`, and the README — drop-in for `npm install ./pkg`.
 #
-# Target is `bundler` (webpack / Vite / Rollup-friendly ESM). Other
-# wasm-pack targets (`web`, `nodejs`) are trivial to add as additional
-# recipes once concrete consumers ask for them.
+# Target is `bundler` (webpack / Vite / Rollup-friendly ESM). Use
+# `just wasm-web` for direct browser ESM (`<script type="module">`)
+# or `just wasm-node` for CommonJS Node consumers.
 #
 # `--scope hyeonslab` makes the generated `package.json.name`
 # `@hyeonslab/wick-wasm` so a published artifact lands under the
@@ -234,9 +234,27 @@ swift-smoke:
 # `[package.metadata.wasm-pack.profile.release]` so this recipe and the
 # CI `wick-wasm-pack` job produce byte-identical output.
 wasm:
-    wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
-    @echo "--- wick-wasm/pkg/ ---"
-    @ls -lh wick-wasm/pkg/
+    wasm-pack build wick-wasm --target bundler --release --scope hyeonslab --out-dir pkg-bundler
+    @echo "--- wick-wasm/pkg-bundler/ ---"
+    @ls -lh wick-wasm/pkg-bundler/
+
+# Build the `--target web` variant — direct browser ESM, no bundler
+# required. Consumers `import init, { ... } from './wick_wasm.js'`
+# and `await init()` once before calling exports. Right shape for
+# `<script type="module">` and bundler-less workflows.
+wasm-web:
+    wasm-pack build wick-wasm --target web --release --scope hyeonslab --out-dir pkg-web
+    @echo "--- wick-wasm/pkg-web/ ---"
+    @ls -lh wick-wasm/pkg-web/
+
+# Build the `--target nodejs` variant — CommonJS module that Node
+# consumers `require('@hyeonslab/wick-wasm')` directly without the
+# experimental-wasm-modules dance. Right shape for Node CLI tools
+# / scripts that prefer CommonJS or are stuck on older Node.
+wasm-node:
+    wasm-pack build wick-wasm --target nodejs --release --scope hyeonslab --out-dir pkg-nodejs
+    @echo "--- wick-wasm/pkg-nodejs/ ---"
+    @ls -lh wick-wasm/pkg-nodejs/
 
 # Clean build artifacts
 clean:
