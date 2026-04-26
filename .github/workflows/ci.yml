@@ -136,14 +136,57 @@ jobs:
         # `wick-wasm` and downstream consumers would see two names
         # for the same artifact.
         run: wasm-pack build wick-wasm --target bundler --release --scope hyeonslab
-      - name: Report .wasm size
+      - name: Check .wasm size budget
+        # Hard cap on the post-wasm-opt cdylib size. Catches the
+        # next time something bloats the bundle silently. Crossing
+        # the budget is intentional sometimes (a real new capability,
+        # not a regression) — when it happens, justify in the PR
+        # description and bump `BUDGET_KB` here in the same commit.
+        # Don't let a passing CI become a license to grow the wasm
+        # without scrutiny.
+        #
+        # Current floor (post wasm-opt -O3, --target bundler):
+        #   PR #67 (manifest only):              174 KB
+        #   PR #69 (engine + tokenizer):         1.2 MB  (+1.0 MB minijinja + LFM2)
+        #   PR #70 (Session + generate):         1.2 MB  (~unchanged)
+        #   PR #72 (applyChatTemplate):          2.0 MB  (+800 KB minijinja render)
+        # Budget:                                2.5 MB  (~25% headroom)
+        #
+        # Plain bash arithmetic (no `numfmt` etc.) so this script
+        # runs identically on the macOS / Linux developer machines
+        # where contributors will sanity-check it locally.
         run: |
+          set -euo pipefail
+          WASM=wick-wasm/pkg/wick_wasm_bg.wasm
+          SIZE_BYTES=$(wc -c < "$WASM")
+          BUDGET_KB=2560  # 2.5 MB
+          BUDGET_BYTES=$((BUDGET_KB * 1024))
+          # Display rounds UP to KB so a 2,560,001-byte file reads as
+          # "2561 KB" not "2560 KB" — keeps the human-readable line
+          # honest with the byte-precision comparison below.
+          SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
+          # Default $GITHUB_STEP_SUMMARY to /dev/null so a contributor
+          # can copy this script and run it locally — the variable is
+          # only set inside GitHub Actions, and `set -u` would
+          # otherwise abort on the redirect.
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
             echo "## Wick-Wasm Pack output"
+            echo
+            echo "**\`$WASM\`: ${SIZE_KB} KB / ${BUDGET_KB} KB budget**"
+            echo
             echo '```'
             ls -lh wick-wasm/pkg/
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$SUMMARY"
+          # Compare in bytes so the gate is a true hard cap; comparing
+          # in KB would let a file overshoot by up to 1023 bytes
+          # before failing.
+          if [ "$SIZE_BYTES" -gt "$BUDGET_BYTES" ]; then
+            echo "::error file=.github/workflows/ci.yml::wick_wasm_bg.wasm is ${SIZE_KB} KB (${SIZE_BYTES} B), over the ${BUDGET_KB} KB (${BUDGET_BYTES} B) budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
+            exit 1
+          fi
+          echo "wick_wasm_bg.wasm: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
       - uses: actions/upload-artifact@v4
         with:
           name: wick-wasm-pkg
