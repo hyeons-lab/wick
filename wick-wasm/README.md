@@ -164,7 +164,7 @@ at the next checkpoint.
 The catch: JS workers (web + `worker_threads`) are single-threaded.
 While `generate()` is blocking, the worker's own message handlers
 **cannot run** — a `postMessage({ kind: 'cancel' })` from the main
-thread queues but doesn't dispatch until generate returns. So a
+thread queues but doesn't dispatch until `generate` returns. So a
 plain JS flag set by an `onmessage` handler can't be updated
 mid-decode.
 
@@ -189,7 +189,7 @@ signalling. Allocate an `Int32Array` on a `SharedArrayBuffer`,
 poll it from inside the callback with `Atomics.load`, set it from
 the main thread with `Atomics.store`. **Requires cross-origin
 isolation** in browsers (`Cross-Origin-Opener-Policy: same-origin`
-+ `Cross-Origin-Embedder-Policy: require-corp` headers); transparent
+and `Cross-Origin-Embedder-Policy: require-corp` headers); transparent
 on Node `worker_threads`.
 
 ```js
@@ -205,11 +205,11 @@ worker.postMessage({ kind: 'generate', params: { maxTokens: 64 } });
 // later, to cancel:
 Atomics.store(cancelFlag, 0, 1);
 
-// worker.js — generate() is invoked from inside the message
+// worker.js — `generate()` is invoked from inside the message
 // handler so `cancelFlag` is guaranteed initialized first; running
-// generate at top-level would race with `init` and crash on
-// `Atomics.load(undefined, 0)`. The cancelFlag null check guards
-// against `generate` arriving before `init` (out-of-order
+// `generate` at top-level would race with `init` and crash on
+// `Atomics.load(undefined, 0)`. The `cancelFlag` null check guards
+// against a `generate` message arriving before `init` (out-of-order
 // messages).
 let cancelFlag;
 self.onmessage = (ev) => {
@@ -229,8 +229,8 @@ self.onmessage = (ev) => {
 ```
 
 A pure `postMessage`-flag pattern only works if the cancel arrives
-before generate is called (the listener runs during the gap
-between message receipt and the next generate). It's unreliable
+before `generate` is called (the listener runs during the gap
+between message receipt and the next `generate`). It's unreliable
 for in-flight cancellation; use one of the two patterns above.
 
 Bundlers without native wasm support need a loader plugin; see the
