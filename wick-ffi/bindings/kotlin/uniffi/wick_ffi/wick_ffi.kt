@@ -1411,7 +1411,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wick_ffi_checksum_method_modalitysink_on_done() != 22104.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wick_ffi_checksum_method_session_append_audio() != 49509.toShort()) {
+    if (lib.uniffi_wick_ffi_checksum_method_session_append_audio() != 56415.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_session_append_text() != 1419.toShort()) {
@@ -3194,23 +3194,35 @@ public object FfiConverterTypeModalitySink : FfiConverter<ModalitySink, Long> {
 public interface SessionInterface {
     /**
      * Append PCM audio samples (mono `f32`, normalized to roughly
-     * `[-1.0, 1.0]`) at `sample_rate` Hz. Routes through the
-     * model's audio encoder; the resulting tokens are appended to
-     * the KV cache the same way `append_text` would. Use this for
-     * LFM2-Audio-class models that accept audio input.
+     * `[-1.0, 1.0]`) at `sample_rate` Hz.
      *
-     * **Marshaling cost**: UniFFI maps `Vec<f32>` to
-     * `List<Float>` in Kotlin and `[Float]` in Swift. The Kotlin
-     * side boxes each `Float` to `java.lang.Float`, a ~4× memory
-     * overhead vs the underlying `f32` wire bytes (negligible for
-     * O(seconds × sample-rate) chunks but worth knowing if you're
-     * streaming continuous audio in tight loops).
+     * **Status: placeholder.** The FFI shape is wired through to
+     * `wick::Session::append_audio`, but the wick core method is
+     * currently a scaffold — for any model it always errors,
+     * either with `UnsupportedModality` (text-only LLMs) or with
+     * `Backend("...not yet implemented...")` (audio-capable
+     * models, awaiting Session-side audio-tokenizer wiring). This
+     * FFI export exists so consumers can lock in the symbol /
+     * signature now and the bindings-drift CI catches any future
+     * shape changes; it does **not** yet decode and append audio
+     * tokens. Use `wick::audio_engine::generate_audio` directly
+     * (Rust-side) until the Session wiring lands.
      *
-     * Errors:
+     * **Marshaling cost (relevant when the real impl lands)**:
+     * UniFFI maps `Vec<f32>` to `List<Float>` in Kotlin and
+     * `[Float]` in Swift. The Kotlin side boxes each `Float` to
+     * `java.lang.Float`, a ~4× memory overhead vs the underlying
+     * `f32` wire bytes — negligible for O(seconds × sample-rate)
+     * chunks but worth knowing if you're streaming continuous
+     * audio in tight loops.
+     *
+     * Errors today:
+     * - `EmptyInput` if `samples` is empty (fast-fail, enforced
+     * here for parity with `append_text` / `append_tokens`).
      * - `UnsupportedModality` if the loaded model's
-     * [`ModalityCapabilities::audio_in`] is `false` (text-only
-     * LLMs can't accept audio).
-     * - `EmptyInput` if `samples` is empty.
+     * [`ModalityCapabilities::audio_in`] is `false`.
+     * - `Backend(...)` for audio-capable models — placeholder
+     * until the real implementation lands.
      */
     fun `appendAudio`(
         `samples`: List<kotlin.Float>,
@@ -3476,23 +3488,35 @@ open class Session :
 
     /**
      * Append PCM audio samples (mono `f32`, normalized to roughly
-     * `[-1.0, 1.0]`) at `sample_rate` Hz. Routes through the
-     * model's audio encoder; the resulting tokens are appended to
-     * the KV cache the same way `append_text` would. Use this for
-     * LFM2-Audio-class models that accept audio input.
+     * `[-1.0, 1.0]`) at `sample_rate` Hz.
      *
-     * **Marshaling cost**: UniFFI maps `Vec<f32>` to
-     * `List<Float>` in Kotlin and `[Float]` in Swift. The Kotlin
-     * side boxes each `Float` to `java.lang.Float`, a ~4× memory
-     * overhead vs the underlying `f32` wire bytes (negligible for
-     * O(seconds × sample-rate) chunks but worth knowing if you're
-     * streaming continuous audio in tight loops).
+     * **Status: placeholder.** The FFI shape is wired through to
+     * `wick::Session::append_audio`, but the wick core method is
+     * currently a scaffold — for any model it always errors,
+     * either with `UnsupportedModality` (text-only LLMs) or with
+     * `Backend("...not yet implemented...")` (audio-capable
+     * models, awaiting Session-side audio-tokenizer wiring). This
+     * FFI export exists so consumers can lock in the symbol /
+     * signature now and the bindings-drift CI catches any future
+     * shape changes; it does **not** yet decode and append audio
+     * tokens. Use `wick::audio_engine::generate_audio` directly
+     * (Rust-side) until the Session wiring lands.
      *
-     * Errors:
+     * **Marshaling cost (relevant when the real impl lands)**:
+     * UniFFI maps `Vec<f32>` to `List<Float>` in Kotlin and
+     * `[Float]` in Swift. The Kotlin side boxes each `Float` to
+     * `java.lang.Float`, a ~4× memory overhead vs the underlying
+     * `f32` wire bytes — negligible for O(seconds × sample-rate)
+     * chunks but worth knowing if you're streaming continuous
+     * audio in tight loops.
+     *
+     * Errors today:
+     * - `EmptyInput` if `samples` is empty (fast-fail, enforced
+     * here for parity with `append_text` / `append_tokens`).
      * - `UnsupportedModality` if the loaded model's
-     * [`ModalityCapabilities::audio_in`] is `false` (text-only
-     * LLMs can't accept audio).
-     * - `EmptyInput` if `samples` is empty.
+     * [`ModalityCapabilities::audio_in`] is `false`.
+     * - `Backend(...)` for audio-capable models — placeholder
+     * until the real implementation lands.
      */
     @Throws(FfiException::class)
     override fun `appendAudio`(
