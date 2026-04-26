@@ -386,6 +386,11 @@ uint64_t uniffi_wick_ffi_fn_clone_session(uint64_t handle, RustCallStatus *_Nonn
 void uniffi_wick_ffi_fn_free_session(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_APPEND_AUDIO
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_APPEND_AUDIO
+void uniffi_wick_ffi_fn_method_session_append_audio(uint64_t ptr, RustBuffer samples, uint32_t sample_rate, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_APPEND_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_APPEND_TEXT
 void uniffi_wick_ffi_fn_method_session_append_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -827,6 +832,12 @@ uint16_t uniffi_wick_ffi_checksum_method_modalitysink_on_audio_frames(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_DONE
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_DONE
 uint16_t uniffi_wick_ffi_checksum_method_modalitysink_on_done(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_APPEND_AUDIO
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_APPEND_AUDIO
+uint16_t uniffi_wick_ffi_checksum_method_session_append_audio(void
     
 );
 #endif

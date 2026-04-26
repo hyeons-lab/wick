@@ -1407,6 +1407,28 @@ public func FfiConverterTypeModalitySink_lower(_ value: ModalitySink) -> UInt64 
 public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
+     * Append PCM audio samples (mono `f32`, normalized to roughly
+     * `[-1.0, 1.0]`) at `sample_rate` Hz. Routes through the
+     * model's audio encoder; the resulting tokens are appended to
+     * the KV cache the same way `append_text` would. Use this for
+     * LFM2-Audio-class models that accept audio input.
+     *
+     * **Marshaling cost**: UniFFI maps `Vec<f32>` to
+     * `List<Float>` in Kotlin and `[Float]` in Swift. The Kotlin
+     * side boxes each `Float` to `java.lang.Float`, a ~4× memory
+     * overhead vs the underlying `f32` wire bytes (negligible for
+     * O(seconds × sample-rate) chunks but worth knowing if you're
+     * streaming continuous audio in tight loops).
+     *
+     * Errors:
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::audio_in`] is `false` (text-only
+     * LLMs can't accept audio).
+     * - `EmptyInput` if `samples` is empty.
+     */
+    func appendAudio(samples: [Float], sampleRate: UInt32) throws 
+    
+    /**
      * Append raw text to the context, running a prefill over just
      * the new tokens. `EmptyInput` error if `text` is empty.
      */
@@ -1608,6 +1630,35 @@ open class Session: SessionProtocol, @unchecked Sendable {
 
     
 
+    
+    /**
+     * Append PCM audio samples (mono `f32`, normalized to roughly
+     * `[-1.0, 1.0]`) at `sample_rate` Hz. Routes through the
+     * model's audio encoder; the resulting tokens are appended to
+     * the KV cache the same way `append_text` would. Use this for
+     * LFM2-Audio-class models that accept audio input.
+     *
+     * **Marshaling cost**: UniFFI maps `Vec<f32>` to
+     * `List<Float>` in Kotlin and `[Float]` in Swift. The Kotlin
+     * side boxes each `Float` to `java.lang.Float`, a ~4× memory
+     * overhead vs the underlying `f32` wire bytes (negligible for
+     * O(seconds × sample-rate) chunks but worth knowing if you're
+     * streaming continuous audio in tight loops).
+     *
+     * Errors:
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::audio_in`] is `false` (text-only
+     * LLMs can't accept audio).
+     * - `EmptyInput` if `samples` is empty.
+     */
+open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_method_session_append_audio(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(samples),
+        FfiConverterUInt32.lower(sampleRate),$0
+    )
+}
+}
     
     /**
      * Append raw text to the context, running a prefill over just
@@ -3728,6 +3779,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_modalitysink_on_done() != 22104) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_session_append_audio() != 49509) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_session_append_text() != 1419) {

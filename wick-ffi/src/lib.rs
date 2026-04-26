@@ -1053,6 +1053,29 @@ impl Session {
         Ok(())
     }
 
+    /// Append PCM audio samples (mono `f32`, normalized to roughly
+    /// `[-1.0, 1.0]`) at `sample_rate` Hz. Routes through the
+    /// model's audio encoder; the resulting tokens are appended to
+    /// the KV cache the same way `append_text` would. Use this for
+    /// LFM2-Audio-class models that accept audio input.
+    ///
+    /// **Marshaling cost**: UniFFI maps `Vec<f32>` to
+    /// `List<Float>` in Kotlin and `[Float]` in Swift. The Kotlin
+    /// side boxes each `Float` to `java.lang.Float`, a ~4× memory
+    /// overhead vs the underlying `f32` wire bytes (negligible for
+    /// O(seconds × sample-rate) chunks but worth knowing if you're
+    /// streaming continuous audio in tight loops).
+    ///
+    /// Errors:
+    /// - `UnsupportedModality` if the loaded model's
+    ///   [`ModalityCapabilities::audio_in`] is `false` (text-only
+    ///   LLMs can't accept audio).
+    /// - `EmptyInput` if `samples` is empty.
+    pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError> {
+        self.lock_inner()?.append_audio(&samples, sample_rate)?;
+        Ok(())
+    }
+
     /// Run autoregressive decode and return all emitted tokens +
     /// a summary. Synchronous — the call blocks until the decode
     /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
