@@ -5080,17 +5080,16 @@ sealed class FfiException : kotlin.Exception() {
      * The caller (or the cancel-on-drop guard) flipped the cancel
      * atomic mid-call. Surfaces from `append_text`, `append_tokens`,
      * and `append_audio` when chunked prefill detects the cancel
-     * flag between micro-batches and aborts (see PR #33,
-     * `wick::Session::append_tokens` doc); call
-     * [`Session::clear_cancel`] to reset the flag so the next call
-     * can proceed.
+     * flag between micro-batches and aborts (see
+     * [`wick::Session::append_tokens`] for the chunked-prefill
+     * mechanism). Call [`Session::clear_cancel`] to reset the flag
+     * so the next call can proceed.
      *
      * `generate` reports cancellation via a different path: the
-     * call still returns `Ok(GenerateOutput)`, with
-     * `finish_reason == "Cancelled"` on the summary. Two paths
-     * because chunked prefill has nothing useful to return on
-     * cancel (no decoded tokens) while decode has accumulated
-     * tokens worth preserving.
+     * call still returns `Ok(GenerateOutput)`, with `finish_reason`
+     * set to `Cancelled` on the summary. Two paths because chunked
+     * prefill has nothing useful to return on cancel (no decoded
+     * tokens) while decode has accumulated tokens worth preserving.
      */
     class Cancelled : FfiException() {
         override val message
