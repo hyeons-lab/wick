@@ -692,6 +692,20 @@ impl WickEngine {
         self.inner.tokenizer().special_token_id(&name)
     }
 
+    /// `true` when `id` is registered as a control or user-defined
+    /// special token in the model's GGUF metadata
+    /// (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+    /// output filtering — e.g. dropping `<|im_end|>` from streamed
+    /// tokens before rendering them to a UI — and for token-class
+    /// classification in analysis tools.
+    ///
+    /// Out-of-range IDs (>= vocab size) and regular vocab tokens
+    /// both return `false`. Companion to [`Self::special_token_id`]
+    /// which goes the other direction (name → ID).
+    pub fn is_special_token(&self, id: u32) -> bool {
+        self.inner.tokenizer().is_special_token(id)
+    }
+
     /// `true` if the model's tokenizer carries a chat template (a
     /// minijinja string from GGUF metadata). Foreign callers should
     /// check this before calling [`WickEngine::apply_chat_template`].

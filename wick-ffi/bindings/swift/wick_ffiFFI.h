@@ -506,6 +506,11 @@ RustBuffer uniffi_wick_ffi_fn_method_wickengine_eos_token(uint64_t ptr, RustCall
 int8_t uniffi_wick_ffi_fn_method_wickengine_has_chat_template(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_IS_SPECIAL_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_IS_SPECIAL_TOKEN
+int8_t uniffi_wick_ffi_fn_method_wickengine_is_special_token(uint64_t ptr, uint32_t id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_METADATA
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_METADATA
 RustBuffer uniffi_wick_ffi_fn_method_wickengine_metadata(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -951,6 +956,12 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_eos_token(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_HAS_CHAT_TEMPLATE
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_has_chat_template(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_IS_SPECIAL_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_IS_SPECIAL_TOKEN
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_is_special_token(void
     
 );
 #endif

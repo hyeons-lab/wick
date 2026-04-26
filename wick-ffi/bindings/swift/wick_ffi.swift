@@ -2070,6 +2070,20 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
     func hasChatTemplate()  -> Bool
     
     /**
+     * `true` when `id` is registered as a control or user-defined
+     * special token in the model's GGUF metadata
+     * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+     * output filtering — e.g. dropping `<|im_end|>` from streamed
+     * tokens before rendering them to a UI — and for token-class
+     * classification in analysis tools.
+     *
+     * Out-of-range IDs (>= vocab size) and regular vocab tokens
+     * both return `false`. Companion to [`Self::special_token_id`]
+     * which goes the other direction (name → ID).
+     */
+    func isSpecialToken(id: UInt32)  -> Bool
+    
+    /**
      * Short summary of the loaded model (architecture, vocab size,
      * max context, etc.). Returns a `Clone` of the stored metadata.
      */
@@ -2348,6 +2362,27 @@ open func hasChatTemplate() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * `true` when `id` is registered as a control or user-defined
+     * special token in the model's GGUF metadata
+     * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+     * output filtering — e.g. dropping `<|im_end|>` from streamed
+     * tokens before rendering them to a UI — and for token-class
+     * classification in analysis tools.
+     *
+     * Out-of-range IDs (>= vocab size) and regular vocab tokens
+     * both return `false`. Companion to [`Self::special_token_id`]
+     * which goes the other direction (name → ID).
+     */
+open func isSpecialToken(id: UInt32) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_is_special_token(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(id),$0
     )
 })
 }
@@ -3922,6 +3957,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_has_chat_template() != 54268) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_is_special_token() != 18773) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_metadata() != 60987) {
