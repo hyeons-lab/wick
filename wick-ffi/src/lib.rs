@@ -1202,10 +1202,15 @@ impl Session {
     }
 
     /// Clear the cancel flag without dropping any session state.
-    /// Use this after handling a `WickError::Cancelled` from
-    /// `append_tokens` / `generate` when you want to resume work
-    /// on the same session (append more tokens, generate again)
-    /// without losing the accumulated KV cache.
+    /// Use this after observing a cancellation signal — either
+    /// [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+    /// / `append_audio` (mid-prefill cancellation surfaces
+    /// typed), or `finish_reason = "Cancelled"` on the
+    /// [`GenerateOutput`] returned from `generate` (cancellation
+    /// during decode is reported as an `Ok` with that finish
+    /// reason rather than an `Err`) — when you want to resume
+    /// work on the same session without losing the accumulated
+    /// KV cache.
     ///
     /// Compared to [`Self::reset`]:
     /// - `clear_cancel`: keeps KV state + position + sampler
