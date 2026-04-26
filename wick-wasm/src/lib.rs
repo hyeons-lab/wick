@@ -67,11 +67,11 @@ const TS_CAPABILITIES: &'static str = r#"
  * make these flags reflect the real capability surface.
  */
 export interface Capabilities {
-    textIn: boolean;
-    textOut: boolean;
-    imageIn: boolean;
-    audioIn: boolean;
-    audioOut: boolean;
+    readonly textIn: boolean;
+    readonly textOut: boolean;
+    readonly imageIn: boolean;
+    readonly audioIn: boolean;
+    readonly audioOut: boolean;
 }
 "#;
 
@@ -94,32 +94,16 @@ fn capabilities_to_js(caps: wick::ModalityCapabilities) -> Capabilities {
     let obj = js_sys::Object::new();
     // `Reflect::set` only fails when the target isn't an object
     // — `Object::new()` always is, so the `Result` is structurally
-    // unreachable here. Discarding it keeps the call sites flat.
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("textIn"),
-        &JsValue::from_bool(caps.text_in),
-    );
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("textOut"),
-        &JsValue::from_bool(caps.text_out),
-    );
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("imageIn"),
-        &JsValue::from_bool(caps.image_in),
-    );
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("audioIn"),
-        &JsValue::from_bool(caps.audio_in),
-    );
-    let _ = js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("audioOut"),
-        &JsValue::from_bool(caps.audio_out),
-    );
+    // unreachable here. Discard it inside the helper closure to
+    // keep the per-field calls one line each.
+    let set_bool = |key: &str, value: bool| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(value));
+    };
+    set_bool("textIn", caps.text_in);
+    set_bool("textOut", caps.text_out);
+    set_bool("imageIn", caps.image_in);
+    set_bool("audioIn", caps.audio_in);
+    set_bool("audioOut", caps.audio_out);
     JsValue::from(obj).unchecked_into()
 }
 
