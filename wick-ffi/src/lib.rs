@@ -633,6 +633,22 @@ impl WickEngine {
         self.inner.capabilities().into()
     }
 
+    /// Effective context-window size (KV cache cap) the engine was
+    /// configured with. Mirrors the `context_size` field of the
+    /// [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+    /// resolved through wick's defaulting rules (a `0` request
+    /// becomes the model's `max_seq_len`).
+    ///
+    /// Useful for "show effective KV cap" UIs and diagnostic
+    /// logging when the caller didn't keep the original
+    /// `EngineConfig` around. Note this is the *requested* cap —
+    /// the actual per-session KV is `min(context_size, model.max_seq_len)`,
+    /// surfaced via `metadata().max_seq_len` if the caller needs
+    /// the per-session ceiling.
+    pub fn context_size(&self) -> u64 {
+        self.inner.config().context_size as u64
+    }
+
     // ----- Tokenizer surface (PR 13) ---------------------------------
     //
     // Wraps `wick::tokenizer::BpeTokenizer` so foreign callers can

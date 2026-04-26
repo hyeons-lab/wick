@@ -486,6 +486,11 @@ RustBuffer uniffi_wick_ffi_fn_method_wickengine_bos_token(uint64_t ptr, RustCall
 RustBuffer uniffi_wick_ffi_fn_method_wickengine_capabilities(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_CONTEXT_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_CONTEXT_SIZE
+uint64_t uniffi_wick_ffi_fn_method_wickengine_context_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_DECODE_TOKENS
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_DECODE_TOKENS
 RustBuffer uniffi_wick_ffi_fn_method_wickengine_decode_tokens(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
@@ -932,6 +937,12 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_bos_token(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CAPABILITIES
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CAPABILITIES
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_capabilities(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CONTEXT_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_CONTEXT_SIZE
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_context_size(void
     
 );
 #endif

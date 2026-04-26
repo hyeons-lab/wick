@@ -323,6 +323,22 @@ impl WickEngine {
         capabilities_to_js(self.inner.capabilities())
     }
 
+    /// Effective context-window size (KV cache cap) the engine was
+    /// configured with. Mirrors what `fromGgufBytes(bytes,
+    /// contextSize)` resolved to (a missing or `0` request becomes
+    /// the model's `maxSeqLen`).
+    ///
+    /// Useful for "show effective KV cap" UIs and diagnostic
+    /// logging when JS callers didn't keep the original
+    /// `contextSize` value around. Note this is the *requested* cap
+    /// — the actual per-session KV is `min(contextSize, maxSeqLen)`,
+    /// so use `Math.min(engine.contextSize, engine.maxSeqLen)` if
+    /// you need the per-session ceiling.
+    #[wasm_bindgen(getter, js_name = contextSize)]
+    pub fn context_size(&self) -> u32 {
+        self.inner.config().context_size as u32
+    }
+
     /// Returns a `Tokenizer` handle bound to this engine's vocab.
     /// Each call allocates a fresh JS object but the underlying
     /// tokenizer state is shared via `Arc` — cheap to call, JS
