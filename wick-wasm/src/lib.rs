@@ -945,6 +945,45 @@ impl Session {
         self.inner.cancel()
     }
 
+    /// Drop accumulated state and return the session to a freshly-
+    /// opened shape. Clears the KV cache, `position`, the last
+    /// logits, and the cancel flag, then re-seeds the sampler from
+    /// the `SessionConfig.seed` originally passed to `newSession`.
+    ///
+    /// Use this for "clear conversation" UI actions — it skips the
+    /// per-session setup cost that `engine.newSession(config)`
+    /// would pay (model + tokenizer Arc clones, sampler ctor),
+    /// while still leaving the session indistinguishable from a
+    /// fresh one.
+    ///
+    /// Sampler re-seed semantics:
+    /// - `SessionConfig.seed = some bigint` — deterministic
+    ///   sessions stay deterministic across `reset()`; the next
+    ///   `generate` produces the same first token sequence as the
+    ///   original.
+    /// - `SessionConfig.seed = null` — the sampler picks a new
+    ///   random seed on each `reset()`, so successive
+    ///   conversations decorrelate.
+    ///
+    /// Engine-level disk prefix cache (when configured on
+    /// `WickEngine`) is not touched — those entries are
+    /// engine-scoped, not session-scoped.
+    ///
+    /// **Threading:** unlike `cancel()` (which only flips an
+    /// atomic and is safe to call concurrently with anything),
+    /// `reset()` takes `&mut self` and rebuilds non-atomic
+    /// internal state (KV cache, sampler). Must be called on
+    /// the owning thread, with no in-flight `generate` /
+    /// `appendText` / `appendTokens` running. The wasm-bindgen
+    /// borrow check enforces this within a single Worker; if
+    /// you share a `Session` across Workers via
+    /// `SharedArrayBuffer`-style schemes, it's on you to
+    /// serialize calls.
+    #[wasm_bindgen]
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
     /// Decode tokens until `opts.maxTokens`, a stop token, EOS, or
     /// `cancel()` fires. The `onTextTokens` callback is invoked once
     /// per flush boundary with a `Uint32Array` of the latest tokens
