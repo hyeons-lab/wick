@@ -31,7 +31,9 @@ filesystem tree manually" workaround.
 | 12 | `DownloadProgressSink` foreign-trait callback + `BundleRepo::with_progress` |
 | 13 | Tokenizer + chat-template surface on `WickEngine` (encode/decode, `ChatMessage`, `apply_chat_template`) |
 | 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
-| 15+ | Parity harness, Maven publishing |
+| 15 | Parity harness (`wick-parity` Kotlin/Swift legs + perf gate) |
+| 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `WickEngine::is_special_token`, `WickEngine::context_size` resolved getter |
+| later | Maven Central / SwiftPM remote publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -606,10 +608,12 @@ messages without going through `Session::append_text`. Useful for:
 | `engine.encodeText(text)` → `Vec<u32>` | Tokenize a string. |
 | `engine.decodeTokens(tokens)` → `String` | Detokenize. |
 | `engine.vocabSize()` → `u32` | Total vocab size. |
-| `engine.bosToken()` / `engine.eosToken()` → `u32?` | Special tokens. |
-| `engine.specialTokenId(name)` → `u32?` | Lookup by name. |
+| `engine.bosToken()` / `engine.eosToken()` → `u32?` | Common special tokens (typo-safe getters for the two everyone needs). |
+| `engine.specialTokenId(name)` → `u32?` | Lookup by literal vocab name (e.g. <code>&lt;|im_start|&gt;</code>). Only tokens with `tokenizer.ggml.token_type` 3 (control) or 4 (user-defined) are reachable. |
+| `engine.isSpecialToken(id)` → `Bool` | Inverse of `specialTokenId` — useful for filtering control tokens out of streamed output before rendering. |
 | `engine.hasChatTemplate()` → `Bool` | Check before render. |
 | `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
+| `engine.contextSize()` → `u64` | **Requested** engine `context_size` after applying the `0` → model `max_seq_len` default (so callers never see the internal `usize::MAX` sentinel). This is the engine-level config readback, **not** the per-session ceiling — wick clamps the model's `max_seq_len` to `min(requested, gguf_max)` at load time, so `engine.metadata().maxSeqLen` is the effective cap. |
 
 ### Kotlin example
 
@@ -683,6 +687,125 @@ if engine.hasChatTemplate() {
   template's own logic — many templates have an explicit error
   path for unrecognized roles, but it's template-dependent rather
   than enforced by `applyChatTemplate`.
+
+## Session API
+
+`engine.newSession(config)` produces an `Arc<Session>` that holds
+the model + tokenizer Arc'd from the engine plus its own KV cache,
+sampler, and cancel atomic. Sessions are independent — many can
+run against the same engine concurrently (each holds its own
+`Mutex` over the inner `wick::Session`).
+
+### Surface
+
+| Method | Signature | Notes |
+|---|---|---|
+| `engine.newSession(config)` | `(SessionConfig) -> Arc<Session>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). |
+| `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
+| `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
+| `session.appendAudio(samples, sampleRate)` | `(Vec<f32>, u32) -> Result<(), FfiError>` | **Placeholder** — wired through to `wick::Session::append_audio`, which is currently a scaffold (always errors). The FFI shape is locked in early so consumers can compile against it; real audio routing lands when `wick::Session::append_audio` is implemented core-side. |
+| `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full token list + summary in one shot. |
+| `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text tokens or audio frames per the model's modality). Returns the summary only — token IDs flow through the sink. |
+| `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Cancel by dropping the future. |
+| `session.generateStreamingAsync(opts, sink)` | `async (GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Async + streaming. Cancel by dropping the future (also fires `Session::cancel` via the internal `AbortOnDrop` guard). |
+| `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
+| `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
+| `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
+| `session.reset()` | `() -> Result<(), FfiError>` | Drop KV + position + last logits + re-seed sampler from `SessionConfig.seed`. |
+| `session.capabilities()` | `() -> ModalityCapabilities` | The same flags `engine.capabilities()` reports — exposed on `Session` too so a caller holding only the session handle can probe. |
+
+### Lifecycle (Kotlin)
+
+```kotlin
+val engine = WickEngine.fromPath("...", config)
+
+// Per-session knobs. SessionConfig.default() picks the wick
+// defaults (random sampler seed, no nKeep pin, ubatchSize 512).
+val session = engine.newSession(SessionConfig.default())
+
+session.appendText("Hello, what is the capital of France?")
+val out = session.generate(GenerateOpts.default())
+println("decoded ${out.tokens.size} tokens, finish=${out.summary.finishReason}")
+println(engine.decodeTokens(out.tokens))
+```
+
+### Streaming (Swift)
+
+```swift
+class StreamSink: ModalitySink {
+    var collected: [UInt32] = []
+    func onTextTokens(tokens: [UInt32]) {
+        collected.append(contentsOf: tokens)
+        // Marshal off-thread; the callback fires on the decode thread.
+        DispatchQueue.main.async { self.updateUI(self.collected) }
+    }
+    func onAudioFrames(pcm: [Float], sampleRate: UInt32) { /* LFM2-Audio */ }
+    func onDone(reason: FinishReason) { print("done: \(reason)") }
+    func updateUI(_ tokens: [UInt32]) { /* render */ }
+}
+
+let sink = StreamSink()
+let summary = try session.generateStreaming(opts: opts, sink: sink)
+```
+
+### Resuming after cancel vs starting over
+
+After a cancellation lands (`FfiError::Cancelled` from
+`appendText` / `appendTokens` / `appendAudio` mid-prefill, or
+`FinishReason::Cancelled` on the `GenerateOutput` from `generate`),
+two primitives let callers continue with the same `Session`
+without paying `engine.newSession(...)` setup cost again:
+
+| API | KV cache | `position` | Sampler | When to use |
+|---|---|---|---|---|
+| `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing" — keep the conversation context, append more tokens, generate again |
+| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button — start fresh on the same model + tokenizer |
+
+```kotlin
+val tokensBefore = session.position().toInt()       // snapshot before the call
+try {
+    session.appendTokens(longPrompt)                // may throw FfiException.Cancelled mid-prefill
+} catch (e: FfiException.Cancelled) {
+    val consumed = session.position().toInt() - tokensBefore
+    session.clearCancel()                           // resume without losing KV
+    session.appendTokens(longPrompt.drop(consumed))
+}
+```
+
+```swift
+let tokensBefore = Int(session.position())          // snapshot before the call
+do {
+    try session.appendTokens(tokens: longPrompt)
+} catch FfiError.Cancelled {
+    let consumed = Int(session.position()) - tokensBefore
+    session.clearCancel()
+    try session.appendTokens(tokens: Array(longPrompt[consumed...]))
+}
+```
+
+### Notes
+
+- **Threading.** `appendText` / `appendTokens` / `appendAudio` /
+  `generate*` / `reset` mutate session state and acquire an
+  internal `Mutex`. Concurrent calls on the same `Session` block;
+  cross-session calls don't. `cancel` / `clearCancel` / `position`
+  / `capabilities` are atomic-only and safe to call concurrently
+  with anything (including from inside a `ModalitySink` callback
+  on a different thread).
+- **Cancel + drop semantics.** `generate*` calls held by an
+  async task that gets dropped also fire the cancel atomic via
+  the internal `AbortOnDrop` guard — no need to manually
+  `session.cancel()` before letting a Swift `Task` go out of scope.
+- **Streaming sink errors aren't recoverable mid-decode.** A
+  `ModalitySink` implementation that throws an exception will
+  unwind the decode loop. The `GenerateOutput` returned will
+  carry whatever tokens decoded before the throw, but the session
+  is left in a partial state — call `reset()` (or `clearCancel()`
+  if you want to keep the partial KV) before the next `generate`.
+- **`appendImage` doesn't exist** in the FFI surface yet —
+  `wick::Session::append_image` is a stub that always returns
+  `UnsupportedModality`. The FFI shape will land alongside real
+  VL support core-side.
 
 ## Design notes
 

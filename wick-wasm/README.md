@@ -4,8 +4,15 @@
 [wick](https://github.com/hyeons-lab/wick) inference engine.
 
 > Status: pre-1.0. Today's surface covers manifest parsing, model
-> loading (CPU-only), metadata access, tokenizer encode/decode, and
-> sync streaming text generation via `Session.generate(opts, cb)`.
+> loading (CPU-only), engine metadata + capability probes, full
+> tokenizer access (`encode` / `decode` / `applyChatTemplate` /
+> `specialTokenId` / `isSpecialToken`), session lifecycle (`reset`
+> / `cancel` / `clearCancel`), and sync streaming text generation
+> via `Session.generate(opts, cb)`. `Session.appendAudio` is wired
+> as a placeholder symbol — the wick-core method is still a
+> scaffold (always errors); the wasm signature is locked in so JS
+> code stabilizes against the same shape the JVM/Apple bindings
+> expose.
 
 ## Install
 
@@ -75,16 +82,33 @@ const bytes = new Uint8Array(await res.arrayBuffer());
 const engine = WickEngine.fromGgufBytes(bytes, 2048);
 
 console.log(engine.architecture);     // "lfm2"
-console.log(engine.maxSeqLen);        // 4096
+console.log(engine.maxSeqLen);        // 2048 (clamped to min(contextSize, gguf max))
+console.log(engine.contextSize);      // 2048 — what you passed (or 4096 if omitted)
+console.log(engine.vocabSize);
 console.log(engine.quantization);     // "Q4_0", "Q8_0", "BF16", etc.
 console.log(engine.hasChatTemplate);  // true / false
 console.log(engine.addBosToken);      // honor when hand-building token sequences
+
+// Modality capability probe. Plain JS object — no .free() needed,
+// destructurable. Today every model loaded via fromGgufBytes
+// reports text-only because wasm uses wick's synthetic-text
+// manifest path; a model-aware loader (planned) will surface real
+// audioIn / imageIn flags.
+const { textIn, audioIn, audioOut, imageIn } = engine.capabilities;
 
 // Tokenize a string.
 const tok = engine.tokenizer;
 const ids = tok.encode('hello world');  // Uint32Array
 console.log(ids);
 console.log(tok.decode(ids));           // round-trips to "hello world"
+
+// Look up a control token by literal vocab name (only tokens
+// flagged with token_type 3 / 4 in GGUF metadata are reachable).
+const imStart = tok.specialTokenId('<|im_start|>');  // number | undefined
+
+// Filter control tokens from a streamed batch before rendering
+// to UI — keeps `<|im_end|>` etc. out of the displayed text.
+const visible = ids.filter(id => !tok.isSpecialToken(id));
 
 // Render the GGUF-embedded Jinja chat template against a message
 // list. `addGenerationPrompt` defaults to `true` for the
@@ -314,6 +338,35 @@ A pure `postMessage`-flag pattern only works if the cancel arrives
 before `generate` is called (the listener runs during the gap
 between message receipt and the next `generate`). It's unreliable
 for in-flight cancellation; use one of the two patterns above.
+
+### Resuming after cancel vs starting over
+
+After a cancellation lands (`finishReason === "Cancelled"` from
+`generate`, or a thrown error from `appendText` / `appendTokens`),
+two primitives let JS callers continue with the same `Session`
+without paying `engine.newSession(config)` setup cost again:
+
+| API | KV cache | `position` | Sampler | When to use |
+|---|---|---|---|---|
+| `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing" — keep the conversation context, append more tokens, generate again |
+| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button — start fresh |
+
+`clearCancel()` takes `&self`, `reset()` takes `&mut self` —
+remember `reset()` must be invoked outside any in-flight `generate`
+(wasm-bindgen's borrow check rejects re-entry).
+
+```js
+try {
+    session.appendTokens(longPrompt);  // may throw "cancelled" mid-prefill
+} catch (e) {
+    if (String(e).includes('cancelled')) {
+        session.clearCancel();           // resume without losing KV
+        session.appendTokens(remainingTokens);
+    } else {
+        throw e;
+    }
+}
+```
 
 Bundlers without native wasm support need a loader plugin; see the
 [`wasm-pack` bundler guide](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
