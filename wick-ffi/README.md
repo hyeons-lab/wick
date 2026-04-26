@@ -31,7 +31,9 @@ filesystem tree manually" workaround.
 | 12 | `DownloadProgressSink` foreign-trait callback + `BundleRepo::with_progress` |
 | 13 | Tokenizer + chat-template surface on `WickEngine` (encode/decode, `ChatMessage`, `apply_chat_template`) |
 | 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
-| 15+ | Parity harness, Maven publishing |
+| 15 | Parity harness (`wick-parity` Kotlin/Swift legs + perf gate) |
+| 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `WickEngine::is_special_token`, `WickEngine::context_size` resolved getter |
+| later | Maven Central / SwiftPM remote publishing |
 
 Don't add FFI exposure to `wick` directly — the `wick` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -606,10 +608,12 @@ messages without going through `Session::append_text`. Useful for:
 | `engine.encodeText(text)` → `Vec<u32>` | Tokenize a string. |
 | `engine.decodeTokens(tokens)` → `String` | Detokenize. |
 | `engine.vocabSize()` → `u32` | Total vocab size. |
-| `engine.bosToken()` / `engine.eosToken()` → `u32?` | Special tokens. |
-| `engine.specialTokenId(name)` → `u32?` | Lookup by name. |
+| `engine.bosToken()` / `engine.eosToken()` → `u32?` | Common special tokens (typo-safe getters for the two everyone needs). |
+| `engine.specialTokenId(name)` → `u32?` | Lookup by literal vocab name (e.g. `<\|im_start\|>`). Only tokens with `tokenizer.ggml.token_type` 3 (control) or 4 (user-defined) are reachable. |
+| `engine.isSpecialToken(id)` → `Bool` | Inverse of `specialTokenId` — useful for filtering control tokens out of streamed output before rendering. |
 | `engine.hasChatTemplate()` → `Bool` | Check before render. |
 | `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
+| `engine.contextSize()` → `u64` | Resolved KV cap the engine was loaded with (defaults `0` requests back to the model's `max_seq_len` so callers don't see the internal `usize::MAX` sentinel). |
 
 ### Kotlin example
 

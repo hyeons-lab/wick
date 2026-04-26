@@ -294,6 +294,7 @@ See `wick/src/turboquant.rs` for the implementation and `wick/src/kv_cache.rs` f
 - **Bench harness** — `wick bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering
 - **Single static binary**
+- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeonslab/wick-wasm`) all driven from the same Rust core via `wick-ffi` (UniFFI) and `wick-wasm` (`wasm-bindgen`).
 
 ## Build
 
@@ -326,11 +327,13 @@ wick tokenize --model model.gguf "Hello world"
 
 ## Architecture
 
-Three-crate workspace:
+Five-crate workspace:
 
 - **`wick`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
 - **`wick-cli`** — CLI binary (clap, dispatches to `wick`)
 - **`wick-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`wick-ffi/README.md`](wick-ffi/README.md) for scope + roadmap.
+- **`wick-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeonslab/wick-wasm` shape). See [`wick-wasm/README.md`](wick-wasm/README.md) for usage + worker / cancellation patterns.
+- **`wick-parity`** — cross-binding parity harness that runs the same prompt through `wick`, `wick-ffi` (JNA / Swift), and reports drift. See [`wick-parity/README.md`](wick-parity/README.md).
 
 ### Module layout
 
