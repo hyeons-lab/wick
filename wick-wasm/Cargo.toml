@@ -6,12 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "wasm-bindgen browser/Node bindings for the wick inference engine"
-# wasm-pack reads this and packages the listed files into pkg/.
+# wasm-pack + cargo both read this when building / packaging.
 # The LICENSE-* entries are symlinks to the workspace-root copies
-# so we don't duplicate the text on disk; npm and git both follow
-# the symlinks transparently. The README is generated as
-# `pkg/README.md` (wasm-pack copies the crate's own README into
-# the pkg/), so we don't list it here — wasm-pack handles it.
+# so we don't duplicate the text on disk; cargo, npm, and git all
+# follow them transparently. README.md is listed explicitly so
+# crates.io picks it up if/when this crate is published there;
+# wasm-pack also copies it into `pkg/README.md` for the npm side.
 include = [
     "src/**/*",
     "Cargo.toml",

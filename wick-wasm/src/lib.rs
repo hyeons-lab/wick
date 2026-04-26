@@ -345,11 +345,14 @@ fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessa
     let array = value
         .dyn_ref::<js_sys::Array>()
         .ok_or_else(|| JsError::new("messages must be an array"))?;
-    let len = array.length() as usize;
-    let mut msgs = Vec::with_capacity(len);
+    // `js_sys::Array::length` returns `u32` and that's the index
+    // type `Array::get` takes — keep `len` in `u32` for the loop
+    // and only widen to `usize` at the `Vec::with_capacity` call.
+    let len = array.length();
+    let mut msgs = Vec::with_capacity(len as usize);
     let role_key = JsValue::from_str("role");
     let content_key = JsValue::from_str("content");
-    for i in 0..len as u32 {
+    for i in 0..len {
         let entry = array.get(i);
         let role = js_sys::Reflect::get(&entry, &role_key)
             .map_err(|_| JsError::new(&format!("messages[{i}] missing role")))?
