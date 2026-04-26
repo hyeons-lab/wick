@@ -354,17 +354,43 @@ fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessa
     let content_key = JsValue::from_str("content");
     for i in 0..len {
         let entry = array.get(i);
-        let role = js_sys::Reflect::get(&entry, &role_key)
-            .map_err(|_| JsError::new(&format!("messages[{i}] missing role")))?
-            .as_string()
-            .ok_or_else(|| JsError::new(&format!("messages[{i}].role must be a string")))?;
-        let content = js_sys::Reflect::get(&entry, &content_key)
-            .map_err(|_| JsError::new(&format!("messages[{i}] missing content")))?
-            .as_string()
-            .ok_or_else(|| JsError::new(&format!("messages[{i}].content must be a string")))?;
-        msgs.push(wick::tokenizer::ChatMessage { role, content });
+        msgs.push(wick::tokenizer::ChatMessage {
+            role: read_string_field(&entry, &role_key, "role", i)?,
+            content: read_string_field(&entry, &content_key, "content", i)?,
+        });
     }
     Ok(msgs)
+}
+
+/// Read a string-typed field off a JS object, distinguishing the
+/// three failure modes a JS caller will commonly hit so the thrown
+/// `JsError` actually points at the bug:
+///   - `entry` is not an object (`Reflect::get` errors)
+///   - the field is missing (`Reflect::get` returns `undefined`)
+///   - the field is present but not a string
+///
+/// `js_sys::Reflect::get` only `Err`s on the first case (proxy
+/// throws, target not Object); missing-property-on-an-Object
+/// returns `Ok(JsValue::UNDEFINED)`, which would otherwise
+/// silently fall through to a misleading "must be a string"
+/// message. Splitting the cases keeps `messages[i].role missing`
+/// distinguishable from `messages[i].role must be a string`.
+fn read_string_field(
+    entry: &JsValue,
+    key: &JsValue,
+    field_name: &str,
+    index: u32,
+) -> Result<String, JsError> {
+    let value = js_sys::Reflect::get(entry, key)
+        .map_err(|_| JsError::new(&format!("messages[{index}] is not an object")))?;
+    if value.is_undefined() {
+        return Err(JsError::new(&format!(
+            "messages[{index}] missing '{field_name}' field"
+        )));
+    }
+    value
+        .as_string()
+        .ok_or_else(|| JsError::new(&format!("messages[{index}].{field_name} must be a string")))
 }
 
 // ---------------------------------------------------------------------------
