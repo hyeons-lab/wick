@@ -945,6 +945,41 @@ impl Session {
         self.inner.cancel()
     }
 
+    /// Clear the cancel flag without dropping any session state.
+    /// Use this after observing a cancellation signal — either a
+    /// thrown cancellation error from `appendText` / `appendTokens`
+    /// (mid-prefill cancellation surfaces as a thrown error) or
+    /// `summary.finishReason === "Cancelled"` on the value
+    /// returned from `generate` (cancellation during decode is
+    /// reported via the finish reason, not a thrown error) — when
+    /// you want to resume work on the same session without losing
+    /// the accumulated KV cache.
+    ///
+    /// Compared to `reset()`:
+    /// - `clearCancel`: keeps KV state, `position`, and the
+    ///   sampler intact; only flips the cancel atomic back to
+    ///   `false`. Use for "interrupted but continuing" flows.
+    /// - `reset()`: drops KV cache, `position`, last logits, and
+    ///   re-seeds the sampler. Use for "clear conversation"
+    ///   flows.
+    ///
+    /// **Call sequencing:** invoke this *after* `generate` /
+    /// `appendText` / `appendTokens` has returned. Even though
+    /// the underlying wick method takes `&self`, wasm-bindgen's
+    /// JS-side borrow check on the `Session` wrapper rejects any
+    /// method call (including this `&self` one) while another
+    /// method is still borrowing the same handle — calling
+    /// `session.clearCancel()` from inside a `generate` token
+    /// callback would throw "recursive use of an object". The
+    /// `&self` Rust shape matters in the native binding
+    /// (`wick-ffi`) where there's no JS-side borrow check; in
+    /// wasm it just means there's no `&mut self` cost on the wick
+    /// core side.
+    #[wasm_bindgen(js_name = clearCancel)]
+    pub fn clear_cancel(&self) {
+        self.inner.clear_cancel()
+    }
+
     /// Drop accumulated state and return the session to a freshly-
     /// opened shape. Clears the KV cache, `position`, the last
     /// logits, and the cancel flag, then re-seeds the sampler from

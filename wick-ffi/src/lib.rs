@@ -1201,6 +1201,31 @@ impl Session {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Clear the cancel flag without dropping any session state.
+    /// Use this after observing a cancellation signal — either
+    /// [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+    /// / `append_audio` (mid-prefill cancellation surfaces
+    /// typed), or `finish_reason = "Cancelled"` on the
+    /// [`GenerateOutput`] returned from `generate` (cancellation
+    /// during decode is reported as an `Ok` with that finish
+    /// reason rather than an `Err`) — when you want to resume
+    /// work on the same session without losing the accumulated
+    /// KV cache.
+    ///
+    /// Compared to [`Self::reset`]:
+    /// - `clear_cancel`: keeps KV state + position + sampler
+    ///   intact; only flips the cancel atomic back to `false`.
+    ///   Use for "interrupted but continuing" flows.
+    /// - `reset`: drops KV cache + position + last logits +
+    ///   re-seeds sampler. Use for "clear conversation" flows.
+    ///
+    /// Atomic-backed; no mutex acquire, infallible, safe from
+    /// any thread (mirrors the shape of [`Self::cancel`]).
+    pub fn clear_cancel(&self) {
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Drop cached state + resample the seed. After `reset()` the
     /// session behaves like a freshly-opened one (same
     /// model/tokenizer/config, no accumulated context).

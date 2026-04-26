@@ -1466,6 +1466,30 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func capabilities()  -> ModalityCapabilities
     
     /**
+     * Clear the cancel flag without dropping any session state.
+     * Use this after observing a cancellation signal — either
+     * [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+     * / `append_audio` (mid-prefill cancellation surfaces
+     * typed), or `finish_reason = "Cancelled"` on the
+     * [`GenerateOutput`] returned from `generate` (cancellation
+     * during decode is reported as an `Ok` with that finish
+     * reason rather than an `Err`) — when you want to resume
+     * work on the same session without losing the accumulated
+     * KV cache.
+     *
+     * Compared to [`Self::reset`]:
+     * - `clear_cancel`: keeps KV state + position + sampler
+     * intact; only flips the cancel atomic back to `false`.
+     * Use for "interrupted but continuing" flows.
+     * - `reset`: drops KV cache + position + last logits +
+     * re-seeds sampler. Use for "clear conversation" flows.
+     *
+     * Atomic-backed; no mutex acquire, infallible, safe from
+     * any thread (mirrors the shape of [`Self::cancel`]).
+     */
+    func clearCancel() 
+    
+    /**
      * Run autoregressive decode and return all emitted tokens +
      * a summary. Synchronous — the call blocks until the decode
      * loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -1730,6 +1754,35 @@ open func capabilities() -> ModalityCapabilities  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Clear the cancel flag without dropping any session state.
+     * Use this after observing a cancellation signal — either
+     * [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+     * / `append_audio` (mid-prefill cancellation surfaces
+     * typed), or `finish_reason = "Cancelled"` on the
+     * [`GenerateOutput`] returned from `generate` (cancellation
+     * during decode is reported as an `Ok` with that finish
+     * reason rather than an `Err`) — when you want to resume
+     * work on the same session without losing the accumulated
+     * KV cache.
+     *
+     * Compared to [`Self::reset`]:
+     * - `clear_cancel`: keeps KV state + position + sampler
+     * intact; only flips the cancel atomic back to `false`.
+     * Use for "interrupted but continuing" flows.
+     * - `reset`: drops KV cache + position + last logits +
+     * re-seeds sampler. Use for "clear conversation" flows.
+     *
+     * Atomic-backed; no mutex acquire, infallible, safe from
+     * any thread (mirrors the shape of [`Self::cancel`]).
+     */
+open func clearCancel()  {try! rustCall() {
+    uniffi_wick_ffi_fn_method_session_clear_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
     /**
@@ -3818,6 +3871,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_session_capabilities() != 13393) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_session_clear_cancel() != 40022) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_session_generate() != 53155) {

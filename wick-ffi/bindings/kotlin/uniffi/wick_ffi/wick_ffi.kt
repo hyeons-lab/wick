@@ -860,6 +860,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_method_session_capabilities(): Short
 
+    external fun uniffi_wick_ffi_checksum_method_session_clear_cancel(): Short
+
     external fun uniffi_wick_ffi_checksum_method_session_generate(): Short
 
     external fun uniffi_wick_ffi_checksum_method_session_generate_async(): Short
@@ -1046,6 +1048,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_session_clear_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_wick_ffi_fn_method_session_generate(
         `ptr`: Long,
@@ -1424,6 +1431,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_session_capabilities() != 13393.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_session_clear_cancel() != 40022.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_session_generate() != 53155.toShort()) {
@@ -3255,6 +3265,30 @@ public interface SessionInterface {
     fun `capabilities`(): ModalityCapabilities
 
     /**
+     * Clear the cancel flag without dropping any session state.
+     * Use this after observing a cancellation signal — either
+     * [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+     * / `append_audio` (mid-prefill cancellation surfaces
+     * typed), or `finish_reason = "Cancelled"` on the
+     * [`GenerateOutput`] returned from `generate` (cancellation
+     * during decode is reported as an `Ok` with that finish
+     * reason rather than an `Err`) — when you want to resume
+     * work on the same session without losing the accumulated
+     * KV cache.
+     *
+     * Compared to [`Self::reset`]:
+     * - `clear_cancel`: keeps KV state + position + sampler
+     * intact; only flips the cancel atomic back to `false`.
+     * Use for "interrupted but continuing" flows.
+     * - `reset`: drops KV cache + position + last logits +
+     * re-seeds sampler. Use for "clear conversation" flows.
+     *
+     * Atomic-backed; no mutex acquire, infallible, safe from
+     * any thread (mirrors the shape of [`Self::cancel`]).
+     */
+    fun `clearCancel`()
+
+    /**
      * Run autoregressive decode and return all emitted tokens +
      * a summary. Synchronous — the call blocks until the decode
      * loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -3595,6 +3629,38 @@ open class Session :
                 }
             },
         )
+
+    /**
+     * Clear the cancel flag without dropping any session state.
+     * Use this after observing a cancellation signal — either
+     * [`FfiError::Cancelled`] from `append_text` / `append_tokens`
+     * / `append_audio` (mid-prefill cancellation surfaces
+     * typed), or `finish_reason = "Cancelled"` on the
+     * [`GenerateOutput`] returned from `generate` (cancellation
+     * during decode is reported as an `Ok` with that finish
+     * reason rather than an `Err`) — when you want to resume
+     * work on the same session without losing the accumulated
+     * KV cache.
+     *
+     * Compared to [`Self::reset`]:
+     * - `clear_cancel`: keeps KV state + position + sampler
+     * intact; only flips the cancel atomic back to `false`.
+     * Use for "interrupted but continuing" flows.
+     * - `reset`: drops KV cache + position + last logits +
+     * re-seeds sampler. Use for "clear conversation" flows.
+     *
+     * Atomic-backed; no mutex acquire, infallible, safe from
+     * any thread (mirrors the shape of [`Self::cancel`]).
+     */
+    override fun `clearCancel`() =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_wick_ffi_fn_method_session_clear_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     /**
      * Run autoregressive decode and return all emitted tokens +
