@@ -708,16 +708,16 @@ pub fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32)
     }
 }
 
-/// Exact GELU activation in-place using the erf form:
-/// `gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`.
+/// erf-form GELU activation in-place:
+/// `gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`, using a polynomial
+/// approximation of `erf` (max abs error ~1.5e-7) — close enough that
+/// downstream f32 activations carry the precision floor, but not the
+/// "exact GELU" of higher-precision libm impls.
 ///
 /// Used by the Conformer audio encoder's MLP adapter (`mm.a.mlp`).
-/// LFM2's main path uses SiLU (`silu_inplace`); the audio encoder is the
-/// only consumer of GELU today, so this lives in the encoder-kernels
-/// section rather than next to SiLU. Calls `libm::erff` indirectly via
-/// `f32::erf` once it stabilizes; for now uses a Numerical-Recipes-style
-/// rational approximation matching ggml's `ggml_gelu_erf` to within the
-/// last ULP for the typical activation range.
+/// LFM2's main path uses SiLU (`silu_inplace`); the audio encoder is
+/// the only consumer of GELU today, so this lives in the
+/// encoder-kernels section rather than next to SiLU.
 pub fn gelu_erf_inplace(x: &mut [f32]) {
     // sqrt(2)^-1 ≈ 0.7071067811865476
     const INV_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -726,15 +726,12 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
     }
 }
 
-/// Approximation of `erf(x)` for `f32`. Abramowitz & Stegun 7.1.26 form
-/// (max abs error ~1.5e-7 in the range we care about — well below the
-/// inherent f32 precision floor of GELU activations downstream).
-///
-/// `f32::erf` doesn't exist in stable `std`, and the only crates that
-/// provide it (`libm`, `statrs`) would add a dep for one function.
-/// Wick already avoids that pattern (`ggml_expf` was hand-written for
-/// the same reason). This matches the `gelu_erf_f32` kernel in ggml's
-/// CPU implementation.
+/// Approximation of `erf(x)` for `f32`. Abramowitz & Stegun 7.1.26
+/// form, max abs error ~1.5e-7. `f32::erf` isn't in stable `std`, and
+/// adding `libm` for one function would break the "no extra math deps
+/// where wick has a hand-rolled equivalent" pattern (`ggml_expf` set
+/// the precedent). Uses `ggml_expf` for the inner exponential to stay
+/// consistent with that pattern.
 fn erff(x: f32) -> f32 {
     // Constants from Abramowitz & Stegun 7.1.26 (truncated to f32
     // precision; original tabulated values have more digits but they
@@ -749,17 +746,26 @@ fn erff(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let abs_x = x.abs();
     let t = 1.0 / (1.0 + P * abs_x);
-    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-abs_x * abs_x).exp();
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * ggml_expf(-abs_x * abs_x);
     sign * y
 }
 
-/// 1D convolution along the time dimension. Generic enough to cover both
-/// "standard" and "depthwise" conv1d via the `groups` argument:
+/// 1D convolution along the time dimension. Writes to a separate
+/// `output` buffer (not in-place over `input`) — name omits the
+/// `_inplace` suffix to reflect that.
+///
+/// Generic enough to cover standard, depthwise, and grouped conv1d
+/// via the `groups` argument:
 ///
 /// - `groups = 1`: every output channel sees every input channel
 ///   (standard conv).
-/// - `groups = in_channels = out_channels`: depthwise conv, each output
-///   channel uses exactly one matching input channel.
+/// - `groups > 1, out_channels = in_channels`: depthwise conv, one
+///   kernel per channel.
+/// - `groups > 1, out_channels = in_channels × M` for some integer
+///   multiplier `M`: depthwise with channel multiplier (each input
+///   channel maps to `M` output channels).
+/// - Other `groups` values that divide both `in_channels` and
+///   `out_channels`: grouped conv.
 ///
 /// Layout:
 /// - `input`:  `[in_channels × t_in]`, row-major (channel-major).
@@ -767,10 +773,10 @@ fn erff(x: f32) -> f32 {
 ///   row-major. Matches the GGUF `[O, I/G, K]` shape that the Conformer
 ///   stem (`a.conv1d.{i}.weight`) and per-block depthwise conv
 ///   (`a.blk.{i}.conv_dw.weight`) ship.
-/// - `bias`:   `[out_channels]`. Pass an all-zeros slice if the layer
-///   has no bias.
-/// - `output`: `[out_channels × t_out]`, written in-place. Caller sizes
-///   it; this fn computes `t_out` from the standard formula and
+/// - `bias`:   `Some(&[out_channels])` to add a per-output-channel
+///   bias; `None` for a bias-less layer (no allocation needed).
+/// - `output`: `[out_channels × t_out]`, written by this fn. Caller
+///   sizes it; the fn computes `t_out` from the standard formula and
 ///   returns it for sanity assertion. `t_out = ((t_in + 2*pad - kernel)
 ///   / stride) + 1`.
 ///
@@ -782,10 +788,10 @@ fn erff(x: f32) -> f32 {
 /// throughput dominates over per-frame latency. Metal acceleration
 /// lands in a follow-up PR using the same shape signature.
 #[allow(clippy::too_many_arguments)]
-pub fn conv1d_inplace(
+pub fn conv1d(
     input: &[f32],
     weight: &[f32],
-    bias: &[f32],
+    bias: Option<&[f32]>,
     output: &mut [f32],
     in_channels: usize,
     out_channels: usize,
@@ -795,10 +801,15 @@ pub fn conv1d_inplace(
     pad: usize,
     groups: usize,
 ) -> usize {
+    debug_assert!(stride > 0, "stride must be > 0");
+    debug_assert!(groups > 0, "groups must be > 0");
+    debug_assert!(kernel_size > 0, "kernel_size must be > 0");
     debug_assert_eq!(input.len(), in_channels * t_in);
     debug_assert!(in_channels % groups == 0);
     debug_assert!(out_channels % groups == 0);
-    debug_assert_eq!(bias.len(), out_channels);
+    if let Some(b) = bias {
+        debug_assert_eq!(b.len(), out_channels);
+    }
     let in_per_group = in_channels / groups;
     let out_per_group = out_channels / groups;
     debug_assert_eq!(weight.len(), out_channels * in_per_group * kernel_size);
@@ -808,17 +819,14 @@ pub fn conv1d_inplace(
     let t_out = (padded_t_in - kernel_size) / stride + 1;
     debug_assert_eq!(output.len(), out_channels * t_out);
 
-    // Zero output before accumulation. Using fill rather than re-loop in
-    // the inner accumulator keeps the inner loop branch-free.
-    output.fill(0.0);
-
     for g in 0..groups {
         for oc_local in 0..out_per_group {
             let oc = g * out_per_group + oc_local;
-            let bias_v = bias[oc];
+            let bias_v = bias.map_or(0.0, |b| b[oc]);
 
-            // Pre-bias every output position for this channel — saves a
-            // branch in the inner loop.
+            // Pre-bias every output position for this channel — also
+            // doubles as the zero-init pass since the accumulator
+            // below uses `+=` over multiple input channels.
             let out_row_start = oc * t_out;
             for ot in 0..t_out {
                 output[out_row_start + ot] = bias_v;
@@ -1961,9 +1969,8 @@ mod tests {
             1.0, 0.0, // out 0: in 0=1, in 1=0
             0.0, 1.0, // out 1: in 0=0, in 1=1
         ];
-        let bias = vec![0.0; 2];
         let mut output = vec![0.0; 2 * 3];
-        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 2, 2, 3, 1, 1, 0, 1);
+        let t_out = conv1d(&input, &weight, None, &mut output, 2, 2, 3, 1, 1, 0, 1);
         assert_eq!(t_out, 3);
         assert_eq!(output, input);
     }
@@ -1983,9 +1990,8 @@ mod tests {
             1.0, 0.0, 0.0, // ch 0 kernel
             0.0, 0.0, 1.0, // ch 1 kernel
         ];
-        let bias = vec![0.0; 2];
         let mut output = vec![0.0; 2 * 4];
-        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 2, 2, 4, 3, 1, 1, 2);
+        let t_out = conv1d(&input, &weight, None, &mut output, 2, 2, 4, 3, 1, 1, 2);
         assert_eq!(t_out, 4);
         // Channel 0: shift left by 1 with zero pad → [0, 1, 2, 3]
         assert_eq!(&output[0..4], &[0.0, 1.0, 2.0, 3.0]);
@@ -1998,9 +2004,8 @@ mod tests {
         // 1 channel, kernel=2, stride=2, pad=0. Halves the timesteps.
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 6 timesteps
         let weight = vec![1.0, 1.0]; // sum-pair kernel
-        let bias = vec![0.0];
         let mut output = vec![0.0; 3]; // (6-2)/2 + 1 = 3
-        let t_out = conv1d_inplace(&input, &weight, &bias, &mut output, 1, 1, 6, 2, 2, 0, 1);
+        let t_out = conv1d(&input, &weight, None, &mut output, 1, 1, 6, 2, 2, 0, 1);
         assert_eq!(t_out, 3);
         // Sum pairs: [1+2, 3+4, 5+6] = [3, 7, 11]
         assert_eq!(output, vec![3.0, 7.0, 11.0]);
@@ -2012,7 +2017,19 @@ mod tests {
         let weight = vec![1.0]; // 1×1 identity
         let bias = vec![5.0];
         let mut output = vec![0.0; 3];
-        conv1d_inplace(&input, &weight, &bias, &mut output, 1, 1, 3, 1, 1, 0, 1);
+        conv1d(
+            &input,
+            &weight,
+            Some(&bias),
+            &mut output,
+            1,
+            1,
+            3,
+            1,
+            1,
+            0,
+            1,
+        );
         // Input + bias.
         assert_eq!(output, vec![6.0, 7.0, 8.0]);
     }
