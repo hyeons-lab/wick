@@ -945,6 +945,29 @@ impl Session {
         self.inner.cancel()
     }
 
+    /// Clear the cancel flag without dropping any session state.
+    /// Use this after handling a `"Cancelled"` finish reason from
+    /// `generate` (or a thrown cancellation error from
+    /// `appendTokens`) when you want to resume work on the same
+    /// session without losing the accumulated KV cache.
+    ///
+    /// Compared to `reset()`:
+    /// - `clearCancel`: keeps KV state, `position`, and the
+    ///   sampler intact; only flips the cancel atomic back to
+    ///   `false`. Use for "interrupted but continuing" flows.
+    /// - `reset()`: drops KV cache, `position`, last logits, and
+    ///   re-seeds the sampler. Use for "clear conversation"
+    ///   flows.
+    ///
+    /// Takes `&self` (atomic-only, like `cancel()`), so it's
+    /// callable while another borrow of the session is live —
+    /// e.g. from inside a token callback that already holds a
+    /// reference for the duration of `generate`.
+    #[wasm_bindgen(js_name = clearCancel)]
+    pub fn clear_cancel(&self) {
+        self.inner.clear_cancel()
+    }
+
     /// Drop accumulated state and return the session to a freshly-
     /// opened shape. Clears the KV cache, `position`, the last
     /// logits, and the cancel flag, then re-seeds the sampler from

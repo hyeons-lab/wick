@@ -411,6 +411,11 @@ void uniffi_wick_ffi_fn_method_session_cancel(uint64_t ptr, RustCallStatus *_Non
 RustBuffer uniffi_wick_ffi_fn_method_session_capabilities(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_CLEAR_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_CLEAR_CANCEL
+void uniffi_wick_ffi_fn_method_session_clear_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_GENERATE
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_SESSION_GENERATE
 RustBuffer uniffi_wick_ffi_fn_method_session_generate(uint64_t ptr, RustBuffer opts, RustCallStatus *_Nonnull out_status
@@ -862,6 +867,12 @@ uint16_t uniffi_wick_ffi_checksum_method_session_cancel(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_CAPABILITIES
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_CAPABILITIES
 uint16_t uniffi_wick_ffi_checksum_method_session_capabilities(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_CLEAR_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_SESSION_CLEAR_CANCEL
+uint16_t uniffi_wick_ffi_checksum_method_session_clear_cancel(void
     
 );
 #endif
