@@ -777,8 +777,8 @@ fn erff(x: f32) -> f32 {
 ///   bias; `None` for a bias-less layer (no allocation needed).
 /// - `output`: `[out_channels × t_out]`, written by this fn. Caller
 ///   sizes it; the fn computes `t_out` from the standard formula and
-///   returns it for sanity assertion. `t_out = ((t_in + 2*pad - kernel)
-///   / stride) + 1`.
+///   returns it for sanity assertion.
+///   `t_out = ((t_in + 2*pad - kernel_size) / stride) + 1`.
 ///
 /// Padding is symmetric (same on both ends); causal/asymmetric padding
 /// is the caller's job (zero-pad `input` before calling).
