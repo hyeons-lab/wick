@@ -16,6 +16,40 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+// Custom TypeScript declarations injected into the generated
+// `wick_wasm.d.ts`. wasm-bindgen would otherwise type wasm-side
+// `JsValue` parameters as `any`, losing IDE completion + type
+// checking for the structured shapes we expect from JS callers.
+//
+// Each `extern "C" { #[wasm_bindgen(typescript_type = "...")]
+// pub type T; }` block below declares a Rust-side opaque handle
+// whose only purpose is to carry a custom TS type label. At
+// runtime these are still plain `JsValue`s.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_APPEND: &'static str = r#"
+/**
+ * One entry in the chat-message array passed to
+ * `Tokenizer.applyChatTemplate`. Mirrors the OpenAI / Anthropic
+ * SDK shape — wick currently models only `role` and `content`;
+ * tool-calls / function-calls are not yet supported.
+ */
+export interface ChatMessage {
+    role: string;
+    content: string;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Opaque type-label wrapper for `ChatMessage[]` — the
+    /// argument shape `Tokenizer.applyChatTemplate` accepts.
+    /// At the wasm boundary this is just a JsValue array; the
+    /// generated .d.ts surfaces it as `ChatMessage[]` so JS/TS
+    /// callers get IDE completion + type checking.
+    #[wasm_bindgen(typescript_type = "ChatMessage[]")]
+    pub type ChatMessageArray;
+}
+
 /// Returns the version of the `wick` core library this binding wraps.
 ///
 /// Note this is **`wick`'s** version, not `wick-wasm`'s — JS callers
@@ -330,10 +364,15 @@ impl Tokenizer {
     #[wasm_bindgen(js_name = applyChatTemplate)]
     pub fn apply_chat_template(
         &self,
-        messages: JsValue,
+        messages: ChatMessageArray,
         add_generation_prompt: Option<bool>,
     ) -> Result<String, JsError> {
-        let msgs = parse_chat_messages(&messages)?;
+        // `ChatMessageArray` is a wasm-bindgen opaque type-label
+        // wrapper around `JsValue` — the runtime check + parse
+        // still happens in `parse_chat_messages`. The TS-side
+        // win is purely surface (callers get `ChatMessage[]`
+        // instead of `any`).
+        let msgs = parse_chat_messages(messages.as_ref())?;
         wick::tokenizer::apply_chat_template(
             &self.inner,
             &msgs,
