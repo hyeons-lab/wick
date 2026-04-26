@@ -523,16 +523,29 @@ impl SessionConfig {
 
     /// KV cache compression configuration. `null` (default) stores
     /// keys and values as f32 — best fidelity, biggest memory
-    /// footprint. Set to a [`TurboQuantConfig`] to enable
+    /// footprint. Set to a [`TurboQuantConfig`] to **request**
     /// TurboQuant compression — keys to ~3 bits/elem, values to
     /// ~2 bits/elem (plus f16 norms per block); the same `seed`
     /// reproduces the same per-layer Hadamard rotations
     /// deterministically.
     ///
+    /// **Silent fallbacks to be aware of:**
+    /// - TurboQuant only kicks in when the loaded model's
+    ///   attention `head_dim` is a power of two (a constraint of
+    ///   the Hadamard rotation). If it isn't, wick logs a warning
+    ///   and falls back to the uncompressed f32 path even with
+    ///   this set — there's no JS-visible error, just no
+    ///   compression.
+    /// - `nKeep` (context-shift) is incompatible with TurboQuant.
+    ///   Setting both gets a warning at session creation and the
+    ///   `nKeep` value is ignored on KV overflow (the cache
+    ///   overflows hard instead of shifting). Pick one.
+    ///
     /// Setting this consumes the JS-side `TurboQuantConfig`
     /// handle (wasm-bindgen's `Option<T>` parameter shape). Read
-    /// back via the getter — which returns a fresh handle — if
-    /// you need to inspect the current config.
+    /// back via the getter — which returns a fresh handle that's
+    /// a snapshot, not a live link — if you need to inspect the
+    /// current config without affecting it.
     #[wasm_bindgen(getter, js_name = kvCompression)]
     pub fn kv_compression(&self) -> Option<TurboQuantConfig> {
         match &self.inner.kv_compression {
