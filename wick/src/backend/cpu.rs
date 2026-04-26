@@ -830,9 +830,7 @@ pub fn conv1d(
             // doubles as the zero-init pass since the accumulator
             // below uses `+=` over multiple input channels.
             let out_row_start = oc * t_out;
-            for ot in 0..t_out {
-                output[out_row_start + ot] = bias_v;
-            }
+            output[out_row_start..out_row_start + t_out].fill(bias_v);
 
             for ic_local in 0..in_per_group {
                 let ic = g * in_per_group + ic_local;
@@ -1986,18 +1984,21 @@ mod tests {
             5.0, 6.0, 7.0, 8.0, // channel 1
         ];
         // groups=2 (depthwise), weight shape [out=2, in/groups=1, k=3].
-        // Kernel = [1, 0, 0] for channel 0 → shifts left by 1 (with pad).
-        // Kernel = [0, 0, 1] for channel 1 → shifts right by 1.
+        // With pad=1, output[t] = sum_k input[t+k-1] * kernel[k].
+        // Kernel = [1, 0, 0] taps input[t-1] only → values shift RIGHT
+        // by 1 (each output position takes the value to its left).
+        // Kernel = [0, 0, 1] taps input[t+1] only → values shift LEFT
+        // by 1 (each output position takes the value to its right).
         let weight = vec![
-            1.0, 0.0, 0.0, // ch 0 kernel
-            0.0, 0.0, 1.0, // ch 1 kernel
+            1.0, 0.0, 0.0, // ch 0 kernel — right-shift / delay
+            0.0, 0.0, 1.0, // ch 1 kernel — left-shift / advance
         ];
         let mut output = vec![0.0; 2 * 4];
         let t_out = conv1d(&input, &weight, None, &mut output, 2, 2, 4, 3, 1, 1, 2);
         assert_eq!(t_out, 4);
-        // Channel 0: shift left by 1 with zero pad → [0, 1, 2, 3]
+        // Channel 0 input [1,2,3,4] right-shift → [0, 1, 2, 3] (pad fills the leading zero).
         assert_eq!(&output[0..4], &[0.0, 1.0, 2.0, 3.0]);
-        // Channel 1: shift right by 1 with zero pad → [6, 7, 8, 0]
+        // Channel 1 input [5,6,7,8] left-shift → [6, 7, 8, 0] (pad fills the trailing zero).
         assert_eq!(&output[4..8], &[6.0, 7.0, 8.0, 0.0]);
     }
 
