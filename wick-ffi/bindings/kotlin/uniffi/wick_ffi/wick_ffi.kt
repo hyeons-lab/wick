@@ -888,6 +888,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_has_chat_template(): Short
 
+    external fun uniffi_wick_ffi_checksum_method_wickengine_is_special_token(): Short
+
     external fun uniffi_wick_ffi_checksum_method_wickengine_metadata(): Short
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_new_session(): Short
@@ -1153,6 +1155,12 @@ internal object UniffiLib {
 
     external fun uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_is_special_token(
+        `ptr`: Long,
+        `id`: Int,
         uniffi_out_err: UniffiRustCallStatus,
     ): Byte
 
@@ -1473,6 +1481,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_has_chat_template() != 54268.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_is_special_token() != 18773.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_metadata() != 60987.toShort()) {
@@ -4048,6 +4059,20 @@ public interface WickEngineInterface {
     fun `hasChatTemplate`(): kotlin.Boolean
 
     /**
+     * `true` when `id` is registered as a control or user-defined
+     * special token in the model's GGUF metadata
+     * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+     * output filtering — e.g. dropping `<|im_end|>` from streamed
+     * tokens before rendering them to a UI — and for token-class
+     * classification in analysis tools.
+     *
+     * Out-of-range IDs (>= vocab size) and regular vocab tokens
+     * both return `false`. Companion to [`Self::special_token_id`]
+     * which goes the other direction (name → ID).
+     */
+    fun `isSpecialToken`(`id`: kotlin.UInt): kotlin.Boolean
+
+    /**
      * Short summary of the loaded model (architecture, vocab size,
      * max context, etc.). Returns a `Clone` of the stored metadata.
      */
@@ -4312,6 +4337,31 @@ open class WickEngine :
                 uniffiRustCall { _status ->
                     UniffiLib.uniffi_wick_ffi_fn_method_wickengine_has_chat_template(
                         it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * `true` when `id` is registered as a control or user-defined
+     * special token in the model's GGUF metadata
+     * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+     * output filtering — e.g. dropping `<|im_end|>` from streamed
+     * tokens before rendering them to a UI — and for token-class
+     * classification in analysis tools.
+     *
+     * Out-of-range IDs (>= vocab size) and regular vocab tokens
+     * both return `false`. Companion to [`Self::special_token_id`]
+     * which goes the other direction (name → ID).
+     */
+    override fun `isSpecialToken`(`id`: kotlin.UInt): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_is_special_token(
+                        it,
+                        FfiConverterUInt.lower(`id`),
                         _status,
                     )
                 }

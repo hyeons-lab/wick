@@ -440,6 +440,22 @@ impl Tokenizer {
         self.inner.special_token_id(name)
     }
 
+    /// `true` when `id` is registered as a control or user-defined
+    /// special token in the model's GGUF metadata
+    /// (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+    /// output filtering — e.g. dropping `<|im_end|>` from a
+    /// `Session.generate` token-callback batch before joining the
+    /// IDs into UI-rendered text — and for token-class
+    /// classification in analysis tools.
+    ///
+    /// Out-of-range IDs (>= vocab size) and regular vocab tokens
+    /// both return `false`. Companion to `specialTokenId` which
+    /// goes the other direction (name → ID).
+    #[wasm_bindgen(js_name = isSpecialToken)]
+    pub fn is_special_token(&self, id: u32) -> bool {
+        self.inner.is_special_token(id)
+    }
+
     /// Raw embedded Jinja chat template from the GGUF metadata, if
     /// any. Most callers should use [`Self::apply_chat_template`]
     /// (`applyChatTemplate` in JS) instead — this getter is for
