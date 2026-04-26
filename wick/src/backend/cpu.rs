@@ -732,6 +732,7 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
 /// where wick has a hand-rolled equivalent" pattern (`ggml_expf` set
 /// the precedent). Uses `ggml_expf` for the inner exponential to stay
 /// consistent with that pattern.
+#[inline(always)]
 fn erff(x: f32) -> f32 {
     // Constants from Abramowitz & Stegun 7.1.26 (truncated to f32
     // precision; original tabulated values have more digits but they
