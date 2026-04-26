@@ -136,6 +136,35 @@ session.free();
 engine.free();
 ```
 
+### Reproducibility (seeded sampler)
+
+Pass a `SessionConfig` with a fixed `seed` to `newSession` so the
+sampler RNG is deterministic across runs. Same seed + same prompt
++ same `GenerateOpts` → identical token sequence:
+
+```js
+import { WickEngine, SessionConfig, GenerateOpts } from '@hyeonslab/wick-wasm';
+
+const cfg = new SessionConfig();
+cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
+
+// You can also tune:
+//   cfg.maxSeqLen = 1024;   // override the model's KV cap
+//   cfg.nKeep = 16;         // pin the first 16 tokens across context shifts
+//                           // (useful for keeping a system prompt resident)
+//   cfg.ubatchSize = 256;   // smaller chunked-prefill batches give finer
+//                           // session.cancel() checkpoints during long prompts
+
+const session = engine.newSession(cfg);
+session.appendText('once upon a time');
+const opts = new GenerateOpts();
+opts.maxTokens = 16;
+opts.temperature = 1.0;  // non-greedy so the seed actually matters
+const out = [];
+session.generate(opts, (toks) => out.push(...toks));
+// `out` is identical for any session built with the same seed + prompt + opts.
+```
+
 > **Worker note:** `Session.generate` is **synchronous** and blocks
 > the thread it runs on for the full decode duration (potentially
 > seconds). On the browser main thread that freezes the page —

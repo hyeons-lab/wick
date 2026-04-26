@@ -224,18 +224,24 @@ impl WickEngine {
         }
     }
 
-    /// Construct a new `Session` for this engine, using the default
-    /// `SessionConfig` (no `n_keep`, no KV compression, model's own
-    /// `max_seq_len`). Customizable per-field session config will land
-    /// when concrete consumers ask.
+    /// Construct a new `Session` for this engine. Pass a
+    /// [`SessionConfig`] to override per-session knobs
+    /// (sampler `seed`, `n_keep` pinned-prefix size,
+    /// `ubatch_size` chunked-prefill batch, `max_seq_len`
+    /// KV cap); omit / pass `null` for the wick defaults
+    /// (`max_seq_len = model's max`, `n_keep = 0`,
+    /// `seed = null`, `ubatch_size = 512`).
     ///
     /// The returned `Session` keeps its own `Arc` clones of the
     /// engine's model and tokenizer, so freeing the engine doesn't
     /// invalidate any in-flight sessions.
     #[wasm_bindgen(js_name = newSession)]
-    pub fn new_session(&self) -> Session {
+    pub fn new_session(&self, config: Option<SessionConfig>) -> Session {
+        let cfg = config
+            .map(|c| c.inner)
+            .unwrap_or_else(wick::SessionConfig::default);
         Session {
-            inner: self.inner.new_session(wick::SessionConfig::default()),
+            inner: self.inner.new_session(cfg),
         }
     }
 }
@@ -396,6 +402,78 @@ fn read_string_field(
 // ---------------------------------------------------------------------------
 // Session + generate
 // ---------------------------------------------------------------------------
+
+/// Per-session knobs frozen at `WickEngine.newSession(config)` time.
+/// Constructed via `new SessionConfig()` in JS (returns the wick
+/// defaults: `maxSeqLen=null` → model's own max, `nKeep=0`,
+/// `seed=null`, `ubatchSize=512`).
+///
+/// `kvCompression` (TurboQuant) is intentionally not exposed yet —
+/// its variant has its own nested config (keys/values toggles +
+/// per-layer seed) that deserves a dedicated design pass. v1 of
+/// `SessionConfig` ships without compression knobs.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct SessionConfig {
+    inner: wick::SessionConfig,
+}
+
+#[wasm_bindgen]
+impl SessionConfig {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cap on total tokens held in KV. `null` defers to the model's
+    /// own `max_seq_len` (the common case).
+    #[wasm_bindgen(getter, js_name = maxSeqLen)]
+    pub fn max_seq_len(&self) -> Option<u32> {
+        self.inner.max_seq_len
+    }
+    #[wasm_bindgen(setter, js_name = maxSeqLen)]
+    pub fn set_max_seq_len(&mut self, v: Option<u32>) {
+        self.inner.max_seq_len = v;
+    }
+
+    /// Number of leading tokens pinned in KV across context shifts —
+    /// a system prompt or persistent prefix that should survive
+    /// when the cache fills. `0` (default) disables the pin.
+    #[wasm_bindgen(getter, js_name = nKeep)]
+    pub fn n_keep(&self) -> u32 {
+        self.inner.n_keep
+    }
+    #[wasm_bindgen(setter, js_name = nKeep)]
+    pub fn set_n_keep(&mut self, v: u32) {
+        self.inner.n_keep = v;
+    }
+
+    /// Deterministic sampler seed. `null` (default) uses a fresh
+    /// random seed per session — set this to make a session's
+    /// outputs reproducible across runs (useful for testing /
+    /// demos / regression checks).
+    #[wasm_bindgen(getter)]
+    pub fn seed(&self) -> Option<u64> {
+        self.inner.seed
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_seed(&mut self, v: Option<u64>) {
+        self.inner.seed = v;
+    }
+
+    /// Chunked-prefill batch size (tokens per micro-batch during
+    /// the prefill pass). Smaller values give finer-grained
+    /// `Session.cancel()` checkpoints during long prompt eval at
+    /// some perf cost. wick's default is `512`.
+    #[wasm_bindgen(getter, js_name = ubatchSize)]
+    pub fn ubatch_size(&self) -> u32 {
+        self.inner.ubatch_size
+    }
+    #[wasm_bindgen(setter, js_name = ubatchSize)]
+    pub fn set_ubatch_size(&mut self, v: u32) {
+        self.inner.ubatch_size = v;
+    }
+}
 
 /// Per-call generation options. Constructed via `new GenerateOpts()`
 /// in JS (returns the wick defaults: `maxTokens=256`,
