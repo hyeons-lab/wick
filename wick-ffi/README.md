@@ -609,11 +609,11 @@ messages without going through `Session::append_text`. Useful for:
 | `engine.decodeTokens(tokens)` → `String` | Detokenize. |
 | `engine.vocabSize()` → `u32` | Total vocab size. |
 | `engine.bosToken()` / `engine.eosToken()` → `u32?` | Common special tokens (typo-safe getters for the two everyone needs). |
-| `engine.specialTokenId(name)` → `u32?` | Lookup by literal vocab name (e.g. `<\|im_start\|>`). Only tokens with `tokenizer.ggml.token_type` 3 (control) or 4 (user-defined) are reachable. |
+| `engine.specialTokenId(name)` → `u32?` | Lookup by literal vocab name (e.g. <code>&lt;|im_start|&gt;</code>). Only tokens with `tokenizer.ggml.token_type` 3 (control) or 4 (user-defined) are reachable. |
 | `engine.isSpecialToken(id)` → `Bool` | Inverse of `specialTokenId` — useful for filtering control tokens out of streamed output before rendering. |
 | `engine.hasChatTemplate()` → `Bool` | Check before render. |
 | `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
-| `engine.contextSize()` → `u64` | Resolved KV cap the engine was loaded with (defaults `0` requests back to the model's `max_seq_len` so callers don't see the internal `usize::MAX` sentinel). |
+| `engine.contextSize()` → `u64` | **Requested** engine `context_size` after applying the `0` → model `max_seq_len` default (so callers never see the internal `usize::MAX` sentinel). This is the engine-level config readback, **not** the per-session ceiling — wick clamps the model's `max_seq_len` to `min(requested, gguf_max)` at load time, so `engine.metadata().maxSeqLen` is the effective cap. |
 
 ### Kotlin example
 
@@ -762,16 +762,18 @@ without paying `engine.newSession(...)` setup cost again:
 | `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button — start fresh on the same model + tokenizer |
 
 ```kotlin
+val tokensBefore = session.position().toInt()       // snapshot before the call
 try {
-    session.appendTokens(longPrompt)        // may throw FfiError.Cancelled mid-prefill
+    session.appendTokens(longPrompt)                // may throw FfiException.Cancelled mid-prefill
 } catch (e: FfiException.Cancelled) {
-    val consumed = (session.position() - tokensBefore.toUInt()).toInt()
-    session.clearCancel()                   // resume without losing KV
+    val consumed = session.position().toInt() - tokensBefore
+    session.clearCancel()                           // resume without losing KV
     session.appendTokens(longPrompt.drop(consumed))
 }
 ```
 
 ```swift
+let tokensBefore = Int(session.position())          // snapshot before the call
 do {
     try session.appendTokens(tokens: longPrompt)
 } catch FfiError.Cancelled {

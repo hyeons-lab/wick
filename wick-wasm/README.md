@@ -93,7 +93,7 @@ console.log(engine.addBosToken);      // honor when hand-building token sequence
 // destructurable. Today every model loaded via fromGgufBytes
 // reports text-only because wasm uses wick's synthetic-text
 // manifest path; a model-aware loader (planned) will surface real
-// audio_in / image_in flags.
+// audioIn / imageIn flags.
 const { textIn, audioIn, audioOut, imageIn } = engine.capabilities;
 
 // Tokenize a string.
