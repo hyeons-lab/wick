@@ -880,6 +880,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_capabilities(): Short
 
+    external fun uniffi_wick_ffi_checksum_method_wickengine_context_size(): Short
+
     external fun uniffi_wick_ffi_checksum_method_wickengine_decode_tokens(): Short
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_encode_text(): Short
@@ -1135,6 +1137,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_context_size(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
 
     external fun uniffi_wick_ffi_fn_method_wickengine_decode_tokens(
         `ptr`: Long,
@@ -1469,6 +1476,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_context_size() != 42065.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245.toShort()) {
@@ -4030,6 +4040,25 @@ public interface WickEngineInterface {
     fun `capabilities`(): ModalityCapabilities
 
     /**
+     * Resolved context-window size (KV cache cap) the engine was
+     * configured with. Mirrors the `context_size` field of the
+     * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
+     *
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
+     */
+    fun `contextSize`(): kotlin.ULong
+
+    /**
      * Decode token IDs back to text. Out-of-vocab IDs are silently
      * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
      * only appends bytes for IDs it has in `vocab.get(id)`. No
@@ -4265,6 +4294,35 @@ open class WickEngine :
             callWithHandle {
                 uniffiRustCall { _status ->
                     UniffiLib.uniffi_wick_ffi_fn_method_wickengine_capabilities(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Resolved context-window size (KV cache cap) the engine was
+     * configured with. Mirrors the `context_size` field of the
+     * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
+     *
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
+     */
+    override fun `contextSize`(): kotlin.ULong =
+        FfiConverterULong.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_context_size(
                         it,
                         _status,
                     )

@@ -633,6 +633,34 @@ impl WickEngine {
         self.inner.capabilities().into()
     }
 
+    /// Resolved context-window size (KV cache cap) the engine was
+    /// configured with. Mirrors the `context_size` field of the
+    /// [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+    /// with the `0` → `model.max_seq_len` defaulting already
+    /// applied so callers always see a meaningful number rather
+    /// than the internal `usize::MAX` sentinel.
+    ///
+    /// Note this is the **engine-level** requested cap, not a
+    /// per-session ceiling. wick core clamps the model's
+    /// `max_seq_len` at load time to `min(requested_context,
+    /// gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+    /// [`Self::metadata`]`.max_seq_len` is already the effective
+    /// ceiling for any session built from this engine — `context_size`
+    /// is informational ("what cap did this engine load with?")
+    /// rather than a value callers should `min(...)` against.
+    pub fn context_size(&self) -> u64 {
+        let cs = self.inner.config().context_size;
+        // EngineConfig::try_from maps a `0` request to `usize::MAX`
+        // as a "use the model's own max" sentinel; resolve it back
+        // to a real number for FFI consumers so they don't see a
+        // 18-quintillion-token cap.
+        if cs == usize::MAX {
+            self.inner.metadata().max_seq_len as u64
+        } else {
+            cs as u64
+        }
+    }
+
     // ----- Tokenizer surface (PR 13) ---------------------------------
     //
     // Wraps `wick::tokenizer::BpeTokenizer` so foreign callers can

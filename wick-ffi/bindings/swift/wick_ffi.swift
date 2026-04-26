@@ -2041,6 +2041,25 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
     func capabilities()  -> ModalityCapabilities
     
     /**
+     * Resolved context-window size (KV cache cap) the engine was
+     * configured with. Mirrors the `context_size` field of the
+     * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
+     *
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
+     */
+    func contextSize()  -> UInt64
+    
+    /**
      * Decode token IDs back to text. Out-of-vocab IDs are silently
      * skipped (omitted from the decoded output) — `BpeTokenizer::decode`
      * only appends bytes for IDs it has in `vocab.get(id)`. No
@@ -2306,6 +2325,31 @@ open func bosToken() -> UInt32?  {
 open func capabilities() -> ModalityCapabilities  {
     return try!  FfiConverterTypeModalityCapabilities_lift(try! rustCall() {
     uniffi_wick_ffi_fn_method_wickengine_capabilities(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Resolved context-window size (KV cache cap) the engine was
+     * configured with. Mirrors the `context_size` field of the
+     * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
+     * with the `0` → `model.max_seq_len` defaulting already
+     * applied so callers always see a meaningful number rather
+     * than the internal `usize::MAX` sentinel.
+     *
+     * Note this is the **engine-level** requested cap, not a
+     * per-session ceiling. wick core clamps the model's
+     * `max_seq_len` at load time to `min(requested_context,
+     * gguf_max_seq_len)` (see `wick/src/model/lfm2.rs`), so
+     * [`Self::metadata`]`.max_seq_len` is already the effective
+     * ceiling for any session built from this engine — `context_size`
+     * is informational ("what cap did this engine load with?")
+     * rather than a value callers should `min(...)` against.
+     */
+open func contextSize() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_wick_ffi_fn_method_wickengine_context_size(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -3945,6 +3989,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_capabilities() != 25378) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_context_size() != 42065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_decode_tokens() != 20245) {
