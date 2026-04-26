@@ -159,8 +159,17 @@ jobs:
           set -euo pipefail
           WASM=wick-wasm/pkg/wick_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          SIZE_KB=$((SIZE_BYTES / 1024))
           BUDGET_KB=2560  # 2.5 MB
+          BUDGET_BYTES=$((BUDGET_KB * 1024))
+          # Display rounds UP to KB so a 2,560,001-byte file reads as
+          # "2561 KB" not "2560 KB" — keeps the human-readable line
+          # honest with the byte-precision comparison below.
+          SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
+          # Default $GITHUB_STEP_SUMMARY to /dev/null so a contributor
+          # can copy this script and run it locally — the variable is
+          # only set inside GitHub Actions, and `set -u` would
+          # otherwise abort on the redirect.
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
             echo "## Wick-Wasm Pack output"
             echo
@@ -169,9 +178,12 @@ jobs:
             echo '```'
             ls -lh wick-wasm/pkg/
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$SIZE_KB" -gt "$BUDGET_KB" ]; then
-            echo "::error file=.github/workflows/ci.yml::wick_wasm_bg.wasm is ${SIZE_KB} KB, over the ${BUDGET_KB} KB budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
+          } >> "$SUMMARY"
+          # Compare in bytes so the gate is a true hard cap; comparing
+          # in KB would let a file overshoot by up to 1023 bytes
+          # before failing.
+          if [ "$SIZE_BYTES" -gt "$BUDGET_BYTES" ]; then
+            echo "::error file=.github/workflows/ci.yml::wick_wasm_bg.wasm is ${SIZE_KB} KB (${SIZE_BYTES} B), over the ${BUDGET_KB} KB (${BUDGET_BYTES} B) budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
             exit 1
           fi
           echo "wick_wasm_bg.wasm: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
