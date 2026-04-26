@@ -411,6 +411,35 @@ impl Tokenizer {
         self.inner.eos_token()
     }
 
+    /// Look up a special-token ID by its literal name (e.g.
+    /// `"<|im_start|>"`, `"<|tool_calls_section_begin|>"`).
+    /// Returns `undefined` when no entry exists for that name in
+    /// the model's special-token registry.
+    ///
+    /// Lookup scope: only tokens flagged as control or
+    /// user-defined in the GGUF metadata are registered for this
+    /// lookup. wick reads `tokenizer.ggml.token_type` and admits
+    /// tokens with type `3` (control) or type `4` (user-defined);
+    /// regular vocab entries are not reachable via this method
+    /// even though their names exist in `tokenizer.ggml.tokens`.
+    /// Names accepted here are the literal vocab strings indexed
+    /// by the special token's ID.
+    ///
+    /// Useful for constructing prompts with specific control
+    /// tokens directly (chat-template-like flows) without
+    /// round-tripping through `applyChatTemplate`. For BOS / EOS
+    /// prefer `bosToken` / `eosToken` (named getters that don't
+    /// risk a typo in the lookup string).
+    ///
+    /// Mirrors `WickEngine.specialTokenId` from wick-ffi (where
+    /// it lives engine-side); wick-wasm hangs it off `Tokenizer`
+    /// to match the established `engine.tokenizer.<method>`
+    /// access pattern.
+    #[wasm_bindgen(js_name = specialTokenId)]
+    pub fn special_token_id(&self, name: &str) -> Option<u32> {
+        self.inner.special_token_id(name)
+    }
+
     /// Raw embedded Jinja chat template from the GGUF metadata, if
     /// any. Most callers should use [`Self::apply_chat_template`]
     /// (`applyChatTemplate` in JS) instead — this getter is for
