@@ -445,11 +445,12 @@ pub fn conformer_ffn_forward(
     debug_assert_eq!(down_b.len(), n_embd);
     debug_assert_eq!(scratch_pre_norm.len(), n_embd);
     debug_assert_eq!(scratch_ff.len(), n_ff);
+    debug_assert_eq!(up_w.rows, n_ff);
+    debug_assert_eq!(up_w.cols, n_embd);
+    debug_assert_eq!(down_w.rows, n_embd);
+    debug_assert_eq!(down_w.cols, n_ff);
 
-    for ti in 0..t {
-        let row_start = ti * n_embd;
-        let row = &x[row_start..row_start + n_embd];
-
+    for row in x.chunks_mut(n_embd) {
         // pre_norm = LayerNorm(x[t]; norm_w, norm_b)
         scratch_pre_norm.copy_from_slice(row);
         crate::backend::cpu::layer_norm_inplace(scratch_pre_norm, norm_w, norm_b, eps);
@@ -468,8 +469,7 @@ pub fn conformer_ffn_forward(
         crate::backend::cpu::add_inplace(scratch_pre_norm, down_b);
 
         // Accumulate with 0.5 residual scale into x[t].
-        let row_mut = &mut x[row_start..row_start + n_embd];
-        for (xv, &dv) in row_mut.iter_mut().zip(scratch_pre_norm.iter()) {
+        for (xv, &dv) in row.iter_mut().zip(scratch_pre_norm.iter()) {
             *xv += 0.5 * dv;
         }
     }
