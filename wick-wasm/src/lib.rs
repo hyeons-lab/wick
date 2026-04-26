@@ -50,6 +50,63 @@ extern "C" {
     pub type ChatMessageArray;
 }
 
+#[wasm_bindgen(typescript_custom_section)]
+const TS_CAPABILITIES: &'static str = r#"
+/**
+ * Modality capability flags for a loaded model. Returned by
+ * `WickEngine.capabilities` and `Session.capabilities`. Mirrors
+ * the `ModalityCapabilities` shape exposed by the JVM/Apple
+ * bindings (wick-ffi) so cross-platform consumers can probe the
+ * same fields regardless of which binding they're driving.
+ *
+ * Note: under wick-wasm's current loader (`fromGgufBytes`), the
+ * model's `inference_type` is synthesized as text-only — these
+ * flags will report `textIn: true, textOut: true` and `false`
+ * for everything else even for genuinely audio- or
+ * image-capable models. A model-aware loader (planned) will
+ * make these flags reflect the real capability surface.
+ */
+export interface Capabilities {
+    readonly textIn: boolean;
+    readonly textOut: boolean;
+    readonly imageIn: boolean;
+    readonly audioIn: boolean;
+    readonly audioOut: boolean;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Opaque type-label wrapper for the `Capabilities`
+    /// interface declared in the TS custom section above. At the
+    /// wasm boundary this is a plain JS object; the type label
+    /// surfaces in `.d.ts` so callers get IDE completion +
+    /// destructuring (`const { audioIn } = engine.capabilities`).
+    #[wasm_bindgen(typescript_type = "Capabilities")]
+    pub type Capabilities;
+}
+
+/// Build a JS-side `Capabilities` object from a wick core
+/// `ModalityCapabilities`. Used by both `WickEngine.capabilities`
+/// and `Session.capabilities` so the field set + naming stays in
+/// lock-step.
+fn capabilities_to_js(caps: wick::ModalityCapabilities) -> Capabilities {
+    let obj = js_sys::Object::new();
+    // `Reflect::set` only fails when the target isn't an object
+    // — `Object::new()` always is, so the `Result` is structurally
+    // unreachable here. Discard it inside the helper closure to
+    // keep the per-field calls one line each.
+    let set_bool = |key: &str, value: bool| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(value));
+    };
+    set_bool("textIn", caps.text_in);
+    set_bool("textOut", caps.text_out);
+    set_bool("imageIn", caps.image_in);
+    set_bool("audioIn", caps.audio_in);
+    set_bool("audioOut", caps.audio_out);
+    JsValue::from(obj).unchecked_into()
+}
+
 /// Returns the version of the `wick` core library this binding wraps.
 ///
 /// Note this is **`wick`'s** version, not `wick-wasm`'s — JS callers
@@ -245,6 +302,25 @@ impl WickEngine {
     #[wasm_bindgen(getter, js_name = addBosToken)]
     pub fn add_bos_token(&self) -> bool {
         self.inner.metadata().add_bos_token
+    }
+
+    /// Modality capability flags reported by the loaded model.
+    /// See the `Capabilities` interface in the generated `.d.ts`
+    /// for the field shape.
+    ///
+    /// **Caveat:** today wick-wasm only loads models via
+    /// `WickEngine.fromGgufBytes`, which routes through wick's
+    /// synthetic-text manifest path. As a result this getter
+    /// always returns `{ textIn: true, textOut: true, imageIn:
+    /// false, audioIn: false, audioOut: false }` — even for
+    /// genuinely audio- or image-capable models. The shape is
+    /// exposed now so JS code stabilizes against the same surface
+    /// the JVM/Apple bindings (wick-ffi) report; a model-aware
+    /// loader (planned) will make these flags reflect the real
+    /// capability surface without a binding break.
+    #[wasm_bindgen(getter)]
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities_to_js(self.inner.capabilities())
     }
 
     /// Returns a `Tokenizer` handle bound to this engine's vocab.
@@ -846,6 +922,16 @@ impl Session {
     #[wasm_bindgen(getter)]
     pub fn position(&self) -> u32 {
         self.inner.position()
+    }
+
+    /// Modality capability flags reported by the model backing
+    /// this session. Same shape as `WickEngine.capabilities` —
+    /// see that getter for the `Capabilities` field documentation
+    /// and the synthetic-text caveat that applies to all
+    /// `fromGgufBytes`-loaded models today.
+    #[wasm_bindgen(getter)]
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities_to_js(self.inner.capabilities())
     }
 
     /// Flip the cancel atomic, requesting that any in-flight
