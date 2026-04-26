@@ -163,7 +163,12 @@ sampler RNG is deterministic across runs. Same seed + same prompt
 + same `GenerateOpts` → identical token sequence:
 
 ```js
-import { WickEngine, SessionConfig, GenerateOpts } from '@hyeonslab/wick-wasm';
+import {
+    WickEngine,
+    SessionConfig,
+    GenerateOpts,
+    TurboQuantConfig,
+} from '@hyeonslab/wick-wasm';
 
 const cfg = new SessionConfig();
 cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
@@ -179,6 +184,22 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //                           // (useful for keeping a system prompt resident)
 //   cfg.ubatchSize = 256;   // smaller chunked-prefill batches give finer
 //                           // session.cancel() checkpoints during long prompts
+
+// Optional: turn on TurboQuant KV compression. Compresses keys to
+// ~3 bits/elem and values to ~2 bits/elem (plus f16 norms per
+// block). Pass an explicit seed so the per-layer Hadamard
+// rotations are reproducible — paired with `cfg.seed` above this
+// keeps the whole session bitwise-identical across runs.
+//
+// Caveats:
+// - Only kicks in when the model's `head_dim` is a power of two.
+//   wick logs a warning and falls back to f32 if not — no JS
+//   error.
+// - Don't combine with `cfg.nKeep > 0` (context-shift); wick
+//   warns at session creation and ignores nKeep on overflow.
+const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true
+// tq.keys = false;  // flip per-side toggles for debugging
+cfg.kvCompression = tq;  // setter consumes `tq` — read back via getter to inspect
 
 const session = engine.newSession(cfg);
 session.appendText('once upon a time');
