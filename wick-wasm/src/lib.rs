@@ -325,8 +325,11 @@ impl WickEngine {
 
     /// Effective context-window size (KV cache cap) the engine was
     /// configured with. Mirrors what `fromGgufBytes(bytes,
-    /// contextSize)` resolved to (a missing or `0` request becomes
-    /// the model's `maxSeqLen`).
+    /// contextSize)` resolved to — i.e. the value of `contextSize`
+    /// you passed in, or `4096` if you omitted it. Unlike
+    /// `wick-ffi`'s `EngineConfig::try_from`, the wasm load path
+    /// doesn't treat `0` specially; it's passed straight through
+    /// to wick core (and capped at `maxSeqLen` per session).
     ///
     /// Useful for "show effective KV cap" UIs and diagnostic
     /// logging when JS callers didn't keep the original
