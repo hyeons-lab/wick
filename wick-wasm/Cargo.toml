@@ -12,7 +12,13 @@ description = "wasm-bindgen browser/Node bindings for the wick inference engine"
 # the symlinks transparently. The README is generated as
 # `pkg/README.md` (wasm-pack copies the crate's own README into
 # the pkg/), so we don't list it here — wasm-pack handles it.
-include = ["src/**/*", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
 
 [lib]
 # `cdylib` produces the `.wasm` artifact that wasm-bindgen-cli post-

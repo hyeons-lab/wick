@@ -290,9 +290,10 @@ impl Tokenizer {
     }
 
     /// Raw embedded Jinja chat template from the GGUF metadata, if
-    /// any. Most callers should use [`applyChatTemplate`] instead —
-    /// this getter is for inspection or for callers who want to
-    /// render with a different Jinja runtime.
+    /// any. Most callers should use [`Self::apply_chat_template`]
+    /// (`applyChatTemplate` in JS) instead — this getter is for
+    /// inspection or for callers who want to render with a
+    /// different Jinja runtime.
     #[wasm_bindgen(getter, js_name = chatTemplate)]
     pub fn chat_template(&self) -> Option<String> {
         self.inner.chat_template().map(str::to_owned)
@@ -332,11 +333,14 @@ impl Tokenizer {
 
 /// Parse a JS-side `[{ role, content }, ...]` array into the wick
 /// core type, using `js_sys::Reflect` directly rather than going
-/// through `serde-wasm-bindgen`. The former adds ~800 KB to the
-/// wasm bundle (full serde monomorphization + a JsValue
-/// deserialiser); for two flat string fields the manual lookup is
-/// trivial and keeps the binary lean. If a future surface needs
-/// rich nested deserialisation, revisit and add the dep then.
+/// through `serde-wasm-bindgen`. Both approaches were measured —
+/// they produce **the same wasm size** (the size growth from
+/// `apply_chat_template` is dominated by minijinja's render path,
+/// not the deserialiser). The manual `Reflect` walk is preferred
+/// here because it keeps the dep graph smaller (one less crate to
+/// audit + faster cold builds) for two flat string fields. If a
+/// future surface needs rich nested deserialisation, revisit and
+/// add `serde-wasm-bindgen` then.
 fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessage>, JsError> {
     let array = value
         .dyn_ref::<js_sys::Array>()
@@ -345,7 +349,7 @@ fn parse_chat_messages(value: &JsValue) -> Result<Vec<wick::tokenizer::ChatMessa
     let mut msgs = Vec::with_capacity(len);
     let role_key = JsValue::from_str("role");
     let content_key = JsValue::from_str("content");
-    for i in 0..array.length() {
+    for i in 0..len as u32 {
         let entry = array.get(i);
         let role = js_sys::Reflect::get(&entry, &role_key)
             .map_err(|_| JsError::new(&format!("messages[{i}] missing role")))?
