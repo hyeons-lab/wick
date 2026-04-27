@@ -224,6 +224,18 @@ impl AudioEncoderWeights {
     /// Errors if any required tensor or metadata key is missing —
     /// no silent defaults. Per-tensor `with_context` makes the first
     /// missing name visible at the top of the error chain.
+    ///
+    /// **Required metadata keys**: `clip.audio.block_count`,
+    /// `clip.audio.embedding_length`, `clip.audio.attention.head_count`,
+    /// `clip.audio.attention.layer_norm_epsilon`,
+    /// `clip.audio.num_mel_bins`.
+    ///
+    /// **Optional / advisory**: `clip.audio.feed_forward_length` is
+    /// read only to detect tensor/metadata disagreement and emit
+    /// a warn-level log; the actual `n_ff` is always derived from
+    /// the loaded `ffn_up.weight` shape (the metadata key is stale
+    /// on the real LFM2.5-Audio-1.5B mmproj GGUF — claims 512 while
+    /// the tensor is `[512, 2048]`).
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         // ── Config from metadata ──
         let n_layer = gguf
@@ -232,9 +244,6 @@ impl AudioEncoderWeights {
         let n_embd = gguf
             .get_u32(KEY_N_EMBD)
             .with_context(|| format!("missing `{KEY_N_EMBD}`"))? as usize;
-        let n_ff = gguf
-            .get_u32(KEY_N_FF)
-            .with_context(|| format!("missing `{KEY_N_FF}`"))? as usize;
         let n_head = gguf
             .get_u32(KEY_N_HEAD)
             .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
@@ -244,6 +253,12 @@ impl AudioEncoderWeights {
         let n_mel_bins =
             gguf.get_u32(KEY_N_MEL_BINS)
                 .with_context(|| format!("missing `{KEY_N_MEL_BINS}`"))? as usize;
+        // `n_ff` is derived from the loaded ffn_up tensor below, not
+        // from `KEY_N_FF`. The metadata key is unreliable on the
+        // real LFM2.5-Audio-1.5B mmproj GGUF (says 512 but the
+        // actual `ffn_up.weight` is `[512, 2048]`, so n_ff = 2048).
+        // Read it if present only to warn on disagreement.
+        let metadata_n_ff = gguf.get_u32(KEY_N_FF).map(|v| v as usize);
 
         // ── Conv stem (positional indices 0/2/3/5/6 — 1/4/7 are
         //    parameter-free ReLU activations) ──
@@ -266,6 +281,93 @@ impl AudioEncoderWeights {
         let mut layers = Vec::with_capacity(n_layer);
         for il in 0..n_layer {
             layers.push(load_conformer_block(gguf, il)?);
+        }
+
+        // Derive `n_ff` from the first block's `ffn_up.weight.rows`
+        // (same "tensor is the source of truth" pattern as
+        // `llm_hidden_size` below). Validate every per-block FFN
+        // tensor against the derived `n_ff` and the metadata
+        // `n_embd` — release-fatal so corrupted / mismatched
+        // blocks are caught at load time instead of producing
+        // a misleading panic deep inside `conformer_ffn_forward`.
+        anyhow::ensure!(
+            !layers.is_empty(),
+            "audio encoder must have at least one Conformer block"
+        );
+        let n_ff = layers[0].ffn_up_w.rows;
+        for (il, layer) in layers.iter().enumerate() {
+            // FFN-1
+            anyhow::ensure!(
+                layer.ffn_up_w.rows == n_ff && layer.ffn_up_w.cols == n_embd,
+                "block {il} ffn_up shape ({}, {}) != ({n_ff}, {n_embd})",
+                layer.ffn_up_w.rows,
+                layer.ffn_up_w.cols
+            );
+            anyhow::ensure!(
+                layer.ffn_up_b.len() == n_ff,
+                "block {il} ffn_up.bias len ({}) != n_ff ({n_ff})",
+                layer.ffn_up_b.len()
+            );
+            anyhow::ensure!(
+                layer.ffn_down_w.rows == n_embd && layer.ffn_down_w.cols == n_ff,
+                "block {il} ffn_down shape ({}, {}) != ({n_embd}, {n_ff})",
+                layer.ffn_down_w.rows,
+                layer.ffn_down_w.cols
+            );
+            anyhow::ensure!(
+                layer.ffn_down_b.len() == n_embd,
+                "block {il} ffn_down.bias len ({}) != n_embd ({n_embd})",
+                layer.ffn_down_b.len()
+            );
+            // FFN-2
+            anyhow::ensure!(
+                layer.ffn_up_1_w.rows == n_ff && layer.ffn_up_1_w.cols == n_embd,
+                "block {il} ffn_up_1 shape ({}, {}) != ({n_ff}, {n_embd})",
+                layer.ffn_up_1_w.rows,
+                layer.ffn_up_1_w.cols
+            );
+            anyhow::ensure!(
+                layer.ffn_up_1_b.len() == n_ff,
+                "block {il} ffn_up_1.bias len ({}) != n_ff ({n_ff})",
+                layer.ffn_up_1_b.len()
+            );
+            anyhow::ensure!(
+                layer.ffn_down_1_w.rows == n_embd && layer.ffn_down_1_w.cols == n_ff,
+                "block {il} ffn_down_1 shape ({}, {}) != ({n_embd}, {n_ff})",
+                layer.ffn_down_1_w.rows,
+                layer.ffn_down_1_w.cols
+            );
+            anyhow::ensure!(
+                layer.ffn_down_1_b.len() == n_embd,
+                "block {il} ffn_down_1.bias len ({}) != n_embd ({n_embd})",
+                layer.ffn_down_1_b.len()
+            );
+            // Pre-FFN LayerNorm weights (n_embd-wide, both FFN-1
+            // and FFN-2 paths). Shape errors here would manifest
+            // as a silent zip-truncation in `add_inplace` during
+            // the forward pass — fail loudly at load instead.
+            anyhow::ensure!(
+                layer.ffn_norm_w.len() == n_embd && layer.ffn_norm_b.len() == n_embd,
+                "block {il} ffn_norm w/b lens ({}, {}) != n_embd ({n_embd})",
+                layer.ffn_norm_w.len(),
+                layer.ffn_norm_b.len()
+            );
+            anyhow::ensure!(
+                layer.ffn_norm_1_w.len() == n_embd && layer.ffn_norm_1_b.len() == n_embd,
+                "block {il} ffn_norm_1 w/b lens ({}, {}) != n_embd ({n_embd})",
+                layer.ffn_norm_1_w.len(),
+                layer.ffn_norm_1_b.len()
+            );
+        }
+        if let Some(meta) = metadata_n_ff
+            && meta != n_ff
+        {
+            tracing::warn!(
+                target: "wick::audio_encoder",
+                metadata_n_ff = meta,
+                tensor_n_ff = n_ff,
+                "{KEY_N_FF} metadata disagrees with ffn_up tensor shape; trusting tensor"
+            );
         }
 
         // ── MLP adapter ──
@@ -1514,6 +1616,59 @@ mod tests {
                     "expected missing-key error, got: {msg}"
                 );
             }
+        }
+    }
+
+    /// Loads the real `mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf` if it
+    /// exists at the canonical local cache path and verifies the
+    /// derived `n_ff` is the **tensor**-driven value (= 2048 on
+    /// the real bundle), NOT the metadata-claimed `512`. Regression
+    /// guard for the metadata mismatch flagged in PR #99's devlog.
+    ///
+    /// Gated `#[ignore]` so the suite stays runnable on CI machines
+    /// that don't have the bundle. Run locally with:
+    ///
+    /// ```bash
+    /// cargo test -p wick from_gguf_real_lfm2a_audio_mmproj -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs ~/.leap/models/LFM2.5-Audio-1.5B-Q4_0/mmproj-...gguf locally"]
+    fn from_gguf_real_lfm2a_audio_mmproj() {
+        // Skip cleanly on systems without HOME (e.g. Windows CI
+        // running the gated suite). Mirrors the bench_perf.rs
+        // pattern.
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("skip: HOME not set");
+            return;
+        };
+        let path = std::path::PathBuf::from(home)
+            .join(".leap")
+            .join("models")
+            .join("LFM2.5-Audio-1.5B-Q4_0")
+            .join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+        if !path.exists() {
+            eprintln!("skip: mmproj GGUF not at {}", path.display());
+            return;
+        }
+        let gguf = GgufFile::open(&path).expect("open mmproj gguf");
+        let w = AudioEncoderWeights::from_gguf(&gguf).expect("load mmproj gguf");
+
+        // Real-bundle config (verified via `wick-cli inspect`):
+        // 17 Conformer blocks, n_embd = 512, n_head = 8,
+        // n_ff = 2048 (NOT the metadata's claimed 512).
+        assert_eq!(w.config.n_layer, 17, "n_layer");
+        assert_eq!(w.config.n_embd, 512, "n_embd");
+        assert_eq!(w.config.n_head, 8, "n_head");
+        assert_eq!(
+            w.config.n_ff, 2048,
+            "n_ff must be derived from ffn_up tensor (2048), not from \
+             clip.audio.feed_forward_length metadata (512)"
+        );
+        // Per-block ffn_up consistency (the loader's cross-block
+        // assertion fires loudly if violated; this is a smoke check).
+        for (il, layer) in w.layers.iter().enumerate() {
+            assert_eq!(layer.ffn_up_w.rows, 2048, "block {il} ffn_up");
+            assert_eq!(layer.ffn_up_1_w.rows, 2048, "block {il} ffn_up_1");
         }
     }
 
