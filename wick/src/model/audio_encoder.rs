@@ -1226,6 +1226,258 @@ pub fn conv_stem_forward(
     (encoder_in, t_out)
 }
 
+/// Run the full LFM2A audio encoder on a single mel-spectrogram
+/// chunk. Wires the conv subsampling stem (PR #98) +
+/// `n_layer` Conformer blocks + the per-block final LayerNorm +
+/// the MLP adapter into one entry point. Output is the per-frame
+/// embedding sequence in the LLM's hidden dimension, ready to be
+/// injected as soft tokens.
+///
+/// Mirrors the C++ reference `conformer.cpp` in full
+/// (`build_inp_raw → conv stem → N × (FFN-½ → self-attn →
+/// conv module → FFN-½ → ln_2) → adapter`).
+///
+/// Algorithm:
+/// ```text
+/// (encoder_in, t_out) = conv_stem_forward(mel)        // [t_out × n_embd]
+/// pos_emb              = relative_pos_emb(t_out)       // [(2t-1) × POS_EMB_DIM]
+/// for il in 0..n_layer:
+///   conformer_ffn_forward(x, FFN-1 weights)            // ½ residual
+///   conformer_self_attention_forward(x, pos_emb, ...)  // full residual
+///   conformer_conv_module_forward(x, ..., k=conv_dw_k) // full residual
+///   conformer_ffn_forward(x, FFN-2 weights)            // ½ residual
+///   ln2_inplace(x)                                     // final block norm
+/// // MLP adapter (no residual)
+/// for ti in 0..t_out:
+///   pre_norm = LN(x[ti]; mm.0)
+///   mid      = mm.1 @ pre_norm + mm.1.bias
+///   GELU_ERF(mid)
+///   out[ti]  = mm.3 @ mid + mm.3.bias                  // → llm_hidden_size
+/// ```
+///
+/// `kernel_size` for the per-block depthwise conv module is
+/// derived per-block from `conv_dw_shape[0]` (the GGUF-preserved
+/// 1D conv shape `[k, channels]`).
+///
+/// Empty input (`n_frames == 0`) returns an empty vec.
+pub fn audio_encoder_forward(
+    mel: &[f32],
+    n_frames: usize,
+    weights: &AudioEncoderWeights,
+) -> (Vec<f32>, usize) {
+    let cfg = &weights.config;
+    let n_embd = cfg.n_embd;
+    let n_ff = cfg.n_ff;
+    let n_head = cfg.n_head;
+    let n_layer = cfg.n_layer;
+    let eps = cfg.eps;
+    let llm_hidden_size = cfg.llm_hidden_size;
+
+    // Stage 1: conv subsampling stem.
+    let (mut x, t_out) = conv_stem_forward(mel, n_frames, &weights.conv_stem, cfg);
+    if t_out == 0 {
+        return (Vec::new(), 0);
+    }
+
+    // Stage 2: relative-position embedding (built once per chunk).
+    let pos_emb = relative_pos_emb(t_out);
+
+    // Pre-allocate FFN scratch — same shape every block, reused
+    // across all 2 * n_layer FFN calls.
+    let mut scratch_pre_norm = vec![0.0f32; n_embd];
+    let mut scratch_ff = vec![0.0f32; n_ff];
+
+    // Stage 3: Conformer block stack.
+    // Release-fatal: n_layer config and the loaded layers vec
+    // must agree, or the indexed access below panics with an
+    // unhelpful out-of-bounds.
+    assert_eq!(
+        weights.layers.len(),
+        n_layer,
+        "audio_encoder_forward: config.n_layer ({}) != weights.layers.len() ({})",
+        n_layer,
+        weights.layers.len()
+    );
+    for il in 0..n_layer {
+        let layer = &weights.layers[il];
+        // FFN ½ #1 — half-residual (handled inside conformer_ffn_forward).
+        conformer_ffn_forward(
+            &mut x,
+            &layer.ffn_norm_w,
+            &layer.ffn_norm_b,
+            &layer.ffn_up_w,
+            &layer.ffn_up_b,
+            &layer.ffn_down_w,
+            &layer.ffn_down_b,
+            n_embd,
+            n_ff,
+            t_out,
+            eps,
+            &mut scratch_pre_norm,
+            &mut scratch_ff,
+        );
+
+        // Self-attention (with relative-position bias).
+        conformer_self_attention_forward(
+            &mut x,
+            &pos_emb,
+            &layer.ln1_w,
+            &layer.ln1_b,
+            &layer.attn_q_w,
+            &layer.attn_q_b,
+            &layer.attn_k_w,
+            &layer.attn_k_b,
+            &layer.attn_v_w,
+            &layer.attn_v_b,
+            &layer.attn_o_w,
+            &layer.attn_o_b,
+            &layer.pos_bias_u,
+            &layer.pos_bias_v,
+            &layer.linear_pos_w,
+            n_embd,
+            n_head,
+            t_out,
+            eps,
+        );
+
+        // Conv module — derive kernel_size from the loaded 1D
+        // conv shape so block-to-block kernel changes (if any)
+        // are picked up automatically. LFM2A stores conv_dw as
+        // 2D `[k, channels]` but other 1D-conv loaders in the
+        // codebase use the 3D form `[k, 1, channels]` (with the
+        // singleton in_per_group elided in 2D); accept both.
+        // First dim is kernel_size in either case.
+        let dw_rank = layer.conv_dw_shape.len();
+        assert!(
+            dw_rank == 2 || dw_rank == 3,
+            "audio_encoder_forward: block {il}: expected 2- or 3-dim conv_dw shape, got {:?}",
+            layer.conv_dw_shape
+        );
+        let kernel_size = layer.conv_dw_shape[0];
+        // Sanity: `kernel_size * n_embd` must match the actual
+        // weight buffer length (depthwise has in_per_group == 1).
+        assert_eq!(
+            kernel_size * n_embd,
+            layer.conv_dw_w.len(),
+            "audio_encoder_forward: block {il}: kernel_size ({kernel_size}) * n_embd ({n_embd}) != conv_dw_w.len() ({})",
+            layer.conv_dw_w.len()
+        );
+        conformer_conv_module_forward(
+            &mut x,
+            &layer.norm_conv_w,
+            &layer.norm_conv_b,
+            &layer.conv_pw1_w,
+            &layer.conv_pw1_b,
+            &layer.conv_dw_w,
+            &layer.conv_dw_b,
+            &layer.conv_norm_w,
+            &layer.conv_norm_b,
+            &layer.conv_pw2_w,
+            &layer.conv_pw2_b,
+            n_embd,
+            t_out,
+            kernel_size,
+            eps,
+        );
+
+        // FFN ½ #2.
+        conformer_ffn_forward(
+            &mut x,
+            &layer.ffn_norm_1_w,
+            &layer.ffn_norm_1_b,
+            &layer.ffn_up_1_w,
+            &layer.ffn_up_1_b,
+            &layer.ffn_down_1_w,
+            &layer.ffn_down_1_b,
+            n_embd,
+            n_ff,
+            t_out,
+            eps,
+            &mut scratch_pre_norm,
+            &mut scratch_ff,
+        );
+
+        // Final per-block LayerNorm (ln_2). No residual.
+        for row in x.chunks_exact_mut(n_embd) {
+            crate::backend::cpu::layer_norm_inplace(row, &layer.ln2_w, &layer.ln2_b, eps);
+        }
+    }
+
+    // Stage 4: MLP adapter — per-timestep LN + 2-layer MLP with
+    // GELU. Projects from `n_embd` to `llm_hidden_size`. No
+    // residual. Reuses `scratch_pre_norm` for the LN output.
+    let n_ff_adapter = weights.mlp_adapter.up_w.rows;
+    // Release-fatal: `add_inplace` zips silently to the shorter
+    // slice if the lengths disagree, so a real-weights mismatch
+    // here would produce subtly wrong output instead of a panic.
+    assert_eq!(
+        weights.mlp_adapter.up_w.cols, n_embd,
+        "audio_encoder_forward: mlp_adapter.up_w.cols ({}) != n_embd ({n_embd})",
+        weights.mlp_adapter.up_w.cols
+    );
+    assert_eq!(
+        weights.mlp_adapter.down_w.rows, llm_hidden_size,
+        "audio_encoder_forward: mlp_adapter.down_w.rows ({}) != llm_hidden_size ({llm_hidden_size})",
+        weights.mlp_adapter.down_w.rows
+    );
+    assert_eq!(
+        weights.mlp_adapter.down_w.cols, n_ff_adapter,
+        "audio_encoder_forward: mlp_adapter.down_w.cols ({}) != up_w.rows ({n_ff_adapter})",
+        weights.mlp_adapter.down_w.cols
+    );
+    assert_eq!(
+        weights.mlp_adapter.up_b.len(),
+        n_ff_adapter,
+        "audio_encoder_forward: mlp_adapter.up_b.len ({}) != n_ff_adapter ({n_ff_adapter})",
+        weights.mlp_adapter.up_b.len()
+    );
+    assert_eq!(
+        weights.mlp_adapter.down_b.len(),
+        llm_hidden_size,
+        "audio_encoder_forward: mlp_adapter.down_b.len ({}) != llm_hidden_size ({llm_hidden_size})",
+        weights.mlp_adapter.down_b.len()
+    );
+    assert_eq!(
+        weights.mlp_adapter.norm_w.len(),
+        n_embd,
+        "audio_encoder_forward: mlp_adapter.norm_w.len ({}) != n_embd ({n_embd})",
+        weights.mlp_adapter.norm_w.len()
+    );
+    assert_eq!(
+        weights.mlp_adapter.norm_b.len(),
+        n_embd,
+        "audio_encoder_forward: mlp_adapter.norm_b.len ({}) != n_embd ({n_embd})",
+        weights.mlp_adapter.norm_b.len()
+    );
+    let mut adapter_mid = vec![0.0f32; n_ff_adapter];
+    let total_out_len = t_out
+        .checked_mul(llm_hidden_size)
+        .expect("audio_encoder_forward: t_out * llm_hidden_size overflowed usize");
+    let mut encoder_out = vec![0.0f32; total_out_len];
+
+    for ti in 0..t_out {
+        let in_row = &x[ti * n_embd..(ti + 1) * n_embd];
+        scratch_pre_norm.copy_from_slice(in_row);
+        crate::backend::cpu::layer_norm_inplace(
+            &mut scratch_pre_norm,
+            &weights.mlp_adapter.norm_w,
+            &weights.mlp_adapter.norm_b,
+            eps,
+        );
+        weights
+            .mlp_adapter
+            .up_w
+            .gemv(&scratch_pre_norm, &mut adapter_mid);
+        crate::backend::cpu::add_inplace(&mut adapter_mid, &weights.mlp_adapter.up_b);
+        crate::backend::cpu::gelu_erf_inplace(&mut adapter_mid);
+        let out_row = &mut encoder_out[ti * llm_hidden_size..(ti + 1) * llm_hidden_size];
+        weights.mlp_adapter.down_w.gemv(&adapter_mid, out_row);
+        crate::backend::cpu::add_inplace(out_row, &weights.mlp_adapter.down_b);
+    }
+
+    (encoder_out, t_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,6 +2206,355 @@ mod tests {
         };
 
         let (out, t_out) = conv_stem_forward(&[], 0, &stem, &cfg);
+        assert_eq!(t_out, 0);
+        assert!(out.is_empty());
+    }
+
+    /// Build a minimal `ConformerLayerWeights` with zero-ish
+    /// weights and unit norms — used by the audio_encoder
+    /// smoke test below. Contributions from ffn / attention /
+    /// conv module are all zero so the residual passes through
+    /// unchanged; the only transform is the per-block ln_2
+    /// LayerNorm + the MLP adapter.
+    fn neutral_conformer_block(n_embd: usize, n_ff: usize) -> ConformerLayerWeights {
+        let zero_w = |rows, cols| F32Weight {
+            data: vec![0.0; rows * cols],
+            rows,
+            cols,
+        };
+        ConformerLayerWeights {
+            // FFN-1
+            ffn_norm_w: vec![1.0; n_embd],
+            ffn_norm_b: vec![0.0; n_embd],
+            ffn_up_w: zero_w(n_ff, n_embd),
+            ffn_up_b: vec![0.0; n_ff],
+            ffn_down_w: zero_w(n_embd, n_ff),
+            ffn_down_b: vec![0.0; n_embd],
+            // Self-attention
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: vec![0.0; n_embd],
+            attn_q_w: zero_w(n_embd, n_embd),
+            attn_q_b: vec![0.0; n_embd],
+            attn_k_w: zero_w(n_embd, n_embd),
+            attn_k_b: vec![0.0; n_embd],
+            attn_v_w: zero_w(n_embd, n_embd),
+            attn_v_b: vec![0.0; n_embd],
+            attn_o_w: zero_w(n_embd, n_embd),
+            attn_o_b: vec![0.0; n_embd],
+            pos_bias_u: vec![0.0; n_embd],
+            pos_bias_v: vec![0.0; n_embd],
+            linear_pos_w: zero_w(n_embd, POS_EMB_DIM),
+            // Conv module
+            norm_conv_w: vec![1.0; n_embd],
+            norm_conv_b: vec![0.0; n_embd],
+            conv_pw1_w: zero_w(2 * n_embd, n_embd),
+            conv_pw1_b: vec![0.0; 2 * n_embd],
+            conv_dw_w: vec![0.0; n_embd * 3],
+            conv_dw_b: vec![0.0; n_embd],
+            conv_dw_shape: vec![3, n_embd],
+            conv_norm_w: vec![1.0; n_embd],
+            conv_norm_b: vec![0.0; n_embd],
+            conv_pw2_w: zero_w(n_embd, n_embd),
+            conv_pw2_b: vec![0.0; n_embd],
+            // FFN-2
+            ffn_norm_1_w: vec![1.0; n_embd],
+            ffn_norm_1_b: vec![0.0; n_embd],
+            ffn_up_1_w: zero_w(n_ff, n_embd),
+            ffn_up_1_b: vec![0.0; n_ff],
+            ffn_down_1_w: zero_w(n_embd, n_ff),
+            ffn_down_1_b: vec![0.0; n_embd],
+            // ln_2
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: vec![0.0; n_embd],
+        }
+    }
+
+    /// End-to-end smoke test wiring conv stem + 1 Conformer block
+    /// + MLP adapter. Verifies the orchestration runs without
+    /// panicking and produces finite output of the expected shape
+    /// `[t_out × llm_hidden_size]`. Per-piece correctness is
+    /// covered by the dedicated tests above; this catches wiring
+    /// bugs (mismatched scratch sizes, missing residual, wrong
+    /// loop bounds) in the orchestration layer.
+    #[test]
+    fn audio_encoder_forward_smoke() {
+        let n_embd = 4;
+        let n_ff = 8;
+        let n_head = 1;
+        let n_layer = 1;
+        let n_mel_bins = 8;
+        let n_frames = 24;
+        let llm_hidden_size = 6;
+        let n_ff_adapter = 8;
+        let expected_t_out = 3; // same as conv_stem smoke test dims
+
+        // Conv stem: zero kernels + identity 1×1s + identity
+        // pre_encode_out (so the Conformer block sees a
+        // hand-traceable input).
+        let out_ch = n_embd; // stem out channels = encoder n_embd
+        let mut id_pw = vec![0.0f32; out_ch * out_ch];
+        for c in 0..out_ch {
+            id_pw[c * out_ch + c] = 1.0;
+        }
+        let conv_stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.3.weight".into(),
+                    weight: id_pw.clone(),
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+                zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, out_ch, vec![0.1; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.6.weight".into(),
+                    weight: id_pw,
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+            ],
+            // pre_encode_out: identity (plane = out_ch * F_out = 4 * 1 = 4 = n_embd).
+            pre_encode_out_w: {
+                let mut data = vec![0.0f32; n_embd * n_embd];
+                for i in 0..n_embd {
+                    data[i * n_embd + i] = 1.0;
+                }
+                F32Weight {
+                    data,
+                    rows: n_embd,
+                    cols: n_embd,
+                }
+            },
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+
+        // MLP adapter — small but real: norm + 2-layer MLP with
+        // GELU. Use mostly-identity weights so the output isn't
+        // zeroed out.
+        let mut adapter_up = vec![0.0f32; n_ff_adapter * n_embd];
+        for i in 0..n_embd.min(n_ff_adapter) {
+            adapter_up[i * n_embd + i] = 1.0;
+        }
+        let mut adapter_down = vec![0.0f32; llm_hidden_size * n_ff_adapter];
+        for i in 0..llm_hidden_size.min(n_ff_adapter) {
+            adapter_down[i * n_ff_adapter + i] = 1.0;
+        }
+        let mlp_adapter = AudioMlpAdapterWeights {
+            norm_w: vec![1.0; n_embd],
+            norm_b: vec![0.0; n_embd],
+            up_w: F32Weight {
+                data: adapter_up,
+                rows: n_ff_adapter,
+                cols: n_embd,
+            },
+            up_b: vec![0.0; n_ff_adapter],
+            down_w: F32Weight {
+                data: adapter_down,
+                rows: llm_hidden_size,
+                cols: n_ff_adapter,
+            },
+            down_b: vec![0.0; llm_hidden_size],
+        };
+
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem,
+            layers: vec![neutral_conformer_block(n_embd, n_ff)],
+            mlp_adapter,
+        };
+
+        let mel: Vec<f32> = (0..n_frames * n_mel_bins)
+            .map(|i| ((i % 17) as f32) * 0.05 - 0.3)
+            .collect();
+
+        let (encoder_out, t_out) = audio_encoder_forward(&mel, n_frames, &weights);
+
+        assert_eq!(t_out, expected_t_out);
+        assert_eq!(encoder_out.len(), t_out * llm_hidden_size);
+        for (i, &v) in encoder_out.iter().enumerate() {
+            assert!(v.is_finite(), "encoder_out[{i}] = {v} (not finite)");
+        }
+    }
+
+    /// Multi-layer variant: stack 3 neutral Conformer blocks
+    /// instead of 1, with the same conv stem + adapter shape as
+    /// the smoke test. Catches block-loop iteration bugs (off-
+    /// by-ones, scratch buffer aliasing across iterations) that
+    /// the single-layer test wouldn't surface.
+    #[test]
+    fn audio_encoder_forward_multi_layer_smoke() {
+        let n_embd = 4;
+        let n_ff = 8;
+        let n_head = 1;
+        let n_layer = 3;
+        let n_mel_bins = 8;
+        let n_frames = 24;
+        let llm_hidden_size = 6;
+        let n_ff_adapter = 8;
+        let expected_t_out = 3;
+
+        let out_ch = n_embd;
+        let mut id_pw = vec![0.0f32; out_ch * out_ch];
+        for c in 0..out_ch {
+            id_pw[c * out_ch + c] = 1.0;
+        }
+        let conv_stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.3.weight".into(),
+                    weight: id_pw.clone(),
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+                zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, out_ch, vec![0.1; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.6.weight".into(),
+                    weight: id_pw,
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+            ],
+            pre_encode_out_w: {
+                let mut data = vec![0.0f32; n_embd * n_embd];
+                for i in 0..n_embd {
+                    data[i * n_embd + i] = 1.0;
+                }
+                F32Weight {
+                    data,
+                    rows: n_embd,
+                    cols: n_embd,
+                }
+            },
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+
+        let mut adapter_up = vec![0.0f32; n_ff_adapter * n_embd];
+        for i in 0..n_embd.min(n_ff_adapter) {
+            adapter_up[i * n_embd + i] = 1.0;
+        }
+        let mut adapter_down = vec![0.0f32; llm_hidden_size * n_ff_adapter];
+        for i in 0..llm_hidden_size.min(n_ff_adapter) {
+            adapter_down[i * n_ff_adapter + i] = 1.0;
+        }
+        let mlp_adapter = AudioMlpAdapterWeights {
+            norm_w: vec![1.0; n_embd],
+            norm_b: vec![0.0; n_embd],
+            up_w: F32Weight {
+                data: adapter_up,
+                rows: n_ff_adapter,
+                cols: n_embd,
+            },
+            up_b: vec![0.0; n_ff_adapter],
+            down_w: F32Weight {
+                data: adapter_down,
+                rows: llm_hidden_size,
+                cols: n_ff_adapter,
+            },
+            down_b: vec![0.0; llm_hidden_size],
+        };
+
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem,
+            layers: (0..n_layer)
+                .map(|_| neutral_conformer_block(n_embd, n_ff))
+                .collect(),
+            mlp_adapter,
+        };
+
+        let mel: Vec<f32> = (0..n_frames * n_mel_bins)
+            .map(|i| ((i % 17) as f32) * 0.05 - 0.3)
+            .collect();
+
+        let (encoder_out, t_out) = audio_encoder_forward(&mel, n_frames, &weights);
+        assert_eq!(t_out, expected_t_out);
+        assert_eq!(encoder_out.len(), t_out * llm_hidden_size);
+        for (i, &v) in encoder_out.iter().enumerate() {
+            assert!(v.is_finite(), "encoder_out[{i}] = {v} (not finite)");
+        }
+    }
+
+    /// Empty input (n_frames = 0) returns an empty vec without
+    /// panicking. Mirrors `conv_stem_forward`'s t=0 guard at the
+    /// top-level entry point.
+    #[test]
+    fn audio_encoder_forward_empty_input_is_empty_output() {
+        // Reuse the smoke test's stem setup, but minimal.
+        let n_embd = 2;
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 0,
+                n_embd,
+                n_ff: 2,
+                n_head: 1,
+                eps: 1e-5,
+                n_mel_bins: 4,
+                llm_hidden_size: 2,
+            },
+            conv_stem: ConvStemWeights {
+                layers: vec![
+                    zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    ConvLayerWeights {
+                        name: "a.conv1d.3.weight".into(),
+                        weight: vec![1.0, 0.0, 0.0, 1.0],
+                        bias: vec![0.0; n_embd],
+                        shape: vec![1, 1, n_embd, n_embd],
+                    },
+                    zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    ConvLayerWeights {
+                        name: "a.conv1d.6.weight".into(),
+                        weight: vec![1.0, 0.0, 0.0, 1.0],
+                        bias: vec![0.0; n_embd],
+                        shape: vec![1, 1, n_embd, n_embd],
+                    },
+                ],
+                pre_encode_out_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                pre_encode_out_b: vec![0.0; n_embd],
+            },
+            layers: vec![],
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![1.0; n_embd],
+                norm_b: vec![0.0; n_embd],
+                up_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                up_b: vec![0.0; n_embd],
+                down_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                down_b: vec![0.0; n_embd],
+            },
+        };
+
+        let (out, t_out) = audio_encoder_forward(&[], 0, &weights);
         assert_eq!(t_out, 0);
         assert!(out.is_empty());
     }
