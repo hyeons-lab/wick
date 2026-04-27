@@ -747,6 +747,286 @@ pub fn conformer_conv_module_forward(
     }
 }
 
+/// Run one Conformer multi-head self-attention sub-block on a
+/// `[t × n_embd]` time-major sequence, accumulating with a full
+/// residual scale (`x += attn_out`, no 0.5 factor — that's only on
+/// the FFN macarons).
+///
+/// Applies the pre-block LayerNorm (`ln1_w/b`) to a scratch buffer,
+/// runs Q/K/V projections + relative-position attention on the
+/// normalized scratch, and adds the result back to the original
+/// (un-normalized) `x` as the residual. Mirrors the
+/// `conformer_ffn_forward` / `conformer_conv_module_forward` pattern.
+///
+/// Algorithm (mirrors `conformer.cpp` lines 86-150 in the
+/// llama.cpp `mtmd` code):
+///
+/// ```text
+/// pre_norm = LayerNorm(x; ln1_w, ln1_b)              // [t × n_embd] scratch
+/// Q        = Wq @ pre_norm + bq                       // [t × n_embd]
+/// K        = Wk @ pre_norm + bk                       // [t × n_embd]
+/// V        = Wv @ pre_norm + bv                       // [t × n_embd]
+/// p        = linear_pos_w @ pos_emb                   // [seq_len × n_embd]
+/// // per head h, query q, key k:
+/// matrix_ac[h, q, k] = ⟨Q[q,h] + u[h], K[k,h]⟩
+/// matrix_bd[h, q, p] = ⟨Q[q,h] + v[h], p_proj[p,h]⟩  // p ∈ [0, 2t-2]
+/// shifted_bd[h, q, k] = matrix_bd[h, q, (t-1) - q + k]   // rel-shift
+/// scores              = (matrix_ac + shifted_bd) / sqrt(d_head)
+/// attn                = softmax(scores)               // along the k axis
+/// attn_v[t, h, d]     = sum_k attn[h, q, k] * V[k, h, d]
+/// concat_heads        = attn_v reshaped [t × n_embd]
+/// out                 = Wo @ concat_heads + bo
+/// x                  += out                            // residual onto un-normalized x
+/// ```
+///
+/// Notes that don't fit the diagram:
+///
+/// - **Relative position bias** comes in two pieces (the
+///   Transformer-XL split): `matrix_ac` is the standard
+///   content-content score with a per-head `pos_bias_u` added to
+///   `Q`; `matrix_bd` is the content-position score using
+///   `pos_bias_v + Q` against `linear_pos_w @ pos_emb`. The
+///   "rel-shift" trick maps each row of `matrix_bd` (indexed by
+///   absolute position `p ∈ [0, 2t-2]`) into a `t × t`
+///   relative-position layout aligned with `matrix_ac`.
+/// - **`pos_emb` shape**: `[(2t - 1) × POS_EMB_DIM]` —
+///   built once per chunk by `relative_pos_emb(t)`. Caller's
+///   responsibility; this function checks the length with a
+///   `debug_assert_eq!` (debug builds only). An incorrect length
+///   in release builds would panic later on slice bounds inside
+///   the per-row indexing loops.
+/// - **No causal masking.** Conformer encoders attend
+///   bidirectionally; the conv module's depthwise causal pad is
+///   the only causal element in the block.
+/// - **`f64` accumulation** is used for the attention-score dot
+///   products (`matrix_ac`, `matrix_bd`), the softmax sums, and
+///   the `attn @ V` reduction. The dense projections (`Q`/`K`/`V`,
+///   `linear_pos`, output) go through `F32Weight::gemv`, which
+///   accumulates in `f32`. A future change could swap in an
+///   f64-accumulating GEMV path if encoder numerics need
+///   tightening.
+///
+/// Empty sequences (`t == 0`) are a no-op early return — the
+/// rel-shift index math underflows on `t = 0` otherwise.
+///
+/// Allocates several scratch `Vec<f32>`s per call. The encoder
+/// runs once per audio chunk (not per token), so the allocation
+/// overhead is negligible relative to the FLOPs; pre-allocated
+/// scratch buffers can be threaded through later if profiling
+/// shows otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn conformer_self_attention_forward(
+    x: &mut [f32],
+    pos_emb: &[f32],
+    ln1_w: &[f32],
+    ln1_b: &[f32],
+    attn_q_w: &F32Weight,
+    attn_q_b: &[f32],
+    attn_k_w: &F32Weight,
+    attn_k_b: &[f32],
+    attn_v_w: &F32Weight,
+    attn_v_b: &[f32],
+    attn_o_w: &F32Weight,
+    attn_o_b: &[f32],
+    pos_bias_u: &[f32],
+    pos_bias_v: &[f32],
+    linear_pos_w: &F32Weight,
+    n_embd: usize,
+    n_head: usize,
+    t: usize,
+    eps: f32,
+) {
+    assert!(n_head > 0, "n_head must be > 0");
+    assert!(
+        n_embd % n_head == 0,
+        "n_embd ({n_embd}) must be divisible by n_head ({n_head})"
+    );
+    if t == 0 {
+        return;
+    }
+
+    let d_head = n_embd / n_head;
+
+    // Checked size math for the scratch allocations. Mirrors
+    // `relative_pos_emb`'s pattern: on 64-bit the bounds are
+    // astronomical, but the checks compile away when LLVM proves
+    // the inputs sane, and on 32-bit they catch silent wraps that
+    // would otherwise mis-size the buffers and panic later inside
+    // the per-row indexing.
+    let seq_len = t
+        .checked_mul(2)
+        .and_then(|v| v.checked_sub(1))
+        .expect("conformer_self_attention_forward: 2 * t - 1 overflowed usize");
+    let t_n_embd = t
+        .checked_mul(n_embd)
+        .expect("conformer_self_attention_forward: t * n_embd overflowed usize");
+    let seq_n_embd = seq_len
+        .checked_mul(n_embd)
+        .expect("conformer_self_attention_forward: seq_len * n_embd overflowed usize");
+    let scores_len = n_head
+        .checked_mul(t)
+        .and_then(|v| v.checked_mul(t))
+        .expect("conformer_self_attention_forward: n_head * t * t overflowed usize");
+
+    debug_assert_eq!(x.len(), t_n_embd);
+    debug_assert_eq!(pos_emb.len(), seq_len * POS_EMB_DIM);
+    debug_assert_eq!(ln1_w.len(), n_embd);
+    debug_assert_eq!(ln1_b.len(), n_embd);
+    debug_assert_eq!(attn_q_w.rows, n_embd);
+    debug_assert_eq!(attn_q_w.cols, n_embd);
+    debug_assert_eq!(attn_q_b.len(), n_embd);
+    debug_assert_eq!(attn_k_w.rows, n_embd);
+    debug_assert_eq!(attn_k_w.cols, n_embd);
+    debug_assert_eq!(attn_k_b.len(), n_embd);
+    debug_assert_eq!(attn_v_w.rows, n_embd);
+    debug_assert_eq!(attn_v_w.cols, n_embd);
+    debug_assert_eq!(attn_v_b.len(), n_embd);
+    debug_assert_eq!(attn_o_w.rows, n_embd);
+    debug_assert_eq!(attn_o_w.cols, n_embd);
+    debug_assert_eq!(attn_o_b.len(), n_embd);
+    debug_assert_eq!(pos_bias_u.len(), n_embd);
+    debug_assert_eq!(pos_bias_v.len(), n_embd);
+    debug_assert_eq!(linear_pos_w.rows, n_embd);
+    debug_assert_eq!(linear_pos_w.cols, POS_EMB_DIM);
+
+    // ── Step 1+2: pre-block LayerNorm + Q/K/V projections.
+    // Per timestep, normalize then project into Q, K, V (all
+    // `[t × n_embd]`, head-interleaved within the n_embd axis). ──
+    let mut pre_norm = vec![0.0f32; n_embd];
+    let mut q_proj = vec![0.0f32; t_n_embd];
+    let mut k_proj = vec![0.0f32; t_n_embd];
+    let mut v_proj = vec![0.0f32; t_n_embd];
+    for ti in 0..t {
+        let in_row = &x[ti * n_embd..(ti + 1) * n_embd];
+        pre_norm.copy_from_slice(in_row);
+        crate::backend::cpu::layer_norm_inplace(&mut pre_norm, ln1_w, ln1_b, eps);
+        let q_row = &mut q_proj[ti * n_embd..(ti + 1) * n_embd];
+        attn_q_w.gemv(&pre_norm, q_row);
+        crate::backend::cpu::add_inplace(q_row, attn_q_b);
+        let k_row = &mut k_proj[ti * n_embd..(ti + 1) * n_embd];
+        attn_k_w.gemv(&pre_norm, k_row);
+        crate::backend::cpu::add_inplace(k_row, attn_k_b);
+        let v_row = &mut v_proj[ti * n_embd..(ti + 1) * n_embd];
+        attn_v_w.gemv(&pre_norm, v_row);
+        crate::backend::cpu::add_inplace(v_row, attn_v_b);
+    }
+
+    // ── Step 3: project the relative-position embedding through
+    // `linear_pos_w` once. Yields `p_proj` of shape `[seq_len ×
+    // n_embd]`, head-interleaved like Q/K/V. ──
+    let mut p_proj = vec![0.0f32; seq_n_embd];
+    for pi in 0..seq_len {
+        let pe_row = &pos_emb[pi * POS_EMB_DIM..(pi + 1) * POS_EMB_DIM];
+        let p_row = &mut p_proj[pi * n_embd..(pi + 1) * n_embd];
+        linear_pos_w.gemv(pe_row, p_row);
+    }
+
+    // ── Step 4: build `scores` of shape `[n_head × t × t]`
+    // directly, fusing matrix_ac, matrix_bd, the rel-shift trick,
+    // and the `1/sqrt(d_head)` scale. f64 accumulation per the
+    // project's numerical-precision convention. ──
+    //
+    // Rel-shift mapping derived from `relative_pos_emb`'s row
+    // ordering: row index 0 ↔ rel_pos = +(t - 1), row index
+    // 2t-2 ↔ rel_pos = -(t - 1). For query position `q` attending
+    // to key position `k`, rel_pos = q - k, so the matching
+    // pos_emb row is `(t - 1) - (q - k) = (t - 1) - q + k`.
+    //
+    // Scale computed and applied in f64 so the sqrt + reciprocal
+    // happen at f64 precision and the final f32 cast on the
+    // scaled score is the only narrowing step.
+    let scale = 1.0f64 / (d_head as f64).sqrt();
+    let t_minus_1 = t - 1;
+    let mut scores = vec![0.0f32; scores_len];
+    // q + u and q + v are loop-invariant in k — hoist out of the
+    // inner k loop. Reused across the t iterations of q.
+    let mut q_plus_u = vec![0.0f32; d_head];
+    let mut q_plus_v = vec![0.0f32; d_head];
+    for h in 0..n_head {
+        let u_h = &pos_bias_u[h * d_head..(h + 1) * d_head];
+        let v_h = &pos_bias_v[h * d_head..(h + 1) * d_head];
+        for q in 0..t {
+            let q_h = &q_proj[q * n_embd + h * d_head..q * n_embd + (h + 1) * d_head];
+            for d in 0..d_head {
+                q_plus_u[d] = q_h[d] + u_h[d];
+                q_plus_v[d] = q_h[d] + v_h[d];
+            }
+            for k in 0..t {
+                let k_h = &k_proj[k * n_embd + h * d_head..k * n_embd + (h + 1) * d_head];
+                let pos_idx = t_minus_1 + k - q;
+                let p_h =
+                    &p_proj[pos_idx * n_embd + h * d_head..pos_idx * n_embd + (h + 1) * d_head];
+                // matrix_ac[h, q, k] = ⟨Q[q,h] + u[h], K[k,h]⟩
+                // matrix_bd[h, q, pos_idx] = ⟨Q[q,h] + v[h], p_proj[pos_idx,h]⟩
+                // Fused into a single d pass — q_plus_u/v and the
+                // d_head-sized k_h/p_h slices share cache footprint.
+                // Cast operands to f64 before the multiply so the
+                // product is computed at f64 precision, not just
+                // the accumulator.
+                let mut ac = 0.0f64;
+                let mut bd = 0.0f64;
+                for d in 0..d_head {
+                    ac += q_plus_u[d] as f64 * k_h[d] as f64;
+                    bd += q_plus_v[d] as f64 * p_h[d] as f64;
+                }
+                scores[h * t * t + q * t + k] = ((ac + bd) * scale) as f32;
+            }
+        }
+    }
+
+    // ── Step 5: row-wise softmax along the k axis (per (head, q)
+    // row of length t). ──
+    for h in 0..n_head {
+        for q in 0..t {
+            let row = &mut scores[h * t * t + q * t..h * t * t + (q + 1) * t];
+            crate::backend::cpu::softmax_inplace(row);
+        }
+    }
+    let attn = scores; // rename for readability in the next stage
+
+    // ── Step 6: attn @ V, per head. Result `attn_v[t × n_embd]`
+    // head-interleaved (drop in directly as the input to the
+    // output projection — no transpose needed, since per-head
+    // d_head slots line up with `attn_o_w`'s expected column
+    // layout).
+    //
+    // Loop nesting is `(k, d)` rather than `(d, k)` so each k
+    // iteration scans a contiguous `d_head`-wide slice of `v_proj`
+    // (the per-head V row) instead of a strided one with stride
+    // `n_embd`. The f64 `acc` buffer (`d_head` floats) is hoisted
+    // out of the (h, q) loops so it's allocated once per call. ──
+    let mut attn_v = vec![0.0f32; t_n_embd];
+    let mut acc = vec![0.0f64; d_head];
+    for h in 0..n_head {
+        for q in 0..t {
+            let attn_row = &attn[h * t * t + q * t..h * t * t + (q + 1) * t];
+            acc.fill(0.0);
+            for k in 0..t {
+                let attn_k = attn_row[k] as f64;
+                let v_row = &v_proj[k * n_embd + h * d_head..k * n_embd + (h + 1) * d_head];
+                for d in 0..d_head {
+                    acc[d] += attn_k * v_row[d] as f64;
+                }
+            }
+            let out_slot = &mut attn_v[q * n_embd + h * d_head..q * n_embd + (h + 1) * d_head];
+            for d in 0..d_head {
+                out_slot[d] = acc[d] as f32;
+            }
+        }
+    }
+
+    // ── Step 7: output projection + bias, accumulate as full
+    // residual onto un-normalized `x`. ──
+    let mut out_row = vec![0.0f32; n_embd];
+    for ti in 0..t {
+        let av_row = &attn_v[ti * n_embd..(ti + 1) * n_embd];
+        attn_o_w.gemv(av_row, &mut out_row);
+        crate::backend::cpu::add_inplace(&mut out_row, attn_o_b);
+        let res = &mut x[ti * n_embd..(ti + 1) * n_embd];
+        crate::backend::cpu::add_inplace(res, &out_row);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,5 +1322,258 @@ mod tests {
             let pe = relative_pos_emb(n);
             assert_eq!(pe.len(), (2 * n - 1) * POS_EMB_DIM, "n_frames={n}");
         }
+    }
+
+    /// Drives `conformer_self_attention_forward` against a pure
+    /// scalar reference implementation built inline in the test.
+    /// Both consume the same Q/K/V/output weights, the same
+    /// pos_bias_u/v + linear_pos_w, the same `pos_emb`, and the
+    /// same input `x`. Asserts element-wise agreement.
+    ///
+    /// What this catches that an analytical "echo" test wouldn't:
+    /// - Rel-shift index off-by-one (the reference computes
+    ///   `pos_idx = (t-1) - q + k` directly without going through
+    ///   `relative_pos_emb`'s row layout, so a sign flip in the
+    ///   implementation would diverge).
+    /// - Per-head slicing bugs (heads have non-trivial,
+    ///   per-head-specific pos_bias_u/v in this fixture).
+    /// - Softmax row-axis confusion (q vs k axis).
+    /// - Output projection / residual application.
+    ///
+    /// Uses a deterministic structured weight pattern (no rand
+    /// dep). Tolerance is `1e-4` to accommodate f32 round-off
+    /// across the LN → matmul → softmax → matmul chain.
+    #[test]
+    fn conformer_self_attention_forward_matches_scalar_reference() {
+        let n_embd = 6;
+        let n_head = 2;
+        let d_head = n_embd / n_head; // 3
+        let t = 4;
+        let seq_len = 2 * t - 1; // 7
+        let eps = 1e-5_f32;
+
+        // Deterministic, seedable, non-trivial value pattern in
+        // roughly [-0.4, 0.92]. Replaces a rand dep — repeatable
+        // across runs and across reviewers.
+        let pat = |seed: usize, i: usize| -> f32 {
+            let v = ((i.wrapping_mul(7).wrapping_add(seed) * 31) % 23) as f32;
+            -0.4 + v * 0.06
+        };
+
+        let x_orig: Vec<f32> = (0..t * n_embd).map(|i| pat(11, i)).collect();
+        let mut x_under_test = x_orig.clone();
+
+        let pos_emb = relative_pos_emb(t);
+
+        let ln1_w: Vec<f32> = (0..n_embd).map(|i| 0.9 + 0.05 * i as f32).collect();
+        let ln1_b: Vec<f32> = (0..n_embd).map(|i| 0.01 * i as f32).collect();
+
+        let mk_w = |seed: usize| -> F32Weight {
+            let data: Vec<f32> = (0..n_embd * n_embd).map(|i| pat(seed, i)).collect();
+            F32Weight {
+                data,
+                rows: n_embd,
+                cols: n_embd,
+            }
+        };
+        let mk_b = |seed: usize| -> Vec<f32> { (0..n_embd).map(|i| pat(seed, i) * 0.5).collect() };
+
+        let attn_q_w = mk_w(101);
+        let attn_q_b = mk_b(102);
+        let attn_k_w = mk_w(103);
+        let attn_k_b = mk_b(104);
+        let attn_v_w = mk_w(105);
+        let attn_v_b = mk_b(106);
+        let attn_o_w = mk_w(107);
+        let attn_o_b = mk_b(108);
+
+        let pos_bias_u: Vec<f32> = (0..n_embd).map(|i| pat(201, i)).collect();
+        let pos_bias_v: Vec<f32> = (0..n_embd).map(|i| pat(202, i)).collect();
+
+        // linear_pos_w: shape [n_embd × POS_EMB_DIM]. Use a sparse
+        // pattern (only first 12 cols non-zero) so the projection
+        // exercises real arithmetic without massive scratch space.
+        let linear_pos_w = {
+            let mut data = vec![0.0f32; n_embd * POS_EMB_DIM];
+            for r in 0..n_embd {
+                for c in 0..12 {
+                    data[r * POS_EMB_DIM + c] = pat(301 + r, c);
+                }
+            }
+            F32Weight {
+                data,
+                rows: n_embd,
+                cols: POS_EMB_DIM,
+            }
+        };
+
+        conformer_self_attention_forward(
+            &mut x_under_test,
+            &pos_emb,
+            &ln1_w,
+            &ln1_b,
+            &attn_q_w,
+            &attn_q_b,
+            &attn_k_w,
+            &attn_k_b,
+            &attn_v_w,
+            &attn_v_b,
+            &attn_o_w,
+            &attn_o_b,
+            &pos_bias_u,
+            &pos_bias_v,
+            &linear_pos_w,
+            n_embd,
+            n_head,
+            t,
+            eps,
+        );
+
+        // ── Scalar reference ──
+        let layer_norm = |row: &[f32], w: &[f32], b: &[f32]| -> Vec<f32> {
+            let n = row.len();
+            let mean = row.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+            let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+            let inv_std = 1.0 / (var + eps as f64).sqrt();
+            row.iter()
+                .enumerate()
+                .map(|(i, &v)| ((v as f64 - mean) * inv_std * w[i] as f64 + b[i] as f64) as f32)
+                .collect()
+        };
+        let matvec = |w: &F32Weight, x: &[f32], b: &[f32]| -> Vec<f32> {
+            (0..w.rows)
+                .map(|r| {
+                    let row = &w.data[r * w.cols..(r + 1) * w.cols];
+                    let mut s = b[r] as f64;
+                    for c in 0..w.cols {
+                        s += row[c] as f64 * x[c] as f64;
+                    }
+                    s as f32
+                })
+                .collect()
+        };
+
+        let mut q = vec![0.0f32; t * n_embd];
+        let mut k = vec![0.0f32; t * n_embd];
+        let mut v = vec![0.0f32; t * n_embd];
+        for ti in 0..t {
+            let row = &x_orig[ti * n_embd..(ti + 1) * n_embd];
+            let ln = layer_norm(row, &ln1_w, &ln1_b);
+            q[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(&matvec(&attn_q_w, &ln, &attn_q_b));
+            k[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(&matvec(&attn_k_w, &ln, &attn_k_b));
+            v[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(&matvec(&attn_v_w, &ln, &attn_v_b));
+        }
+
+        let zero_b = vec![0.0f32; n_embd];
+        let mut p_proj = vec![0.0f32; seq_len * n_embd];
+        for pi in 0..seq_len {
+            let pe = &pos_emb[pi * POS_EMB_DIM..(pi + 1) * POS_EMB_DIM];
+            p_proj[pi * n_embd..(pi + 1) * n_embd].copy_from_slice(&matvec(
+                &linear_pos_w,
+                pe,
+                &zero_b,
+            ));
+        }
+
+        let scale = 1.0f32 / (d_head as f32).sqrt();
+        let mut scores = vec![0.0f32; n_head * t * t];
+        for h in 0..n_head {
+            for qi in 0..t {
+                for ki in 0..t {
+                    let pos_idx = (t - 1) - qi + ki;
+                    let mut ac = 0.0f64;
+                    let mut bd = 0.0f64;
+                    for d in 0..d_head {
+                        let qd = q[qi * n_embd + h * d_head + d];
+                        let kd = k[ki * n_embd + h * d_head + d];
+                        let pd = p_proj[pos_idx * n_embd + h * d_head + d];
+                        let u = pos_bias_u[h * d_head + d];
+                        let vv = pos_bias_v[h * d_head + d];
+                        ac += ((qd + u) * kd) as f64;
+                        bd += ((qd + vv) * pd) as f64;
+                    }
+                    scores[h * t * t + qi * t + ki] = (ac + bd) as f32 * scale;
+                }
+            }
+        }
+        // Row-wise softmax along the k axis.
+        for h in 0..n_head {
+            for qi in 0..t {
+                let row = &mut scores[h * t * t + qi * t..h * t * t + (qi + 1) * t];
+                let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f64;
+                for v in row.iter_mut() {
+                    *v = (*v - m).exp();
+                    sum += *v as f64;
+                }
+                for v in row.iter_mut() {
+                    *v = (*v as f64 / sum) as f32;
+                }
+            }
+        }
+
+        let mut attn_v = vec![0.0f32; t * n_embd];
+        for h in 0..n_head {
+            for qi in 0..t {
+                for d in 0..d_head {
+                    let mut s = 0.0f64;
+                    for ki in 0..t {
+                        s += (scores[h * t * t + qi * t + ki] * v[ki * n_embd + h * d_head + d])
+                            as f64;
+                    }
+                    attn_v[qi * n_embd + h * d_head + d] = s as f32;
+                }
+            }
+        }
+
+        let mut x_ref = x_orig.clone();
+        for ti in 0..t {
+            let av = &attn_v[ti * n_embd..(ti + 1) * n_embd];
+            let out = matvec(&attn_o_w, av, &attn_o_b);
+            for c in 0..n_embd {
+                x_ref[ti * n_embd + c] += out[c];
+            }
+        }
+
+        for i in 0..x_ref.len() {
+            let diff = (x_under_test[i] - x_ref[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "mismatch at i={i}: under_test={} ref={} diff={}",
+                x_under_test[i],
+                x_ref[i],
+                diff
+            );
+        }
+    }
+
+    /// Empty sequence (`t == 0`) is a no-op early return — not a
+    /// panic. Catches "function panics on the t=0 boundary case
+    /// the encoder might hit when fed a zero-length frame buffer".
+    #[test]
+    fn conformer_self_attention_forward_empty_sequence_is_noop() {
+        let n_embd = 4;
+        let n_head = 2;
+        let mut x: Vec<f32> = vec![];
+        let pos_emb: Vec<f32> = vec![];
+        let zero_w = F32Weight {
+            data: vec![0.0; n_embd * n_embd],
+            rows: n_embd,
+            cols: n_embd,
+        };
+        let zero_b = vec![0.0; n_embd];
+        let zero_pos = vec![0.0; n_embd];
+        let zero_lp = F32Weight {
+            data: vec![0.0; n_embd * POS_EMB_DIM],
+            rows: n_embd,
+            cols: POS_EMB_DIM,
+        };
+        let ones = vec![1.0; n_embd];
+
+        conformer_self_attention_forward(
+            &mut x, &pos_emb, &ones, &zero_b, &zero_w, &zero_b, &zero_w, &zero_b, &zero_w, &zero_b,
+            &zero_w, &zero_b, &zero_pos, &zero_pos, &zero_lp, n_embd, n_head, 0, 1e-5,
+        );
+        assert!(x.is_empty(), "t=0 should not modify or grow x");
     }
 }
