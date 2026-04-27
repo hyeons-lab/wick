@@ -176,6 +176,18 @@ pub trait Model: Send + Sync {
         unimplemented!("forward_embedding not supported by this backend")
     }
 
+    /// Static capability probe: does this backend implement
+    /// [`Self::forward_from_embedding`] (and the related
+    /// `forward_*_from_embedding` family)? Default `false` so new
+    /// backends opt in deliberately. Callers (today:
+    /// `Session::append_embeddings`) MUST consult this before
+    /// invoking the embedding-input methods so unsupported backends
+    /// surface a typed error instead of the default `unimplemented!`
+    /// panic.
+    fn supports_embedding_input(&self) -> bool {
+        false
+    }
+
     /// Forward pass with a float embedding as input (instead of a token ID).
     /// Used to feed audio codec embeddings back into the LLM after an audio frame.
     /// Default: panics (must be overridden by backends that support audio).
