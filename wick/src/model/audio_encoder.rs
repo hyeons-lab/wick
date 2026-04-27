@@ -1580,6 +1580,32 @@ pub fn audio_encoder_forward(
     (encoder_out, t_out)
 }
 
+/// Convenience entry point: PCM samples → per-frame embeddings in
+/// the LLM's hidden dimension. Wires
+/// [`crate::model::audio_preprocessor::log_mel_spectrogram`] into
+/// [`audio_encoder_forward`] using the `n_mel_bins` value the
+/// encoder was loaded with.
+///
+/// `pcm` is mono PCM at `SAMPLE_RATE` (16 kHz), normalized to
+/// `[-1, 1]`. Empty input returns `(vec![], 0)`.
+///
+/// Returns `(encoder_out, t_out)` where `encoder_out` is a flat
+/// `[t_out × llm_hidden_size]` row-major buffer ready for soft-
+/// token injection into an LLM session.
+///
+/// This is a thin glue helper — callers that need to drive the
+/// preprocessor and encoder separately (e.g. for feature caching,
+/// chunked streaming, or to swap in a different mel preprocessor)
+/// can call those two stages directly.
+pub fn encode_audio_pcm(pcm: &[f32], weights: &AudioEncoderWeights) -> (Vec<f32>, usize) {
+    let (mel, n_frames) =
+        crate::model::audio_preprocessor::log_mel_spectrogram(pcm, weights.config.n_mel_bins);
+    if n_frames == 0 {
+        return (Vec::new(), 0);
+    }
+    audio_encoder_forward(&mel, n_frames, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2710,6 +2736,182 @@ mod tests {
         };
 
         let (out, t_out) = audio_encoder_forward(&[], 0, &weights);
+        assert_eq!(t_out, 0);
+        assert!(out.is_empty());
+    }
+
+    /// End-to-end smoke for the `encode_audio_pcm` glue helper.
+    /// 0.5 seconds of a 1 kHz sine wave through the full pipeline
+    /// (mel preprocessor → conv stem → 1 Conformer block → MLP
+    /// adapter) should produce a finite, properly-shaped output
+    /// `[t_out × llm_hidden_size]`. Catches mismatches between
+    /// the preprocessor's `n_mel_bins` output and the encoder's
+    /// `config.n_mel_bins` expectation.
+    #[test]
+    fn encode_audio_pcm_smoke() {
+        // Same neutral synthetic encoder as audio_encoder_forward_smoke,
+        // sized so mel preprocessing on 0.5s @ 16kHz produces
+        // enough frames for the conv-stem subsampling.
+        let n_embd = 4;
+        let n_ff = 8;
+        let n_head = 1;
+        let n_mel_bins = 8; // overridden so log_mel_spectrogram emits 8 mel bins
+        let llm_hidden_size = 6;
+        let n_ff_adapter = 8;
+
+        let out_ch = n_embd;
+        let mut id_pw = vec![0.0f32; out_ch * out_ch];
+        for c in 0..out_ch {
+            id_pw[c * out_ch + c] = 1.0;
+        }
+        let conv_stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.3.weight".into(),
+                    weight: id_pw.clone(),
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+                zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.6.weight".into(),
+                    weight: id_pw,
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+            ],
+            pre_encode_out_w: {
+                let mut data = vec![0.0f32; n_embd * n_embd];
+                for i in 0..n_embd {
+                    data[i * n_embd + i] = 1.0;
+                }
+                F32Weight {
+                    data,
+                    rows: n_embd,
+                    cols: n_embd,
+                }
+            },
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+
+        let mut adapter_up = vec![0.0f32; n_ff_adapter * n_embd];
+        for i in 0..n_embd.min(n_ff_adapter) {
+            adapter_up[i * n_embd + i] = 1.0;
+        }
+        let mut adapter_down = vec![0.0f32; llm_hidden_size * n_ff_adapter];
+        for i in 0..llm_hidden_size.min(n_ff_adapter) {
+            adapter_down[i * n_ff_adapter + i] = 1.0;
+        }
+        let mlp_adapter = AudioMlpAdapterWeights {
+            norm_w: vec![1.0; n_embd],
+            norm_b: vec![0.0; n_embd],
+            up_w: F32Weight {
+                data: adapter_up,
+                rows: n_ff_adapter,
+                cols: n_embd,
+            },
+            up_b: vec![0.0; n_ff_adapter],
+            down_w: F32Weight {
+                data: adapter_down,
+                rows: llm_hidden_size,
+                cols: n_ff_adapter,
+            },
+            down_b: vec![0.0; llm_hidden_size],
+        };
+
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 1,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem,
+            layers: vec![neutral_conformer_block(n_embd, n_ff)],
+            mlp_adapter,
+        };
+
+        // 0.5 seconds of audio at the encoder's expected sample
+        // rate, 1 kHz sine wave.
+        let n_samples = SAMPLE_RATE as usize / 2;
+        let pcm: Vec<f32> = (0..n_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+
+        let (out, t_out) = encode_audio_pcm(&pcm, &weights);
+        assert!(t_out > 0, "expected at least one output frame");
+        assert_eq!(out.len(), t_out * llm_hidden_size);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.is_finite(), "out[{i}] = {v} (not finite)");
+        }
+    }
+
+    /// Empty PCM through the glue helper returns an empty vec at
+    /// the top level (the preprocessor's empty-input guard fires
+    /// first; the encoder is never invoked).
+    #[test]
+    fn encode_audio_pcm_empty_input_is_empty_output() {
+        let n_embd = 2;
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 0,
+                n_embd,
+                n_ff: 2,
+                n_head: 1,
+                eps: 1e-5,
+                n_mel_bins: 4,
+                llm_hidden_size: 2,
+            },
+            conv_stem: ConvStemWeights {
+                layers: vec![
+                    zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    ConvLayerWeights {
+                        name: "a.conv1d.3.weight".into(),
+                        weight: vec![1.0, 0.0, 0.0, 1.0],
+                        bias: vec![0.0; n_embd],
+                        shape: vec![1, 1, n_embd, n_embd],
+                    },
+                    zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, n_embd, vec![0.0; n_embd]),
+                    ConvLayerWeights {
+                        name: "a.conv1d.6.weight".into(),
+                        weight: vec![1.0, 0.0, 0.0, 1.0],
+                        bias: vec![0.0; n_embd],
+                        shape: vec![1, 1, n_embd, n_embd],
+                    },
+                ],
+                pre_encode_out_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                pre_encode_out_b: vec![0.0; n_embd],
+            },
+            layers: vec![],
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![1.0; n_embd],
+                norm_b: vec![0.0; n_embd],
+                up_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                up_b: vec![0.0; n_embd],
+                down_w: F32Weight {
+                    data: vec![0.0; n_embd * n_embd],
+                    rows: n_embd,
+                    cols: n_embd,
+                },
+                down_b: vec![0.0; n_embd],
+            },
+        };
+
+        let (out, t_out) = encode_audio_pcm(&[], &weights);
         assert_eq!(t_out, 0);
         assert!(out.is_empty());
     }
