@@ -897,6 +897,380 @@ pub fn conv1d(
     t_out
 }
 
+/// 2D convolution. Generalizes `conv1d` to two spatial axes;
+/// covers all the modes the LFM2A conv subsampling stem needs:
+/// - Regular conv (`groups = 1`).
+/// - Depthwise conv (`groups = in_channels`). The depthwise fast
+///   path further requires `out_channels == in_channels`; a
+///   depthwise channel-multiplier (`out_channels = in_channels * M`,
+///   `M > 1`) is supported by the naive 7-loop fallback.
+/// - Pointwise conv (`kh = kw = 1`).
+///
+/// Three fast paths land before the naive 7-loop fallback:
+///
+/// 1. **Pointwise** (`kh = kw = 1`, stride 1, no pad, groups 1):
+///    dispatch directly to a gemm — pointwise conv is mathematically
+///    a per-position matmul.
+/// 2. **Regular k×k** (`groups == 1`, kernel > 1×1): im2col the
+///    input into `[in_ch * kh * kw, plane_out]`, then dispatch the
+///    resulting `[out_ch × kk·ic] @ [kk·ic × plane_out]` gemm.
+/// 3. **Depthwise** (`groups == in_channels == out_channels`):
+///    parallelize across channels with rayon (under the `parallel`
+///    feature); each thread holds its own `[kh*kw, plane_out]`
+///    im2col scratch and runs a flat per-channel matmul.
+///
+/// Paths 1 and 2 use `gemm_with_bias_broadcast`, which dispatches
+/// to BLAS (Apple Accelerate / OpenBLAS) under the `blas` feature
+/// and falls back to scalar `matmul_f32` otherwise.
+///
+/// See `tests/bench_conv2d.rs` for measured numbers on the LFM2A
+/// audio encoder stem (320× cumulative speedup vs the naive baseline
+/// in the BLAS build, 42× in the default-feature scalar build).
+/// Inputs that don't match any fast path fall through to the naive
+/// 7-loop — the LFM2A stem itself doesn't hit it.
+///
+/// Layouts (all row-major, channel-major outer):
+/// - `input`: `[in_channels, h_in, w_in]`.
+/// - `weight`: `[out_channels, in_per_group, kh, kw]` where
+///   `in_per_group = in_channels / groups`.
+/// - `bias`: `[out_channels]` if present.
+/// - `output`: `[out_channels, h_out, w_out]` where
+///   `h_out = (h_in + 2 * pad_h - kh) / stride_h + 1` and
+///   `w_out = (w_in + 2 * pad_w - kw) / stride_w + 1`.
+///
+/// Returns `(h_out, w_out)`. Out-of-bounds reads from the conceptual
+/// pad zone contribute zero (no explicit pad buffer materialized).
+///
+/// Dilation is fixed at 1 — the LFM2A stem doesn't use dilated
+/// convs. Add a `(dil_h, dil_w)` parameter when a caller actually
+/// needs it.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+    in_channels: usize,
+    out_channels: usize,
+    h_in: usize,
+    w_in: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    groups: usize,
+) -> (usize, usize) {
+    debug_assert!(stride_h > 0, "stride_h must be > 0");
+    debug_assert!(stride_w > 0, "stride_w must be > 0");
+    debug_assert!(groups > 0, "groups must be > 0");
+    debug_assert!(kh > 0, "kh must be > 0");
+    debug_assert!(kw > 0, "kw must be > 0");
+    debug_assert_eq!(input.len(), in_channels * h_in * w_in);
+    debug_assert!(in_channels % groups == 0);
+    debug_assert!(out_channels % groups == 0);
+    if let Some(b) = bias {
+        debug_assert_eq!(b.len(), out_channels);
+    }
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    debug_assert_eq!(weight.len(), out_channels * in_per_group * kh * kw);
+
+    // Checked size math. On 64-bit the bounds are astronomical
+    // and these checks compile away when LLVM proves the inputs
+    // sane; on 32-bit they catch silent wraps that would otherwise
+    // mis-size the scratch allocations and panic later inside the
+    // per-row indexing.
+    let two_pad_h = pad_h
+        .checked_mul(2)
+        .expect("conv2d: 2 * pad_h overflowed usize");
+    let two_pad_w = pad_w
+        .checked_mul(2)
+        .expect("conv2d: 2 * pad_w overflowed usize");
+    let padded_h = h_in
+        .checked_add(two_pad_h)
+        .expect("conv2d: h_in + 2 * pad_h overflowed usize");
+    let padded_w = w_in
+        .checked_add(two_pad_w)
+        .expect("conv2d: w_in + 2 * pad_w overflowed usize");
+    debug_assert!(padded_h >= kh, "kh exceeds padded h_in");
+    debug_assert!(padded_w >= kw, "kw exceeds padded w_in");
+    let h_out = (padded_h - kh) / stride_h + 1;
+    let w_out = (padded_w - kw) / stride_w + 1;
+    let plane_in = h_in
+        .checked_mul(w_in)
+        .expect("conv2d: h_in * w_in overflowed usize");
+    let plane_out = h_out
+        .checked_mul(w_out)
+        .expect("conv2d: h_out * w_out overflowed usize");
+    let kernel_plane = kh
+        .checked_mul(kw)
+        .expect("conv2d: kh * kw overflowed usize");
+    let total_out = out_channels
+        .checked_mul(plane_out)
+        .expect("conv2d: out_channels * plane_out overflowed usize");
+    debug_assert_eq!(output.len(), total_out);
+
+    // Compute `output[m × n] = weight[m × k] @ input[k × n] +
+    // bias_broadcast`. Used by both the pointwise and im2col fast
+    // paths below. Dispatches to BLAS (Apple Accelerate AMX or
+    // OpenBLAS) when the `blas` feature is on; falls back to the
+    // scalar `matmul_f32` with the bias-prefill trick otherwise.
+    fn gemm_with_bias_broadcast(
+        output: &mut [f32],
+        weight: &[f32],
+        input: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        #[cfg(feature = "blas")]
+        {
+            // sgemm overwrites C (alpha=1, beta=0). Bias is added
+            // in a separate per-channel sweep — small relative to
+            // the gemm cost.
+            crate::backend::blas::sgemm_rowmajor_nn(m, n, k, weight, input, output);
+            if let Some(b) = bias {
+                for oc in 0..m {
+                    let bias_v = b[oc];
+                    for v in output[oc * n..(oc + 1) * n].iter_mut() {
+                        *v += bias_v;
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "blas"))]
+        {
+            // matmul_f32 accumulates onto C — pre-fill with the
+            // broadcast bias so the bias add lands for free.
+            for oc in 0..m {
+                let bias_v = bias.map_or(0.0, |b| b[oc]);
+                output[oc * n..(oc + 1) * n].fill(bias_v);
+            }
+            matmul_f32(weight, input, output, m, n, k);
+        }
+    }
+
+    // Fast path 1: pointwise convs (1x1, stride 1, no pad, groups 1).
+    // Mathematically a per-position matmul; the naive 7-loop below
+    // has terrible cache behavior for this case (~5s on the LFM2A
+    // 30s-audio stem layer.3 vs ~80ms via matmul_f32). Pre-fill
+    // output with the broadcast bias so the accumulating matmul
+    // lands the bias add for free. weight `[out_ch × in_ch × 1 × 1]`
+    // is already exactly `[m × k]` for matmul_f32(weight, input, out).
+    let pointwise = kh == 1
+        && kw == 1
+        && stride_h == 1
+        && stride_w == 1
+        && pad_h == 0
+        && pad_w == 0
+        && groups == 1;
+    if pointwise {
+        gemm_with_bias_broadcast(
+            output,
+            weight,
+            input,
+            bias,
+            out_channels,
+            plane_out,
+            in_channels,
+        );
+        return (h_out, w_out);
+    }
+
+    // Fast path 2: regular (non-grouped) k×k convs. Im2col the input
+    // into `[in_ch * kh * kw, plane_out]`, then dispatch the
+    // [out_ch × kk·ic] @ [kk·ic × plane_out] gemm to matmul_f32.
+    // weight is already laid out as [out_ch × in_ch × kh × kw] —
+    // matmul reads it as [m × k] with k = in_ch * kh * kw, matching
+    // our im2col row decomposition `(ic * kh + ki) * kw + kj`.
+    //
+    // Memory: im2col is `kh * kw * in_ch * plane_out * 4` bytes.
+    // For the LFM2A stem layer.0 at 30s (in_ch=1, plane_out=60K):
+    // 2.16 MB — acceptable. Skip this path for depthwise / grouped
+    // convs (the per-group matmuls would be too small to amortize
+    // the im2col allocation; the naive path is plenty fast there).
+    if groups == 1 {
+        let cols = kernel_plane
+            .checked_mul(in_channels)
+            .expect("conv2d: kernel_plane * in_channels overflowed usize");
+        let im2col_len = cols
+            .checked_mul(plane_out)
+            .expect("conv2d: im2col buffer size overflowed usize");
+        let mut im2col = vec![0.0f32; im2col_len];
+        for ic in 0..in_channels {
+            let in_plane = ic * plane_in;
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let row_idx = (ic * kh + ki) * kw + kj;
+                    let im_row_start = row_idx * plane_out;
+                    for oh in 0..h_out {
+                        let pad_row = oh * stride_h + ki;
+                        if pad_row < pad_h || pad_row >= h_in + pad_h {
+                            // Whole row is zero — leave the
+                            // pre-zeroed im2col untouched.
+                            continue;
+                        }
+                        let ih = pad_row - pad_h;
+                        let in_row_start = in_plane + ih * w_in;
+                        let out_row_start = im_row_start + oh * w_out;
+                        for ow in 0..w_out {
+                            let pad_col = ow * stride_w + kj;
+                            if pad_col >= pad_w && pad_col < w_in + pad_w {
+                                let iw = pad_col - pad_w;
+                                im2col[out_row_start + ow] = input[in_row_start + iw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        gemm_with_bias_broadcast(output, weight, &im2col, bias, out_channels, plane_out, cols);
+        return (h_out, w_out);
+    }
+
+    // Fast path 3: depthwise convs (groups == in_channels ==
+    // out_channels). Each channel is independent — parallelize
+    // across channels with rayon under the `parallel` feature.
+    // Per-channel work: build a `[kh * kw, plane_out]` im2col,
+    // then dispatch a flat `[1 × kk] @ [kk × plane_out]` matmul
+    // — eliminates the per-multiply bounds-check branch that
+    // hurts the naive 7-loop on the LFM2A stem.
+    //
+    // Memory: under `parallel`, one im2col scratch per worker
+    // thread via `for_each_init` (rayon-only API; the sequential
+    // shim in `crate::par` doesn't expose it, so the wasm /
+    // single-threaded path uses one scratch reused across the
+    // sequential `chunks_mut` loop). For the LFM2A 30s layer.2:
+    // 540KB per worker.
+    let depthwise = groups == in_channels && out_channels == in_channels;
+    if depthwise {
+        let im2col_len = kernel_plane
+            .checked_mul(plane_out)
+            .expect("conv2d: depthwise im2col buffer size overflowed usize");
+        // Per-channel work, factored into a closure so both the
+        // parallel and sequential branches below share a body.
+        let do_channel = |im2col: &mut [f32], ic: usize, out_chunk: &mut [f32]| {
+            let bias_v = bias.map_or(0.0, |b| b[ic]);
+            out_chunk.fill(bias_v);
+            // No per-channel `im2col.fill(0.0)` needed: the per-thread
+            // scratch is zero-initialized once at allocation, and the
+            // "skip" branches in the pad-bounds checks below depend
+            // only on (ki, kj, oh, ow, stride, pad, h_in, w_in) — not
+            // on `ic`. So the same im2col slots are written every
+            // channel and the same slots are skipped every channel,
+            // meaning the skipped (padded-zone) cells retain their
+            // initial 0 across the entire run.
+            let in_plane = ic * plane_in;
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let row_idx = ki * kw + kj;
+                    let im_row_start = row_idx * plane_out;
+                    for oh in 0..h_out {
+                        let pad_row = oh * stride_h + ki;
+                        if pad_row < pad_h || pad_row >= h_in + pad_h {
+                            continue;
+                        }
+                        let ih = pad_row - pad_h;
+                        let in_row_start = in_plane + ih * w_in;
+                        let out_row_start = im_row_start + oh * w_out;
+                        for ow in 0..w_out {
+                            let pad_col = ow * stride_w + kj;
+                            if pad_col >= pad_w && pad_col < w_in + pad_w {
+                                let iw = pad_col - pad_w;
+                                im2col[out_row_start + ow] = input[in_row_start + iw];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Per-channel kernel: a contiguous `kernel_plane`-wide
+            // slice of `weight`. matmul_f32 accumulates onto the
+            // bias-prefilled `out_chunk` so the bias add lands for
+            // free.
+            let w_start = ic * kernel_plane;
+            matmul_f32(
+                &weight[w_start..w_start + kernel_plane],
+                im2col,
+                out_chunk,
+                1,
+                plane_out,
+                kernel_plane,
+            );
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            output.par_chunks_mut(plane_out).enumerate().for_each_init(
+                || vec![0.0f32; im2col_len],
+                |im2col, (ic, out_chunk)| do_channel(im2col, ic, out_chunk),
+            );
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut im2col = vec![0.0f32; im2col_len];
+            for (ic, out_chunk) in output.chunks_mut(plane_out).enumerate() {
+                do_channel(&mut im2col, ic, out_chunk);
+            }
+        }
+        return (h_out, w_out);
+    }
+
+    for g in 0..groups {
+        for oc_local in 0..out_per_group {
+            let oc = g * out_per_group + oc_local;
+            let bias_v = bias.map_or(0.0, |b| b[oc]);
+
+            // Pre-bias every output position for this channel — also
+            // doubles as the zero-init pass since the per-input-channel
+            // accumulator below uses `+=`.
+            let oc_offset = oc * plane_out;
+            output[oc_offset..oc_offset + plane_out].fill(bias_v);
+
+            for ic_local in 0..in_per_group {
+                let ic = g * in_per_group + ic_local;
+                // Weight layout per (oc, ic_local): [kh × kw], row-major.
+                let w_oc_ic = (oc * in_per_group + ic_local) * kernel_plane;
+                let in_plane = ic * plane_in;
+
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut acc = 0.0f32;
+                        for ki in 0..kh {
+                            let pad_row = oh * stride_h + ki;
+                            // Translate back to the unpadded input.
+                            // Skip rows entirely outside the unpadded
+                            // window (their contribution is zero).
+                            if pad_row < pad_h || pad_row >= h_in + pad_h {
+                                continue;
+                            }
+                            let ih = pad_row - pad_h;
+                            for kj in 0..kw {
+                                let pad_col = ow * stride_w + kj;
+                                if pad_col < pad_w || pad_col >= w_in + pad_w {
+                                    continue;
+                                }
+                                let iw = pad_col - pad_w;
+                                let w = weight[w_oc_ic + ki * kw + kj];
+                                let x = input[in_plane + ih * w_in + iw];
+                                acc += w * x;
+                            }
+                        }
+                        output[oc_offset + oh * w_out + ow] += acc;
+                    }
+                }
+            }
+        }
+    }
+
+    (h_out, w_out)
+}
+
 // ── Attention score/value computation ───────────────────────────────────────
 
 /// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
@@ -2096,6 +2470,214 @@ mod tests {
         );
         // Input + bias.
         assert_eq!(output, vec![6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_conv2d_pointwise_identity() {
+        // 1×1 kernel with identity per-channel weights = passthrough.
+        // Input: 2 channels × 2×3 (h × w).
+        let input = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, // channel 0 (h=2, w=3)
+            7.0, 8.0, 9.0, 10.0, 11.0, 12.0, // channel 1
+        ];
+        // Weight [oc=2, ic=2, kh=1, kw=1]: identity per-channel.
+        let weight = vec![
+            1.0, 0.0, // oc 0: ic 0=1, ic 1=0
+            0.0, 1.0, // oc 1: ic 0=0, ic 1=1
+        ];
+        let mut output = vec![0.0; 2 * 2 * 3];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            None,
+            &mut output,
+            2,
+            2,
+            2,
+            3,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+        );
+        assert_eq!((h_out, w_out), (2, 3));
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_conv2d_strided_with_pad() {
+        // Stride 2x2, pad 1x1, kernel 3x3, single channel — common
+        // first-layer subsampling pattern (LFM2A stem layer.0 shape).
+        // Input: 1 × 4 × 4. Output dims: (4 + 2*1 - 3)/2 + 1 = 2.
+        let input: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+        // Mean-pool kernel (1/9 each cell).
+        let weight = vec![1.0 / 9.0; 9];
+        let mut output = vec![0.0; 2 * 2];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            None,
+            &mut output,
+            1,
+            1,
+            4,
+            4,
+            3,
+            3,
+            2,
+            2,
+            1,
+            1,
+            1,
+        );
+        assert_eq!((h_out, w_out), (2, 2));
+        // For pad=1 + 4×4 input with mean-pool 3×3 stride-2 kernel,
+        // each output covers a 3×3 window centered on (oh*2, ow*2)
+        // in the unpadded input space, with out-of-bounds rows/cols
+        // contributing zero. Spot-check the top-left output:
+        // window covers (-1, -1)..(1, 1) in unpadded coords; valid
+        // cells are input[0..2, 0..2] = [1, 2, 5, 6]. Sum = 14;
+        // mean = 14/9.
+        assert!((output[0] - 14.0 / 9.0).abs() < 1e-6, "got {}", output[0]);
+    }
+
+    #[test]
+    fn test_conv2d_depthwise_per_channel_independence() {
+        // groups = in_channels = 2 → depthwise. Each input channel
+        // is convolved with its own kernel, no cross-channel sums.
+        // Verify channel 1's data doesn't leak into channel 0's
+        // output and vice versa.
+        let input = vec![
+            1.0, 2.0, 3.0, 4.0, // ch 0 (h=2, w=2)
+            10.0, 20.0, 30.0, 40.0, // ch 1
+        ];
+        // Two depthwise kernels, each 1×1: ch 0 weight = 2.0 (double),
+        // ch 1 weight = 0.5 (half).
+        let weight = vec![2.0, 0.5];
+        let mut output = vec![0.0; 2 * 2 * 2];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            None,
+            &mut output,
+            2,
+            2,
+            2,
+            2,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            2,
+        );
+        assert_eq!((h_out, w_out), (2, 2));
+        assert_eq!(&output[0..4], &[2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(&output[4..8], &[5.0, 10.0, 15.0, 20.0]);
+    }
+
+    #[test]
+    fn test_conv2d_with_bias() {
+        let input = vec![1.0, 2.0, 3.0, 4.0]; // 1 × 2 × 2
+        let weight = vec![1.0]; // 1×1 identity
+        let bias = vec![10.0];
+        let mut output = vec![0.0; 4];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            Some(&bias),
+            &mut output,
+            1,
+            1,
+            2,
+            2,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+        );
+        assert_eq!((h_out, w_out), (2, 2));
+        assert_eq!(output, vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    #[test]
+    fn test_conv2d_pad_zero_contribution() {
+        // 3×3 kernel with all weights = 1, pad = 1, single 1×1 input.
+        // Output is 1×1: only the input center contributes; the 8
+        // surrounding pad cells contribute zero. Result = input value.
+        let input = vec![7.0];
+        let weight = vec![1.0; 9];
+        let mut output = vec![0.0; 1];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            None,
+            &mut output,
+            1,
+            1,
+            1,
+            1,
+            3,
+            3,
+            1,
+            1,
+            1,
+            1,
+            1,
+        );
+        assert_eq!((h_out, w_out), (1, 1));
+        assert_eq!(output[0], 7.0);
+    }
+
+    #[test]
+    fn test_conv2d_grouped_non_depthwise_fallback() {
+        // groups = 2 with in_ch = 4, out_ch = 4 (in_per_group =
+        // out_per_group = 2). This is the only conv2d shape that
+        // misses all three fast paths and falls through to the
+        // naive 7-loop. Verify the fallback still computes a
+        // correct grouped conv: each group sees only its own input
+        // channels and produces only its own output channels.
+        //
+        // Input: 4 ch × 1 × 1 (single spatial position).
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        // Weight [oc=4, in_per_group=2, kh=1, kw=1]:
+        //   group 0 (oc 0,1) sees in 0,1: identity within group
+        //   group 1 (oc 2,3) sees in 2,3: identity within group
+        let weight = vec![
+            1.0, 0.0, // oc 0: in_grp 0 = 1, in_grp 1 = 0
+            0.0, 1.0, // oc 1: in_grp 0 = 0, in_grp 1 = 1
+            1.0, 0.0, // oc 2 (grp 1): in_grp 0 = 1, in_grp 1 = 0
+            0.0, 1.0, // oc 3 (grp 1): in_grp 0 = 0, in_grp 1 = 1
+        ];
+        let mut output = vec![0.0; 4];
+        let (h_out, w_out) = conv2d(
+            &input,
+            &weight,
+            None,
+            &mut output,
+            4,
+            4,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            2,
+        );
+        assert_eq!((h_out, w_out), (1, 1));
+        // group 0 maps in 0→oc 0, in 1→oc 1.
+        // group 1 maps in 2→oc 2, in 3→oc 3.
+        assert_eq!(output, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
