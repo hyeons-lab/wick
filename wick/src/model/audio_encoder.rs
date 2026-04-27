@@ -1027,6 +1027,205 @@ pub fn conformer_self_attention_forward(
     }
 }
 
+/// Run the LFM2A conv subsampling stem on a single mel-spectrogram
+/// chunk. Returns the encoder's per-frame embedding sequence flat
+/// `[t_out × n_embd]` ready to feed into the Conformer block stack.
+///
+/// Mirrors the C++ reference `conformer.cpp:18-62` (LFM2A `mtmd`
+/// conv stem):
+///
+/// ```text
+/// in [1 × T × F]                                    ─ mel-spectrogram, time-major
+/// → conv2d(3x3, s=2, p=1)        + bias + ReLU      ─ layer.0 + layer.1
+/// → conv2d(3x3, s=2, p=1, dw)    + bias             ─ layer.2
+/// → conv2d(1x1, pw)              + bias + ReLU      ─ layer.3 + layer.4
+/// → conv2d(3x3, s=2, p=1, dw)    + bias             ─ layer.5
+/// → conv2d(1x1, pw)              + bias + ReLU      ─ layer.6 + layer.7
+/// → permute(0,2,1,3) + reshape   = [T_out × (C·F)]  ─ flatten channel + freq into per-time-step rows
+/// → linear(C·F → n_embd)         + bias             ─ pre_encode_out
+/// out [T_out × n_embd]
+/// ```
+///
+/// Three stride-2 layers (0/2/5) downsample the time axis by 8x;
+/// for `n_frames = 3000` (30s @ 16kHz/hop=160) → `t_out = 375`.
+///
+/// Hardcoded layer modes (matching the C++ ref): layer indices 0,
+/// 3, 6 are regular `groups = 1` convs; indices 2, 5 are depthwise
+/// (`groups = in_channels`). The loaded `ConvStemWeights.layers`
+/// vector has these in positional order 0..=4 (the parameter-free
+/// ReLUs at GGUF indices 1, 4, 7 are not stored and are applied
+/// implicitly here).
+///
+/// `mel` is `[n_frames × n_mel_bins]` row-major (time-major outer,
+/// freq inner). Caller is responsible for the mel-preprocessor
+/// transpose if their mel buffer is freq-major.
+///
+/// Empty input (`n_frames == 0`) returns an empty vec — the conv2d
+/// stride math underflows on n_frames < 1 otherwise.
+pub fn conv_stem_forward(
+    mel: &[f32],
+    n_frames: usize,
+    weights: &ConvStemWeights,
+    config: &AudioEncoderConfig,
+) -> (Vec<f32>, usize) {
+    let n_mel_bins = config.n_mel_bins;
+    let n_embd = config.n_embd;
+
+    // Release-fatal: this is a public API contract violation —
+    // failing it loudly here is far more actionable than a slice
+    // bounds panic deep inside conv2d.
+    assert_eq!(
+        mel.len(),
+        n_frames * n_mel_bins,
+        "conv_stem_forward: mel.len() = {} != n_frames * n_mel_bins = {} * {}",
+        mel.len(),
+        n_frames,
+        n_mel_bins,
+    );
+    assert_eq!(
+        weights.layers.len(),
+        5,
+        "conv_stem_forward: expected exactly 5 stem conv layers (positions 0,2,3,5,6); got {}",
+        weights.layers.len()
+    );
+
+    if n_frames == 0 {
+        return (Vec::new(), 0);
+    }
+
+    // Per-stem-layer (groups_kind, stride, pad) descriptors.
+    // Hardcoded to the LFM2A C++ reference; the loaded layer's
+    // shape Vec gives (kw, kh, in_per_group, out_ch) in GGUF order.
+    let layer_modes: [(usize, usize, usize); 5] = [
+        // (groups_kind, stride, pad)
+        // groups_kind: 0 = regular (groups = 1), 1 = depthwise
+        // (groups = in_channels). Stride/pad shared across both
+        // spatial axes.
+        (0, 2, 1), // layer.0: regular 3x3 s2 p1, 1 → 256
+        (1, 2, 1), // layer.2: depthwise 3x3 s2 p1, 256 ch
+        (0, 1, 0), // layer.3: pointwise 1x1, 256 → 256
+        (1, 2, 1), // layer.5: depthwise 3x3 s2 p1, 256 ch
+        (0, 1, 0), // layer.6: pointwise 1x1, 256 → 256
+    ];
+    // ReLU follows positions 0, 2 (after layer 3's pw), and 4 (after
+    // layer 6's pw). Indexed in *positional* (5-layer) order: layers
+    // [0, 1, 2, 3, 4] are the loaded indices for the GGUF layers
+    // [0, 2, 3, 5, 6]. ReLUs go after positional 0, 2, 4.
+    let relu_after: [bool; 5] = [true, false, true, false, true];
+
+    // Initial input shape: 1 channel, [n_frames × n_mel_bins] flat.
+    let mut cur_data: Vec<f32> = mel.to_vec();
+    let mut cur_ch: usize = 1;
+    let mut cur_h: usize = n_frames;
+    let mut cur_w: usize = n_mel_bins;
+
+    for (pos, layer) in weights.layers.iter().enumerate() {
+        // Decode the per-layer GGUF shape: [kw, kh, in_per_group, out_ch].
+        assert_eq!(
+            layer.shape.len(),
+            4,
+            "conv stem layer {pos}: expected 4-dim weight shape, got {:?}",
+            layer.shape
+        );
+        let kw = layer.shape[0];
+        let kh = layer.shape[1];
+        let in_per_group = layer.shape[2];
+        let out_ch = layer.shape[3];
+        let (groups_kind, stride, pad) = layer_modes[pos];
+        let groups = if groups_kind == 0 { 1 } else { cur_ch };
+        // Sanity: in_per_group must satisfy in_per_group * groups == cur_ch.
+        assert_eq!(
+            in_per_group * groups,
+            cur_ch,
+            "conv stem layer {pos}: in_per_group ({in_per_group}) * groups ({groups}) != cur_ch ({cur_ch})"
+        );
+
+        // Checked output-dim math. Underflow would happen if
+        // `cur_* + 2*pad < k*` (e.g., a pathological 0-mel-bin
+        // input). Catching it here surfaces a clear panic message
+        // instead of an out-of-memory or downstream slice panic.
+        let two_pad = pad
+            .checked_mul(2)
+            .expect("conv_stem_forward: 2 * pad overflowed usize");
+        let padded_h = cur_h
+            .checked_add(two_pad)
+            .expect("conv_stem_forward: cur_h + 2 * pad overflowed usize");
+        let padded_w = cur_w
+            .checked_add(two_pad)
+            .expect("conv_stem_forward: cur_w + 2 * pad overflowed usize");
+        assert!(
+            padded_h >= kh,
+            "conv stem layer {pos}: kh ({kh}) > padded_h ({padded_h})"
+        );
+        assert!(
+            padded_w >= kw,
+            "conv stem layer {pos}: kw ({kw}) > padded_w ({padded_w})"
+        );
+        let new_h = (padded_h - kh) / stride + 1;
+        let new_w = (padded_w - kw) / stride + 1;
+        let next_len = out_ch
+            .checked_mul(new_h)
+            .and_then(|v| v.checked_mul(new_w))
+            .expect("conv_stem_forward: out_ch * new_h * new_w overflowed usize");
+        let mut next = vec![0.0f32; next_len];
+        crate::backend::cpu::conv2d(
+            &cur_data,
+            &layer.weight,
+            Some(&layer.bias),
+            &mut next,
+            cur_ch,
+            out_ch,
+            cur_h,
+            cur_w,
+            kh,
+            kw,
+            stride,
+            stride,
+            pad,
+            pad,
+            groups,
+        );
+        if relu_after[pos] {
+            crate::backend::cpu::relu_inplace(&mut next);
+        }
+
+        cur_data = next;
+        cur_ch = out_ch;
+        cur_h = new_h;
+        cur_w = new_w;
+    }
+
+    // Permute (channel × time × freq) → (time × (channel × freq))
+    // and project per time step through `pre_encode_out`. The
+    // gather order matches the C++ reference's
+    // `permute(0, 2, 1, 3) + reshape_2d(W*C, T)`: per time step,
+    // `flat[ti, c, f] = stem_out[c, ti, f]`.
+    let t_out = cur_h;
+    let f_out = cur_w;
+    let plane = cur_ch * f_out;
+    debug_assert_eq!(weights.pre_encode_out_w.cols, plane);
+    debug_assert_eq!(weights.pre_encode_out_w.rows, n_embd);
+    debug_assert_eq!(weights.pre_encode_out_b.len(), n_embd);
+
+    let mut flat_per_step = vec![0.0f32; plane];
+    let mut encoder_in = vec![0.0f32; t_out * n_embd];
+    for ti in 0..t_out {
+        // Gather the (channel × freq) plane for this time step.
+        for c in 0..cur_ch {
+            let src =
+                &cur_data[c * t_out * f_out + ti * f_out..c * t_out * f_out + (ti + 1) * f_out];
+            let dst = &mut flat_per_step[c * f_out..(c + 1) * f_out];
+            dst.copy_from_slice(src);
+        }
+        // Project through pre_encode_out.
+        let out_row = &mut encoder_in[ti * n_embd..(ti + 1) * n_embd];
+        weights.pre_encode_out_w.gemv(&flat_per_step, out_row);
+        crate::backend::cpu::add_inplace(out_row, &weights.pre_encode_out_b);
+    }
+
+    (encoder_in, t_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1575,5 +1774,187 @@ mod tests {
             &zero_w, &zero_b, &zero_pos, &zero_pos, &zero_lp, n_embd, n_head, 0, 1e-5,
         );
         assert!(x.is_empty(), "t=0 should not modify or grow x");
+    }
+
+    /// Helper: build a `ConvLayerWeights` with all-zero kernel
+    /// weights and a per-channel bias. Used by the smoke test to
+    /// produce a stem whose output is analytically determined by
+    /// the per-layer biases — independent of input mel values.
+    fn zero_kernel_layer(
+        name: &str,
+        kw: usize,
+        kh: usize,
+        in_per_group: usize,
+        out_ch: usize,
+        bias: Vec<f32>,
+    ) -> ConvLayerWeights {
+        ConvLayerWeights {
+            name: name.into(),
+            weight: vec![0.0f32; out_ch * in_per_group * kh * kw],
+            bias,
+            shape: vec![kw, kh, in_per_group, out_ch],
+        }
+    }
+
+    /// End-to-end value-assertion smoke test. With **zero conv
+    /// weights** and per-layer biases, the stem output is a
+    /// hand-traceable per-channel constant independent of the
+    /// input mel values:
+    ///
+    /// ```text
+    /// layer.0 (3x3 zero w, b=b0):  output[c, t, f] = b0[c]
+    /// → ReLU                       (b0 chosen positive — passes through)
+    /// layer.2 (dw zero w, b=b2):   output[c, t, f] = b2[c]
+    /// layer.3 (1x1 identity w, b=0): output[c, t, f] = b2[c]  (carries forward)
+    /// → ReLU
+    /// layer.5 (dw zero w, b=b5):   output[c, t, f] = b5[c]
+    /// layer.6 (1x1 identity w, b=0): output[c, t, f] = b5[c]
+    /// → ReLU
+    /// permute + identity pre_encode_out:
+    ///   encoder_in[ti, c * F + f] = b5[c]  (constant across ti and f)
+    /// ```
+    ///
+    /// Verifying this catches:
+    /// - Every per-layer bias being applied (not silently dropped).
+    /// - ReLU not killing positive values.
+    /// - The 1x1 identity pointwise carrying values forward.
+    /// - The permute+reshape gather using the right indexing
+    ///   (per-time-step rows align to the per-channel constants).
+    /// - Pre_encode_out projection landing the values where expected.
+    #[test]
+    fn conv_stem_forward_smoke() {
+        // Pick dims so the stem's output spatial shape is small.
+        // Input mel: 24 frames × 8 bins (1-channel). After three
+        // stride-2 layers: T_out = 3, F_out = 1.
+        let out_ch = 4;
+        let n_mel_bins = 8;
+        let n_frames = 24;
+        let expected_t_out = 3;
+        let expected_f_out = 1;
+        let plane = out_ch * expected_f_out; // 4
+        let n_embd = plane; // identity projection so n_embd == plane
+
+        // Per-channel biases. b5 (layer 5) is what survives all
+        // the way through to the output; all other biases are
+        // intentionally zeroed so the propagation chain is clear.
+        let b5: Vec<f32> = (0..out_ch).map(|c| 0.1 * (c as f32 + 1.0)).collect();
+
+        // Identity weight for 1x1 pointwise: weight[oc * in + ic]
+        // (= weight[oc, ic, 0, 0] in [out × in × 1 × 1]).
+        let mut id_pw = vec![0.0f32; out_ch * out_ch];
+        for c in 0..out_ch {
+            id_pw[c * out_ch + c] = 1.0;
+        }
+
+        let stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, out_ch, vec![0.0; out_ch]),
+                ConvLayerWeights {
+                    name: "a.conv1d.3.weight".into(),
+                    weight: id_pw.clone(),
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+                zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, out_ch, b5.clone()),
+                ConvLayerWeights {
+                    name: "a.conv1d.6.weight".into(),
+                    weight: id_pw,
+                    bias: vec![0.0; out_ch],
+                    shape: vec![1, 1, out_ch, out_ch],
+                },
+            ],
+            pre_encode_out_w: {
+                // Identity from `plane` → `n_embd` (= plane).
+                let mut data = vec![0.0f32; n_embd * plane];
+                for i in 0..n_embd {
+                    data[i * plane + i] = 1.0;
+                }
+                F32Weight {
+                    data,
+                    rows: n_embd,
+                    cols: plane,
+                }
+            },
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+        let cfg = AudioEncoderConfig {
+            n_layer: 0,
+            n_embd,
+            n_ff: 0,
+            n_head: 0,
+            eps: 1e-5,
+            n_mel_bins,
+            llm_hidden_size: 0,
+        };
+
+        // Mel input values are arbitrary — they don't reach the
+        // output because the conv kernels are zero.
+        let mel: Vec<f32> = (0..n_frames * n_mel_bins)
+            .map(|i| ((i % 17) as f32) * 0.05 - 0.3)
+            .collect();
+
+        let (encoder_in, t_out) = conv_stem_forward(&mel, n_frames, &stem, &cfg);
+
+        assert_eq!(t_out, expected_t_out);
+        assert_eq!(encoder_in.len(), t_out * n_embd);
+        // Per-channel constant across all (ti, fi). With
+        // F_out = 1, plane index for (c, fi=0) is c * F + 0 = c.
+        for ti in 0..t_out {
+            for c in 0..out_ch {
+                let expected = b5[c];
+                let actual = encoder_in[ti * n_embd + c];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "encoder_in[ti={ti}, c={c}] = {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Empty input (n_frames = 0) returns an empty vec without
+    /// panicking on the conv2d stride-math underflow.
+    #[test]
+    fn conv_stem_forward_empty_input_is_empty_output() {
+        let cfg = AudioEncoderConfig {
+            n_layer: 0,
+            n_embd: 2,
+            n_ff: 0,
+            n_head: 0,
+            eps: 1e-5,
+            n_mel_bins: 4,
+            llm_hidden_size: 0,
+        };
+        // Minimal stem — never indexed, since the empty-input
+        // early return short-circuits before any layer runs.
+        let stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, 2, vec![0.0; 2]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, 1, 2, vec![0.0; 2]),
+                ConvLayerWeights {
+                    name: "a.conv1d.3.weight".into(),
+                    weight: vec![1.0, 0.0, 0.0, 1.0],
+                    bias: vec![0.0; 2],
+                    shape: vec![1, 1, 2, 2],
+                },
+                zero_kernel_layer("a.conv1d.5.weight", 3, 3, 1, 2, vec![0.0; 2]),
+                ConvLayerWeights {
+                    name: "a.conv1d.6.weight".into(),
+                    weight: vec![1.0, 0.0, 0.0, 1.0],
+                    bias: vec![0.0; 2],
+                    shape: vec![1, 1, 2, 2],
+                },
+            ],
+            pre_encode_out_w: F32Weight {
+                data: vec![0.0; 2 * 2],
+                rows: 2,
+                cols: 2,
+            },
+            pre_encode_out_b: vec![0.0; 2],
+        };
+
+        let (out, t_out) = conv_stem_forward(&[], 0, &stem, &cfg);
+        assert_eq!(t_out, 0);
+        assert!(out.is_empty());
     }
 }
