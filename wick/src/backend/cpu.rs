@@ -641,6 +641,18 @@ pub fn silu_inplace(x: &mut [f32]) {
     }
 }
 
+/// ReLU activation in-place: `x = max(x, 0)`. Used between the
+/// LFM2A conv subsampling stem layers; trivial enough to inline,
+/// but kept here so it's grep-able and can be SIMD-replaced later
+/// without touching call sites.
+pub fn relu_inplace(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        if *v < 0.0 {
+            *v = 0.0;
+        }
+    }
+}
+
 /// Fused SiLU activation + element-wise multiply: gate = silu(gate) * up.
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
