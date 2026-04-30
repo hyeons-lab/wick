@@ -21,6 +21,7 @@ use crate::time::Instant;
 
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
+use crate::model::audio_encoder::AudioEncoderWeights;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
 
@@ -267,6 +268,12 @@ pub struct Session {
     /// Retained for `reset()` (rebuild state + sampler) and
     /// `sync_sampler_from_opts` (read back the seed).
     config: SessionConfig,
+    /// Audio encoder weights, if attached. None for text-only
+    /// sessions; populated via [`Self::attach_audio_encoder`] before
+    /// [`Self::append_audio`] is called. Held by `Arc` so the same
+    /// encoder can back multiple sessions (one per concurrent
+    /// generation) without re-loading the ~hundreds-of-MB weights.
+    audio_encoder: Option<Arc<AudioEncoderWeights>>,
 }
 
 impl Session {
@@ -357,7 +364,26 @@ impl Session {
             max_seq_len,
             capabilities,
             config,
+            audio_encoder: None,
         }
+    }
+
+    /// Attach an audio encoder so [`Self::append_audio`] can encode
+    /// PCM samples into LLM-ready embeddings. Callers load the encoder
+    /// from the bundle's `multimodal_projector` GGUF via
+    /// [`crate::model::audio_encoder::AudioEncoderWeights::from_gguf`].
+    ///
+    /// Replaces any previously-attached encoder. Preserved across
+    /// [`Self::reset`] — the encoder is independent of KV state.
+    ///
+    /// Does **not** validate that the encoder's `llm_hidden_size`
+    /// matches the LLM's `hidden_size`; that check lives on
+    /// [`Self::append_audio`] so a stub encoder used in test setup
+    /// doesn't have to wire up matching dimensions just to be
+    /// attached. Real callers should always pair the encoder with
+    /// the LLM it was trained against.
+    pub fn attach_audio_encoder(&mut self, encoder: Arc<AudioEncoderWeights>) {
+        self.audio_encoder = Some(encoder);
     }
 
     /// What this session accepts as input / emits as output. Derived
@@ -434,44 +460,87 @@ impl Session {
         self.append_tokens(&tokens)
     }
 
-    /// Append PCM audio input to the session's context. For audio-in
-    /// models the samples are run through the model's audio tokenizer
-    /// and the resulting tokens are prefilled into the KV cache.
+    /// Append PCM audio input to the session's context. Runs the
+    /// samples through the attached audio encoder (mel + Conformer +
+    /// MLP adapter) and prefills the resulting per-frame hidden
+    /// states into KV via [`Self::append_embeddings`].
     ///
-    /// `sample_rate` is the PCM rate in Hz (LFM2-Audio expects 24_000).
+    /// `samples` is f32 PCM in `[-1, 1]`, mono. `sample_rate` must
+    /// match [`crate::model::audio_encoder::SAMPLE_RATE`] (16 kHz);
+    /// resampling is out of scope — caller is expected to resample
+    /// externally if their source rate differs.
     ///
-    /// **Current status (Phase 1.x scaffold):** the API is locked in
-    /// for FFI surface-freeze reasons, but the actual audio-tokenizer
-    /// wiring lands in a follow-up PR. Two distinct error modes:
+    /// Errors are checked in the order listed. The first matching
+    /// condition wins — e.g. an empty `samples` buffer paired with
+    /// an audio-incapable session returns `UnsupportedModality`,
+    /// not `EmptyInput`.
     ///
-    /// - When the loaded model **does not** support audio input
-    ///   ([`Session::capabilities`]`.audio_in == false`):
-    ///   [`WickError::UnsupportedModality`] — structurally unfixable by
-    ///   the caller; they need a different model.
-    /// - When the model **does** support audio input but the Session
-    ///   wiring isn't in place yet: [`WickError::Backend`] with a
-    ///   message pointing at [`crate::audio_engine::generate_audio`] as
-    ///   the interim driver. Caller can switch code paths.
-    ///
-    /// Distinguishing the two matters for FFI consumers gating UI on
-    /// the error — one is a hard "model can't do this," the other is
-    /// "wick can't do this yet."
+    /// 1. [`WickError::UnsupportedModality`] when the loaded model
+    ///    doesn't support audio input
+    ///    ([`Self::capabilities`]`.audio_in == false`).
+    /// 2. [`WickError::Backend`] with a "no encoder attached" message
+    ///    when the model supports audio but
+    ///    [`Self::attach_audio_encoder`] hasn't been called yet.
+    /// 3. [`WickError::Backend`] when the attached encoder's
+    ///    `llm_hidden_size` doesn't match the LLM's `hidden_size`
+    ///    (wrong-bundle encoder).
+    /// 4. [`WickError::Backend`] on sample-rate mismatch.
+    /// 5. [`WickError::EmptyInput`] when `samples` is empty *or* the
+    ///    audio is too short to produce any encoder frames (less than
+    ///    one window after center-padded STFT).
+    /// 6. [`WickError::ContextOverflow`] / [`WickError::Cancelled`]
+    ///    propagated from the underlying [`Self::append_embeddings`]
+    ///    call.
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), WickError> {
-        let _ = samples;
-        let _ = sample_rate;
         if !self.capabilities.audio_in {
             return Err(WickError::UnsupportedModality);
         }
-        // Audio-in-capable model, but the tokenizer + prefill path
-        // isn't wired through Session yet. Callers that need audio
-        // input today should drive it through the existing
-        // `wick::audio_engine::generate_audio` free function.
-        Err(WickError::Backend(
-            "Session::append_audio is not yet implemented for audio-capable models — \
-             drive `wick::audio_engine::generate_audio` directly until the \
-             Session-side audio-tokenizer wiring lands"
-                .to_string(),
-        ))
+        let Some(encoder) = self.audio_encoder.as_ref() else {
+            return Err(WickError::Backend(
+                "Session::append_audio: no audio encoder attached. Call \
+                 attach_audio_encoder() with weights loaded via \
+                 AudioEncoderWeights::from_gguf(...) on the bundle's \
+                 multimodal_projector GGUF before calling append_audio."
+                    .to_string(),
+            ));
+        };
+        // Catch encoder/LLM dimension mismatch upfront with a clear
+        // message naming both sides. Without this, `append_embeddings`
+        // would still reject the resulting buffer downstream — but
+        // with a generic shape error that doesn't point at the real
+        // cause (encoder loaded from a different bundle than the LLM).
+        let llm_hidden = self.model.config().hidden_size;
+        let enc_hidden = encoder.config.llm_hidden_size;
+        if enc_hidden != llm_hidden {
+            return Err(WickError::Backend(format!(
+                "Session::append_audio: attached encoder's llm_hidden_size ({enc_hidden}) \
+                 does not match the LLM's hidden_size ({llm_hidden}). \
+                 The encoder must be the multimodal_projector trained for the \
+                 currently-loaded LLM."
+            )));
+        }
+        if sample_rate != crate::model::audio_encoder::SAMPLE_RATE {
+            return Err(WickError::Backend(format!(
+                "Session::append_audio: sample_rate {} != {} required by \
+                 encoder (resampling is out of scope; resample externally \
+                 before passing samples in)",
+                sample_rate,
+                crate::model::audio_encoder::SAMPLE_RATE,
+            )));
+        }
+        if samples.is_empty() {
+            return Err(WickError::EmptyInput);
+        }
+        let (embeddings, n_frames) =
+            crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref());
+        if n_frames == 0 {
+            // Sub-window-length input: log_mel_spectrogram produced
+            // zero frames. Caller's audio was too short to encode
+            // anything; surface as EmptyInput rather than slicing
+            // the empty embedding buffer downstream.
+            return Err(WickError::EmptyInput);
+        }
+        self.append_embeddings(&embeddings, n_frames)
     }
 
     /// Append raw token IDs, running a prefill pass from the current position

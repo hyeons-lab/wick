@@ -622,3 +622,366 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
     assert_eq!(state_a.seq_len, n);
     assert_eq!(state_b.seq_len, n);
 }
+
+// ---------------------------------------------------------------------------
+// append_audio (PR 4d): end-to-end audio-input pipeline.
+//
+// The text-only-capability test below uses `make_session` (which
+// pins capabilities to `text_only`) — that's exactly what its
+// `UnsupportedModality` assertion needs. Every other test in this
+// section constructs the session directly with `audio_in: true` so
+// the audio pipeline can run.
+// ---------------------------------------------------------------------------
+
+/// Audio-in capability disabled → `UnsupportedModality` regardless of
+/// encoder attachment / samples / sample rate.
+#[test]
+#[ignore]
+fn append_audio_text_only_returns_unsupported_modality() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let mut session = make_session(model, tokenizer, SessionConfig::default());
+
+    let pcm = vec![0.0f32; 16_000];
+    let err = session.append_audio(&pcm, 16_000).unwrap_err();
+    assert!(
+        matches!(err, wick::WickError::UnsupportedModality),
+        "expected UnsupportedModality for text-only session, got {err:?}"
+    );
+}
+
+/// Audio-in capability enabled but no encoder attached → typed
+/// `Backend` error pointing at `attach_audio_encoder`.
+#[test]
+#[ignore]
+fn append_audio_without_encoder_returns_backend_error() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+
+    let pcm = vec![0.0f32; 16_000];
+    let err = session.append_audio(&pcm, 16_000).unwrap_err();
+    let wick::WickError::Backend(msg) = err else {
+        panic!("expected Backend error for missing encoder, got {err:?}");
+    };
+    assert!(
+        msg.contains("attach_audio_encoder"),
+        "Backend error message should reference attach_audio_encoder; got: {msg}"
+    );
+}
+
+/// Wrong sample rate → typed `Backend` error mentioning the expected
+/// rate. Tests the guard before any encoder work.
+#[test]
+#[ignore]
+fn append_audio_wrong_sample_rate_returns_backend_error() {
+    use wick::model::audio_encoder::AudioEncoderWeights;
+
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let mmproj_path = std::path::PathBuf::from(&home)
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !mmproj_path.exists() {
+        eprintln!(
+            "no mmproj available at {} — skipping",
+            mmproj_path.display()
+        );
+        return;
+    }
+    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mut weights = AudioEncoderWeights::from_gguf(&mmproj).unwrap();
+
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 1024).unwrap();
+    // The LFM2.5-Audio encoder targets 2048-dim hidden, but our
+    // fallback model is LFM2-VL-450M (1024-dim). Patch the encoder's
+    // config to match the LLM so the dim-mismatch guard doesn't
+    // fire first — this test is specifically about the sample-rate
+    // check, which is the next gate in line.
+    weights.config.llm_hidden_size = model.config().hidden_size;
+    let encoder = Arc::new(weights);
+
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+    session.attach_audio_encoder(encoder);
+
+    let pcm = vec![0.0f32; 16_000];
+    let err = session.append_audio(&pcm, 24_000).unwrap_err();
+    let wick::WickError::Backend(msg) = err else {
+        panic!("expected Backend error for sample-rate mismatch, got {err:?}");
+    };
+    assert!(
+        msg.contains("sample_rate") && msg.contains("16000"),
+        "Backend error should mention sample_rate + expected 16000; got: {msg}"
+    );
+}
+
+/// End-to-end smoke: load LFM2.5-Audio + its mmproj, attach the
+/// encoder, feed 0.5s of synthetic PCM, verify position advances by
+/// exactly the encoder's frame count and `last_logits` is set so a
+/// follow-up `generate()` succeeds without an intervening
+/// `append_tokens`.
+#[test]
+#[ignore]
+fn append_audio_end_to_end() {
+    use wick::model::audio_encoder::{AudioEncoderWeights, SAMPLE_RATE};
+
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let bundle = std::path::PathBuf::from(&home).join(".leap/models/LFM2.5-Audio-1.5B-Q4_0");
+    let primary = bundle.join("LFM2.5-Audio-1.5B-Q4_0.gguf");
+    let mmproj_path = bundle.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !primary.exists() || !mmproj_path.exists() {
+        eprintln!(
+            "no LFM2.5-Audio bundle (need {} and {}) — skipping",
+            primary.display(),
+            mmproj_path.display()
+        );
+        return;
+    }
+
+    let primary_gguf = wick::gguf::GgufFile::open(&primary).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&primary_gguf).unwrap();
+    let model = wick::model::load_model(primary_gguf, 2048).unwrap();
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+
+    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
+    session.attach_audio_encoder(encoder);
+
+    // 0.5 s of low-amplitude pink-ish noise (deterministic). Pure
+    // silence works but produces nearly-zero activations end-to-end;
+    // a small varying signal exercises the FFT path more honestly.
+    let n_samples = (SAMPLE_RATE as usize) / 2;
+    let pcm: Vec<f32> = (0..n_samples)
+        .map(|i| ((i as f32 * 0.07).sin() + (i as f32 * 0.013).sin()) * 0.05)
+        .collect();
+
+    let pos_before = session.position();
+    session
+        .append_audio(&pcm, SAMPLE_RATE)
+        .expect("append_audio");
+    let n_frames = session.position() - pos_before;
+    assert!(n_frames > 0, "encoder must produce at least one frame");
+    eprintln!(
+        "append_audio: 0.5 s @ {} Hz → {} encoder frames",
+        SAMPLE_RATE, n_frames
+    );
+
+    // Follow-up greedy generate(1) must succeed without an
+    // intervening append_tokens — same contract as
+    // append_embeddings's smoke test. We don't assert on token
+    // count: synthetic noise can produce EOS as the argmax of the
+    // first sampling step, which is a valid `Stop` outcome
+    // (greedy breaks before emitting anything). The Ok() return
+    // alone proves `last_logits` was populated by append_audio.
+    let opts = greedy_opts(1);
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).expect("generate");
+    eprintln!(
+        "post-audio generate: emitted {} tokens, finish_reason = {:?}",
+        sink.0.len(),
+        summary.finish_reason
+    );
+    assert!(
+        sink.0.len() <= 1,
+        "greedy(1) should emit 0 or 1 tokens, got {}",
+        sink.0.len()
+    );
+}
+
+/// `Session::reset` clears KV state + sampler but preserves the
+/// attached audio encoder — the encoder is independent of session
+/// state and rebuilding it would force callers into an awkward
+/// "re-attach after every reset" dance. This test exercises that
+/// contract directly: attach, reset, then call `append_audio` and
+/// verify it doesn't fail with the "no encoder attached" backend
+/// error.
+#[test]
+#[ignore]
+fn reset_preserves_attached_audio_encoder() {
+    use wick::model::audio_encoder::AudioEncoderWeights;
+
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let mmproj_path = std::path::PathBuf::from(&home)
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !mmproj_path.exists() {
+        eprintln!(
+            "no mmproj available at {} — skipping",
+            mmproj_path.display()
+        );
+        return;
+    }
+    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
+
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+    session.attach_audio_encoder(encoder);
+    session.reset();
+
+    // After reset, calling append_audio should hit the
+    // dimension-mismatch path (encoder is for LFM2.5-Audio, model
+    // is the LFM2-VL fallback), NOT the "no encoder" path.
+    // Either Backend variant is fine here; what we're asserting is
+    // that the encoder was preserved.
+    let pcm = vec![0.0f32; 16_000];
+    match session.append_audio(&pcm, 16_000) {
+        Err(wick::WickError::Backend(msg)) => {
+            assert!(
+                !msg.contains("no audio encoder attached"),
+                "encoder should have been preserved across reset; got: {msg}"
+            );
+        }
+        Ok(()) => {
+            // Encoder is preserved AND dimensions matched (encoder
+            // bundle was loaded for the same LLM). Either way, the
+            // contract holds.
+        }
+        Err(other) => panic!("unexpected error after reset: {other:?}"),
+    }
+}
+
+/// Wrong-bundle encoder: `llm_hidden_size` mismatch must surface
+/// as a typed `Backend` error mentioning both sides, not as a
+/// generic shape error from `append_embeddings` downstream.
+#[test]
+#[ignore]
+fn append_audio_dimension_mismatch_returns_backend_error() {
+    use wick::model::audio_encoder::AudioEncoderWeights;
+
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let mmproj_path = std::path::PathBuf::from(&home)
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !mmproj_path.exists() {
+        eprintln!(
+            "no mmproj available at {} — skipping",
+            mmproj_path.display()
+        );
+        return;
+    }
+    // Encoder is for LFM2.5-Audio (llm_hidden_size = 1024), but the
+    // LLM here is LFM2-VL-450M (hidden_size = 1024 too — they
+    // happen to match). To force a mismatch, swap the encoder's
+    // config llm_hidden_size to something deliberately wrong.
+    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mut weights = AudioEncoderWeights::from_gguf(&mmproj).unwrap();
+    let actual = weights.config.llm_hidden_size;
+    weights.config.llm_hidden_size = actual + 1; // poison
+    let encoder = Arc::new(weights);
+
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+    session.attach_audio_encoder(encoder);
+
+    let pcm = vec![0.0f32; 16_000];
+    let err = session.append_audio(&pcm, 16_000).unwrap_err();
+    let wick::WickError::Backend(msg) = err else {
+        panic!("expected Backend error for dim mismatch, got {err:?}");
+    };
+    assert!(
+        msg.contains("llm_hidden_size") && msg.contains("hidden_size"),
+        "Backend error should mention both encoder llm_hidden_size and LLM hidden_size; got: {msg}"
+    );
+}
