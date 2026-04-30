@@ -1078,133 +1078,31 @@ impl Lfm2Model {
         state.scratch.normed = normed;
         state.scratch.ffn_input = ffn_input;
     }
-}
 
-impl Model for Lfm2Model {
-    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
-        let token_id = tokens[0] as usize;
-        let cfg = &self.config;
-        assert!(
-            token_id < cfg.vocab_size,
-            "token_id {token_id} out of range (vocab_size={})",
-            cfg.vocab_size
-        );
-
-        // 1. Embedding lookup → layers → output norm
-        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
-        self.run_layers(&mut hidden, pos, state);
-
-        // 2. Output projection (tied embeddings)
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        #[cfg(target_arch = "aarch64")]
-        {
-            Self::quantize_to_scratch(&hidden, state);
-            self.gemv_preq(
-                &self.embd_ref,
-                &hidden,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                &mut logits,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, &hidden, &mut logits);
-
-        logits
-    }
-
-    fn supports_embedding_input(&self) -> bool {
-        true
-    }
-
-    fn forward_from_embedding(
+    /// Layer loop + output norm + tied logit projection for batched
+    /// prefill. Takes a column-major hidden buffer (`hs × n`, channel
+    /// `i` of token `j` at index `i * n + j`) already populated by the
+    /// caller, runs the per-layer attn / conv + FFN passes, advances
+    /// `state.seq_len` to `start_pos + n`, and projects the last
+    /// frame's hidden state to logits over the vocabulary.
+    ///
+    /// Shared between [`Self::forward_prefill`] (token-id input,
+    /// embedding-table lookup) and [`Self::forward_prefill_from_embeddings`]
+    /// (raw embedding input, copied + transposed into the column-major
+    /// `hidden` layout). The two entry points differ only in how they
+    /// fill `hidden`; everything from the first RMSnorm onward is
+    /// identical and lives here.
+    fn prefill_layers_and_logits(
         &self,
-        embedding: &[f32],
-        _pos: usize,
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
-        let cfg = &self.config;
-        let mut hidden = embedding.to_vec();
-        let pos = state.seq_len;
-        self.run_layers(&mut hidden, pos, state);
-
-        // Output projection (tied embeddings)
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        #[cfg(target_arch = "aarch64")]
-        {
-            Self::quantize_to_scratch(&hidden, state);
-            self.gemv_preq(
-                &self.embd_ref,
-                &hidden,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                &mut logits,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, &hidden, &mut logits);
-
-        logits
-    }
-
-    fn forward_embedding(
-        &self,
-        tokens: &[u32],
-        _pos: usize,
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
-        assert_eq!(tokens.len(), 1);
-        let token_id = tokens[0] as usize;
-        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
-        let pos = state.seq_len;
-        self.run_layers(&mut hidden, pos, state);
-        hidden
-    }
-
-    fn forward_hidden_from_embedding(
-        &self,
-        embedding: &[f32],
-        _pos: usize,
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
-        let mut hidden = embedding.to_vec();
-        let pos = state.seq_len;
-        self.run_layers(&mut hidden, pos, state);
-        hidden
-    }
-
-    fn forward_prefill(
-        &self,
-        tokens: &[u32],
+        mut hidden: Vec<f32>,
+        n: usize,
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let n = tokens.len();
-        assert!(
-            !tokens.is_empty(),
-            "forward_prefill requires at least one token"
-        );
 
-        // 1. Embed all tokens → hidden[hs × n] with stride n (token j at indices [j, n+j, 2n+j, ...])
-        let mut hidden = vec![0.0f32; hs * n];
-        let mut emb_buf = vec![0.0f32; hs];
-        for (j, &token_id) in tokens.iter().enumerate() {
-            let token_id = token_id as usize;
-            assert!(
-                token_id < self.embd_ref.m,
-                "token_id {token_id} out of range for vocab size {}",
-                self.embd_ref.m
-            );
-            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
-            for i in 0..hs {
-                hidden[i * n + j] = emb_buf[i];
-            }
-        }
-
-        // 2. Per-layer loop — pre-allocate all large buffers outside the loop
+        // Per-layer loop — pre-allocate all large buffers outside the loop
         let mut normed = vec![0.0f32; hs * n];
         let mut block_out = vec![0.0f32; hs * n];
         let mut ffn_input = vec![0.0f32; hs * n];
@@ -2177,7 +2075,7 @@ impl Model for Lfm2Model {
         // the single-token forward() does that. So set it here:
         state.seq_len = start_pos + n;
 
-        // 3. Extract last token, apply output norm + projection
+        // Extract last token, apply output norm + projection
         let mut last_hidden = vec![0.0f32; hs];
         for i in 0..hs {
             last_hidden[i] = hidden[i * n + (n - 1)];
@@ -2200,6 +2098,176 @@ impl Model for Lfm2Model {
         self.gemv(&self.embd_ref, &last_hidden, &mut logits);
 
         logits
+    }
+}
+
+impl Model for Lfm2Model {
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        assert!(
+            token_id < cfg.vocab_size,
+            "token_id {token_id} out of range (vocab_size={})",
+            cfg.vocab_size
+        );
+
+        // 1. Embedding lookup → layers → output norm
+        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+        self.run_layers(&mut hidden, pos, state);
+
+        // 2. Output projection (tied embeddings)
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        self.gemv(&self.embd_ref, &hidden, &mut logits);
+
+        logits
+    }
+
+    fn supports_embedding_input(&self) -> bool {
+        true
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let mut hidden = embedding.to_vec();
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+
+        // Output projection (tied embeddings)
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::quantize_to_scratch(&hidden, state);
+            self.gemv_preq(
+                &self.embd_ref,
+                &hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut logits,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        self.gemv(&self.embd_ref, &hidden, &mut logits);
+
+        logits
+    }
+
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1);
+        let token_id = tokens[0] as usize;
+        let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+        hidden
+    }
+
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let mut hidden = embedding.to_vec();
+        let pos = state.seq_len;
+        self.run_layers(&mut hidden, pos, state);
+        hidden
+    }
+
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill requires at least one token"
+        );
+
+        // Embed all tokens → hidden[hs × n] with stride n (token j at
+        // indices [j, n+j, 2n+j, ...]). Layer loop + output projection
+        // is shared with `forward_prefill_from_embeddings` via
+        // `prefill_layers_and_logits`.
+        let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
+        for (j, &token_id) in tokens.iter().enumerate() {
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
+            for i in 0..hs {
+                hidden[i * n + j] = emb_buf[i];
+            }
+        }
+
+        self.prefill_layers_and_logits(hidden, n, start_pos, state)
+    }
+
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = n_tokens;
+        assert!(
+            n > 0,
+            "forward_prefill_from_embeddings requires at least one frame"
+        );
+        assert_eq!(
+            embeddings.len(),
+            n * hs,
+            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
+            embeddings.len(),
+            n,
+            hs
+        );
+
+        // Transpose row-major embeddings (frame j at [j*hs..(j+1)*hs])
+        // into column-major hidden (token j's channel i at [i*n + j]) —
+        // same layout `forward_prefill` builds via the embed-table
+        // lookup. After this, the layer loop + output projection in
+        // `prefill_layers_and_logits` is identical to the token path.
+        let mut hidden = vec![0.0f32; hs * n];
+        for j in 0..n {
+            let frame = &embeddings[j * hs..(j + 1) * hs];
+            for i in 0..hs {
+                hidden[i * n + j] = frame[i];
+            }
+        }
+
+        self.prefill_layers_and_logits(hidden, n, start_pos, state)
     }
 
     fn config(&self) -> &ModelConfig {

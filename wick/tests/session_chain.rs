@@ -552,3 +552,73 @@ fn append_embeddings_advances_position_and_sets_logits() {
     session.generate(&opts, &mut sink).expect("generate");
     assert_eq!(sink.0.len(), 1, "should emit exactly one token");
 }
+
+/// Parity test: the batched
+/// `Model::forward_prefill_from_embeddings` override on
+/// `Lfm2Model` must produce the same final-frame logits as the
+/// per-frame `forward_from_embedding` loop the trait default
+/// performs. Reduction-order differences between GEMV and GEMM
+/// allow a small epsilon, but the two paths must agree on every
+/// vocab entry — proves the column-major transpose + shared
+/// `prefill_layers_and_logits` helper match the sequential
+/// forward path.
+#[test]
+#[ignore]
+fn forward_prefill_from_embeddings_matches_per_frame_loop() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf_a = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let gguf_b = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let model_a = wick::model::load_model(gguf_a, 4096).unwrap();
+    let model_b = wick::model::load_model(gguf_b, 4096).unwrap();
+    let cfg = model_a.config().clone();
+    let hidden_size = cfg.hidden_size;
+
+    // Small but non-trivial frame count. Big enough to exercise the
+    // batched per-layer GEMM path; small enough that the test is
+    // fast even on cold caches.
+    let n: usize = 6;
+    let embeddings: Vec<f32> = (0..n * hidden_size)
+        .map(|i| (((i * 31 + 7) % 257) as f32) * 0.001 - 0.1)
+        .collect();
+
+    // Path A: loop forward_from_embedding per frame (the trait
+    // default's behavior, exercised here directly).
+    let mut state_a = wick::kv_cache::InferenceState::from_config(&cfg);
+    let mut last_a: Vec<f32> = Vec::new();
+    for j in 0..n {
+        let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
+        last_a = model_a.forward_from_embedding(frame, j, &mut state_a);
+    }
+
+    // Path B: single batched call.
+    let mut state_b = wick::kv_cache::InferenceState::from_config(&cfg);
+    let last_b = model_b.forward_prefill_from_embeddings(&embeddings, n, 0, &mut state_b);
+
+    assert_eq!(
+        last_a.len(),
+        last_b.len(),
+        "logit vector length mismatch between loop and batched paths"
+    );
+
+    let mut max_abs_diff = 0.0f32;
+    for (i, (a, b)) in last_a.iter().zip(last_b.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > max_abs_diff {
+            max_abs_diff = d;
+        }
+        assert!(
+            d < 1e-2,
+            "logit {i}: loop={a} batched={b} diff={d} (max so far {max_abs_diff})"
+        );
+    }
+    eprintln!("forward_prefill_from_embeddings parity: max |Δlogit| = {max_abs_diff:.4e}");
+
+    // Final state seq_len must match — both paths processed n
+    // frames starting from pos 0.
+    assert_eq!(state_a.seq_len, n);
+    assert_eq!(state_b.seq_len, n);
+}

@@ -594,20 +594,20 @@ impl Session {
     ///
     /// Mirrors `append_tokens`'s context-shift logic
     /// (`n_keep`-aware) and `last_logits` semantics. Cancellation
-    /// is checked between frames; on cancel, `last_logits` is
-    /// cleared and `Err(Cancelled)` is returned with the frames
-    /// processed so far still in KV (caller can `clear_cancel`
-    /// and resume from `position()` like `append_tokens`).
+    /// is checked between `ubatch_size`-sized chunks (granularity:
+    /// one chunk); on cancel, `last_logits` is cleared and
+    /// `Err(Cancelled)` is returned with the frames processed so
+    /// far still in KV (caller can `clear_cancel` and resume from
+    /// `position()` like `append_tokens`).
     ///
-    /// Performance note: today this loops
-    /// [`Model::forward_from_embedding`] per frame (one full
-    /// forward per row). That's correct but not as efficient as
-    /// a true batched embedding-prefill — adding
-    /// `forward_prefill_from_embeddings` to the `Model` trait is
-    /// a follow-up optimization. For typical audio chunks
-    /// (~50–375 frames per 5–30s of audio at 16 kHz), the
-    /// per-frame cost is comparable to text prefill of the same
-    /// number of tokens.
+    /// Dispatches to [`Model::forward_prefill_from_embeddings`]
+    /// in `ubatch`-sized chunks, mirroring
+    /// [`Model::forward_prefill_chunked`] for tokens. Backends
+    /// with a true batched embedding-prefill path (CPU `Lfm2Model`)
+    /// process a whole chunk per call and amortize per-layer GEMM
+    /// dispatch across frames; the trait default falls back to a
+    /// per-frame `forward_from_embedding` loop, preserving
+    /// correctness for backends that haven't overridden.
     pub fn append_embeddings(
         &mut self,
         embeddings: &[f32],
@@ -669,25 +669,36 @@ impl Session {
             );
         }
 
-        // Per-frame forward. Position advances by 1 per call;
-        // cancel is checked AFTER each frame so we always make
-        // progress on at least one frame before observing the
-        // flag — mirrors `forward_prefill_chunked`'s
-        // "always-one-chunk" guarantee and avoids leaving the
-        // session wedged on an entry-time cancel.
+        // Chunk over `ubatch_size` frames, calling the batched
+        // embedding-prefill once per chunk. Position advances by
+        // chunk size after each call. Cancel is checked AFTER each
+        // chunk so we always make progress on at least one chunk
+        // before observing the flag — mirrors
+        // `forward_prefill_chunked`'s "always-one-chunk" guarantee
+        // and avoids leaving the session wedged on an entry-time
+        // cancel. `ubatch == 0` means "no chunking" (one call
+        // covering all frames), matching CLI `--ubatch-size 0`.
+        let ubatch = self.config.ubatch_size as usize;
+        let chunk_size = if ubatch == 0 { n_tokens } else { ubatch };
         let mut last_logits: Option<Vec<f32>> = None;
-        for ti in 0..n_tokens {
-            let frame = &embeddings[ti * hidden_size..(ti + 1) * hidden_size];
-            let logits =
-                self.model
-                    .forward_from_embedding(frame, self.current_pos, &mut self.state);
-            self.current_pos += 1;
+        let mut ti = 0usize;
+        while ti < n_tokens {
+            let end = (ti + chunk_size).min(n_tokens);
+            let chunk = &embeddings[ti * hidden_size..end * hidden_size];
+            let logits = self.model.forward_prefill_from_embeddings(
+                chunk,
+                end - ti,
+                self.current_pos,
+                &mut self.state,
+            );
+            self.current_pos += end - ti;
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             last_logits = Some(logits);
+            ti = end;
             // Only abort if more frames remain — guarantees ≥ 1
-            // frame of progress before observing the flag.
-            if self.cancel.load(Ordering::Relaxed) && ti + 1 < n_tokens {
+            // chunk of progress before observing the flag.
+            if self.cancel.load(Ordering::Relaxed) && ti < n_tokens {
                 self.last_logits = None;
                 return Err(WickError::Cancelled);
             }
