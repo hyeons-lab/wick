@@ -577,6 +577,126 @@ impl Session {
         }
     }
 
+    /// Append a sequence of pre-computed hidden-dim embeddings —
+    /// the soft-token analog of [`Self::append_tokens`].
+    ///
+    /// Each row of `embeddings` is fed straight into the model
+    /// at the LLM's input-embedding stage, bypassing the
+    /// `embed_tokens` lookup. Used for non-text input modalities
+    /// where an external encoder produces hidden states directly
+    /// (e.g. the LFM2A audio encoder's per-frame output via
+    /// [`crate::model::audio_encoder::encode_audio_pcm`]).
+    ///
+    /// `embeddings` is a flat row-major buffer of length
+    /// `n_tokens * hidden_size`. Position advances by `n_tokens`.
+    /// Returns `Err(EmptyInput)` for `n_tokens == 0`,
+    /// `Err(Backend(...))` for shape mismatch.
+    ///
+    /// Mirrors `append_tokens`'s context-shift logic
+    /// (`n_keep`-aware) and `last_logits` semantics. Cancellation
+    /// is checked between frames; on cancel, `last_logits` is
+    /// cleared and `Err(Cancelled)` is returned with the frames
+    /// processed so far still in KV (caller can `clear_cancel`
+    /// and resume from `position()` like `append_tokens`).
+    ///
+    /// Performance note: today this loops
+    /// [`Model::forward_from_embedding`] per frame (one full
+    /// forward per row). That's correct but not as efficient as
+    /// a true batched embedding-prefill — adding
+    /// `forward_prefill_from_embeddings` to the `Model` trait is
+    /// a follow-up optimization. For typical audio chunks
+    /// (~50–375 frames per 5–30s of audio at 16 kHz), the
+    /// per-frame cost is comparable to text prefill of the same
+    /// number of tokens.
+    pub fn append_embeddings(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+    ) -> Result<(), WickError> {
+        if n_tokens == 0 {
+            return Err(WickError::EmptyInput);
+        }
+        // Backend capability check: surface a typed error instead
+        // of the default `unimplemented!` panic on backends that
+        // don't implement `forward_from_embedding`.
+        if !self.model.supports_embedding_input() {
+            return Err(WickError::UnsupportedModality);
+        }
+        let hidden_size = self.model.config().hidden_size;
+        let expected_len = n_tokens.checked_mul(hidden_size).ok_or_else(|| {
+            WickError::Backend("append_embeddings: n_tokens * hidden_size overflow".into())
+        })?;
+        if embeddings.len() != expected_len {
+            return Err(WickError::Backend(format!(
+                "append_embeddings: embeddings.len() ({}) != n_tokens ({n_tokens}) * hidden_size ({hidden_size}) = {expected_len}",
+                embeddings.len()
+            )));
+        }
+
+        let new_end = self
+            .current_pos
+            .checked_add(n_tokens)
+            .ok_or(WickError::Backend("position overflow".into()))?;
+        if new_end > self.max_seq_len {
+            // Same `n_keep` context-shift logic as append_tokens.
+            let n_keep = self.config.n_keep as usize;
+            let shift_needed = new_end - self.max_seq_len;
+            if !can_shift(
+                self.model.supports_kv_shift(),
+                n_keep,
+                self.state.is_compressed(),
+                self.current_pos,
+                shift_needed,
+            ) {
+                return Err(WickError::ContextOverflow {
+                    max_seq_len: self.max_seq_len as u32,
+                    by: (new_end - self.max_seq_len) as u32,
+                });
+            }
+            self.model.shift_kv(&mut self.state, n_keep, shift_needed);
+            let before = self.current_pos;
+            self.current_pos -= shift_needed;
+            self.position_atomic
+                .store(self.current_pos as u32, Ordering::Relaxed);
+            self.last_logits = None;
+            tracing::info!(
+                target: "wick::kv_shift",
+                n_keep = n_keep,
+                shift = shift_needed,
+                seq_len_before = before,
+                seq_len_after = self.current_pos,
+                "kv context shift (append_embeddings)"
+            );
+        }
+
+        // Per-frame forward. Position advances by 1 per call;
+        // cancel is checked AFTER each frame so we always make
+        // progress on at least one frame before observing the
+        // flag — mirrors `forward_prefill_chunked`'s
+        // "always-one-chunk" guarantee and avoids leaving the
+        // session wedged on an entry-time cancel.
+        let mut last_logits: Option<Vec<f32>> = None;
+        for ti in 0..n_tokens {
+            let frame = &embeddings[ti * hidden_size..(ti + 1) * hidden_size];
+            let logits =
+                self.model
+                    .forward_from_embedding(frame, self.current_pos, &mut self.state);
+            self.current_pos += 1;
+            self.position_atomic
+                .store(self.current_pos as u32, Ordering::Relaxed);
+            last_logits = Some(logits);
+            // Only abort if more frames remain — guarantees ≥ 1
+            // frame of progress before observing the flag.
+            if self.cancel.load(Ordering::Relaxed) && ti + 1 < n_tokens {
+                self.last_logits = None;
+                return Err(WickError::Cancelled);
+            }
+        }
+
+        self.last_logits = last_logits;
+        Ok(())
+    }
+
     /// Clear the cancel flag. Call this after handling a
     /// [`WickError::Cancelled`] from `append_tokens` / `generate` when
     /// you want to resume work on the same session (append more tokens,

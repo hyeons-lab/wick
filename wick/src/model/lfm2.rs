@@ -1114,6 +1114,10 @@ impl Model for Lfm2Model {
         logits
     }
 
+    fn supports_embedding_input(&self) -> bool {
+        true
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],

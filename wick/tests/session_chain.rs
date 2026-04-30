@@ -485,3 +485,70 @@ fn position_updates_per_token_during_decode() {
         assert!(w[0] <= w[1], "position went backwards: {:?}", sink.observed);
     }
 }
+
+/// Smoke test for `Session::append_embeddings` — the soft-token
+/// analog of `append_tokens` used by audio / VL input paths.
+/// Feeds a small deterministic `[n × hidden_size]` buffer and
+/// asserts position advances by `n` and `last_logits` is set
+/// (= a follow-up `generate()` could decode without an
+/// intervening `append_tokens`).
+#[test]
+#[ignore]
+fn append_embeddings_advances_position_and_sets_logits() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let hidden_size = model.config().hidden_size;
+
+    // append_embeddings is the soft-token path used by audio /
+    // VL encoders, so capabilities reflect that — even though
+    // the underlying model fixture (text-path GGUF) doesn't
+    // technically expose audio in. This test cares about the
+    // soft-token wiring, not the modality contract.
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer = Arc::new(tokenizer);
+    let mut session = Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+
+    // Tiny deterministic stand-in for a real encoder output. The
+    // numbers are arbitrary — we're not asserting numerical
+    // semantics, only that the loop runs cleanly and the
+    // session bookkeeping advances correctly.
+    let n = 4;
+    let embeddings: Vec<f32> = (0..n * hidden_size)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.05)
+        .collect();
+
+    let pos_before = session.position();
+    session
+        .append_embeddings(&embeddings, n)
+        .expect("append_embeddings");
+    assert_eq!(
+        session.position(),
+        pos_before + n as u32,
+        "position must advance by exactly n_tokens"
+    );
+
+    // After append_embeddings with last_logits set, generate()
+    // should be able to produce a token without an intervening
+    // append_tokens (mirrors the post-append_tokens contract).
+    let opts = greedy_opts(1);
+    let mut sink = CollectSink(Vec::new());
+    session.generate(&opts, &mut sink).expect("generate");
+    assert_eq!(sink.0.len(), 1, "should emit exactly one token");
+}

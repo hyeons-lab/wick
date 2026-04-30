@@ -2153,6 +2153,10 @@ impl Model for MetalLfm2Model {
         self.ctx.read_f32(&self.normed_buf, hs)
     }
 
+    fn supports_embedding_input(&self) -> bool {
+        true
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],
