@@ -211,6 +211,55 @@ pub trait Model: Send + Sync {
         unimplemented!("forward_hidden_from_embedding not supported by this backend")
     }
 
+    /// Batched forward pass for prefill from raw embeddings (instead of token
+    /// IDs). Mirrors [`Self::forward_prefill`] but accepts a row-major embedding
+    /// buffer (`embeddings.len() == n_tokens * hidden_size`, frame `j` at
+    /// `[j * hs .. (j + 1) * hs]`) so audio / vision / soft-token inputs avoid
+    /// the per-frame `forward_from_embedding` loop. Returns logits for the LAST
+    /// frame only.
+    ///
+    /// Capability: gated by [`Self::supports_embedding_input`] (same probe as
+    /// `forward_from_embedding`). Callers MUST consult that probe; the default
+    /// impl below relies on `forward_from_embedding`, which itself panics when
+    /// unsupported.
+    ///
+    /// Default impl loops [`Self::forward_from_embedding`] per frame —
+    /// preserves correctness for backends that haven't overridden but
+    /// gives no perf win. Backends with a true batched path (CPU
+    /// `Lfm2Model`) override to share their `forward_prefill` layer
+    /// loop.
+    ///
+    /// Panics on `n_tokens == 0` or shape mismatch (`embeddings.len()
+    /// != n_tokens * hidden_size`). The Session-level caller pre-validates
+    /// both, so panics here indicate a bug in a non-Session caller.
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let hidden_size = self.config().hidden_size;
+        assert!(
+            n_tokens > 0,
+            "forward_prefill_from_embeddings requires at least one frame"
+        );
+        assert_eq!(
+            embeddings.len(),
+            n_tokens * hidden_size,
+            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
+            embeddings.len(),
+            n_tokens,
+            hidden_size
+        );
+        let mut logits = Vec::new();
+        for i in 0..n_tokens {
+            let frame = &embeddings[i * hidden_size..(i + 1) * hidden_size];
+            logits = self.forward_from_embedding(frame, start_pos + i, state);
+        }
+        logits
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///
