@@ -64,9 +64,11 @@ enum Command {
         #[arg(short, long)]
         model: String,
 
-        /// The prompt to generate from.
+        /// The prompt to generate from. Required for text mode; optional
+        /// when `--audio-in` is set (in which case it becomes a leading
+        /// text instruction before the audio).
         #[arg(short, long)]
-        prompt: String,
+        prompt: Option<String>,
 
         /// Maximum number of tokens to generate.
         #[arg(long, default_value_t = 256)]
@@ -92,6 +94,21 @@ enum Command {
         /// Path to vocoder GGUF for audio generation. Enables audio output.
         #[arg(long)]
         vocoder: Option<String>,
+
+        /// Path to a mono PCM16 WAV file at 16 kHz to feed as audio
+        /// input. Encoded via the bundle's mmproj
+        /// (`AudioEncoderWeights`) and prefilled into the LLM as soft
+        /// tokens via `Session::append_audio`. When set together with
+        /// `--prompt`, the text prompt is appended first, then the
+        /// audio.
+        ///
+        /// Mutually exclusive with `--vocoder` (audio output),
+        /// `--audio-out` (output WAV writer — not produced in
+        /// audio-in mode), `--system` (chat-template flow not yet
+        /// wired for audio), and `--token-ids` (audio-in builds its
+        /// own KV from the encoder, not raw tokens).
+        #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "system", "token_ids"])]
+        audio_in: Option<String>,
 
         /// Output WAV file for generated audio.
         #[arg(long)]
@@ -280,6 +297,109 @@ fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     (p(0.1), p(0.5), p(0.9), mean, var.sqrt())
 }
 
+/// Read a WAV file and return (samples_f32_in_minus1_to_1,
+/// sample_rate). Strict: accepts only mono PCM16 (audio_format = 1,
+/// channels = 1, bits_per_sample = 16). Errors on anything else
+/// rather than silently down-mixing or converting — the caller
+/// (today: `--audio-in`) must produce a clean WAV.
+///
+/// Skips unknown subchunks (LIST, JUNK, etc.) between fmt and data
+/// per the RIFF spec.
+fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
+    use anyhow::{Context, anyhow, bail};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening WAV `{path}`"))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .with_context(|| format!("reading WAV `{path}`"))?;
+
+    let read_u16 = |o: usize| -> Result<u16> {
+        let end = o.checked_add(2).ok_or_else(|| anyhow!("offset overflow"))?;
+        if end > buf.len() {
+            bail!(
+                "WAV `{path}` truncated: needed u16 at offset {o}, file is {} bytes",
+                buf.len()
+            );
+        }
+        Ok(u16::from_le_bytes(buf[o..end].try_into().unwrap()))
+    };
+    let read_u32 = |o: usize| -> Result<u32> {
+        let end = o.checked_add(4).ok_or_else(|| anyhow!("offset overflow"))?;
+        if end > buf.len() {
+            bail!(
+                "WAV `{path}` truncated: needed u32 at offset {o}, file is {} bytes",
+                buf.len()
+            );
+        }
+        Ok(u32::from_le_bytes(buf[o..end].try_into().unwrap()))
+    };
+
+    if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
+        bail!("WAV `{path}`: missing RIFF/WAVE header");
+    }
+
+    // Walk subchunks starting at offset 12. Find "fmt " then "data".
+    let mut o = 12usize;
+    let mut fmt_off: Option<usize> = None;
+    let mut data: Option<(usize, usize)> = None;
+    while o + 8 <= buf.len() {
+        let id = &buf[o..o + 4];
+        let sz = read_u32(o + 4)? as usize;
+        let body = o + 8;
+        if id == b"fmt " {
+            fmt_off = Some(body);
+        } else if id == b"data" {
+            if body + sz > buf.len() {
+                bail!(
+                    "WAV `{path}`: data chunk size {sz} exceeds file (body+sz={} > len={})",
+                    body + sz,
+                    buf.len()
+                );
+            }
+            data = Some((body, sz));
+        }
+        // Subchunks are word-aligned: pad odd sizes by 1.
+        o = body + sz + (sz & 1);
+    }
+    let fmt = fmt_off.ok_or_else(|| anyhow!("WAV `{path}`: no `fmt ` chunk"))?;
+    let (data_off, data_sz) = data.ok_or_else(|| anyhow!("WAV `{path}`: no `data` chunk"))?;
+
+    let audio_format = read_u16(fmt)?;
+    let channels = read_u16(fmt + 2)?;
+    let sample_rate = read_u32(fmt + 4)?;
+    let bits = read_u16(fmt + 14)?;
+    if audio_format != 1 {
+        bail!(
+            "WAV `{path}`: audio_format {audio_format} (expected 1=PCM). Re-encode as 16-bit PCM."
+        );
+    }
+    if channels != 1 {
+        bail!(
+            "WAV `{path}`: {channels} channels (expected 1=mono). Down-mix externally before passing in."
+        );
+    }
+    if bits != 16 {
+        bail!("WAV `{path}`: {bits} bits/sample (expected 16). Re-encode as 16-bit PCM.");
+    }
+
+    if data_sz % 2 != 0 {
+        bail!("WAV `{path}`: data chunk size {data_sz} is not a multiple of 2 (PCM16 frame size)");
+    }
+    let n_samples = data_sz / 2;
+    let mut samples = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        let lo = buf[data_off + i * 2];
+        let hi = buf[data_off + i * 2 + 1];
+        let s = i16::from_le_bytes([lo, hi]);
+        // Symmetric scale: i16::MIN -> -1.0, i16::MAX -> ~1.0. Using 32768
+        // (vs 32767) keeps zero exactly at zero and avoids the asymmetric
+        // off-by-one when round-tripping through `write_wav` (which clamps
+        // before scaling by 32767).
+        samples.push(s as f32 / 32768.0);
+    }
+    Ok((samples, sample_rate))
+}
+
 /// Write PCM float32 samples as a WAV file (16-bit PCM, mono).
 fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
     use std::io::Write;
@@ -366,6 +486,7 @@ fn main() -> Result<()> {
             token_ids,
             context_size,
             vocoder,
+            audio_in,
             audio_out,
             system,
             audio_temperature,
@@ -406,6 +527,95 @@ fn main() -> Result<()> {
                 });
             }
 
+            // Audio-input path (mutually exclusive with --vocoder via clap
+            // `conflicts_with`). Skips the chat-template / token-building
+            // dance entirely — the audio is fed in as soft tokens via
+            // `Session::append_audio`, which uses the engine's
+            // auto-attached `AudioEncoderWeights` (PR #106).
+            if let Some(wav_path) = &audio_in {
+                let (pcm, sr) = read_wav_pcm16_mono(wav_path)?;
+                eprintln!(
+                    "Loaded {} samples ({:.2}s @ {sr} Hz) from {wav_path}",
+                    pcm.len(),
+                    pcm.len() as f32 / sr as f32
+                );
+                eprintln!(
+                    "Model: {} | {} layers | hidden={}",
+                    engine.model().config().architecture,
+                    engine.model().config().n_layers,
+                    engine.model().config().hidden_size
+                );
+
+                let mut session = engine.new_session(wick::SessionConfig {
+                    kv_compression,
+                    seed: None,
+                    ubatch_size,
+                    n_keep,
+                    ..Default::default()
+                });
+
+                let prefill_start = std::time::Instant::now();
+                // Honor `add_bos_token` so the prefilled prefix matches
+                // what the text-mode `--prompt` path produces. Without
+                // this, audio-in + text would silently use a different
+                // prefix than plain text generation against the same model.
+                if add_bos {
+                    if let Some(bos) = tokenizer.bos_token() {
+                        session.append_tokens(&[bos])?;
+                    }
+                }
+                if let Some(p) = &prompt {
+                    if !p.is_empty() {
+                        session.append_text(p)?;
+                    }
+                }
+                session.append_audio(&pcm, sr)?;
+                let prefill_elapsed = prefill_start.elapsed();
+                // Snapshot KV size before generate(): that call advances
+                // `position` by every emitted token, so reading it after
+                // would overreport the prefill frame count.
+                let kv_after_prefill = session.position();
+
+                let opts = wick::GenerateOpts {
+                    max_tokens: max_tokens as u32,
+                    temperature,
+                    ..Default::default()
+                };
+
+                let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
+                let summary = session.generate(&opts, &mut sink)?;
+
+                let decode_tps = if summary.decode_ms > 0 {
+                    summary.tokens_generated as f64 / (summary.decode_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+
+                eprintln!();
+                eprintln!("---");
+                eprintln!("Frames in KV after prefill: {kv_after_prefill}");
+                eprintln!("Generated tokens: {}", summary.tokens_generated);
+                eprintln!(
+                    "Prefill (encode + LLM): {:.2}s",
+                    prefill_elapsed.as_secs_f64()
+                );
+                eprintln!("Decode: {:.1} tok/s", decode_tps);
+                return Ok(());
+            }
+
+            // Text mode (audio-in path returned above). `--prompt` is
+            // required here — the audio-in branch is the only context
+            // where it's optional. Treat absence as an explicit usage
+            // error rather than silently prefilling an empty/BOS-only
+            // prefix that would surprise the caller.
+            let prompt = match &prompt {
+                Some(p) => p,
+                None => anyhow::bail!(
+                    "--prompt is required for text mode. Use `wick run --prompt <text> ...` \
+                     or pass `--audio-in <wav>` for the audio-input path."
+                ),
+            };
+
             // Build token sequence.
             let mut tokens = Vec::new();
             if system.is_some() || vocoder.is_some() {
@@ -442,7 +652,7 @@ fn main() -> Result<()> {
                         tokens.push(bos);
                     }
                 }
-                tokens.extend_from_slice(&tokenizer.encode(&prompt));
+                tokens.extend_from_slice(&tokenizer.encode(prompt));
             }
 
             eprintln!(
@@ -761,4 +971,143 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, read_wav_pcm16_mono, write_wav};
+    use clap::Parser;
+
+    /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.
+    /// The reader must recover the same sample count + sample rate, with
+    /// values within one quantization step of the originals.
+    #[test]
+    fn write_then_read_wav_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.wav");
+        let path_str = path.to_str().unwrap();
+
+        let sr = 16_000u32;
+        // 100 samples of a small triangle wave well inside [-1, 1].
+        let samples: Vec<f32> = (0..100)
+            .map(|i| ((i as f32) / 50.0 - 1.0).clamp(-0.9, 0.9))
+            .collect();
+
+        write_wav(path_str, &samples, sr).unwrap();
+        let (back, back_sr) = read_wav_pcm16_mono(path_str).unwrap();
+
+        assert_eq!(back_sr, sr, "sample rate must round-trip");
+        assert_eq!(back.len(), samples.len(), "sample count must round-trip");
+        // 16-bit PCM has ≈ 1/32768 quantization step; allow 2× that
+        // for safety (write_wav uses 32767 scale, read uses 32768).
+        let eps = 2.0 / 32768.0;
+        for (i, (a, b)) in samples.iter().zip(back.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < eps,
+                "sample {i}: orig={a} read={b} diff={}",
+                (a - b).abs()
+            );
+        }
+    }
+
+    /// `--audio-in` must parse cleanly without `--prompt`. This is the
+    /// advertised audio-only entry point — clap-rejecting it would
+    /// make the documented `wick run --audio-in <wav>` form unusable.
+    #[test]
+    fn audio_in_parses_without_prompt() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--model",
+            "/tmp/x",
+            "--audio-in",
+            "/tmp/y.wav",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected --audio-in alone to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `--audio-in` is mutually exclusive with several other flags so
+    /// callers don't silently get wrong behavior. Verify each
+    /// individual conflict surfaces from clap rather than reaching the
+    /// dispatch.
+    #[test]
+    fn audio_in_conflicts_are_enforced_by_clap() {
+        for (label, extra) in [
+            ("--vocoder", vec!["--vocoder", "/tmp/v.gguf"]),
+            ("--audio-out", vec!["--audio-out", "/tmp/o.wav"]),
+            ("--system", vec!["--system", "Perform ASR."]),
+            ("--token-ids", vec!["--token-ids", "1,2,3"]),
+        ] {
+            let mut argv = vec![
+                "wick",
+                "run",
+                "--model",
+                "/tmp/x",
+                "--audio-in",
+                "/tmp/y.wav",
+            ];
+            argv.extend_from_slice(&extra);
+            let r = Cli::try_parse_from(&argv);
+            assert!(
+                r.is_err(),
+                "expected --audio-in + {label} to be rejected by clap, but parsing succeeded"
+            );
+        }
+    }
+
+    /// Text mode without `--audio-in` and without `--prompt` is the
+    /// negative case for the new optional `prompt`. Clap accepts the
+    /// args (since prompt is now `Option<String>`); the runtime check
+    /// in the dispatcher should bail with a clear "--prompt is
+    /// required" message — but that path isn't exercised here (it
+    /// runs after engine load). What we CAN check in unit tests is
+    /// that clap parses both forms, leaving runtime validation as
+    /// the single source of truth.
+    #[test]
+    fn run_without_prompt_or_audio_in_parses() {
+        // Clap parses; the dispatcher will reject at runtime with the
+        // usage error message. We don't try to construct an Engine here.
+        let r = Cli::try_parse_from(["wick", "run", "--model", "/tmp/x"]);
+        assert!(
+            r.is_ok(),
+            "expected bare `run --model` to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// Multi-channel WAV must be rejected with a typed error mentioning
+    /// the channel count.
+    #[test]
+    fn read_wav_rejects_stereo() {
+        // Hand-craft a minimal stereo WAV header (44 bytes + 0 data).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&36u32.to_le_bytes()); // file size - 8
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes()); // fmt size
+        buf.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
+        buf.extend_from_slice(&2u16.to_le_bytes()); // 2 channels
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&64_000u32.to_le_bytes()); // byte rate
+        buf.extend_from_slice(&4u16.to_le_bytes()); // block align
+        buf.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes()); // empty data
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stereo.wav");
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = read_wav_pcm16_mono(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("2 channels") && msg.contains("mono"),
+            "error should mention channels=2 and mono requirement; got: {msg}"
+        );
+    }
 }
