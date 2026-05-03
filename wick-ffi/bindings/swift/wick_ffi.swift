@@ -1408,35 +1408,47 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Append PCM audio samples (mono `f32`, normalized to roughly
-     * `[-1.0, 1.0]`) at `sample_rate` Hz.
+     * `[-1.0, 1.0]`) at `sample_rate` Hz. The audio is encoded via
+     * the bundle's mmproj (`AudioEncoderWeights`) and prefilled
+     * into the LLM as soft tokens — see
+     * [`wick::Session::append_audio`] for the underlying flow.
      *
-     * **Status: placeholder.** The FFI shape is wired through to
-     * `wick::Session::append_audio`, but the wick core method is
-     * currently a scaffold — for any model it always errors,
-     * either with `UnsupportedModality` (text-only LLMs) or with
-     * `Backend("...not yet implemented...")` (audio-capable
-     * models, awaiting Session-side audio-tokenizer wiring). This
-     * FFI export exists so consumers can lock in the symbol /
-     * signature now and the bindings-drift CI catches any future
-     * shape changes; it does **not** yet decode and append audio
-     * tokens. Use `wick::audio_engine::generate_audio` directly
-     * (Rust-side) until the Session wiring lands.
+     * `WickEngine::new_session` auto-attaches the encoder when the
+     * loaded bundle's `inference_type == LlamaCppLfm2AudioV1` and
+     * has `multimodal_projector` set in the manifest, so FFI
+     * consumers don't need any separate "load encoder" call.
+     * Bundles where the manifest omits `multimodal_projector`
+     * silently end up with no encoder attached (no log). Bundles
+     * where the file is named but fails to open or parse log a
+     * `tracing::warn!` at `WickEngine` construction. Both cases
+     * surface here as a "no audio encoder attached" `Backend`
+     * error.
      *
-     * **Marshaling cost (relevant when the real impl lands)**:
-     * UniFFI maps `Vec<f32>` to `List<Float>` in Kotlin and
-     * `[Float]` in Swift. The Kotlin side boxes each `Float` to
-     * `java.lang.Float`, a ~4× memory overhead vs the underlying
-     * `f32` wire bytes — negligible for O(seconds × sample-rate)
-     * chunks but worth knowing if you're streaming continuous
-     * audio in tight loops.
+     * `sample_rate` must be 16000 — resampling is out of scope.
+     * Callers should resample externally before passing samples in.
      *
-     * Errors today:
-     * - `EmptyInput` if `samples` is empty (fast-fail, enforced
-     * here for parity with `append_text` / `append_tokens`).
+     * **Marshaling cost**: UniFFI maps `Vec<f32>` to `List<Float>`
+     * in Kotlin and `[Float]` in Swift. The Kotlin side boxes each
+     * `Float` to `java.lang.Float`, a ~4× memory overhead vs the
+     * underlying `f32` wire bytes — negligible for O(seconds ×
+     * sample-rate) chunks but worth knowing if you're streaming
+     * continuous audio in tight loops.
+     *
+     * Errors:
+     * - `EmptyInput` either when `samples` is empty (fast-fail,
+     * enforced here for parity with `append_text` /
+     * `append_tokens`) **or** when the audio is too short to
+     * produce any encoder frames (e.g. shorter than one
+     * center-padded STFT window).
      * - `UnsupportedModality` if the loaded model's
      * [`ModalityCapabilities::audio_in`] is `false`.
-     * - `Backend(...)` for audio-capable models — placeholder
-     * until the real implementation lands.
+     * - `Backend(...)` for sample-rate mismatch, encoder/LLM
+     * `hidden_size` mismatch, or missing encoder. The latter
+     * includes both "manifest didn't list a mmproj" (no warn
+     * logged) and "mmproj listed but failed to open/parse"
+     * (warn logged at `WickEngine::from_path`).
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
      */
     func appendAudio(samples: [Float], sampleRate: UInt32) throws 
     
@@ -1669,35 +1681,47 @@ open class Session: SessionProtocol, @unchecked Sendable {
     
     /**
      * Append PCM audio samples (mono `f32`, normalized to roughly
-     * `[-1.0, 1.0]`) at `sample_rate` Hz.
+     * `[-1.0, 1.0]`) at `sample_rate` Hz. The audio is encoded via
+     * the bundle's mmproj (`AudioEncoderWeights`) and prefilled
+     * into the LLM as soft tokens — see
+     * [`wick::Session::append_audio`] for the underlying flow.
      *
-     * **Status: placeholder.** The FFI shape is wired through to
-     * `wick::Session::append_audio`, but the wick core method is
-     * currently a scaffold — for any model it always errors,
-     * either with `UnsupportedModality` (text-only LLMs) or with
-     * `Backend("...not yet implemented...")` (audio-capable
-     * models, awaiting Session-side audio-tokenizer wiring). This
-     * FFI export exists so consumers can lock in the symbol /
-     * signature now and the bindings-drift CI catches any future
-     * shape changes; it does **not** yet decode and append audio
-     * tokens. Use `wick::audio_engine::generate_audio` directly
-     * (Rust-side) until the Session wiring lands.
+     * `WickEngine::new_session` auto-attaches the encoder when the
+     * loaded bundle's `inference_type == LlamaCppLfm2AudioV1` and
+     * has `multimodal_projector` set in the manifest, so FFI
+     * consumers don't need any separate "load encoder" call.
+     * Bundles where the manifest omits `multimodal_projector`
+     * silently end up with no encoder attached (no log). Bundles
+     * where the file is named but fails to open or parse log a
+     * `tracing::warn!` at `WickEngine` construction. Both cases
+     * surface here as a "no audio encoder attached" `Backend`
+     * error.
      *
-     * **Marshaling cost (relevant when the real impl lands)**:
-     * UniFFI maps `Vec<f32>` to `List<Float>` in Kotlin and
-     * `[Float]` in Swift. The Kotlin side boxes each `Float` to
-     * `java.lang.Float`, a ~4× memory overhead vs the underlying
-     * `f32` wire bytes — negligible for O(seconds × sample-rate)
-     * chunks but worth knowing if you're streaming continuous
-     * audio in tight loops.
+     * `sample_rate` must be 16000 — resampling is out of scope.
+     * Callers should resample externally before passing samples in.
      *
-     * Errors today:
-     * - `EmptyInput` if `samples` is empty (fast-fail, enforced
-     * here for parity with `append_text` / `append_tokens`).
+     * **Marshaling cost**: UniFFI maps `Vec<f32>` to `List<Float>`
+     * in Kotlin and `[Float]` in Swift. The Kotlin side boxes each
+     * `Float` to `java.lang.Float`, a ~4× memory overhead vs the
+     * underlying `f32` wire bytes — negligible for O(seconds ×
+     * sample-rate) chunks but worth knowing if you're streaming
+     * continuous audio in tight loops.
+     *
+     * Errors:
+     * - `EmptyInput` either when `samples` is empty (fast-fail,
+     * enforced here for parity with `append_text` /
+     * `append_tokens`) **or** when the audio is too short to
+     * produce any encoder frames (e.g. shorter than one
+     * center-padded STFT window).
      * - `UnsupportedModality` if the loaded model's
      * [`ModalityCapabilities::audio_in`] is `false`.
-     * - `Backend(...)` for audio-capable models — placeholder
-     * until the real implementation lands.
+     * - `Backend(...)` for sample-rate mismatch, encoder/LLM
+     * `hidden_size` mismatch, or missing encoder. The latter
+     * includes both "manifest didn't list a mmproj" (no warn
+     * logged) and "mmproj listed but failed to open/parse"
+     * (warn logged at `WickEngine::from_path`).
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
      */
 open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_wick_ffi_fn_method_session_append_audio(
@@ -3946,7 +3970,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wick_ffi_checksum_method_modalitysink_on_done() != 22104) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wick_ffi_checksum_method_session_append_audio() != 56415) {
+    if (uniffi_wick_ffi_checksum_method_session_append_audio() != 13669) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_session_append_text() != 1419) {
