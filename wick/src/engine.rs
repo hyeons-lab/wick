@@ -43,6 +43,7 @@ use crate::kv_cache::KvCacheConfig;
 #[cfg(feature = "mmap")]
 use crate::manifest::ManifestFiles;
 use crate::manifest::{InferenceType, Manifest};
+use crate::model::audio_encoder::AudioEncoderWeights;
 use crate::model::{self, Model};
 use crate::session::{ModalityCapabilities, Session, SessionConfig, WickError};
 use crate::tokenizer::BpeTokenizer;
@@ -180,6 +181,14 @@ pub struct WickEngine {
     tokenizer: Arc<BpeTokenizer>,
     metadata: ModelMetadata,
     config: EngineConfig,
+    /// Audio encoder weights, eagerly loaded from
+    /// `manifest.files.multimodal_projector` at construction when the
+    /// inference_type is audio. `None` for text-only / VL bundles, or
+    /// when the mmproj file is missing / fails to parse (a warn is
+    /// logged in that case so ops can spot it without text generation
+    /// being affected). Auto-attached to every Session returned by
+    /// [`Self::new_session`].
+    audio_encoder: Option<Arc<AudioEncoderWeights>>,
 }
 
 impl WickEngine {
@@ -273,7 +282,16 @@ impl WickEngine {
     /// manually and use [`Self::from_reader`].
     #[cfg(feature = "mmap")]
     pub fn from_files(files: ModelFiles, cfg: EngineConfig) -> Result<Self, WickError> {
-        let manifest = synthesize_manifest_from_files(&files)?;
+        let mut manifest = synthesize_manifest_from_files(&files)?;
+        // Match `from_manifest_file`'s behavior: relative paths in
+        // `multimodal_projector` / `audio_decoder` / etc. are resolved
+        // relative to the primary model's directory. Absolute paths and
+        // URLs pass through unchanged. Without this, downstream code
+        // that expects manifest paths to be normalized (e.g.
+        // `try_load_audio_encoder`) would see un-resolved relative
+        // paths and could fail to open aux files that happen to live
+        // next to the primary GGUF.
+        resolve_all_manifest_files(&mut manifest, files.model.parent(), &cfg)?;
         // If the caller overrode the chat template, apply it by threading
         // it through the manifest; the text loader doesn't need to know.
         // (The tokenizer will still be built from the GGUF; template
@@ -366,12 +384,25 @@ impl WickEngine {
             add_bos_token,
             quantization,
         );
+        // Eager mmproj load for audio bundles. Gated on `path.is_some()`
+        // because hermetic constructors (`from_bytes` / `from_reader`)
+        // shouldn't surreptitiously open filesystem paths even if the
+        // manifest mentions one — that would violate the no-filesystem
+        // contract. Failure here is non-fatal: warn and leave the
+        // encoder unset so text generation still works on a partly-
+        // broken bundle.
+        let audio_encoder = if path.is_some() {
+            try_load_audio_encoder(&manifest)
+        } else {
+            None
+        };
         Ok(Self {
             manifest,
             model,
             tokenizer: Arc::new(tokenizer),
             metadata,
             config: cfg,
+            audio_encoder,
         })
     }
 
@@ -423,12 +454,29 @@ impl WickEngine {
     /// it handed out. The session's [`ModalityCapabilities`] is derived
     /// from the manifest's `inference_type`.
     pub fn new_session(&self, cfg: SessionConfig) -> Session {
-        Session::new(
+        let mut session = Session::new(
             Arc::clone(&self.model),
             Arc::clone(&self.tokenizer),
             self.capabilities(),
             cfg,
-        )
+        );
+        // Auto-attach the eagerly-loaded audio encoder so callers
+        // can `session.append_audio(...)` directly without first
+        // loading + attaching the mmproj GGUF. Encoder is shared
+        // by Arc across every session this engine hands out.
+        if let Some(encoder) = &self.audio_encoder {
+            session.attach_audio_encoder(Arc::clone(encoder));
+        }
+        session
+    }
+
+    /// Borrow the eagerly-loaded audio encoder, if any. Most callers
+    /// shouldn't need this — [`Self::new_session`] auto-attaches the
+    /// encoder to every session — but the audio output pipeline and
+    /// custom integration tests can use it for non-Session
+    /// computations (encoding embeddings without an LLM forward).
+    pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>> {
+        self.audio_encoder.as_ref()
     }
 
     /// Modality capabilities reported by the loaded model, derived from
@@ -775,10 +823,63 @@ fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
     }
 }
 
-/// Peek at the GGUF header and guess an inference type. Minimal mapping
-/// for v1 — only `lfm2` is actually loadable today; the other arches
-/// are listed so auto-detect doesn't silently confuse a future non-text
-/// model for text.
+/// Try to load the audio encoder weights from
+/// `manifest.files.multimodal_projector` when the inference_type
+/// is audio. Returns `None` (with a `warn!`) on any failure so the
+/// engine can continue serving text generation against partly-
+/// broken bundles. Path-only — the manifest's `multimodal_projector`
+/// field is already a resolved filesystem path by the time we get
+/// here (via `resolve_all_manifest_files`).
+///
+/// `mmap`-gated because the underlying `GgufFile::open` is. Wasm
+/// builds without `mmap` get a stub that returns `None`; on those
+/// targets aux files would have to come through `from_bytes` /
+/// `from_reader`, which already skip auto-attach by contract.
+#[cfg(feature = "mmap")]
+fn try_load_audio_encoder(manifest: &Manifest) -> Option<Arc<AudioEncoderWeights>> {
+    if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
+        return None;
+    }
+    let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
+    let path = Path::new(mmproj_path);
+    let gguf = match GgufFile::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                target: "wick::engine",
+                path = %path.display(),
+                error = %format!("{e:#}"),
+                "audio mmproj GGUF failed to open; audio input will surface \
+                 as 'no audio encoder attached' until a working mmproj is supplied"
+            );
+            return None;
+        }
+    };
+    match AudioEncoderWeights::from_gguf(&gguf) {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            tracing::warn!(
+                target: "wick::engine",
+                path = %path.display(),
+                error = %format!("{e:#}"),
+                "audio mmproj GGUF parsed but encoder weights failed to load; \
+                 audio input will surface as 'no audio encoder attached'"
+            );
+            None
+        }
+    }
+}
+
+/// Wasm / no-mmap stub: the loader unconditionally returns `None`
+/// because `GgufFile::open` (the only path-based opener) is
+/// `mmap`-gated. Hermetic constructors are the only way audio
+/// support reaches those targets, and they already skip the eager
+/// load by virtue of `path = None`.
+#[cfg(not(feature = "mmap"))]
+fn try_load_audio_encoder(_manifest: &Manifest) -> Option<Arc<AudioEncoderWeights>> {
+    None
+}
+
 /// Shared gate for the set of `InferenceType`s the engine can actually
 /// load today. Returns `Ok(())` for text + LFM2-audio; returns
 /// `WickError::UnsupportedInferenceType` for VL and anything unknown.
@@ -794,6 +895,10 @@ fn check_inference_type_supported(it: &InferenceType) -> Result<(), WickError> {
     }
 }
 
+/// Peek at the GGUF header and guess an inference type. Minimal mapping
+/// for v1 — only `lfm2` is actually loadable today; the other arches
+/// are listed so auto-detect doesn't silently confuse a future non-text
+/// model for text.
 #[cfg(feature = "mmap")]
 fn auto_detect_inference_type(model_path: &Path) -> Result<InferenceType, WickError> {
     let gguf = GgufFile::open(model_path).map_err(|e| {

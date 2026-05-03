@@ -985,3 +985,81 @@ fn append_audio_dimension_mismatch_returns_backend_error() {
         "Backend error should mention both encoder llm_hidden_size and LLM hidden_size; got: {msg}"
     );
 }
+
+/// End-to-end engine auto-attach: build a `WickEngine` from the
+/// LFM2.5-Audio bundle directory, create a session via
+/// `new_session`, and call `append_audio` directly without manual
+/// `attach_audio_encoder`. The engine must have eagerly loaded the
+/// mmproj from `manifest.files.multimodal_projector` and pre-
+/// attached it to the new session.
+#[test]
+#[ignore]
+fn engine_auto_attaches_audio_encoder_from_bundle() {
+    use wick::model::audio_encoder::SAMPLE_RATE;
+    use wick::{EngineConfig, WickEngine};
+
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let bundle_dir = std::path::PathBuf::from(&home).join(".leap/models/LFM2.5-Audio-1.5B-Q4_0");
+    if !bundle_dir.is_dir() {
+        eprintln!(
+            "no LFM2.5-Audio bundle dir at {} — skipping",
+            bundle_dir.display()
+        );
+        return;
+    }
+
+    let engine = WickEngine::from_path(&bundle_dir, EngineConfig::default()).unwrap();
+    assert!(
+        engine.audio_encoder().is_some(),
+        "engine should eagerly load mmproj for audio bundles"
+    );
+
+    let mut session = engine.new_session(SessionConfig::default());
+
+    // 0.5 s of synthetic deterministic noise — same fixture the
+    // direct-attach test uses; not asserting on token quality.
+    let n_samples = (SAMPLE_RATE as usize) / 2;
+    let pcm: Vec<f32> = (0..n_samples)
+        .map(|i| ((i as f32 * 0.07).sin() + (i as f32 * 0.013).sin()) * 0.05)
+        .collect();
+
+    let pos_before = session.position();
+    session
+        .append_audio(&pcm, SAMPLE_RATE)
+        .expect("append_audio");
+    assert!(
+        session.position() > pos_before,
+        "append_audio must advance position when engine pre-attached the encoder"
+    );
+
+    // Sanity: a follow-up generate succeeds, proving the chain
+    // (engine load → auto-attach → encode → append_embeddings →
+    // last_logits chain) works end-to-end.
+    let opts = greedy_opts(1);
+    let mut sink = CollectSink(Vec::new());
+    let _summary = session.generate(&opts, &mut sink).expect("generate");
+}
+
+/// Negative path: text-only bundle (the LFM2-VL fallback) must not
+/// have an audio encoder pre-loaded. Confirms the inference_type
+/// gate in `try_load_audio_encoder`.
+#[test]
+#[ignore]
+fn engine_does_not_load_encoder_for_text_bundle() {
+    use wick::{EngineConfig, WickEngine};
+
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+    // Direct .gguf load synthesizes a Text manifest — no mmproj
+    // even if the LFM2-VL bundle has one in its real manifest.
+    let engine = WickEngine::from_path(&model_path, EngineConfig::default()).unwrap();
+    assert!(
+        engine.audio_encoder().is_none(),
+        "text-path engine must not eagerly load any audio encoder"
+    );
+}
