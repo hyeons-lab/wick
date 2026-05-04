@@ -2424,6 +2424,14 @@ impl MetalLfm2Model {
         freq_base_bits: u32,
         delta_pos: i32,
     ) {
+        // Belt-and-suspenders precondition: the only caller
+        // (`Model::shift_kv`) gates on this, but a future caller
+        // reading this helper in isolation needs the invariant
+        // documented as code. `dispatch_thread_groups(sz1d(0), ...)`
+        // is invalid on Metal — Copilot review on PR #110 flagged
+        // this exact failure mode, so we keep both the caller-side
+        // gate and the helper-side check.
+        assert!(retained > 0, "encode_kv_shift_layers requires retained > 0");
         let cfg = &self.config;
         let cmd_buf = self.ctx.queue.new_command_buffer();
 
