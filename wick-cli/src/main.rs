@@ -98,16 +98,23 @@ enum Command {
         /// Path to a mono PCM16 WAV file at 16 kHz to feed as audio
         /// input. Encoded via the bundle's mmproj
         /// (`AudioEncoderWeights`) and prefilled into the LLM as soft
-        /// tokens via `Session::append_audio`. When set together with
-        /// `--prompt`, the text prompt is appended first, then the
-        /// audio.
+        /// tokens via `Session::append_audio`.
+        ///
+        /// Combinations:
+        /// - With `--prompt` alone: a leading text prefix (after BOS)
+        ///   then audio. Plain mode, no chat template.
+        /// - With `--system` (and optionally `--prompt`): renders the
+        ///   model's chat template and inserts audio at the end of
+        ///   the user turn (e.g. `--system "Perform ASR."` for
+        ///   transcription). Requires the tokenizer to expose a
+        ///   reserved special token (`<|reserved_4|>` or similar) to
+        ///   mark the audio insertion point in the rendered prompt.
         ///
         /// Mutually exclusive with `--vocoder` (audio output),
         /// `--audio-out` (output WAV writer — not produced in
-        /// audio-in mode), `--system` (chat-template flow not yet
-        /// wired for audio), and `--token-ids` (audio-in builds its
+        /// audio-in mode), and `--token-ids` (audio-in builds its
         /// own KV from the encoder, not raw tokens).
-        #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "system", "token_ids"])]
+        #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "token_ids"])]
         audio_in: Option<String>,
 
         /// Output WAV file for generated audio.
@@ -400,6 +407,79 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
     Ok((samples, sample_rate))
 }
 
+/// Pick a vocab-resident special token to use as the audio
+/// insertion marker in chat-template renders. The token must
+/// (1) tokenize as a single ID regardless of context (i.e. be a
+/// real special token, not a unicode placeholder), and (2) never
+/// appear in real user content so we don't false-match it.
+///
+/// Tries the LFM2-family reserved slots in order. Returns
+/// `(token_id, token_name_for_template_substitution)`. Errors
+/// when none are present — without a marker we can't split the
+/// rendered token stream deterministically; the caller should
+/// drop `--system` to fall back to plain audio-in mode.
+fn pick_audio_marker_token(tok: &BpeTokenizer) -> Result<(u32, &'static str)> {
+    for name in [
+        "<|reserved_4|>",
+        "<|reserved_5|>",
+        "<|reserved_6|>",
+        "<|reserved_7|>",
+    ] {
+        if let Some(id) = tok.special_token_id(name) {
+            return Ok((id, name));
+        }
+    }
+    anyhow::bail!(
+        "no suitable special token for audio chat-template insertion. \
+         Tried <|reserved_4|>..<|reserved_7|>. Drop --system to use \
+         plain audio-in mode (text prefix → audio, no template)."
+    );
+}
+
+/// Find the unique index of `marker_id` in `tokens`. Returns the
+/// zero-based position; the caller slices `tokens[..idx]` and
+/// `tokens[idx + 1..]` for the prefix and suffix around the marker.
+/// Single-pass scan — no allocation.
+///
+/// Errors include `marker_name` (the human-readable special-token
+/// string, not just the numeric id) so users hitting these cases
+/// know which literal to inspect / remove from `--prompt` or
+/// `--system`. The two failures:
+///
+/// - **Marker not found**: chat template stripped the placeholder
+///   (e.g. an aggressive escape filter), OR rendering mismatched
+///   the user content. Caller should drop `--system` to fall back
+///   to plain audio-in.
+/// - **Marker appears more than once**: user-supplied
+///   `--prompt`/`--system` text contains a literal occurrence of
+///   the marker token name, making the insertion point ambiguous.
+///   Caller should remove that literal.
+fn split_at_marker(tokens: &[u32], marker_id: u32, marker_name: &str) -> Result<usize> {
+    let mut found: Option<usize> = None;
+    let mut count: usize = 0;
+    for (i, &t) in tokens.iter().enumerate() {
+        if t == marker_id {
+            count += 1;
+            if found.is_none() {
+                found = Some(i);
+            }
+        }
+    }
+    match (count, found) {
+        (1, Some(idx)) => Ok(idx),
+        (0, _) => anyhow::bail!(
+            "audio marker token `{marker_name}` (id {marker_id}) not found in rendered \
+             chat-template tokens — the template may have stripped or escaped the \
+             placeholder. Drop `--system` to fall back to plain audio-in."
+        ),
+        (n, _) => anyhow::bail!(
+            "audio marker token `{marker_name}` (id {marker_id}) appears {n} times in \
+             rendered tokens; expected exactly one insertion point. Check that \
+             `--prompt` and `--system` text don't contain literal `{marker_name}`."
+        ),
+    }
+}
+
 /// Write PCM float32 samples as a WAV file (16-bit PCM, mono).
 fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
     use std::io::Write;
@@ -555,21 +635,60 @@ fn main() -> Result<()> {
                 });
 
                 let prefill_start = std::time::Instant::now();
-                // Honor `add_bos_token` so the prefilled prefix matches
-                // what the text-mode `--prompt` path produces. Without
-                // this, audio-in + text would silently use a different
-                // prefix than plain text generation against the same model.
-                if add_bos {
-                    if let Some(bos) = tokenizer.bos_token() {
-                        session.append_tokens(&[bos])?;
+                if let Some(sys) = &system {
+                    // Chat-template flow: render the model's template
+                    // with a placeholder marker where audio should land
+                    // (end of user content). Split the rendered tokens
+                    // at the marker and feed prefix → audio → suffix so
+                    // audio sits inside the user turn, before <im_end>.
+                    // The template's `{{ bos_token }}` already adds
+                    // BOS — don't add it again.
+                    let (marker_id, marker_name) = pick_audio_marker_token(tokenizer)?;
+                    let user_text = prompt.as_deref().unwrap_or("");
+                    let user_content = format!("{user_text}{marker_name}");
+                    let messages = vec![
+                        wick::tokenizer::ChatMessage {
+                            role: "system".into(),
+                            content: sys.clone(),
+                        },
+                        wick::tokenizer::ChatMessage {
+                            role: "user".into(),
+                            content: user_content,
+                        },
+                    ];
+                    let formatted =
+                        wick::tokenizer::apply_chat_template(tokenizer, &messages, true)?;
+                    let toks = tokenizer.encode(&formatted);
+                    let split = split_at_marker(&toks, marker_id, marker_name)?;
+                    let (prefix, suffix) = (&toks[..split], &toks[split + 1..]);
+                    eprintln!(
+                        "Chat template: {} prefix tokens, audio, {} suffix tokens",
+                        prefix.len(),
+                        suffix.len()
+                    );
+                    if !prefix.is_empty() {
+                        session.append_tokens(prefix)?;
                     }
-                }
-                if let Some(p) = &prompt {
-                    if !p.is_empty() {
-                        session.append_text(p)?;
+                    session.append_audio(&pcm, sr)?;
+                    if !suffix.is_empty() {
+                        session.append_tokens(suffix)?;
                     }
+                } else {
+                    // Plain audio-in: BOS (when the model wants it),
+                    // optional --prompt as a leading text prefix, then
+                    // audio. No template, no system role.
+                    if add_bos {
+                        if let Some(bos) = tokenizer.bos_token() {
+                            session.append_tokens(&[bos])?;
+                        }
+                    }
+                    if let Some(p) = &prompt {
+                        if !p.is_empty() {
+                            session.append_text(p)?;
+                        }
+                    }
+                    session.append_audio(&pcm, sr)?;
                 }
-                session.append_audio(&pcm, sr)?;
                 let prefill_elapsed = prefill_start.elapsed();
                 // Snapshot KV size before generate(): that call advances
                 // `position` by every emitted token, so reading it after
@@ -975,7 +1094,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, read_wav_pcm16_mono, write_wav};
+    use super::{Cli, read_wav_pcm16_mono, split_at_marker, write_wav};
     use clap::Parser;
 
     /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.
@@ -1033,13 +1152,14 @@ mod tests {
     /// `--audio-in` is mutually exclusive with several other flags so
     /// callers don't silently get wrong behavior. Verify each
     /// individual conflict surfaces from clap rather than reaching the
-    /// dispatch.
+    /// dispatch. `--system` is NOT in this list — it's intentionally
+    /// allowed alongside `--audio-in` so the chat-template flow can
+    /// wrap audio in a system+user turn.
     #[test]
     fn audio_in_conflicts_are_enforced_by_clap() {
         for (label, extra) in [
             ("--vocoder", vec!["--vocoder", "/tmp/v.gguf"]),
             ("--audio-out", vec!["--audio-out", "/tmp/o.wav"]),
-            ("--system", vec!["--system", "Perform ASR."]),
             ("--token-ids", vec!["--token-ids", "1,2,3"]),
         ] {
             let mut argv = vec![
@@ -1057,6 +1177,100 @@ mod tests {
                 "expected --audio-in + {label} to be rejected by clap, but parsing succeeded"
             );
         }
+    }
+
+    /// `--audio-in` + `--system` (and optionally `--prompt`) must
+    /// parse cleanly — the chat-template flow runs at dispatch time.
+    /// Negative case (missing audio marker token) lives in the
+    /// `split_at_marker` test below; this one just guards the clap
+    /// surface.
+    #[test]
+    fn audio_in_plus_system_parses() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--model",
+            "/tmp/x",
+            "--audio-in",
+            "/tmp/y.wav",
+            "--system",
+            "Perform ASR.",
+            "--prompt",
+            "What did the speaker say?",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected --audio-in + --system + --prompt to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `split_at_marker` happy path: a marker in the middle of a
+    /// token list returns the unique index, and the caller can
+    /// slice prefix/suffix around it.
+    #[test]
+    fn split_at_marker_normal_case() {
+        let toks = [10u32, 20, 99, 30, 40];
+        let idx = split_at_marker(&toks, 99, "<|reserved_4|>").unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(&toks[..idx], &[10, 20]);
+        assert_eq!(&toks[idx + 1..], &[30, 40]);
+    }
+
+    /// Marker at position 0 → empty prefix slice.
+    #[test]
+    fn split_at_marker_at_start() {
+        let toks = [99u32, 1, 2, 3];
+        let idx = split_at_marker(&toks, 99, "<|reserved_4|>").unwrap();
+        assert_eq!(idx, 0);
+        assert!(toks[..idx].is_empty());
+        assert_eq!(&toks[idx + 1..], &[1, 2, 3]);
+    }
+
+    /// Marker at the last position → empty suffix slice.
+    #[test]
+    fn split_at_marker_at_end() {
+        let toks = [1u32, 2, 3, 99];
+        let idx = split_at_marker(&toks, 99, "<|reserved_4|>").unwrap();
+        assert_eq!(idx, 3);
+        assert_eq!(&toks[..idx], &[1, 2, 3]);
+        assert!(toks[idx + 1..].is_empty());
+    }
+
+    /// Missing marker → typed error naming the marker by string
+    /// AND id, so users know what literal to inspect (not just
+    /// "id 99 missing"). Plus a hint to drop `--system`.
+    #[test]
+    fn split_at_marker_missing_errors() {
+        let toks = [10u32, 20, 30];
+        let err = split_at_marker(&toks, 99, "<|reserved_4|>").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("<|reserved_4|>") && msg.contains("99") && msg.contains("not found"),
+            "error should name `<|reserved_4|>`, id 99, and 'not found': {msg}"
+        );
+        assert!(
+            msg.contains("--system"),
+            "error should hint at dropping --system: {msg}"
+        );
+    }
+
+    /// Marker appearing more than once → typed error pointing at
+    /// the user-supplied text as the likely culprit. Both the
+    /// occurrence count and the marker name appear in the message.
+    #[test]
+    fn split_at_marker_duplicate_errors() {
+        let toks = [10u32, 99, 20, 99, 30];
+        let err = split_at_marker(&toks, 99, "<|reserved_4|>").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("<|reserved_4|>") && msg.contains("2 times"),
+            "error should name `<|reserved_4|>` and report '2 times': {msg}"
+        );
+        assert!(
+            msg.contains("--prompt") && msg.contains("--system"),
+            "error should point at user-supplied text as the source: {msg}"
+        );
     }
 
     /// Text mode without `--audio-in` and without `--prompt` is the
