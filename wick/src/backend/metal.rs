@@ -187,6 +187,7 @@ pub mod shaders {
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.metal");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.metal");
+    pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

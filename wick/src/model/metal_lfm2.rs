@@ -113,6 +113,8 @@ struct MetalPipelines {
     attention_prefill: ComputePipelineState,
     qk_norm_rope_batch: ComputePipelineState,
     conv1d_fused_batch: ComputePipelineState,
+    kv_shift_k_to_scratch: ComputePipelineState,
+    memcpy_f16_offsets: ComputePipelineState,
 }
 
 #[allow(dead_code)]
@@ -184,6 +186,17 @@ pub struct MetalLfm2Model {
     prefill_proj_buf: Buffer,   // [max(3*hs, hs+2*kv) × max_seq_len] projections
     prefill_gate_buf: Buffer,   // [is × max_seq_len] FFN gate
     prefill_up_buf: Buffer,     // [is × max_seq_len] FFN up
+    /// Scratch buffer for the n_keep KV shift. Sized for the
+    /// largest single-layer K (or V) cache in f16 — same shape as
+    /// any one entry in `MetalState::kv_caches`. The shift kernel
+    /// writes the rotated retained-region into here, then a memcpy
+    /// kernel slides it back into the cache at the new offset; this
+    /// scratch is re-used across all attention layers (one shift
+    /// event processes layers serially within a single command
+    /// buffer) and across both K and V passes per layer. See
+    /// `MetalLfm2Model::shift_kv` and
+    /// `wick/src/backend/shaders/kv_shift.metal`.
+    kv_shift_scratch: Buffer,
     state: MetalState,
     /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
     /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
@@ -294,6 +307,9 @@ impl MetalLfm2Model {
                 .create_pipeline(shaders::QK_NORM_ROPE_BATCH, "qk_norm_rope_batch")?,
             conv1d_fused_batch: ctx
                 .create_pipeline(shaders::CONV1D_FUSED_BATCH, "conv1d_fused_batch")?,
+            kv_shift_k_to_scratch: ctx
+                .create_pipeline(shaders::KV_SHIFT, "kv_shift_k_to_scratch")?,
+            memcpy_f16_offsets: ctx.create_pipeline(shaders::KV_SHIFT, "memcpy_f16_offsets")?,
         };
 
         // Open a second mmap of the same file for the no-copy Metal buffer.
@@ -488,6 +504,14 @@ impl MetalLfm2Model {
             prefill_proj_buf: make_buf(3 * hs * max_seq_len.min(MAX_PREFILL_TOKENS)),
             prefill_gate_buf: make_buf(is * max_seq_len.min(MAX_PREFILL_TOKENS)),
             prefill_up_buf: make_buf(is * max_seq_len.min(MAX_PREFILL_TOKENS)),
+            // Sized for the largest f16 K (or V) cache slice we'd
+            // ever shift — one full attention layer's worth at the
+            // model's clamped max_seq_len. f16 = 2 bytes/elt.
+            kv_shift_scratch: ctx.create_buffer({
+                let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
+                    * (hs / config.n_heads);
+                (max_seq_len * max_kv_dim * 2) as u64
+            }),
             ctx,
             config,
             pipelines,
@@ -2321,9 +2345,156 @@ impl Model for MetalLfm2Model {
         }
         logits
     }
+
+    fn supports_kv_shift(&self) -> bool {
+        // Mirror of CPU `Lfm2Model::supports_kv_shift` — Metal now
+        // implements the GPU-side shift via `kv_shift_k_to_scratch`
+        // + `memcpy_f16_offsets`. See `Self::shift_kv`.
+        true
+    }
+
+    fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
+        assert!(shift > 0, "shift must be > 0");
+        let cur_len = self.state.seq_len.load(Ordering::Relaxed);
+        assert!(
+            n_keep + shift <= cur_len,
+            "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",
+        );
+        // TurboQuant-compressed caches aren't supported on the Metal
+        // path either — the GPU buffer holds dense f16 K/V, but the
+        // Session-side compression flag still has to match the CPU
+        // gate semantics for caller code that branches on it.
+        assert!(
+            !state.is_compressed(),
+            "shift_kv called on a TurboQuant-compressed state; \
+             shifting compressed caches is not yet supported on Metal"
+        );
+
+        let cfg = &self.config;
+        let head_dim = cfg.hidden_size / cfg.n_heads;
+        let new_seq_len = cur_len - shift;
+        let retained = new_seq_len - n_keep;
+        let freq_base_bits = cfg.rope_theta.to_bits();
+        let delta_pos: i32 = -(i32::try_from(shift)
+            .expect("shift exceeds i32::MAX; not representable as RoPE delta"));
+
+        let cmd_buf = self.ctx.queue.new_command_buffer();
+
+        for layer_idx in 0..cfg.n_layers {
+            if cfg.block_types[layer_idx] != BlockType::Attention {
+                continue;
+            }
+            let n_kv_heads = cfg.kv_heads_per_layer[layer_idx];
+            let kv_dim = n_kv_heads * head_dim;
+            let (k_cache, v_cache) = self.state.kv_caches[layer_idx]
+                .as_ref()
+                .expect("attention layer missing GPU kv_caches entry");
+
+            // ── K: shift + RoPE delta into scratch, then copy back ──
+            {
+                let enc = cmd_buf.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipelines.kv_shift_k_to_scratch);
+                enc.set_buffer(0, Some(k_cache), 0);
+                enc.set_buffer(1, Some(&self.kv_shift_scratch), 0);
+                #[repr(C)]
+                #[derive(Copy, Clone)]
+                struct KParams {
+                    n_keep: u32,
+                    shift: u32,
+                    new_seq_len: u32,
+                    n_kv_heads: u32,
+                    head_dim: u32,
+                    freq_base_bits: u32,
+                    delta_pos: i32,
+                    _pad: u32,
+                }
+                let kparams = KParams {
+                    n_keep: n_keep as u32,
+                    shift: shift as u32,
+                    new_seq_len: new_seq_len as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    head_dim: head_dim as u32,
+                    freq_base_bits,
+                    delta_pos,
+                    _pad: 0,
+                };
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of::<KParams>() as u64,
+                    &kparams as *const _ as *const _,
+                );
+                let half_dim = head_dim / 2;
+                let total = (retained * n_kv_heads * half_dim) as u64;
+                enc.dispatch_thread_groups(sz1d(total.div_ceil(256)), sz1d(256));
+                enc.end_encoding();
+            }
+            // Copy rotated K back into the cache at the n_keep offset.
+            self.encode_memcpy_f16(
+                cmd_buf,
+                &self.kv_shift_scratch,
+                0,
+                k_cache,
+                (n_keep * kv_dim) as u32,
+                (retained * kv_dim) as u32,
+            );
+
+            // ── V: copy through scratch (no rotation) ───────────────
+            self.encode_memcpy_f16(
+                cmd_buf,
+                v_cache,
+                ((n_keep + shift) * kv_dim) as u32,
+                &self.kv_shift_scratch,
+                0,
+                (retained * kv_dim) as u32,
+            );
+            self.encode_memcpy_f16(
+                cmd_buf,
+                &self.kv_shift_scratch,
+                0,
+                v_cache,
+                (n_keep * kv_dim) as u32,
+                (retained * kv_dim) as u32,
+            );
+        }
+
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // Decrement both seq_len mirrors. The Metal-side AtomicUsize
+        // is the source of truth used by `forward_prefill_inner`'s
+        // bounds check + KV write offsets; the CPU-side
+        // `InferenceState.seq_len` is the value the Session reads.
+        self.state.seq_len.store(new_seq_len, Ordering::Relaxed);
+        state.seq_len = new_seq_len;
+    }
 }
 
 impl MetalLfm2Model {
+    /// Element-wise f16 copy via the `memcpy_f16_offsets` kernel.
+    /// `n_elements` is in half elements (2 bytes each).
+    fn encode_memcpy_f16(
+        &self,
+        cmd_buf: &metal::CommandBufferRef,
+        src: &Buffer,
+        src_offset_elements: u32,
+        dst: &Buffer,
+        dst_offset_elements: u32,
+        n_elements: u32,
+    ) {
+        let enc = cmd_buf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.pipelines.memcpy_f16_offsets);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        let params: [u32; 4] = [n_elements, src_offset_elements, dst_offset_elements, 0];
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz1d((n_elements as u64).div_ceil(256)), sz1d(256));
+        enc.end_encoding();
+    }
+
     fn forward_prefill_inner(
         &self,
         tokens: &[u32],

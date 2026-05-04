@@ -99,9 +99,15 @@ fn run_with_shift_counter<R>(f: impl FnOnce(Arc<AtomicUsize>) -> R) -> R {
     f(counter)
 }
 
-#[test]
-#[ignore = "downloads ~210 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
-fn shift_runs_through_real_model() {
+/// Body of the shift integration test parameterized by backend.
+///
+/// Both the CPU and Metal entry points run the same prompt + follow-up
+/// pattern: the prompt fills most of the window, the follow-up pushes
+/// past the cap and triggers exactly one `Model::shift_kv` call, and
+/// the follow-up's prefill — which reads the shifted K cache through
+/// every attention layer — must complete without panicking on a
+/// tensor-length assert or producing NaNs that would cascade.
+fn run_shift_through_real_model(backend: BackendPreference) {
     if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
         eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
         return;
@@ -120,7 +126,7 @@ fn shift_runs_through_real_model() {
         QUANT,
         EngineConfig {
             context_size: CTX,
-            backend: BackendPreference::Cpu,
+            backend,
             bundle_repo: Some(repo),
             ..Default::default()
         },
@@ -177,9 +183,9 @@ fn shift_runs_through_real_model() {
         // Follow-up sized to definitely overflow + fire shift. The
         // post-shift prefill runs through every attention layer using
         // re-rotated K cells — a sign or indexing bug in
-        // `apply_rope_delta_to_head` would propagate NaNs here and
-        // either panic downstream (tensor-length assertions) or
-        // surface as a numeric error.
+        // `apply_rope_delta_to_head` (CPU) or `kv_shift_k_to_scratch`
+        // (Metal) would propagate NaNs here and either panic downstream
+        // (tensor-length assertions) or surface as a numeric error.
         let follow = "Additionally, the narrator walks slowly along the river path. ".repeat(15);
         session.append_text(&follow).expect("append forcing shift");
         let pos_after_follow = session.position() as usize;
@@ -209,4 +215,22 @@ fn shift_runs_through_real_model() {
         shift_count >= 1,
         "expected ≥1 shift event, got {shift_count}"
     );
+}
+
+#[test]
+#[ignore = "downloads ~210 MB; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+fn shift_runs_through_real_model() {
+    run_shift_through_real_model(BackendPreference::Cpu);
+}
+
+/// Metal variant of `shift_runs_through_real_model` — the GPU `shift_kv`
+/// override on `MetalLfm2Model` is exercised end-to-end. The follow-up
+/// prefill reads the shifted (re-rotated) K cache on the GPU; a sign
+/// or layout bug in `kv_shift.metal` would surface as either a
+/// numerical issue here or a downstream panic.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore = "downloads ~210 MB + needs Metal; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+fn shift_runs_through_real_model_metal() {
+    run_shift_through_real_model(BackendPreference::Metal);
 }
