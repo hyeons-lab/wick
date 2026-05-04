@@ -69,10 +69,12 @@ kernel void kv_shift_k_to_scratch(
     float x1 = float(k_cache[src_i1]);
 
     float freq_base = as_type<float>(params.freq_base_bits);
-    // Compute as `1.0 / powr(freq_base, 2*d/head_dim)` to match the
-    // forward-time RoPE in `rope.metal` / `qk_norm_rope.metal`. The
-    // identity `pow(b, -x) = 1/pow(b, x)` makes them equivalent;
-    // using the same form here guarantees bit-exact composition.
+    // Mathematically equivalent to the forward-time RoPE expression
+    // (`rope.metal` uses the same form; `qk_norm_rope*.metal` uses an
+    // iterated `powr(theta_scale, d)` shape — different float ops, same
+    // value in the limit). Composing this delta with whatever angle
+    // the cell already encodes yields the new-position angle to within
+    // the f16-storage round-trip error of the surrounding K cache.
     float freq = 1.0f / powr(freq_base, float(2u * d) / float(params.head_dim));
     float angle = float(params.delta_pos) * freq;
     float c = cos(angle);

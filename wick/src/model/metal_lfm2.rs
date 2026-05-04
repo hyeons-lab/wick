@@ -2378,6 +2378,53 @@ impl Model for MetalLfm2Model {
         let delta_pos: i32 = -(i32::try_from(shift)
             .expect("shift exceeds i32::MAX; not representable as RoPE delta"));
 
+        // Edge case: a shift that drops EVERY non-keep cell (i.e.
+        // `cur_len == n_keep + shift`) leaves nothing to re-rotate or
+        // copy. Encoding `dispatch_thread_groups(sz1d(0), ...)` is
+        // invalid on Metal and trips a runtime validation assert, so
+        // skip all per-layer work — only the seq_len mirrors below
+        // need updating. This case is reachable: `n_keep = 32`,
+        // `max_seq_len = 256`, an append that pushes to `cur_len = 256`
+        // yields `shift_needed = 224 = cur_len - n_keep`, and the next
+        // append-time shift hits exactly this boundary.
+        if retained > 0 {
+            self.encode_kv_shift_layers(
+                n_keep,
+                shift,
+                new_seq_len,
+                retained,
+                head_dim,
+                freq_base_bits,
+                delta_pos,
+            );
+        }
+
+        // Decrement both seq_len mirrors. The Metal-side AtomicUsize
+        // is the source of truth used by `forward_prefill_inner`'s
+        // bounds check + KV write offsets; the CPU-side
+        // `InferenceState.seq_len` is the value the Session reads.
+        self.state.seq_len.store(new_seq_len, Ordering::Relaxed);
+        state.seq_len = new_seq_len;
+    }
+}
+
+impl MetalLfm2Model {
+    /// Per-layer dispatch loop for the n_keep KV shift. Split out from
+    /// `Model::shift_kv` so the trait method can early-return on the
+    /// `retained == 0` edge case before encoding any GPU work — Metal
+    /// rejects empty dispatches at validation time.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_kv_shift_layers(
+        &self,
+        n_keep: usize,
+        shift: usize,
+        new_seq_len: usize,
+        retained: usize,
+        head_dim: usize,
+        freq_base_bits: u32,
+        delta_pos: i32,
+    ) {
+        let cfg = &self.config;
         let cmd_buf = self.ctx.queue.new_command_buffer();
 
         for layer_idx in 0..cfg.n_layers {
@@ -2459,19 +2506,12 @@ impl Model for MetalLfm2Model {
 
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
-
-        // Decrement both seq_len mirrors. The Metal-side AtomicUsize
-        // is the source of truth used by `forward_prefill_inner`'s
-        // bounds check + KV write offsets; the CPU-side
-        // `InferenceState.seq_len` is the value the Session reads.
-        self.state.seq_len.store(new_seq_len, Ordering::Relaxed);
-        state.seq_len = new_seq_len;
     }
-}
 
-impl MetalLfm2Model {
     /// Element-wise f16 copy via the `memcpy_f16_offsets` kernel.
-    /// `n_elements` is in half elements (2 bytes each).
+    /// `n_elements` is in half elements (2 bytes each). A zero-element
+    /// call is a no-op — encoding a `dispatch_thread_groups(sz1d(0),
+    /// ...)` would trip Metal's runtime validation.
     fn encode_memcpy_f16(
         &self,
         cmd_buf: &metal::CommandBufferRef,
@@ -2481,6 +2521,9 @@ impl MetalLfm2Model {
         dst_offset_elements: u32,
         n_elements: u32,
     ) {
+        if n_elements == 0 {
+            return;
+        }
         let enc = cmd_buf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipelines.memcpy_f16_offsets);
         enc.set_buffer(0, Some(src), 0);
