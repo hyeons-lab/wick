@@ -48,6 +48,45 @@ impl ModalitySink for NoopSink {
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
+/// Streams decoded tokens to stdout *and* accumulates them into a
+/// `String` buffer so the chat REPL can capture the full assistant
+/// reply for the next turn's history. Otherwise mirrors `StdoutSink`'s
+/// BrokenPipe-aware write behavior.
+struct ChatSink<'a> {
+    tokenizer: &'a BpeTokenizer,
+    cancel: Arc<AtomicBool>,
+    buffer: String,
+}
+
+impl<'a> ChatSink<'a> {
+    fn new(tokenizer: &'a BpeTokenizer, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            tokenizer,
+            cancel,
+            buffer: String::new(),
+        }
+    }
+    fn into_text(self) -> String {
+        self.buffer
+    }
+}
+
+impl ModalitySink for ChatSink<'_> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        if self.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let piece = self.tokenizer.decode(tokens);
+        let mut out = std::io::stdout().lock();
+        if out.write_all(piece.as_bytes()).is_err() || out.flush().is_err() {
+            self.cancel.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.buffer.push_str(&piece);
+    }
+    fn on_done(&mut self, _reason: FinishReason) {}
+}
+
 #[derive(Parser)]
 #[command(name = "wick", version, about = "Rust-native LLM inference engine")]
 struct Cli {
@@ -187,15 +226,47 @@ enum Command {
         model: String,
     },
 
-    /// Interactive chat session.
+    /// Interactive multi-turn chat REPL.
+    ///
+    /// Reads user messages from stdin one line at a time, renders
+    /// the model's chat template per turn, and streams the assistant
+    /// reply to stdout. The Session is kept alive across turns so
+    /// the engine's prefix cache accelerates each successive prefill.
+    /// Type `/exit` (or `/quit`, or send EOF / Ctrl+D) to leave.
     Chat {
-        /// Path to the GGUF model file.
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles
+        /// manifest, or a directory containing exactly one `.json`
+        /// manifest.
         #[arg(short, long)]
         model: String,
 
-        /// System prompt.
+        /// Optional system prompt pinned at the head of the
+        /// conversation. Carried through every turn unchanged.
         #[arg(long)]
         system: Option<String>,
+
+        /// Device to use: cpu, gpu, metal, or auto.
+        #[arg(long, default_value = "auto")]
+        device: String,
+
+        /// Max KV context window size. Default 4096.
+        #[arg(long, default_value_t = 4096)]
+        context_size: usize,
+
+        /// Max tokens generated per assistant turn.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+
+        /// Sampling temperature. `<= 0` selects greedy decoding
+        /// (reproducible). Default 0 so chat output is deterministic
+        /// without a seed.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// RNG seed for sampling. Only meaningful when
+        /// `--temperature > 0`; ignored under greedy decoding.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -1065,9 +1136,100 @@ fn main() -> Result<()> {
             let ids = tok.encode(&text);
             println!("{ids:?}");
         }
-        Command::Chat { model, .. } => {
-            println!("wick chat: model={model}");
-            println!("Not yet implemented — coming in Phase 6.");
+        Command::Chat {
+            model,
+            system,
+            device,
+            context_size,
+            max_tokens,
+            temperature,
+            seed,
+        } => {
+            use std::io::BufRead;
+
+            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            let tokenizer = engine.tokenizer();
+            let mut session = engine.new_session(wick::SessionConfig {
+                seed,
+                ..Default::default()
+            });
+
+            let mut history: Vec<wick::tokenizer::ChatMessage> = Vec::new();
+            if let Some(sys) = system {
+                history.push(wick::tokenizer::ChatMessage {
+                    role: "system".into(),
+                    content: sys,
+                });
+            }
+
+            eprintln!(
+                "wick chat ({} backend, ctx={context_size}, max_tokens/turn={max_tokens}). \
+                 Send EOF (Ctrl+D) or type `/exit` to quit.",
+                device
+            );
+            if !history.is_empty() {
+                eprintln!("(system prompt active)");
+            }
+
+            let stdin = std::io::stdin();
+            loop {
+                eprint!("\nuser> ");
+                std::io::stderr().flush().ok();
+                let mut line = String::new();
+                let n = stdin.lock().read_line(&mut line)?;
+                if n == 0 {
+                    eprintln!();
+                    break; // EOF
+                }
+                let user = line.trim().to_string();
+                if user.is_empty() {
+                    continue;
+                }
+                if user == "/exit" || user == "/quit" {
+                    break;
+                }
+
+                history.push(wick::tokenizer::ChatMessage {
+                    role: "user".into(),
+                    content: user,
+                });
+
+                // Re-render the full conversation per turn and rely on
+                // the engine's prefix cache for fast turn-N+1 prefill.
+                // Delta-prefill is a future optimization; the simplicity
+                // of "render fresh, reset, prefill" is worth the lookup.
+                let formatted = wick::tokenizer::apply_chat_template(tokenizer, &history, true)?;
+                let tokens = tokenizer.encode(&formatted);
+
+                session.reset();
+                if let Err(e) = session.append_tokens(&tokens) {
+                    eprintln!("error: append_tokens failed: {e}");
+                    // Pop the user turn so a retry doesn't double-add it.
+                    history.pop();
+                    continue;
+                }
+
+                let opts = wick::GenerateOpts {
+                    max_tokens: max_tokens as u32,
+                    temperature,
+                    ..Default::default()
+                };
+
+                eprint!("assistant> ");
+                std::io::stderr().flush().ok();
+
+                let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
+                if let Err(e) = session.generate(&opts, &mut sink) {
+                    eprintln!("\nerror: generate failed: {e}");
+                    history.pop();
+                    continue;
+                }
+                eprintln!();
+                history.push(wick::tokenizer::ChatMessage {
+                    role: "assistant".into(),
+                    content: sink.into_text(),
+                });
+            }
         }
         Command::Bench {
             model,
@@ -1322,6 +1484,49 @@ mod tests {
         assert!(
             r.is_ok(),
             "expected --audio-in + --system + --prompt to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `chat` subcommand must parse cleanly with the minimal
+    /// `--model` flag — the rest of its surface has defaults so a
+    /// bare invocation is the documented entry point.
+    #[test]
+    fn chat_subcommand_parses_minimal() {
+        let r = Cli::try_parse_from(["wick", "chat", "--model", "/tmp/x"]);
+        assert!(
+            r.is_ok(),
+            "expected `chat --model <path>` alone to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `chat` must also accept the full v1 flag surface together —
+    /// guards against a flag rename / clap drift breaking the
+    /// documented invocation.
+    #[test]
+    fn chat_subcommand_parses_full_flags() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "chat",
+            "--model",
+            "/tmp/x",
+            "--system",
+            "Be brief",
+            "--device",
+            "cpu",
+            "--context-size",
+            "2048",
+            "--max-tokens",
+            "256",
+            "--temperature",
+            "0.5",
+            "--seed",
+            "42",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected full `chat` flag surface to parse, got: {:?}",
             r.err()
         );
     }
