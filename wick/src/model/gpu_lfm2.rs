@@ -4,6 +4,7 @@
 // The full forward pass runs in a single CommandEncoder per token — only the
 // logits vector is read back to CPU.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -86,8 +87,12 @@ struct GpuState {
 /// NOTE: This model is stateful — KV caches and conv rolling buffers live on
 /// the GPU and persist across forward() calls. This is inherent to GPU backends
 /// (GPU-resident state can't live in the CPU-side InferenceState). Consequence:
-/// one GpuLfm2Model instance = one session. For concurrent sessions, create
-/// multiple model instances.
+/// one GpuLfm2Model instance = one session for throughput. The internal
+/// `infer_lock` makes the backend self-defending: two `Session`s sharing this
+/// `Arc<dyn Model>` and running `forward()` / `forward_prefill()` concurrently
+/// will serialize cleanly on the lock instead of racing on per-instance scratch
+/// buffers + GPU KV caches. For genuine throughput across concurrent Sessions,
+/// create multiple model instances.
 pub struct GpuLfm2Model {
     ctx: GpuContext,
     config: ModelConfig,
@@ -126,6 +131,16 @@ pub struct GpuLfm2Model {
     conv_gate_buf: wgpu::Buffer, // [hidden_size]
     // GPU state
     gpu_state: GpuState,
+    /// Serializes Model trait calls on this instance. Without it, two
+    /// `Session`s sharing this `Arc<dyn Model>` and running `forward()` /
+    /// `forward_prefill()` concurrently would race on the per-instance
+    /// scratch buffers (`hidden_buf`, `q_buf`, `k_buf`, etc.) and on the
+    /// GPU KV caches in `gpu_state`. Mirrors the equivalent guard on
+    /// `MetalLfm2Model`. Lock cost is ~50 ns uncontended (negligible vs
+    /// wgpu dispatch); the wgpu queue already serializes GPU work — this
+    /// just synchronizes the CPU-side bookkeeping that stages each
+    /// command encoder and reads back logits.
+    infer_lock: Mutex<()>,
 }
 
 impl GpuLfm2Model {
@@ -381,6 +396,7 @@ impl GpuLfm2Model {
             conv_out_buf,
             conv_gate_buf,
             gpu_state,
+            infer_lock: Mutex::new(()),
         };
         model.cache_bind_groups();
         Ok(model)
@@ -553,7 +569,7 @@ impl GpuLfm2Model {
         };
         let workgroups_x = (w.m.div_ceil(rows_per_wg)).min(65535);
         let workgroups_y = (w.m.div_ceil(rows_per_wg)).div_ceil(65535);
-        self.encode(enc, pipeline, &bg, (workgroups_x, workgroups_y, 1), label);
+        self.encode(enc, pipeline, bg, (workgroups_x, workgroups_y, 1), label);
     }
 
     /// Encode f32 GEMV (for tied embeddings output projection which stays f32).
@@ -637,6 +653,7 @@ impl GpuLfm2Model {
         self.encode(enc, &self.pipelines.rmsnorm, &bg, (1, 1, 1), "rmsnorm");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_attention(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -707,8 +724,6 @@ impl GpuLfm2Model {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-
     // encode_per_head_rmsnorm, encode_rope, encode_elementwise, encode_conv1d
     // removed — logic inlined into batched forward pass.
 
@@ -725,8 +740,14 @@ impl GpuLfm2Model {
     }
 }
 
-impl Model for GpuLfm2Model {
-    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+impl GpuLfm2Model {
+    /// Lock-free body of [`Model::forward`]. Callers must already hold
+    /// `infer_lock` — enter via the trait's `forward()` for a single
+    /// token, or `forward_prefill` for the hot prefill loop. The
+    /// `std::sync::Mutex` guarding the Model trait surface is not
+    /// reentrant, so calling `Model::forward` from inside this body
+    /// would deadlock.
+    fn forward_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -1438,6 +1459,13 @@ impl Model for GpuLfm2Model {
         self.ctx.finish_profiler();
         self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
     }
+}
+
+impl Model for GpuLfm2Model {
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.forward_inner(tokens, pos, state)
+    }
 
     // forward_embedding and forward_from_embedding use default impls
     // (unimplemented). Audio generation requires Metal backend for now.
@@ -1450,12 +1478,15 @@ impl Model for GpuLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
-        // Default: sequential single-token forward.
+        // Sequential single-token forward via the lock-free body — calling
+        // `self.forward()` here would re-acquire the (non-reentrant)
+        // `infer_lock` we already hold and deadlock.
         let mut logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
-            logits = self.forward(&[token], start_pos + i, state);
+            logits = self.forward_inner(&[token], start_pos + i, state);
         }
         logits
     }

@@ -1002,8 +1002,8 @@ fn load_text_model_auto(
         let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
             WickError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
         })?;
-        return model::load_model(gguf_for_cpu, context_size)
-            .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")));
+        model::load_model(gguf_for_cpu, context_size)
+            .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")))
     }
 
     #[cfg(not(feature = "gpu"))]
