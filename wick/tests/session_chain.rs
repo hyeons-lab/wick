@@ -1317,26 +1317,48 @@ fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
     (samples, sample_rate)
 }
 
-/// End-to-end ASR on real TTS audio. Loads
-/// `tests/fixtures/audio/today_is_a_beautiful_day.wav` (~1.6 s of
-/// macOS `say` output) through the full chat-template + audio-input
-/// flow, runs greedy decode at temperature 0, and asserts the
-/// transcription contains the case-insensitive substring
-/// `"today is a beautiful day"` — verified locally that
-/// LFM2.5-Audio-1.5B-Q4_0 transcribes the FIRST 5 tokens of this
-/// audio word-for-word with system prompt `"Perform ASR."`.
+/// End-to-end ASR on real TTS audio — **expected to fail on current
+/// wick until the LLM hidden-state magnitude drift is fixed.**
 ///
-/// Why a substring rather than strict equality: Q4_0 doesn't
-/// reliably emit `<|im_end|>` after the transcription, so longer
-/// `max_tokens` runs append hallucinated continuation (typically
-/// "...to be the beautiful day to be"). The substring assertion
-/// absorbs that tail while still catching gross failures — missing
-/// words, NaN propagation, audio-encoder regressions, or a marker-
-/// split bug picking the wrong insertion point — any of which
-/// would either drop the anchor phrase or panic downstream.
+/// Loads `tests/fixtures/audio/today_is_a_beautiful_day.wav` (~1.6 s
+/// of macOS `say` output) through the full chat-template + audio-input
+/// flow with system="Perform ASR.", runs greedy decode at temperature 0,
+/// and asserts the transcription matches llama.cpp's reference output
+/// `"Today is a beautiful day."` exactly (whitespace-trimmed).
+///
+/// ## Status: this test currently fails (regression marker)
+///
+/// llama.cpp's `llama-mtmd-cli` on the same audio + same model + same
+/// prompt produces the reference output and emits `<|im_end|>` at
+/// token 7. Wick produces the first 5 tokens correctly ("Today is a
+/// beautiful day") but at token 6 picks `to` instead of `.`, then
+/// continues into a repetitive hallucinated tail
+/// ("...to be the beautiful day to be the..."). Both implementations
+/// run the same Q4_0 weights through greedy decode (no RNG), so this
+/// is a logit-level divergence at the EOS-emission boundary.
+///
+/// Diagnostic data (set `WICK_DEBUG_HIDDEN=1` to reproduce):
+/// - Wick's hidden-state RMS grows ~44x from input embedding (0.021)
+///   to final layer (0.93) over 16 layers.
+/// - Reference grows ~4.5x for the same shape (per memory note
+///   `project_llm_magnitude_bug.md`).
+/// - The per-layer growth ratio is ~1.27x in wick vs ~1.10x reference;
+///   compounded over 16 layers that's the observed ~10x discrepancy.
+/// - Anomalous spikes at layers 7 FFN (2x), 9 FFN (3x), 11 conv (3x),
+///   with max_abs values reaching 18-40 in late layers.
+///
+/// ## Why this lives as a failing test, not a `#[should_panic]`
+///
+/// `#[ignore]` already gates the test on the LFM2.5-Audio bundle being
+/// present locally, so CI never runs it. When someone explicitly
+/// runs `cargo test ... -- --ignored` (the only way to invoke it),
+/// the failure is the signal — the test name + assertion message
+/// document exactly what wick should produce vs what it does. Marking
+/// it `#[should_panic]` would invert that semantics: a future fix
+/// would silently break the test instead of unblocking it.
 #[test]
 #[ignore]
-fn asr_real_audio_contains_anchor_word() {
+fn asr_real_audio_matches_input_phrase_expected_fail() {
     use wick::model::audio_encoder::AudioEncoderWeights;
     use wick::tokenizer::{ChatMessage, apply_chat_template};
 
@@ -1422,9 +1444,10 @@ fn asr_real_audio_contains_anchor_word() {
         session.append_tokens(suffix).expect("append suffix");
     }
 
-    // Greedy decode. 24 tokens is enough for the model to emit the
-    // anchor word — locally observed at ~7–8 tokens before EOS on
-    // this fixture, but allow headroom for tokenizer drift.
+    // max_tokens=24 covers llama.cpp's expected 7-token output
+    // ("Today is a beautiful day." + `<|im_end|>`) with margin.
+    // On current wick this generates well past EOS — see the
+    // doc comment above for the divergence details.
     let opts = greedy_opts(24);
     let mut sink = CollectSink(Vec::new());
     session.generate(&opts, &mut sink).expect("generate");
@@ -1432,10 +1455,20 @@ fn asr_real_audio_contains_anchor_word() {
     let decoded = tokenizer_arc.decode(&sink.0);
     eprintln!("ASR transcription: {decoded:?}");
 
-    let lower = decoded.to_lowercase();
-    const ANCHOR: &str = "today is a beautiful day";
-    assert!(
-        lower.contains(ANCHOR),
-        "expected anchor phrase '{ANCHOR}' in transcription, got: {decoded:?}"
+    // Strict equality against llama.cpp's reference output. This
+    // assertion FAILS on current wick (the model never picks `.`
+    // at token 6, never emits `<|im_end|>`, and continues into a
+    // hallucinated tail). When the LLM hidden-state magnitude
+    // drift is fixed and wick's logits match llama.cpp's, this
+    // assertion will pass — that's the regression-marker shape.
+    const EXPECTED: &str = "today is a beautiful day.";
+    let normalized = decoded.trim().to_lowercase();
+    assert_eq!(
+        normalized, EXPECTED,
+        "expected ASR transcription to be {EXPECTED:?} (matching llama.cpp's reference output), \
+         got {normalized:?} (raw: {decoded:?}). \
+         If this is the first wick test to pass on this assertion, the LLM hidden-state \
+         magnitude drift has been fixed — congratulations, drop the _EXPECTED_FAIL suffix \
+         from the test name."
     );
 }
