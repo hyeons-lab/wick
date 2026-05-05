@@ -785,21 +785,40 @@ pub fn conformer_conv_module_forward(
     //    in the next step so we don't allocate a separate
     //    `glu_ch_major` intermediate. ──
 
-    // ── Step 4: causal depthwise conv1d. Pre-pad input on the
-    //    left by `kernel_size - 1` zeros so `conv1d` with `pad=0`
-    //    produces a length-`t` output that only sees current +
-    //    past inputs at each output position. The input write
-    //    fuses the time-major → channel-major transpose into the
-    //    pad layout (writes directly at the post-pad offset). ──
-    let pad = kernel_size - 1;
-    let mut padded = vec![0.0f32; n_embd * (t + pad)];
+    // ── Step 4: SYMMETRIC depthwise conv1d. The LFM2A reference
+    //    is a NON-causal encoder (offline ASR) — its conv module
+    //    pads zeros on EACH side of the input, not all on the
+    //    left as a causal conv would. Wick previously did all-left
+    //    causal padding which produced a backwards-shifted
+    //    convolution that diverged sharply from the reference
+    //    (verified by per-tensor diff against ggml's `ssm_conv`
+    //    output: wick output[t=0, c=0..2] = [-0.197, 0.003, 0.417]
+    //    vs reference [3.077, 1.458, 1.064]). The `pad+roll+pad`
+    //    sequence in `tools/mtmd/models/conformer.cpp` is what
+    //    produces the symmetric layout in the reference.
+    //
+    //    Padding split: `pad_total = kernel_size - 1`. For odd
+    //    kernels (the LFM2A case, k=9 → pad_total=8 → 4+4),
+    //    `pad_left == pad_right`. For even kernels we follow the
+    //    standard "extra pad on the right" convention
+    //    (`pad_right = pad_total - pad_left`), matching ggml's
+    //    behavior. `pad_right` isn't read directly because the
+    //    `vec![0.0f32; t + pad_total]` allocation already zeroes
+    //    the trailing slots — declared explicitly here for
+    //    documentation and so the math is unambiguous.
+    let pad_total = kernel_size - 1;
+    let pad_left = pad_total / 2;
+    let _pad_right = pad_total - pad_left;
+    let mut padded = vec![0.0f32; n_embd * (t + pad_total)];
     // Outer loop over channels gives sequential writes to `padded`
     // (per-channel slice is contiguous in memory). Inner loop over
     // ti has strided reads from `glu_time_major` but writes are
     // typically the more cache-sensitive direction (write-allocate).
+    // Zeros at indices [0..pad_left] (left pad) and [pad_left+t..]
+    // (right pad) come for free from the buffer's zero-init.
     for c in 0..n_embd {
         for ti in 0..t {
-            padded[c * (t + pad) + pad + ti] = glu_time_major[ti * n_embd + c];
+            padded[c * (t + pad_total) + pad_left + ti] = glu_time_major[ti * n_embd + c];
         }
     }
 
@@ -809,9 +828,9 @@ pub fn conformer_conv_module_forward(
         conv_dw_w,
         Some(conv_dw_b),
         &mut conv_out,
-        n_embd,  // in_channels
-        n_embd,  // out_channels
-        t + pad, // t_in (after pre-padding)
+        n_embd,        // in_channels
+        n_embd,        // out_channels
+        t + pad_total, // t_in (after symmetric pre-padding)
         kernel_size,
         1,      // stride
         0,      // explicit pad already applied above
@@ -1748,12 +1767,16 @@ mod tests {
         };
         let pw1_b = vec![0.0; 2 * n_embd];
 
-        // conv_dw_w [n_embd × kernel]: per-channel kernel [0, 0, 1].
-        // Last tap reads current position; previous taps read past
-        // (zero-padded for the first 2 timesteps).
+        // conv_dw_w [n_embd × kernel]: per-channel kernel [0, 1, 0].
+        // The MIDDLE tap selects the current position under the
+        // module's symmetric padding (`pad_left = pad_right = (k-1)/2`).
+        // For k=3 that's pad_left=1, pad_right=1, and a kernel with
+        // index 1 = 1.0 reads `padded[ot + 1] = real[ot]` cleanly at
+        // every output position — i.e., this turns the depthwise
+        // conv into an identity operation.
         let mut conv_dw_w = vec![0.0f32; n_embd * kernel_size];
         for c in 0..n_embd {
-            conv_dw_w[c * kernel_size + (kernel_size - 1)] = 1.0;
+            conv_dw_w[c * kernel_size + kernel_size / 2] = 1.0;
         }
         let conv_dw_b = vec![0.0; n_embd];
         let conv_norm_w = vec![1.0; n_embd];

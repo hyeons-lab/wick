@@ -1102,6 +1102,40 @@ impl Lfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
+        // Per-layer hidden-state diagnostic. Set `WICK_DEBUG_HIDDEN=1`
+        // to print the last token's RMS at each layer entry, after
+        // attn/conv (post 1st residual), and after FFN (post 2nd
+        // residual). Used to find the layer where wick's hidden
+        // states diverge from llama.cpp's reference. Off in
+        // production: a missing-env-var check is one syscall per
+        // call, gated above every loop body to keep the hot path
+        // cold. Any non-`"1"` value (including unset, empty, or
+        // `"0"`) leaves diagnostics off — this matches the
+        // documented `=1` setter and avoids a stray
+        // `WICK_DEBUG_HIDDEN=0` accidentally enabling logging.
+        let debug_hidden = std::env::var("WICK_DEBUG_HIDDEN").as_deref() == Ok("1");
+        let log_rms = |label: &str, hidden: &[f32]| {
+            if !debug_hidden {
+                return;
+            }
+            // Last token's hidden vector lives at `hidden[i * n + (n-1)]`
+            // for i in 0..hs (column-major). RMS of those `hs` values
+            // is what feeds the next layer / output norm.
+            let mut sum_sq = 0.0f64;
+            let mut max_abs = 0.0f64;
+            for i in 0..hs {
+                let v = hidden[i * n + (n - 1)] as f64;
+                sum_sq += v * v;
+                let abs_v = v.abs();
+                if abs_v > max_abs {
+                    max_abs = abs_v;
+                }
+            }
+            let rms = (sum_sq / hs as f64).sqrt();
+            eprintln!("[wick.hidden] {label}: rms={rms:.6e} max_abs={max_abs:.6e}");
+        };
+        log_rms("input (pre-layer-0)", &hidden);
+
         // Per-layer loop — pre-allocate all large buffers outside the loop
         let mut normed = vec![0.0f32; hs * n];
         let mut block_out = vec![0.0f32; hs * n];
@@ -1887,9 +1921,37 @@ impl Lfm2Model {
                 }
             }
 
+            // Log the BLOCK OUTPUT magnitude (pre-residual) so we
+            // can see how much each layer contributes vs the prior
+            // residual. Together with the post-block log this lets
+            // us identify whether the magnitude growth is from a
+            // misbehaving block, an oversize residual, or both.
+            // The `if debug_hidden` guard keeps the per-layer
+            // `format!` allocations off the hot path when the env
+            // var isn't set.
+            if debug_hidden {
+                let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
+                    "conv"
+                } else {
+                    "attn"
+                };
+                log_rms(
+                    &format!("layer {layer} ({block_kind}) block-out"),
+                    &block_out,
+                );
+            }
+
             // Residual: hidden += block_out
             for i in 0..hs * n {
                 hidden[i] += block_out[i];
+            }
+            if debug_hidden {
+                let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
+                    "conv"
+                } else {
+                    "attn"
+                };
+                log_rms(&format!("layer {layer} ({block_kind}) post-block"), &hidden);
             }
 
             // FFN pre-norm each column
@@ -2062,9 +2124,15 @@ impl Lfm2Model {
                 }
             }
 
+            if debug_hidden {
+                log_rms(&format!("layer {layer} ffn-out"), &ffn_out);
+            }
             // Second residual
             for i in 0..hs * n {
                 hidden[i] += ffn_out[i];
+            }
+            if debug_hidden {
+                log_rms(&format!("layer {layer} post-ffn"), &hidden);
             }
         }
 
