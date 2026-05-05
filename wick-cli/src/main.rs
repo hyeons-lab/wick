@@ -95,10 +95,14 @@ enum Command {
         #[arg(long)]
         vocoder: Option<String>,
 
-        /// Path to a mono PCM16 WAV file at 16 kHz to feed as audio
-        /// input. Encoded via the bundle's mmproj
-        /// (`AudioEncoderWeights`) and prefilled into the LLM as soft
-        /// tokens via `Session::append_audio`.
+        /// Path to a mono PCM16 WAV file to feed as audio input.
+        /// Any sample rate accepted — non-16 kHz inputs are
+        /// resampled with linear interpolation before encoding.
+        /// For studio-quality downsampling, pre-resample externally
+        /// (sox/ffmpeg) and pass a 16 kHz WAV to bypass that step.
+        /// Encoded via the bundle's mmproj (`AudioEncoderWeights`)
+        /// and prefilled into the LLM as soft tokens via
+        /// `Session::append_audio`.
         ///
         /// Combinations:
         /// - With `--prompt` alone: a leading text prefix (after BOS)
@@ -407,6 +411,58 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
     Ok((samples, sample_rate))
 }
 
+/// Linearly resample `samples` from `sr_in` to `sr_out` Hz.
+/// Returns `samples` unchanged when `sr_in == sr_out`.
+///
+/// Linear interpolation is the simplest viable resampler:
+/// - Upsample (e.g. 8 kHz → 16 kHz): introduces a smoothed
+///   high-frequency rolloff but no aliasing — adequate for ASR.
+/// - Downsample (e.g. 44.1 kHz → 16 kHz): does NOT apply an
+///   anti-aliasing low-pass filter, so frequencies above the
+///   output Nyquist (8 kHz here) fold back as aliasing artifacts.
+///   Speech energy is mostly under 8 kHz so this is tolerable for
+///   ASR but not studio-quality. Users who care can pre-resample
+///   externally with `sox` / `ffmpeg` and pass a 16 kHz WAV
+///   directly to bypass this path.
+///
+/// Time complexity: O(n_out). Space: one allocation of size
+/// `n_out * 4 bytes`. No SIMD; the audio path is dwarfed by
+/// model inference so the linear scan isn't a bottleneck.
+///
+/// Empty input or zero rates return an empty `Vec` — these are
+/// degenerate but cheap to handle here so the caller doesn't
+/// have to special-case them.
+fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
+    if samples.is_empty() || sr_in == 0 || sr_out == 0 {
+        return Vec::new();
+    }
+    if sr_in == sr_out {
+        return samples.to_vec();
+    }
+    let n_in = samples.len();
+    // Output length scales by the rate ratio. Use f64 to avoid
+    // precision loss on long inputs (a 60s @ 44.1kHz clip is
+    // 2.6M samples — f32 mantissa starts losing integer fidelity
+    // around 16M, so f32 would be fine here, but f64 is free).
+    let ratio = sr_out as f64 / sr_in as f64;
+    let n_out = ((n_in as f64) * ratio).round() as usize;
+    let mut out = Vec::with_capacity(n_out);
+    let step = sr_in as f64 / sr_out as f64;
+    for i in 0..n_out {
+        let pos = i as f64 * step;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        // Clamp to [0, n_in - 1]. The last interval (idx == n_in - 1,
+        // frac > 0) interpolates against itself — equivalent to
+        // hold-the-last-sample, which is the standard end-of-buffer
+        // handling for linear resampling.
+        let a = samples[idx.min(n_in - 1)];
+        let b = samples[(idx + 1).min(n_in - 1)];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
 /// Pick a vocab-resident special token to use as the audio
 /// insertion marker in chat-template renders. The token must
 /// (1) tokenize as a single ID regardless of context (i.e. be a
@@ -613,12 +669,31 @@ fn main() -> Result<()> {
             // `Session::append_audio`, which uses the engine's
             // auto-attached `AudioEncoderWeights` (PR #106).
             if let Some(wav_path) = &audio_in {
-                let (pcm, sr) = read_wav_pcm16_mono(wav_path)?;
+                let (pcm_in, sr_in) = read_wav_pcm16_mono(wav_path)?;
                 eprintln!(
-                    "Loaded {} samples ({:.2}s @ {sr} Hz) from {wav_path}",
-                    pcm.len(),
-                    pcm.len() as f32 / sr as f32
+                    "Loaded {} samples ({:.2}s @ {sr_in} Hz) from {wav_path}",
+                    pcm_in.len(),
+                    pcm_in.len() as f32 / sr_in as f32
                 );
+                // LFM2A's audio encoder expects 16 kHz mono PCM. If the
+                // WAV is at any other rate, resample with linear
+                // interpolation. Quality is adequate for ASR speech
+                // (no anti-aliasing on downsample, but speech energy
+                // is mostly under 8 kHz so the worst aliasing folds
+                // outside the recognized band). For studio quality on
+                // long clips, pre-resample externally with sox/ffmpeg.
+                const TARGET_SR: u32 = 16_000;
+                let (pcm, sr) = if sr_in == TARGET_SR {
+                    (pcm_in, sr_in)
+                } else {
+                    let resampled = resample_linear(&pcm_in, sr_in, TARGET_SR);
+                    eprintln!(
+                        "Resampled {sr_in} Hz → {TARGET_SR} Hz: {} → {} samples (linear)",
+                        pcm_in.len(),
+                        resampled.len()
+                    );
+                    (resampled, TARGET_SR)
+                };
                 eprintln!(
                     "Model: {} | {} layers | hidden={}",
                     engine.model().config().architecture,
@@ -1094,7 +1169,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, read_wav_pcm16_mono, split_at_marker, write_wav};
+    use super::{Cli, read_wav_pcm16_mono, resample_linear, split_at_marker, write_wav};
     use clap::Parser;
 
     /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.
@@ -1323,5 +1398,74 @@ mod tests {
             msg.contains("2 channels") && msg.contains("mono"),
             "error should mention channels=2 and mono requirement; got: {msg}"
         );
+    }
+
+    /// `resample_linear` with `sr_in == sr_out` must return the input
+    /// unchanged. Hot path for the common 16 kHz → 16 kHz case (every
+    /// invocation that doesn't actually need resampling); a regression
+    /// here would silently corrupt every same-rate ASR call.
+    #[test]
+    fn resample_linear_same_rate_is_identity() {
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = resample_linear(&samples, 16_000, 16_000);
+        assert_eq!(out, samples);
+    }
+
+    /// Empty input must produce empty output without panicking — the
+    /// caller's `n_samples` could be 0 if a fixture WAV's data chunk
+    /// is missing and the assertion above is bypassed somehow.
+    #[test]
+    fn resample_linear_empty_input() {
+        let out = resample_linear(&[], 44_100, 16_000);
+        assert!(out.is_empty());
+        let out = resample_linear(&[1.0, 2.0], 0, 16_000);
+        assert!(out.is_empty());
+        let out = resample_linear(&[1.0, 2.0], 16_000, 0);
+        assert!(out.is_empty());
+    }
+
+    /// 2× upsample (8 kHz → 16 kHz). Output length doubles; output
+    /// values reproduce the original at even indices and the
+    /// midpoint between adjacent originals at odd indices.
+    #[test]
+    fn resample_linear_2x_upsample_interpolates_midpoints() {
+        let input = vec![0.0, 1.0, 0.0, -1.0]; // 4 samples
+        let out = resample_linear(&input, 8_000, 16_000);
+        // n_out = 4 * 2 = 8 samples expected.
+        assert_eq!(out.len(), 8);
+        // Even indices recover originals (positions 0, 1, 2, 3).
+        assert!((out[0] - 0.0).abs() < 1e-6);
+        assert!((out[2] - 1.0).abs() < 1e-6);
+        assert!((out[4] - 0.0).abs() < 1e-6);
+        assert!((out[6] - -1.0).abs() < 1e-6);
+        // Odd indices interpolate midpoints (0.5, 0.5, -0.5).
+        assert!((out[1] - 0.5).abs() < 1e-6);
+        assert!((out[3] - 0.5).abs() < 1e-6);
+        assert!((out[5] - -0.5).abs() < 1e-6);
+        // Last odd index has no "next" sample — linear resamplers
+        // typically hold the last value; we mirror that.
+        assert!((out[7] - -1.0).abs() < 1e-6);
+    }
+
+    /// Output length scales by the rate ratio (within ±1 sample
+    /// from rounding). 1 second of 44.1 kHz → ~16 000 samples at
+    /// 16 kHz.
+    #[test]
+    fn resample_linear_output_length_matches_ratio() {
+        let n_in = 44_100; // 1 s @ 44.1 kHz
+        let input = vec![0.0; n_in];
+        let out = resample_linear(&input, 44_100, 16_000);
+        let expected = 16_000;
+        let diff = (out.len() as i64 - expected as i64).abs();
+        assert!(
+            diff <= 1,
+            "44.1k → 16k for {n_in} samples: got {} (expected {expected} ±1)",
+            out.len()
+        );
+        // Spot-check 48 kHz → 16 kHz (exact 1/3 ratio).
+        let n_in_48 = 48_000;
+        let input48 = vec![0.0; n_in_48];
+        let out48 = resample_linear(&input48, 48_000, 16_000);
+        assert_eq!(out48.len(), 16_000);
     }
 }
