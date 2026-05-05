@@ -117,8 +117,8 @@ enum Command {
         bundle_id: Option<String>,
 
         /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
-        /// `Q8_0`). Required when `--bundle-id` is set; ignored
-        /// otherwise.
+        /// `Q8_0`). Pairs with `--bundle-id`: clap rejects
+        /// either flag without the other.
         #[arg(long, requires = "bundle_id")]
         quant: Option<String>,
 
@@ -197,11 +197,11 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         audio_top_k: usize,
 
-        /// Cache root: directory for KV prefix cache files
-        /// (enables disk caching for prompt reuse) AND the
-        /// `BundleRepo` download store when `--bundle-id` is
-        /// set (downloads go under `<dir>/huggingface.co/...`).
-        /// Default: `$HOME/.cache/wick`.
+        /// Cache root, shared between KV prefix cache files
+        /// (under `<dir>/kv/`, enables disk caching for prompt
+        /// reuse) AND the `BundleRepo` download store when
+        /// `--bundle-id` is set (downloads under
+        /// `<dir>/huggingface.co/...`). Default: `$HOME/.cache/wick`.
         #[arg(long)]
         cache_dir: Option<String>,
 
@@ -281,8 +281,9 @@ enum Command {
         quant: Option<String>,
 
         /// Cache root: shared between `--bundle-id` downloads
-        /// (under `huggingface.co/...`) and (future) KV prefix
-        /// cache files. Default: `$HOME/.cache/wick`.
+        /// (under `<dir>/huggingface.co/...`) and (future) KV
+        /// prefix cache files (under `<dir>/kv/`). Default:
+        /// `$HOME/.cache/wick`.
         #[arg(long)]
         cache_dir: Option<String>,
 
@@ -399,11 +400,12 @@ enum ModelSpec<'a> {
     },
 }
 
-/// Default cache root: `$HOME/.cache/wick` if `$HOME` is set, otherwise
-/// `std::env::temp_dir()/wick`. Shared between the `BundleRepo` (downloads
-/// go under `<root>/huggingface.co/...`) and the KV prefix cache, so a single
-/// `--cache-dir` flag covers both — unify the user's cache footprint instead
-/// of fragmenting it.
+/// Default cache root, used by the bundle-id flow when `--cache-dir` is
+/// unset: `$HOME/.cache/wick` when `$HOME` is set, otherwise
+/// `<TMPDIR>/.cache/wick`. Shared between the `BundleRepo` (downloads land
+/// under `<root>/huggingface.co/...`) and the KV prefix cache (under
+/// `<root>/kv`), so a single `--cache-dir` flag covers both — unify the
+/// user's cache footprint instead of fragmenting it.
 fn default_cache_dir() -> PathBuf {
     let base = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -920,11 +922,18 @@ fn main() -> Result<()> {
                     max_cold_bytes: 0,
                 });
             } else {
-                let dir = cache_dir.map(std::path::PathBuf::from).or_else(|| {
+                // Derive `<root>/kv` consistently. Explicit `--cache-dir foo`
+                // yields `foo/kv`; default yields `$HOME/.cache/wick/kv`.
+                // Keeps KV files and bundle downloads (under
+                // `<root>/huggingface.co/...`) in distinct subtrees of the
+                // shared root.
+                let dir: Option<std::path::PathBuf> = if let Some(d) = cache_dir {
+                    Some(std::path::PathBuf::from(d).join("kv"))
+                } else {
                     std::env::var("HOME")
                         .ok()
                         .map(|h| std::path::PathBuf::from(h).join(".cache/wick/kv"))
-                });
+                };
                 engine.configure_cache(wick::kv_cache::KvCacheConfig {
                     cache_dir: dir,
                     max_warm_entries: 32,
