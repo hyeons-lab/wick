@@ -445,7 +445,14 @@ fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
     // 2.6M samples — f32 mantissa starts losing integer fidelity
     // around 16M, so f32 would be fine here, but f64 is free).
     let ratio = sr_out as f64 / sr_in as f64;
-    let n_out = ((n_in as f64) * ratio).round() as usize;
+    // Clamp to ≥ 1 for non-empty input. Without this a tiny input
+    // (e.g. `n_in=1` with `sr_in=48_000, sr_out=16_000`) would
+    // round `n_in * ratio = 0.333 → 0` and the resampler would
+    // hand back an empty buffer, which `Session::append_audio`
+    // surfaces as `EmptyInput`. The empty-input early return
+    // above handles `n_in == 0`; this handles the round-to-zero
+    // edge case for non-empty input.
+    let n_out = ((n_in as f64) * ratio).round().max(1.0) as usize;
     let mut out = Vec::with_capacity(n_out);
     let step = sr_in as f64 / sr_out as f64;
     for i in 0..n_out {
@@ -1451,6 +1458,27 @@ mod tests {
         // Last odd index has no "next" sample — linear resamplers
         // typically hold the last value; we mirror that.
         assert!((out[7] - -1.0).abs() < 1e-6);
+    }
+
+    /// Tiny non-empty inputs must still produce ≥ 1 output sample.
+    /// Without the `n_out.max(1)` clamp, a 1-sample input at 48 kHz
+    /// → 16 kHz would round `n_out = 1 * 1/3 = 0.33 → 0` and hand
+    /// back an empty buffer, which `Session::append_audio` surfaces
+    /// as `EmptyInput` — degrading a degenerate-but-valid call into
+    /// a confusing error several layers downstream.
+    #[test]
+    fn resample_linear_tiny_input_does_not_round_to_empty() {
+        // 1 sample, 48 kHz → 16 kHz. Without the clamp, n_out = 0.
+        let out = resample_linear(&[0.7], 48_000, 16_000);
+        assert!(!out.is_empty(), "1 sample 48k → 16k should not be empty");
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 0.7).abs() < 1e-6);
+
+        // 2 samples, 48 kHz → 16 kHz: n_out = round(2/3) = 1.
+        // Different from the 1-sample case — clamp doesn't fire,
+        // we get the natural rounded length.
+        let out = resample_linear(&[0.5, 1.0], 48_000, 16_000);
+        assert_eq!(out.len(), 1);
     }
 
     /// Output length scales by the rate ratio (within ±1 sample
