@@ -12,7 +12,10 @@ name = "wick"
 path = "src/main.rs"
 
 [dependencies]
-wick = { path = "../wick" }
+# `remote` enables `BundleRepo` + `WickEngine::from_bundle_id`, which the CLI's
+# `--bundle-id` / `--quant` flags route through. Pulls reqwest + rustls + sha2
+# (~30 deps) but that's the cost of HTTP-cached bundle downloads.
+wick = { path = "../wick", features = ["remote"] }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

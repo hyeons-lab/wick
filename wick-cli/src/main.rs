@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -98,10 +98,29 @@ struct Cli {
 enum Command {
     /// Run inference on a prompt.
     Run {
-        /// Path to the model: a `.gguf` file, a `.json` LeapBundles manifest,
-        /// or a directory containing exactly one `.json` manifest.
-        #[arg(short, long)]
-        model: String,
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles
+        /// manifest, or a directory containing exactly one `.json`
+        /// manifest. Mutually exclusive with `--bundle-id` /
+        /// `--quant`; one of the two source forms must be set.
+        #[arg(
+            short,
+            long,
+            conflicts_with_all = ["bundle_id", "quant"],
+        )]
+        model: Option<String>,
+
+        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
+        /// with `--quant` for auto-download from
+        /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
+        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        #[arg(long, requires = "quant")]
+        bundle_id: Option<String>,
+
+        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
+        /// `Q8_0`). Required when `--bundle-id` is set; ignored
+        /// otherwise.
+        #[arg(long, requires = "bundle_id")]
+        quant: Option<String>,
 
         /// The prompt to generate from. Required for text mode; optional
         /// when `--audio-in` is set (in which case it becomes a leading
@@ -178,7 +197,11 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         audio_top_k: usize,
 
-        /// Directory for KV prefix cache files. Enables disk caching for prompt reuse.
+        /// Cache root: directory for KV prefix cache files
+        /// (enables disk caching for prompt reuse) AND the
+        /// `BundleRepo` download store when `--bundle-id` is
+        /// set (downloads go under `<dir>/huggingface.co/...`).
+        /// Default: `$HOME/.cache/wick`.
         #[arg(long)]
         cache_dir: Option<String>,
 
@@ -236,9 +259,32 @@ enum Command {
     Chat {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
-        /// manifest.
-        #[arg(short, long)]
-        model: String,
+        /// manifest. Mutually exclusive with `--bundle-id` /
+        /// `--quant`; one of the two source forms must be set.
+        #[arg(
+            short,
+            long,
+            conflicts_with_all = ["bundle_id", "quant"],
+        )]
+        model: Option<String>,
+
+        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
+        /// with `--quant` for auto-download from
+        /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
+        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        #[arg(long, requires = "quant")]
+        bundle_id: Option<String>,
+
+        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
+        /// `Q8_0`). Required when `--bundle-id` is set.
+        #[arg(long, requires = "bundle_id")]
+        quant: Option<String>,
+
+        /// Cache root: shared between `--bundle-id` downloads
+        /// (under `huggingface.co/...`) and (future) KV prefix
+        /// cache files. Default: `$HOME/.cache/wick`.
+        #[arg(long)]
+        cache_dir: Option<String>,
 
         /// Optional system prompt pinned at the head of the
         /// conversation. Carried through every turn unchanged.
@@ -339,20 +385,122 @@ enum Command {
 /// owns the model + tokenizer for the CLI's lifetime; callers get
 /// `engine.new_session(...)` for text and `engine.model()` / `engine.tokenizer()`
 /// handles for the audio pipeline.
-fn load_engine(path: &Path, device: &str, context_size: usize) -> Result<WickEngine> {
+///
+/// Either a local file/manifest path or a LeapBundles `bundle_id`+`quant` pair.
+/// The bundle path constructs a `BundleRepo` rooted at `cache_dir` so the
+/// downloaded manifest + GGUFs land under a stable location and turn-2+ runs
+/// hit the cache.
+enum ModelSpec<'a> {
+    Path(&'a Path),
+    Bundle {
+        id: &'a str,
+        quant: &'a str,
+        cache_dir: PathBuf,
+    },
+}
+
+/// Default cache root: `$HOME/.cache/wick` if `$HOME` is set, otherwise
+/// `std::env::temp_dir()/wick`. Shared between the `BundleRepo` (downloads
+/// go under `<root>/huggingface.co/...`) and the KV prefix cache, so a single
+/// `--cache-dir` flag covers both — unify the user's cache footprint instead
+/// of fragmenting it.
+fn default_cache_dir() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".cache/wick")
+}
+
+/// Take the four CLI flags `(--model, --bundle-id, --quant, --cache-dir)` and
+/// validate "exactly one source set". Then build a `ModelSpec` and load
+/// through [`load_engine_from_spec`]. Errors before any I/O so a flag-misuse
+/// surfaces fast with a clear message rather than a downstream HTTP/file
+/// error.
+fn resolve_engine(
+    model: Option<&str>,
+    bundle_id: Option<&str>,
+    quant: Option<&str>,
+    cache_dir: Option<&str>,
+    device: &str,
+    context_size: usize,
+) -> Result<WickEngine> {
+    match (model, bundle_id, quant) {
+        (Some(p), None, None) => {
+            load_engine_from_spec(ModelSpec::Path(Path::new(p)), device, context_size)
+        }
+        (None, Some(id), Some(q)) => {
+            let cache = cache_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_dir);
+            load_engine_from_spec(
+                ModelSpec::Bundle {
+                    id,
+                    quant: q,
+                    cache_dir: cache,
+                },
+                device,
+                context_size,
+            )
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            anyhow::bail!(
+                "`--bundle-id` and `--quant` must be passed together \
+                 (e.g. `--bundle-id LFM2-1.2B-GGUF --quant Q4_0`)"
+            )
+        }
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => anyhow::bail!(
+            "`--model` and `--bundle-id`/`--quant` are mutually exclusive — \
+             pick one source"
+        ),
+        (None, None, None) => anyhow::bail!(
+            "no model source: pass either `--model <path>` or \
+             `--bundle-id <id> --quant <quant>`"
+        ),
+    }
+}
+
+fn load_engine_from_spec(
+    spec: ModelSpec<'_>,
+    device: &str,
+    context_size: usize,
+) -> Result<WickEngine> {
     let backend = BackendPreference::parse_str(device).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // `..Default::default()` picks up optional fields (e.g. `bundle_repo`
-    // under the `remote` feature, which shows up whenever a workspace
-    // member pulls it transitively). Without the spread, enabling remote
-    // anywhere in the workspace breaks this construction.
-    let engine = WickEngine::from_path(
-        path,
-        EngineConfig {
-            context_size,
-            backend,
-            ..Default::default()
-        },
-    )?;
+    let engine = match spec {
+        ModelSpec::Path(path) => {
+            // `..Default::default()` picks up optional fields (e.g.
+            // `bundle_repo`, which is gated behind the `remote` feature
+            // — wick-cli now enables it unconditionally to power
+            // `--bundle-id`).
+            WickEngine::from_path(
+                path,
+                EngineConfig {
+                    context_size,
+                    backend,
+                    ..Default::default()
+                },
+            )?
+        }
+        ModelSpec::Bundle {
+            id,
+            quant,
+            cache_dir,
+        } => {
+            eprintln!(
+                "Resolving bundle `{id}` (quant `{quant}`) into cache `{}`…",
+                cache_dir.display()
+            );
+            let repo = wick::bundle::BundleRepo::new(cache_dir);
+            WickEngine::from_bundle_id(
+                id,
+                quant,
+                EngineConfig {
+                    context_size,
+                    backend,
+                    bundle_repo: Some(repo),
+                },
+            )?
+        }
+    };
     eprintln!(
         "Using {} backend ({})",
         match backend {
@@ -726,6 +874,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             model,
+            bundle_id,
+            quant,
             prompt,
             max_tokens,
             temperature,
@@ -746,7 +896,16 @@ fn main() -> Result<()> {
             ubatch_size,
             n_keep,
         } => {
-            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            // `cache_dir` is shared between bundle downloads (when
+            // `--bundle-id` is set) and the KV prefix cache below.
+            let engine = resolve_engine(
+                model.as_deref(),
+                bundle_id.as_deref(),
+                quant.as_deref(),
+                cache_dir.as_deref(),
+                &device,
+                context_size,
+            )?;
             let tokenizer = engine.tokenizer();
             let add_bos = engine.metadata().add_bos_token;
 
@@ -1138,6 +1297,9 @@ fn main() -> Result<()> {
         }
         Command::Chat {
             model,
+            bundle_id,
+            quant,
+            cache_dir,
             system,
             device,
             context_size,
@@ -1147,7 +1309,14 @@ fn main() -> Result<()> {
         } => {
             use std::io::BufRead;
 
-            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            let engine = resolve_engine(
+                model.as_deref(),
+                bundle_id.as_deref(),
+                quant.as_deref(),
+                cache_dir.as_deref(),
+                &device,
+                context_size,
+            )?;
             let tokenizer = engine.tokenizer();
 
             // Up-front chat-template probe: fail before the user types
@@ -1292,7 +1461,8 @@ fn main() -> Result<()> {
                 );
             }
 
-            let engine = load_engine(Path::new(&model), &device, context_size)?;
+            let engine =
+                load_engine_from_spec(ModelSpec::Path(Path::new(&model)), &device, context_size)?;
             let tokenizer = engine.tokenizer();
             let add_bos = engine.metadata().add_bos_token;
             let kv_compression = setup_kv_compression(engine.model(), &kv_cache_keys)?;
@@ -1418,7 +1588,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, read_wav_pcm16_mono, resample_linear, split_at_marker, write_wav};
+    use super::{
+        Cli, read_wav_pcm16_mono, resample_linear, resolve_engine, split_at_marker, write_wav,
+    };
     use clap::Parser;
 
     /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.
@@ -1569,6 +1741,124 @@ mod tests {
             r.is_ok(),
             "expected full `chat` flag surface to parse, got: {:?}",
             r.err()
+        );
+    }
+
+    /// `chat --bundle-id <id> --quant <q>` parses cleanly without
+    /// `--model`. This is the documented auto-download entry
+    /// point — clap-rejecting it would make the LeapBundles flow
+    /// unusable.
+    #[test]
+    fn chat_subcommand_parses_with_bundle_id() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "chat",
+            "--bundle-id",
+            "LFM2-1.2B-GGUF",
+            "--quant",
+            "Q4_0",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected `chat --bundle-id X --quant Y` to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `--bundle-id` without `--quant` must be rejected by clap
+    /// (and vice-versa) because the LeapBundles URL needs both.
+    /// Surfacing this at parse time is friendlier than letting
+    /// it through to a runtime error.
+    #[test]
+    fn chat_subcommand_rejects_bundle_id_without_quant() {
+        for partial in [
+            vec!["wick", "chat", "--bundle-id", "X"],
+            vec!["wick", "chat", "--quant", "Q4_0"],
+        ] {
+            let r = Cli::try_parse_from(&partial);
+            assert!(
+                r.is_err(),
+                "expected partial bundle args {partial:?} to be rejected by clap"
+            );
+        }
+    }
+
+    /// `--model` is mutually exclusive with `--bundle-id` /
+    /// `--quant` — passing both is meaningless and we want the
+    /// error at parse time, not after a wasted download attempt.
+    #[test]
+    fn chat_subcommand_rejects_model_with_bundle_id() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "chat",
+            "--model",
+            "/tmp/x",
+            "--bundle-id",
+            "LFM2-1.2B-GGUF",
+            "--quant",
+            "Q4_0",
+        ]);
+        assert!(
+            r.is_err(),
+            "expected `--model` + `--bundle-id` to be rejected by clap"
+        );
+    }
+
+    /// Same auto-download entry point on `run`. Symmetric with
+    /// `chat`'s parse test — flag drift on either subcommand
+    /// breaks the documented form.
+    #[test]
+    fn run_subcommand_parses_with_bundle_id() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--bundle-id",
+            "LFM2-1.2B-GGUF",
+            "--quant",
+            "Q4_0",
+            "--prompt",
+            "hi",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected `run --bundle-id X --quant Y` to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `resolve_engine` with no source flags errors out before
+    /// touching disk or network — fast clear failure on a misuse
+    /// that clap can't catch (both `--model` and `--bundle-id`
+    /// being optional means clap accepts the empty case).
+    #[test]
+    fn resolve_engine_rejects_no_source() {
+        let r = resolve_engine(None, None, None, None, "cpu", 1024);
+        let err = match r {
+            Ok(_) => panic!("expected an error when no source flags are set"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no model source"),
+            "error should explain that no source was given; got: {msg}"
+        );
+    }
+
+    /// `resolve_engine` rejects `--bundle-id` without `--quant`
+    /// (and vice-versa). Clap's `requires` already catches this
+    /// at parse time, but the helper has its own guard for
+    /// programmatic callers (and as a defense-in-depth check).
+    #[test]
+    fn resolve_engine_rejects_partial_bundle_args() {
+        let r = resolve_engine(None, Some("LFM2-1.2B-GGUF"), None, None, "cpu", 1024);
+        assert!(
+            r.is_err(),
+            "expected partial bundle args (id only) to error"
+        );
+        let r = resolve_engine(None, None, Some("Q4_0"), None, "cpu", 1024);
+        assert!(
+            r.is_err(),
+            "expected partial bundle args (quant only) to error"
         );
     }
 
