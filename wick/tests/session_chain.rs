@@ -1256,34 +1256,55 @@ fn engine_does_not_load_encoder_for_text_bundle() {
 }
 
 // ---------------------------------------------------------------------------
-// Real-audio ASR end-to-end (PR 4j).
+// Real-audio ASR end-to-end.
 //
-// Existing audio-in tests above feed synthetic noise — they prove the
-// pipeline doesn't NaN/panic, but say nothing about whether the model
-// actually transcribes. The fixture in `tests/fixtures/audio/` is real
-// macOS-`say` TTS output (16 kHz mono PCM16); the test below feeds it
-// through the full chat-template + ASR flow and asserts the model's
-// transcription contains a known anchor word from the source phrase.
+// Existing audio-in tests above feed synthetic noise — they prove
+// the pipeline doesn't NaN/panic, but say nothing about whether
+// the model actually transcribes. The fixture in
+// `tests/fixtures/audio/` is real macOS-`say` TTS output (16 kHz
+// mono PCM16); the test below feeds it through the full
+// chat-template + ASR flow and asserts the transcription matches
+// `llama.cpp`'s reference output for the same audio + weights.
 //
-// macOS `say` rather than wick's own TTS so a regression in the LLM
-// (e.g. the magnitude divergence tracked in
-// `~/.claude/.../project_llm_magnitude_bug.md`) doesn't shift both
-// directions of a self-loop test in lockstep — see
-// `wick/tests/fixtures/audio/README.md` for the rationale.
+// External TTS (rather than wick's own) so a future LLM
+// regression doesn't shift both directions of a self-loop in
+// lockstep — see `wick/tests/fixtures/audio/README.md` for the
+// independent-oracle rationale.
 // ---------------------------------------------------------------------------
 
 /// Read a 16 kHz mono PCM16 WAV file into f32 samples in [-1, 1].
 /// Mirrors `wick-cli/src/main.rs::read_wav_pcm16_mono` — duplicated
-/// here so the test doesn't depend on the CLI binary. Errors out on
-/// any format other than the canonical wick audio-input shape.
+/// here so the test doesn't depend on the CLI binary. Errors out
+/// on any format other than the canonical wick audio-input shape.
+///
+/// Every offset access goes through `read_u16` / `read_u32` /
+/// the explicit bounds checks below so a malformed or truncated
+/// WAV produces a deterministic assertion message rather than an
+/// out-of-bounds panic.
 fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
     let buf = std::fs::read(path).expect("read fixture WAV");
-    assert!(buf.len() >= 12, "WAV too short");
+    assert!(buf.len() >= 12, "WAV too short for RIFF/WAVE header");
     assert_eq!(&buf[0..4], b"RIFF", "missing RIFF header");
     assert_eq!(&buf[8..12], b"WAVE", "missing WAVE header");
 
-    let read_u16 = |o: usize| u16::from_le_bytes(buf[o..o + 2].try_into().unwrap());
-    let read_u32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    let read_u16 = |o: usize| -> u16 {
+        let end = o.checked_add(2).expect("WAV offset overflow");
+        assert!(
+            end <= buf.len(),
+            "WAV truncated: u16 at {o} OOB ({})",
+            buf.len()
+        );
+        u16::from_le_bytes(buf[o..end].try_into().unwrap())
+    };
+    let read_u32 = |o: usize| -> u32 {
+        let end = o.checked_add(4).expect("WAV offset overflow");
+        assert!(
+            end <= buf.len(),
+            "WAV truncated: u32 at {o} OOB ({})",
+            buf.len()
+        );
+        u32::from_le_bytes(buf[o..end].try_into().unwrap())
+    };
 
     // Walk subchunks from offset 12 to find `fmt ` and `data`.
     let mut o = 12usize;
@@ -1296,21 +1317,48 @@ fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
         if id == b"fmt " {
             fmt_off = Some(body);
         } else if id == b"data" {
+            // Catch a `data_sz` that points past EOF before we
+            // index into it down below.
+            let data_end = body.checked_add(sz).expect("WAV data chunk size overflow");
+            assert!(
+                data_end <= buf.len(),
+                "WAV data chunk size {sz} exceeds file (body+sz={data_end} > len={})",
+                buf.len()
+            );
             data = Some((body, sz));
         }
-        o = body + sz + (sz & 1);
+        // Subchunks are word-aligned: pad odd sizes by 1.
+        o = body
+            .checked_add(sz)
+            .and_then(|x| x.checked_add(sz & 1))
+            .expect("WAV walk overflow");
     }
     let fmt = fmt_off.expect("no fmt chunk");
     let (data_off, data_sz) = data.expect("no data chunk");
 
+    // `fmt` chunk needs at least 16 bytes (PCM format spec): the
+    // fields we read are at offsets 0, 2, 4, 14 — read_u16(fmt + 14)
+    // requires fmt + 16 <= buf.len(). Catch a truncated fmt chunk
+    // before it panics in read_u16.
+    assert!(
+        fmt.checked_add(16).is_some_and(|end| end <= buf.len()),
+        "WAV `fmt ` chunk truncated: needs 16 bytes from offset {fmt}, file is {} bytes",
+        buf.len()
+    );
     assert_eq!(read_u16(fmt), 1, "expected PCM (audio_format=1)");
     assert_eq!(read_u16(fmt + 2), 1, "expected mono");
     let sample_rate = read_u32(fmt + 4);
     assert_eq!(read_u16(fmt + 14), 16, "expected 16-bit");
 
+    assert_eq!(
+        data_sz % 2,
+        0,
+        "WAV data chunk size {data_sz} is not a multiple of 2 (PCM16 frame)"
+    );
     let n_samples = data_sz / 2;
     let mut samples = Vec::with_capacity(n_samples);
     for i in 0..n_samples {
+        // Bounded by the `data_end <= buf.len()` check above.
         let s = i16::from_le_bytes([buf[data_off + i * 2], buf[data_off + i * 2 + 1]]);
         samples.push(s as f32 / 32768.0);
     }
@@ -1410,10 +1458,31 @@ fn asr_real_audio_matches_input_phrase() {
     ];
     let formatted = apply_chat_template(&tokenizer_arc, &messages, true).unwrap();
     let toks = tokenizer_arc.encode(&formatted);
-    let split = toks
-        .iter()
-        .position(|&t| t == marker_id)
-        .expect("marker not in encoded chat-template tokens");
+    // Match `wick-cli`'s `split_at_marker` shape: count occurrences
+    // of `marker_id` and require exactly one. Zero occurrences =
+    // the chat template stripped the placeholder; more than one =
+    // user content contains a literal marker token. Either case
+    // would silently insert the audio at the wrong position
+    // without this check.
+    let mut found: Option<usize> = None;
+    let mut count = 0usize;
+    for (i, &t) in toks.iter().enumerate() {
+        if t == marker_id {
+            count += 1;
+            if found.is_none() {
+                found = Some(i);
+            }
+        }
+    }
+    let split = match (count, found) {
+        (1, Some(idx)) => idx,
+        (0, _) => {
+            panic!("marker `{marker_name}` (id {marker_id}) not in encoded chat-template tokens")
+        }
+        (n, _) => {
+            panic!("marker `{marker_name}` (id {marker_id}) appears {n} times in encoded tokens")
+        }
+    };
     let (prefix, suffix) = (&toks[..split], &toks[split + 1..]);
 
     if !prefix.is_empty() {
@@ -1426,8 +1495,10 @@ fn asr_real_audio_matches_input_phrase() {
 
     // max_tokens=24 covers llama.cpp's expected 7-token output
     // ("Today is a beautiful day." + `<|im_end|>`) with margin.
-    // On current wick this generates well past EOS — see the
-    // doc comment above for the divergence details.
+    // The model emits EOS at token 7 and `generate` stops cleanly;
+    // 24 is a safety bound in case of a future regression that
+    // suppresses EOS, and gives the assertion below a clear
+    // truncation point if that ever happens.
     let opts = greedy_opts(24);
     let mut sink = CollectSink(Vec::new());
     session.generate(&opts, &mut sink).expect("generate");

@@ -35,9 +35,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Voice pinned explicitly so regeneration is reproducible across
+# macOS hosts. The default voice varies by user / OS version /
+# language settings; pinning to a built-in en-US voice ensures
+# identical waveform on every machine. `Samantha` is on every
+# stock macOS install since at least Sierra.
+VOICE="Samantha"
+
 # Phrase: "Today is a beautiful day"
 # Verified faithful at greedy temp 0 on LFM2.5-Audio-1.5B-Q4_0.
-say -o today_is_a_beautiful_day.aiff "Today is a beautiful day"
+say -v "$VOICE" -o today_is_a_beautiful_day.aiff "Today is a beautiful day"
 afconvert today_is_a_beautiful_day.aiff today_is_a_beautiful_day.wav \
     -d LEI16@16000 -f WAVE -c 1
 rm -f today_is_a_beautiful_day.aiff

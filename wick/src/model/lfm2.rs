@@ -1923,21 +1923,33 @@ impl Lfm2Model {
             // residual. Together with the post-block log this lets
             // us identify whether the magnitude growth is from a
             // misbehaving block, an oversize residual, or both.
-            let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
-                "conv"
-            } else {
-                "attn"
-            };
-            log_rms(
-                &format!("layer {layer} ({block_kind}) block-out"),
-                &block_out,
-            );
+            // The `if debug_hidden` guard keeps the per-layer
+            // `format!` allocations off the hot path when the env
+            // var isn't set.
+            if debug_hidden {
+                let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
+                    "conv"
+                } else {
+                    "attn"
+                };
+                log_rms(
+                    &format!("layer {layer} ({block_kind}) block-out"),
+                    &block_out,
+                );
+            }
 
             // Residual: hidden += block_out
             for i in 0..hs * n {
                 hidden[i] += block_out[i];
             }
-            log_rms(&format!("layer {layer} ({block_kind}) post-block"), &hidden);
+            if debug_hidden {
+                let block_kind = if cfg.block_types[layer] == BlockType::GatedConv {
+                    "conv"
+                } else {
+                    "attn"
+                };
+                log_rms(&format!("layer {layer} ({block_kind}) post-block"), &hidden);
+            }
 
             // FFN pre-norm each column
             for j in 0..n {
@@ -2109,12 +2121,16 @@ impl Lfm2Model {
                 }
             }
 
-            log_rms(&format!("layer {layer} ffn-out"), &ffn_out);
+            if debug_hidden {
+                log_rms(&format!("layer {layer} ffn-out"), &ffn_out);
+            }
             // Second residual
             for i in 0..hs * n {
                 hidden[i] += ffn_out[i];
             }
-            log_rms(&format!("layer {layer} post-ffn"), &hidden);
+            if debug_hidden {
+                log_rms(&format!("layer {layer} post-ffn"), &hidden);
+            }
         }
 
         // seq_len tracks total tokens processed. The conv/attn blocks handle
