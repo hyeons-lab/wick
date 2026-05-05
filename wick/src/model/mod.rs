@@ -65,10 +65,10 @@ pub struct ModelConfig {
 /// Session: their KV caches and scratch are still shared and the
 /// lock just turns a races-to-corruption into a serial bottleneck.
 ///
-/// `GpuLfm2Model` (wgpu) has the same shared-state shape; it has not
-/// yet been audited for the lock. CPU `Lfm2Model` has no such shared
-/// state and is safely shareable across concurrent Sessions without
-/// any lock.
+/// `GpuLfm2Model` (wgpu) carries the same `infer_lock` for the same
+/// reason — its per-instance scratch buffers and GPU KV caches share
+/// the same shape. CPU `Lfm2Model` has no such shared state and is
+/// safely shareable across concurrent Sessions without any lock.
 pub trait Model: Send + Sync {
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;

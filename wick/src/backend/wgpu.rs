@@ -190,7 +190,7 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("download"),
             });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
         self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
