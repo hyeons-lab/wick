@@ -389,7 +389,7 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
             "WAV `{path}`: audio_format {audio_format} (expected 1=PCM). Re-encode as 16-bit PCM."
         );
     }
-    if channels < 1 {
+    if channels == 0 {
         bail!("WAV `{path}`: channels=0 in fmt header (must be >= 1)");
     }
     if bits != 16 {
@@ -436,9 +436,9 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
         }
         eprintln!(
             "note: down-mixing {channels}-channel WAV `{path}` to mono \
-             by averaging across channels. For best fidelity pass mono \
+             by averaging across channels. To skip this step, pass mono \
              PCM16 directly — e.g. `sox in.wav -c 1 out.wav` or \
-             `ffmpeg -i in.wav -ac 1 out.wav` — to skip this step."
+             `ffmpeg -i in.wav -ac 1 out.wav`."
         );
     }
     Ok((samples, sample_rate))
