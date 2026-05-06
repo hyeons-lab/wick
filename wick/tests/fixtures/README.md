@@ -1,15 +1,18 @@
 # Test fixtures
 
-## `pug.jpg` (optional)
+## `pug.jpg` (committed, ~299 KB)
 
 End-to-end VL smoke test (`vl_bundle_appends_synthetic_image` in
-`tests/vl_bundle_load.rs`) prefers this fixture when present —
-small JPEG of a recognisable subject so manual output reads
-nicely. When absent the test falls back to a synthesised solid-
-red 256² PNG. Either input lands in the same assertion shape
-(LLM produces non-degenerate text); the fixture only changes
-how interesting the manual output looks.
+`tests/vl_bundle_load.rs`) and clip-parity smoke
+(`vl_clip_parity_smoke` in `tests/vl_clip_parity.rs`) read this
+file directly — a small JPEG of a recognisable subject (a pug
+on a textured carpet, 1024×771, re-encoded with `sips -Z 1024
+-s formatOptions 85`) so manual output reads nicely against the
+real LFM2.5-VL-450M weights. The smoke test falls back to a
+synthesised solid-red 256² PNG if the file is missing, which
+keeps the test runnable on shallow clones.
 
-Not committed to keep the repo small. Drop a small JPEG in this
-directory and the gated test (`WICK_TEST_DOWNLOAD=1 cargo test
---test vl_bundle_load -- --ignored`) will pick it up automatically.
+Committed because it's a stable input for end-to-end parity
+checks; CI cache-restoration of `target/tmp/wick-test-models`
+should not include this file (it's part of the source tree, not
+a download).

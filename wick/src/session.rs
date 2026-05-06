@@ -806,11 +806,36 @@ impl Session {
     /// splices them into the LLM prefill stream at the current
     /// position via [`Self::append_embeddings`].
     ///
-    /// Caller drives the surrounding prompt structure manually —
-    /// e.g. `append_text(prefix)? + append_image(bytes)? +
-    /// append_text(suffix)? + generate(...)`. A higher-level
-    /// chat-template-aware helper that walks `<image>`
-    /// placeholders is a follow-up.
+    /// **Placement matters.** The model was trained on a specific
+    /// surrounding-token envelope (LFM2-VL: `<|image_start|>` /
+    /// `<|image_end|>` *inside* the user-turn opening
+    /// `<|im_start|>user\n…<|im_end|>` block). Calling
+    /// `append_image` at the wrong stream position — before the
+    /// `<bos>` token, outside the user turn, or without the
+    /// model-specific markers — leaves the LLM unable to
+    /// interpret the embeddings as visual content; the visible
+    /// failure mode is a generic non-image-conditioned
+    /// description (e.g. *"I see a complex and abstract scene
+    /// with various shapes…"*). Callers must either:
+    ///
+    /// 1. Drive the marker / user-turn structure manually
+    ///    around `append_image`, e.g.
+    ///    ```ignore
+    ///    let img_start = tokenizer.special_token_id("<|image_start|>")?;
+    ///    let img_end   = tokenizer.special_token_id("<|image_end|>")?;
+    ///    session.append_tokens(&prefix_tokens)?;          // BOS + <|im_start|>user\n
+    ///    session.append_tokens(&[img_start])?;
+    ///    session.append_image(&jpeg_bytes)?;
+    ///    session.append_tokens(&[img_end])?;
+    ///    session.append_tokens(&suffix_tokens)?;          // user text + <|im_end|>\n + asst tag
+    ///    session.generate(&opts, &mut sink)?;
+    ///    ```
+    /// 2. Use a higher-level chat-template-aware helper that
+    ///    walks `<image>` placeholders (slice 2/3 follow-up;
+    ///    not yet implemented).
+    ///
+    /// `wick/tests/vl_bundle_load.rs::vl_bundle_appends_synthetic_image`
+    /// is the reference integration recipe.
     ///
     /// Errors:
     /// 1. [`WickError::EmptyInput`] when `bytes` is empty.

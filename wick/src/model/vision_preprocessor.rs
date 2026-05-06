@@ -40,6 +40,34 @@ pub fn preprocess_image(bytes: &[u8], cfg: &VisionEncoderConfig) -> Result<Vec<f
     let img = image::load_from_memory(bytes)
         .map_err(|e| WickError::Backend(format!("image decode failed: {e}")))?;
 
+    // Aspect-ratio sanity warning: this preprocessor force-resizes
+    // to a square `cfg.image_size × cfg.image_size`. For non-square
+    // inputs (especially extreme — a wide banner squashed to 256²
+    // loses most of the discriminative signal) the encoder still
+    // produces output but a downstream model that depends on
+    // dynamic-resolution features (llama.cpp's
+    // `mtmd_image_preprocessor_lfm2` resizes within the
+    // `[image_min_pixels=65536, image_max_pixels=262144]` band
+    // while preserving aspect) won't see the same input.
+    // Surface the divergence to logs so a user wondering why their
+    // 1024×400 banner produces a vague description sees the cause
+    // without reading the devlog. Threshold 1.5 picks up "panorama
+    // squashed to square" while letting normal photos through.
+    let aspect =
+        (img.width() as f32 / img.height() as f32).max(img.height() as f32 / img.width() as f32);
+    if aspect >= 1.5 {
+        tracing::warn!(
+            input_w = img.width(),
+            input_h = img.height(),
+            target_size = cfg.image_size,
+            aspect_ratio = aspect,
+            "vision_preprocessor: input aspect ratio >= 1.5 will be \
+             force-squashed to a square; encoder output will differ \
+             from llama.cpp's dynamic-resolution path. Consider \
+             centre-cropping the input to a near-square first.",
+        );
+    }
+
     // Resize to image_size × image_size with bilinear (triangle)
     // filter. CLIP-family inputs are square; aspect-preserving
     // resize would mismatch the model's expectations. Convert to
