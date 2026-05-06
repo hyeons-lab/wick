@@ -1525,6 +1525,20 @@ impl GpuLfm2Model {
         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
         let d_conv = kernel_size - 1;
 
+        // `download_f32` returns the FULL staging buffer's contents
+        // (it's grown to the largest historical request and reused),
+        // so the returned `Vec<f32>` may be longer than `count`.
+        // Truncate to the requested element count before slicing into
+        // a snapshot — without this the snapshot would carry stale
+        // tail bytes that downstream `write_buffer` would push past
+        // the live KV region (harmless on restore today, but bad
+        // hygiene + masks future bugs).
+        let download_exact = |buf: &wgpu::Buffer, count: usize| -> Vec<f32> {
+            let mut out = self.ctx.download_f32(buf, count);
+            out.truncate(count);
+            out
+        };
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             if cfg.block_types[i] == BlockType::Attention {
@@ -1533,8 +1547,8 @@ impl GpuLfm2Model {
                 let (k_buf, v_buf) = self.gpu_state.kv_caches[i]
                     .as_ref()
                     .expect("attention layer must have KV buffers");
-                let k_floats = self.ctx.download_f32(k_buf, count);
-                let v_floats = self.ctx.download_f32(v_buf, count);
+                let k_floats = download_exact(k_buf, count);
+                let v_floats = download_exact(v_buf, count);
                 layers.push(LayerSnapshot::Attention {
                     k_data: bytemuck::cast_slice(&k_floats).to_vec(),
                     v_data: bytemuck::cast_slice(&v_floats).to_vec(),
@@ -1544,7 +1558,7 @@ impl GpuLfm2Model {
                 let conv_buf = self.gpu_state.conv_buffers[i]
                     .as_ref()
                     .expect("conv layer must have rolling buffer");
-                let floats = self.ctx.download_f32(conv_buf, count);
+                let floats = download_exact(conv_buf, count);
                 layers.push(LayerSnapshot::Conv {
                     buffer: bytemuck::cast_slice(&floats).to_vec(),
                 });
@@ -1628,21 +1642,35 @@ impl Model for GpuLfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Keep at least one token for the suffix prefill so we
-                // always run a forward pass that produces logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
-                    self.restore_state_locked(&snapshot);
-                    state.seq_len = use_len;
-                    let mut logits = Vec::new();
-                    for (j, &token) in tokens[use_len..].iter().enumerate() {
-                        logits = self.forward_inner(&[token], use_len + j, state);
+                // Strict-prefix hits only. A `prefix_len == tokens.len()`
+                // hit would force `use_len = tokens.len() - 1`, but the
+                // restored state already reflects "after all tokens" —
+                // re-running the last token would advance the conv
+                // rolling buffer one position past where it should be
+                // and overwrite already-correct attention KV cells.
+                // The conv layer state isn't seq_len-gated, so the
+                // off-by-one would corrupt logits.
+                if prefix_len < tokens.len() {
+                    let use_len = prefix_len;
+                    if use_len > 0 {
+                        self.restore_state_locked(&snapshot);
+                        // `restore_state_locked` set `gpu_state.seq_len`
+                        // to `snapshot.seq_len == prefix_len`, which
+                        // matches `use_len` in this strict-prefix path.
+                        // (Kept explicit so future use_len-vs-prefix_len
+                        // splits don't drift.)
+                        self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
+                        state.seq_len = use_len;
+                        let mut logits = Vec::new();
+                        for (j, &token) in tokens[use_len..].iter().enumerate() {
+                            logits = self.forward_inner(&[token], use_len + j, state);
+                        }
+                        self.prefix_cache
+                            .lock()
+                            .expect("prefix_cache mutex poisoned")
+                            .insert(tokens, self.snapshot_state_locked());
+                        return logits;
                     }
-                    self.prefix_cache
-                        .lock()
-                        .expect("prefix_cache mutex poisoned")
-                        .insert(tokens, self.snapshot_state_locked());
-                    return logits;
                 }
             }
         }
