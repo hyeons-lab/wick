@@ -912,8 +912,8 @@ impl MetalLfm2Model {
             y_stride,
             if accumulate { 1 } else { 0 },
         ];
-        let tg_rows = (w.m + 63) / 64; // ceil(m/64)
-        let tg_cols = (n + 31) / 32; // ceil(n/32)
+        let tg_rows = w.m.div_ceil(64);
+        let tg_cols = n.div_ceil(32);
         let gemm_pipeline = match w.dtype {
             DType::Q8_0 => &self.pipelines.gemm_q8_0,
             _ => &self.pipelines.gemm_q4_0,
@@ -1135,6 +1135,7 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemv_splitk_q4_0(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1151,7 +1152,7 @@ impl MetalLfm2Model {
         // `(split_id, row_group)` via integer division. A 2D dispatch won't
         // work here — `tg_id` is bound as `uint`, so it only gets the X
         // component and every TG would compute `split_id == 0`.
-        let rows_per_split = (w.m as u64 + 7) / 8; // ROWS_PER_TG = 8
+        let rows_per_split = (w.m as u64).div_ceil(8); // ROWS_PER_TG = 8
         let grid = MTLSize::new(rows_per_split * n_splits as u64, 1, 1);
         let split_params = [w.m, w.k, n_splits];
 
@@ -1177,6 +1178,7 @@ impl MetalLfm2Model {
         enc.dispatch_threads(sz1d(w.m as u64), sz1d(256));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemv_impl(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1487,6 +1489,7 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_qk_norm_rope(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1987,7 +1990,7 @@ impl MetalLfm2Model {
         let smem_bytes = half_bytes + float_bytes;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
         let q_per_tg = 8u32;
-        let n_tgs = ((n + q_per_tg - 1) / q_per_tg) * n_heads;
+        let n_tgs = n.div_ceil(q_per_tg) * n_heads;
         enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
     }
 }
@@ -2286,9 +2289,16 @@ impl Model for MetalLfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Always keep at least 1 token for forward_prefill_inner to produce logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
+                // Strict-prefix-only: a `prefix_len == tokens.len()`
+                // hit would force `use_len = tokens.len() - 1`, but
+                // the restored conv rolling buffer reflects "after
+                // all tokens" — re-running the last token would
+                // advance the conv buffer one position past where
+                // it should be (conv layers don't gate on
+                // seq_len). Skip full hits; fall through to cold
+                // prefill. Same fix wgpu got in PR #120.
+                if prefix_len < tokens.len() && prefix_len > 0 {
+                    let use_len = prefix_len;
                     self.restore_state_locked(&snapshot);
                     state.seq_len = use_len;
 
@@ -2300,6 +2310,12 @@ impl Model for MetalLfm2Model {
                     return logits;
                 }
             }
+            // Cache miss on a fresh prefill: zero the GPU conv
+            // rolling buffers so stale state from a prior
+            // generation can't leak in. Cache hits skip this
+            // (`restore_state_locked` rewrites the buffers from
+            // the snapshot).
+            self.zero_conv_buffers_locked();
         }
 
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
@@ -2354,9 +2370,15 @@ impl Model for MetalLfm2Model {
         // GPU-resident seq_len counter so we're not appending after
         // KV from a previous generate(). InferenceState is the
         // caller's responsibility on the embedding path (no prefix-
-        // cache restore).
+        // cache restore on the embeddings path; encoder output is
+        // non-deterministic so it isn't worth cache keying).
+        // Conv rolling buffers also need explicit zero — same
+        // reasoning as the token-id `forward_prefill` cache-miss
+        // path; without it stale conv state from a prior generate()
+        // leaks into the new run.
         if start_pos == 0 {
             self.state.seq_len.store(0, Ordering::Relaxed);
+            self.zero_conv_buffers_locked();
         }
 
         self.forward_prefill_inner_from_embeddings(embeddings, n_tokens, start_pos, state)
@@ -2495,11 +2517,55 @@ impl MetalLfm2Model {
                         );
                     }
                 }
+                LayerSnapshot::AttentionCompressed { .. } => {
+                    // Unreachable in normal operation: Metal doesn't
+                    // configure TurboQuant compression, so the prefix
+                    // cache built against this model never contains
+                    // AttentionCompressed snapshots — `model_id` is
+                    // `"metal:..."` vs CPU's `"cpu:..."`, separating
+                    // their on-disk namespaces. Panic on the hard
+                    // error path so an accidental cross-namespace
+                    // load surfaces fast instead of corrupting state.
+                    panic!(
+                        "MetalLfm2Model::restore_state_locked received \
+                         a TurboQuant-compressed snapshot at layer {i}; \
+                         Metal does not support TurboQuant. This indicates \
+                         a cross-backend cache-namespace leak."
+                    );
+                }
             }
         }
         self.state
             .seq_len
             .store(snapshot.seq_len, Ordering::Relaxed);
+    }
+
+    /// Zero every conv layer's GPU rolling buffer. Called on a fresh
+    /// prefill (`start_pos == 0`) cache MISS so stale conv state
+    /// from a prior generation can't leak into the new run. Cache
+    /// HITs go through `restore_state_locked` which overwrites the
+    /// buffers from the snapshot, so this only fires on the cold
+    /// path.
+    ///
+    /// Why this is needed: `state.seq_len` is reset on `start_pos
+    /// == 0`, and attention K/V are cell-keyed by position so
+    /// stale tail data is invisible (kernels honor seq_len). But
+    /// conv layers always read the entire rolling buffer regardless
+    /// of seq_len — see `conv1d.metal`. Without this zero, an FFI /
+    /// long-lived process that reuses the same `MetalLfm2Model`
+    /// across multiple `Session`s would drift on conv state.
+    fn zero_conv_buffers_locked(&self) {
+        let cfg = &self.config;
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::GatedConv
+                && let Some(conv_buf) = self.state.conv_buffers[i].as_ref()
+            {
+                let byte_len = conv_buf.length() as usize;
+                unsafe {
+                    std::ptr::write_bytes(conv_buf.contents() as *mut u8, 0, byte_len);
+                }
+            }
+        }
     }
 }
 

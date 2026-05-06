@@ -2407,22 +2407,26 @@ impl Model for Lfm2Model {
                 };
                 if !compatible {
                     // skip; fall through to cold prefill.
-                } else {
-                    // Keep at least one token for the suffix prefill
-                    // so we always run a forward pass that produces
-                    // logits.
-                    let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                    if use_len > 0 {
-                        state.restore(&snapshot);
-                        let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                        if let Some(snap) = state.snapshot() {
-                            self.prefix_cache
-                                .lock()
-                                .expect("prefix_cache mutex poisoned")
-                                .insert(tokens, snap);
-                        }
-                        return logits;
+                } else if prefix_len < tokens.len() && prefix_len > 0 {
+                    // Strict-prefix-only: a `prefix_len == tokens.len()`
+                    // hit would force `use_len = tokens.len() - 1`, but
+                    // the restored conv rolling buffer reflects "after
+                    // all tokens" — re-running the last token would
+                    // advance the conv buffer one position past where
+                    // it should be (conv layers don't gate on
+                    // seq_len). Skip full hits + fall through to cold
+                    // prefill. Same fix wgpu got in PR #120; tracked
+                    // as 8f on the punch list.
+                    let use_len = prefix_len;
+                    state.restore(&snapshot);
+                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                    if let Some(snap) = state.snapshot() {
+                        self.prefix_cache
+                            .lock()
+                            .expect("prefix_cache mutex poisoned")
+                            .insert(tokens, snap);
                     }
+                    return logits;
                 }
             }
         }

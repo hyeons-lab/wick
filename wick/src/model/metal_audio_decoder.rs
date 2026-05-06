@@ -366,11 +366,9 @@ impl MetalAudioDecoder {
 
     pub fn reset(&self) {
         self.n_past.set(0);
-        for buf in &self.conv_bufs {
-            if let Some(b) = buf {
-                unsafe {
-                    std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
-                }
+        for b in self.conv_bufs.iter().flatten() {
+            unsafe {
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
             }
         }
     }
@@ -478,6 +476,7 @@ impl MetalAudioDecoder {
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_mul_out(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -1096,7 +1095,7 @@ impl MetalDepthformer {
         let mut codes = [0i32; 8];
         let mut prev_token: i32 = -1;
 
-        for j in 0..dec.n_codebook {
+        for (j, code) in codes.iter_mut().enumerate().take(dec.n_codebook) {
             let pos = self.n_past.get();
 
             // Build command buffer for this codebook
@@ -1278,7 +1277,7 @@ impl MetalDepthformer {
                 picked as i32
             };
 
-            codes[j] = sampled;
+            *code = sampled;
             prev_token = sampled;
         }
 

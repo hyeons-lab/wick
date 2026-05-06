@@ -43,7 +43,7 @@ impl MetalContext {
 
     /// Upload f32 data to a GPU buffer (shared storage, unified memory).
     pub fn upload_f32(&self, data: &[f32]) -> Buffer {
-        let size = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size = std::mem::size_of_val(data) as u64;
         self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
             size,

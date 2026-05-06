@@ -1602,11 +1602,60 @@ impl GpuLfm2Model {
                         .expect("conv layer must have rolling buffer");
                     self.ctx.queue.write_buffer(conv_buf, 0, buffer);
                 }
+                LayerSnapshot::AttentionCompressed { .. } => {
+                    // Unreachable in normal operation: wgpu doesn't
+                    // configure TurboQuant compression. `model_id`
+                    // is `"wgpu:..."` vs CPU's `"cpu:..."`, separating
+                    // their on-disk namespaces. Panic on the hard
+                    // error path so an accidental cross-namespace
+                    // load surfaces fast instead of corrupting state.
+                    panic!(
+                        "GpuLfm2Model::restore_state_locked received \
+                         a TurboQuant-compressed snapshot at layer {i}; \
+                         wgpu does not support TurboQuant. This indicates \
+                         a cross-backend cache-namespace leak."
+                    );
+                }
             }
         }
         self.gpu_state
             .seq_len
             .store(snapshot.seq_len, Ordering::Relaxed);
+    }
+
+    /// Zero every conv layer's GPU rolling buffer. Called on a fresh
+    /// prefill (`start_pos == 0`) cache MISS so stale conv state
+    /// from a prior generation can't leak into the new run. Cache
+    /// HITs go through `restore_state_locked` which overwrites the
+    /// buffers from the snapshot, so this only fires on the cold
+    /// path. Mirrors `MetalLfm2Model::zero_conv_buffers_locked`.
+    ///
+    /// Conv layers always read the entire rolling buffer regardless
+    /// of `seq_len`, so the seq_len atomic reset alone isn't enough
+    /// to fence stale state. Without this an FFI / long-lived
+    /// process that reuses the same `GpuLfm2Model` across multiple
+    /// `Session`s would drift on conv state.
+    ///
+    /// Uses wgpu's native `clear_buffer` so the zero fill happens
+    /// GPU-side — no CPU-allocated zero buffer, no CPU→GPU upload.
+    /// One encoder, one submit, regardless of layer count.
+    fn zero_conv_buffers_locked(&self) {
+        let cfg = &self.config;
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zero_conv_buffers"),
+            });
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::GatedConv
+                && let Some(conv_buf) = self.gpu_state.conv_buffers[i].as_ref()
+            {
+                // `None` size = clear entire buffer.
+                enc.clear_buffer(conv_buf, 0, None);
+            }
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
     }
 }
 
@@ -1650,29 +1699,33 @@ impl Model for GpuLfm2Model {
                 // and overwrite already-correct attention KV cells.
                 // The conv layer state isn't seq_len-gated, so the
                 // off-by-one would corrupt logits.
-                if prefix_len < tokens.len() {
+                if prefix_len < tokens.len() && prefix_len > 0 {
                     let use_len = prefix_len;
-                    if use_len > 0 {
-                        self.restore_state_locked(&snapshot);
-                        // `restore_state_locked` set `gpu_state.seq_len`
-                        // to `snapshot.seq_len == prefix_len`, which
-                        // matches `use_len` in this strict-prefix path.
-                        // (Kept explicit so future use_len-vs-prefix_len
-                        // splits don't drift.)
-                        self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
-                        state.seq_len = use_len;
-                        let mut logits = Vec::new();
-                        for (j, &token) in tokens[use_len..].iter().enumerate() {
-                            logits = self.forward_inner(&[token], use_len + j, state);
-                        }
-                        self.prefix_cache
-                            .lock()
-                            .expect("prefix_cache mutex poisoned")
-                            .insert(tokens, self.snapshot_state_locked());
-                        return logits;
+                    self.restore_state_locked(&snapshot);
+                    // `restore_state_locked` set `gpu_state.seq_len`
+                    // to `snapshot.seq_len == prefix_len`, which
+                    // matches `use_len` in this strict-prefix path.
+                    // (Kept explicit so future use_len-vs-prefix_len
+                    // splits don't drift.)
+                    self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
+                    state.seq_len = use_len;
+                    let mut logits = Vec::new();
+                    for (j, &token) in tokens[use_len..].iter().enumerate() {
+                        logits = self.forward_inner(&[token], use_len + j, state);
                     }
+                    self.prefix_cache
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
+                        .insert(tokens, self.snapshot_state_locked());
+                    return logits;
                 }
             }
+            // Cache miss on a fresh prefill: zero the GPU conv
+            // rolling buffers so stale state from a prior
+            // generation can't leak in. Cache hits skip this
+            // (`restore_state_locked` rewrites the buffers from
+            // the snapshot). Mirrors the equivalent fix on Metal.
+            self.zero_conv_buffers_locked();
         }
 
         // Cache miss (or continuation prefill): full prefill loop.
