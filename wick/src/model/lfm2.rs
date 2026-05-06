@@ -2359,14 +2359,13 @@ impl Model for Lfm2Model {
             "forward_prefill requires at least one token"
         );
 
-        // Cache participation gates:
-        // - `start_pos == 0`: only on a fresh prefill. Continuation
-        //   prefills (chunked / mid-sequence) carry KV state from
-        //   the prior chunk so a cache restore would clobber it.
-        // - `!state.is_compressed()`: TurboQuant-compressed caches
-        //   don't fit `LayerSnapshot::Attention { k_data, v_data }`
-        //   cleanly; same gate the n_keep shift uses.
-        let cache_eligible = start_pos == 0 && !state.is_compressed();
+        // Cache participation gate: only on a fresh prefill
+        // (`start_pos == 0`). Continuation prefills (chunked /
+        // mid-sequence) carry KV state from the prior chunk so a
+        // cache restore would clobber it. TurboQuant-compressed
+        // states are now supported via `LayerSnapshot::AttentionCompressed`
+        // (the `!is_compressed()` exclusion was lifted in this PR).
+        let cache_eligible = start_pos == 0;
 
         if cache_eligible {
             let hit = self

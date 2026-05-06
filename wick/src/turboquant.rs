@@ -348,6 +348,7 @@ pub fn unpack_1bit_to_signs(packed: &[u8], out: &mut [f32]) {
 ///
 /// Each KV head's data is stored in a separate contiguous buffer
 /// for stride-free access during attention.
+#[derive(Clone)]
 pub struct CompressedKeyCache {
     /// Packed 2-bit PolarQuant indices per KV head.
     /// Each head: contiguous `[seq_len * polar_bytes_per_key]` where `polar_bytes_per_key = head_dim / 4`.
@@ -441,6 +442,7 @@ impl CompressedKeyCache {
 ///
 /// Storage per vector: `head_dim / 4` bytes (2 bits/elem) + 2 bytes f16 norm.
 /// For `head_dim = 128`: 34 bytes, ~15× smaller than f32 (512 bytes).
+#[derive(Clone)]
 pub struct CompressedValueCache {
     /// Packed 2-bit PolarQuant indices per KV head.
     /// Each head: contiguous `[seq_len * polar_bytes_per_value]` where `polar_bytes_per_value = head_dim / 4`.
@@ -1033,11 +1035,323 @@ fn attn_values_turboquant_gqa_scalar(
     }
 }
 
+// ── Snapshot encoding ──────────────────────────────────────────────────────
+//
+// Used by the KV prefix cache to serialize TurboQuant compressed caches into
+// the `LayerSnapshot::AttentionCompressed { keys, values }` byte slots.
+// Versioned via a 4-byte magic so future format bumps can dispatch:
+//   "TQK1" / "TQV1" — v1 (current).
+// `norms_f32` / `residual_norms_f32` are NOT serialized — recomputed at decode
+// time from the u16 (f16) values, saving ~50% of the per-head bytes.
+
+const TQK1_MAGIC: [u8; 4] = *b"TQK1";
+const TQV1_MAGIC: [u8; 4] = *b"TQV1";
+
+/// Header for a v1 encoded compressed cache (keys or values).
+///
+/// `magic` differentiates keys vs values; `n_kv_heads`, `head_dim`, `seq_len`
+/// reproduce the cache shape on decode. The body that follows is described
+/// per-format in [`encode_compressed_keys`] / [`encode_compressed_values`].
+struct Tq1Header {
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+}
+
+impl Tq1Header {
+    const SIZE: usize = 4 + 4 + 4 + 4; // magic + 3 u32
+
+    fn write(&self, magic: &[u8; 4], out: &mut Vec<u8>) {
+        out.extend_from_slice(magic);
+        out.extend_from_slice(&self.n_kv_heads.to_le_bytes());
+        out.extend_from_slice(&self.head_dim.to_le_bytes());
+        out.extend_from_slice(&self.seq_len.to_le_bytes());
+    }
+
+    fn parse(buf: &[u8], expected_magic: &[u8; 4]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        if &buf[0..4] != expected_magic {
+            return None;
+        }
+        let n_kv_heads = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let head_dim = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let seq_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        Some(Self {
+            n_kv_heads,
+            head_dim,
+            seq_len,
+        })
+    }
+}
+
+/// Encode a [`CompressedKeyCache`] to a self-describing byte blob suitable
+/// for `LayerSnapshot::AttentionCompressed::keys`. Format ("TQK1"):
+///
+/// ```text
+/// [u8;4] magic = "TQK1"
+/// u32 LE n_kv_heads
+/// u32 LE head_dim
+/// u32 LE seq_len
+/// per head: polar_data       (seq_len * head_dim/4 bytes)
+/// per head: jl_data          (seq_len * head_dim/8 bytes)
+/// per head: norms            (seq_len u16 LE)
+/// per head: residual_norms   (seq_len u16 LE)
+/// ```
+pub fn encode_compressed_keys(cache: &CompressedKeyCache) -> Vec<u8> {
+    let seq_len = cache.seq_len();
+    let polar_per = cache.polar_bytes_per_key();
+    let jl_per = cache.jl_bytes_per_key();
+    let body = cache.n_kv_heads * (seq_len * (polar_per + jl_per) + 4 * seq_len);
+    let mut out = Vec::with_capacity(Tq1Header::SIZE + body);
+    Tq1Header {
+        n_kv_heads: cache.n_kv_heads as u32,
+        head_dim: cache.head_dim as u32,
+        seq_len: seq_len as u32,
+    }
+    .write(&TQK1_MAGIC, &mut out);
+    for h in 0..cache.n_kv_heads {
+        out.extend_from_slice(&cache.polar_data[h]);
+    }
+    for h in 0..cache.n_kv_heads {
+        out.extend_from_slice(&cache.jl_data[h]);
+    }
+    for h in 0..cache.n_kv_heads {
+        for &v in &cache.norms[h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for h in 0..cache.n_kv_heads {
+        for &v in &cache.residual_norms[h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_compressed_keys`]. Re-derives the f32 norm caches
+/// from the u16 (f16-bits) values so the hot attention path doesn't pay
+/// per-call f16→f32 conversion.
+pub fn decode_compressed_keys(buf: &[u8]) -> Option<CompressedKeyCache> {
+    let h = Tq1Header::parse(buf, &TQK1_MAGIC)?;
+    let n_kv_heads = h.n_kv_heads as usize;
+    let head_dim = h.head_dim as usize;
+    let seq_len = h.seq_len as usize;
+    if head_dim % 8 != 0 {
+        return None; // jl_bytes = head_dim / 8 must be integer
+    }
+    let polar_per = head_dim / 4;
+    let jl_per = head_dim / 8;
+    let body_len = n_kv_heads * (seq_len * (polar_per + jl_per) + 4 * seq_len);
+    if buf.len() != Tq1Header::SIZE + body_len {
+        return None;
+    }
+    let mut o = Tq1Header::SIZE;
+
+    let mut polar_data: Vec<Vec<u8>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let len = seq_len * polar_per;
+        polar_data.push(buf[o..o + len].to_vec());
+        o += len;
+    }
+    let mut jl_data: Vec<Vec<u8>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let len = seq_len * jl_per;
+        jl_data.push(buf[o..o + len].to_vec());
+        o += len;
+    }
+    let mut norms: Vec<Vec<u16>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let mut v = Vec::with_capacity(seq_len);
+        for _ in 0..seq_len {
+            v.push(u16::from_le_bytes([buf[o], buf[o + 1]]));
+            o += 2;
+        }
+        norms.push(v);
+    }
+    let mut residual_norms: Vec<Vec<u16>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let mut v = Vec::with_capacity(seq_len);
+        for _ in 0..seq_len {
+            v.push(u16::from_le_bytes([buf[o], buf[o + 1]]));
+            o += 2;
+        }
+        residual_norms.push(v);
+    }
+    let norms_f32: Vec<Vec<f32>> = norms
+        .iter()
+        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .collect();
+    let residual_norms_f32: Vec<Vec<f32>> = residual_norms
+        .iter()
+        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .collect();
+    Some(CompressedKeyCache {
+        polar_data,
+        jl_data,
+        norms,
+        residual_norms,
+        norms_f32,
+        residual_norms_f32,
+        head_dim,
+        n_kv_heads,
+    })
+}
+
+/// Encode a [`CompressedValueCache`]. Format ("TQV1"):
+///
+/// ```text
+/// [u8;4] magic = "TQV1"
+/// u32 LE n_kv_heads
+/// u32 LE head_dim
+/// u32 LE seq_len
+/// per head: polar_data (seq_len * head_dim/4 bytes)
+/// per head: norms      (seq_len u16 LE)
+/// ```
+///
+/// Smaller than the keys format — no jl_data and no residual_norms.
+pub fn encode_compressed_values(cache: &CompressedValueCache) -> Vec<u8> {
+    let seq_len = cache.seq_len();
+    let polar_per = cache.polar_bytes_per_value();
+    let body = cache.n_kv_heads * (seq_len * polar_per + 2 * seq_len);
+    let mut out = Vec::with_capacity(Tq1Header::SIZE + body);
+    Tq1Header {
+        n_kv_heads: cache.n_kv_heads as u32,
+        head_dim: cache.head_dim as u32,
+        seq_len: seq_len as u32,
+    }
+    .write(&TQV1_MAGIC, &mut out);
+    for h in 0..cache.n_kv_heads {
+        out.extend_from_slice(&cache.polar_data[h]);
+    }
+    for h in 0..cache.n_kv_heads {
+        for &v in &cache.norms[h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_compressed_values`].
+pub fn decode_compressed_values(buf: &[u8]) -> Option<CompressedValueCache> {
+    let h = Tq1Header::parse(buf, &TQV1_MAGIC)?;
+    let n_kv_heads = h.n_kv_heads as usize;
+    let head_dim = h.head_dim as usize;
+    let seq_len = h.seq_len as usize;
+    let polar_per = head_dim / 4;
+    let body_len = n_kv_heads * (seq_len * polar_per + 2 * seq_len);
+    if buf.len() != Tq1Header::SIZE + body_len {
+        return None;
+    }
+    let mut o = Tq1Header::SIZE;
+
+    let mut polar_data: Vec<Vec<u8>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let len = seq_len * polar_per;
+        polar_data.push(buf[o..o + len].to_vec());
+        o += len;
+    }
+    let mut norms: Vec<Vec<u16>> = Vec::with_capacity(n_kv_heads);
+    for _ in 0..n_kv_heads {
+        let mut v = Vec::with_capacity(seq_len);
+        for _ in 0..seq_len {
+            v.push(u16::from_le_bytes([buf[o], buf[o + 1]]));
+            o += 2;
+        }
+        norms.push(v);
+    }
+    let norms_f32: Vec<Vec<f32>> = norms
+        .iter()
+        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .collect();
+    Some(CompressedValueCache {
+        polar_data,
+        norms,
+        norms_f32,
+        head_dim,
+        n_kv_heads,
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode → decode round-trip on a `CompressedKeyCache` must
+    /// reproduce the per-head packed bytes + the f16-bit norms.
+    /// The f32 caches are derived on decode and must match within
+    /// the f16→f32 conversion (exact, since the source values
+    /// already came from `f16::from_bits().to_f32()`).
+    #[test]
+    fn encode_decode_compressed_keys_roundtrip() {
+        let mut cache = CompressedKeyCache::new(3, 16, 8);
+        for h in 0..3 {
+            // 3 vectors per head; head_dim=16 → polar=4 bytes, jl=2 bytes.
+            for t in 0..3 {
+                let polar: Vec<u8> = (0..4).map(|i| ((h * 10 + t) * 4 + i) as u8).collect();
+                let jl: Vec<u8> = (0..2)
+                    .map(|i| 0xAA ^ (h as u8) ^ (t as u8) ^ (i as u8))
+                    .collect();
+                let norm = (0x1000 + h * 0x100 + t * 0x10) as u16;
+                let res = (0x4000 + h * 0x100 + t * 0x10) as u16;
+                cache.append(h, &polar, &jl, norm, res);
+            }
+        }
+        let encoded = encode_compressed_keys(&cache);
+        assert!(encoded.starts_with(b"TQK1"));
+        let decoded = decode_compressed_keys(&encoded).expect("decode must succeed");
+        assert_eq!(decoded.n_kv_heads, cache.n_kv_heads);
+        assert_eq!(decoded.head_dim, cache.head_dim);
+        assert_eq!(decoded.seq_len(), cache.seq_len());
+        for h in 0..3 {
+            assert_eq!(decoded.polar_data[h], cache.polar_data[h]);
+            assert_eq!(decoded.jl_data[h], cache.jl_data[h]);
+            assert_eq!(decoded.norms[h], cache.norms[h]);
+            assert_eq!(decoded.residual_norms[h], cache.residual_norms[h]);
+            assert_eq!(decoded.norms_f32[h], cache.norms_f32[h]);
+            assert_eq!(decoded.residual_norms_f32[h], cache.residual_norms_f32[h]);
+        }
+    }
+
+    /// Same round-trip on `CompressedValueCache`. No jl_data and no
+    /// residual_norms — verify the smaller layout decodes correctly.
+    #[test]
+    fn encode_decode_compressed_values_roundtrip() {
+        let mut cache = CompressedValueCache::new(2, 16, 8);
+        for h in 0..2 {
+            for t in 0..4 {
+                let polar: Vec<u8> = (0..4)
+                    .map(|i| (h as u8) * 50 + (t as u8) * 10 + i)
+                    .collect();
+                let norm = (0x2000 + h * 0x80 + t * 0x10) as u16;
+                cache.append(h, &polar, norm);
+            }
+        }
+        let encoded = encode_compressed_values(&cache);
+        assert!(encoded.starts_with(b"TQV1"));
+        let decoded = decode_compressed_values(&encoded).expect("decode must succeed");
+        assert_eq!(decoded.n_kv_heads, cache.n_kv_heads);
+        assert_eq!(decoded.head_dim, cache.head_dim);
+        assert_eq!(decoded.seq_len(), cache.seq_len());
+        for h in 0..2 {
+            assert_eq!(decoded.polar_data[h], cache.polar_data[h]);
+            assert_eq!(decoded.norms[h], cache.norms[h]);
+            assert_eq!(decoded.norms_f32[h], cache.norms_f32[h]);
+        }
+    }
+
+    /// Wrong magic bytes must produce `None` from the decoder so
+    /// the cache loader treats a corrupt entry as a miss rather
+    /// than crashing.
+    #[test]
+    fn decode_compressed_keys_rejects_wrong_magic() {
+        let mut bad = b"XXXX".to_vec();
+        bad.extend_from_slice(&[0u8; 12]);
+        assert!(decode_compressed_keys(&bad).is_none());
+    }
 
     #[test]
     fn test_wht_roundtrip() {
