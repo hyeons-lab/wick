@@ -189,6 +189,45 @@ impl MmapWeight {
         );
     }
 
+    /// Dequantise a single row at `row_idx` into `dst`. `dst.len()`
+    /// must equal `self.cols`. Works for any dtype the rest of the
+    /// crate supports (F32 path is a memcpy, quantised dtypes route
+    /// through the matching `dequantize_*_row` kernel). Used by
+    /// embedding-table lookups (audio detokeniser codebooks, LLM
+    /// token embeddings) that historically called
+    /// [`Self::as_f32`] but now have to handle the quantised
+    /// embedding tables `mostly_q4_0` GGUFs ship.
+    pub fn dequantize_row(&self, row_idx: usize, dst: &mut [f32]) {
+        assert_eq!(dst.len(), self.cols);
+        assert!(row_idx < self.rows);
+        let row_bytes = (self.cols / self.dtype.block_size()) * self.dtype.block_bytes();
+        let offset = row_idx * row_bytes;
+        let bytes = &self.data()[offset..offset + row_bytes];
+        match self.dtype {
+            DType::F32 => {
+                let src: &[f32] = bytemuck::cast_slice(bytes);
+                dst.copy_from_slice(src);
+            }
+            DType::F16 => {
+                let src: &[half::f16] = bytemuck::cast_slice(bytes);
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = s.to_f32();
+                }
+            }
+            DType::BF16 => {
+                let src: &[half::bf16] = bytemuck::cast_slice(bytes);
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = s.to_f32();
+                }
+            }
+            DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),
+            DType::Q8_0 => crate::quant::dequantize_q8_0_row(bytes, dst),
+            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(bytes, dst),
+            DType::Q6K => crate::quant::dequantize_q6_k_row(bytes, dst),
+            other => panic!("MmapWeight::dequantize_row: unsupported dtype {other:?}"),
+        }
+    }
+
     /// GEMV restricted to a contiguous row subrange
     /// `[row_start, row_start + n_rows)`. Used by the audio
     /// decoder's per-codebook slicing of `depth_linear`. Same

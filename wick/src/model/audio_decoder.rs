@@ -504,8 +504,9 @@ pub fn sample_audio_frame(
         if j > 0 && prev_token >= 0 {
             let prev_cb = &weights.depth_embeddings[j - 1];
             let tok = prev_token as usize;
-            let emb_row = &prev_cb.embedding.as_f32()[tok * n_embd_d..(tok + 1) * n_embd_d];
-            for (d, e) in depthformer_in.iter_mut().zip(emb_row) {
+            let mut emb_row = vec![0f32; n_embd_d];
+            prev_cb.embedding.dequantize_row(tok, &mut emb_row);
+            for (d, e) in depthformer_in.iter_mut().zip(&emb_row) {
                 *d += e;
             }
         }
@@ -566,10 +567,11 @@ pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec
     let emb_dim = emb.cols;
     let mut result = vec![0.0f32; emb_dim];
 
+    let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
         let offset_idx = j * n_vocab + code as usize;
-        let row = &emb.as_f32()[offset_idx * emb_dim..(offset_idx + 1) * emb_dim];
-        for (r, e) in result.iter_mut().zip(row) {
+        emb.dequantize_row(offset_idx, &mut row);
+        for (r, e) in result.iter_mut().zip(&row) {
             *r += e;
         }
     }
@@ -844,10 +846,11 @@ pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32
     let n_vocab_per_cb = emb.rows / n_codes;
 
     let mut result = vec![0.0f32; emb_dim];
+    let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
         let idx = j * n_vocab_per_cb + code as usize;
-        let row = &emb.as_f32()[idx * emb_dim..(idx + 1) * emb_dim];
-        for (r, e) in result.iter_mut().zip(row) {
+        emb.dequantize_row(idx, &mut row);
+        for (r, e) in result.iter_mut().zip(&row) {
             *r += e;
         }
     }

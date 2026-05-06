@@ -774,6 +774,25 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
     }
 }
 
+/// tanh-approximation GELU activation in-place:
+/// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+/// This is what `ggml_gelu` (i.e. llama.cpp's default GELU) computes,
+/// and what every CLIP-family ViT trained with `clip.use_gelu = true`
+/// in the GGUF metadata expects. Differs from
+/// [`gelu_erf_inplace`] (the exact erf-form) by ~1e-3 relative around
+/// |x| ≈ 1; that gap accumulates over many MLP layers, so picking the
+/// wrong variant degrades downstream output noticeably even though
+/// each individual call looks fine.
+pub fn gelu_inplace(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    for v in x.iter_mut() {
+        let xv = *v;
+        let inner = SQRT_2_OVER_PI * (xv + COEF * xv * xv * xv);
+        *v = 0.5 * xv * (1.0 + inner.tanh());
+    }
+}
+
 /// Approximation of `erf(x)` for `f32`. Abramowitz & Stegun 7.1.26
 /// form, max abs error ~1.5e-7. `f32::erf` isn't in stable `std`, and
 /// adding `libm` for one function would break the "no extra math deps
@@ -2400,6 +2419,24 @@ mod tests {
         assert!((x[1] - 0.8413).abs() < 5e-3, "gelu(1) = {}", x[1]);
         assert!((x[2] + 0.1587).abs() < 5e-3, "gelu(-1) = {}", x[2]);
         assert!((x[3] - 1.9545).abs() < 5e-3, "gelu(2) = {}", x[3]);
+    }
+
+    #[test]
+    fn test_gelu_tanh_known_values() {
+        // tanh-approx GELU values from PyTorch's
+        // F.gelu(x, approximate="tanh"). Differs from the erf-form by
+        // ~1e-3 around |x|≈1 — picking up that gap is exactly the
+        // point of having two kernels.
+        //   gelu_tanh(0)  = 0
+        //   gelu_tanh(1)  ≈ 0.8412
+        //   gelu_tanh(-1) ≈ -0.1588
+        //   gelu_tanh(2)  ≈ 1.9546
+        let mut x = vec![0.0f32, 1.0, -1.0, 2.0];
+        gelu_inplace(&mut x);
+        assert!(x[0].abs() < 1e-4, "gelu_tanh(0) = {}", x[0]);
+        assert!((x[1] - 0.8412).abs() < 5e-3, "gelu_tanh(1) = {}", x[1]);
+        assert!((x[2] + 0.1588).abs() < 5e-3, "gelu_tanh(-1) = {}", x[2]);
+        assert!((x[3] - 1.9546).abs() < 5e-3, "gelu_tanh(2) = {}", x[3]);
     }
 
     #[test]

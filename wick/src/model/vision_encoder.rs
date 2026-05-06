@@ -165,14 +165,15 @@ impl VisionEncoderConfig {
 }
 
 /// Patch-embed Conv2D weights, pre-transposed at load time into
-/// row-major `[n_embd × in_dim]` where `in_dim = 3·patch_size²`.
+/// row-major `[in_dim × n_embd]` where `in_dim = 3·patch_size²`.
 /// The conv-with-stride-equal-to-kernel-size collapses to a per-
-/// patch GEMV, so storing the kernel as a plain `[out × in]`
-/// matrix (rather than the 4D GGUF layout `[kw, kh, ic, oc]`)
-/// lets the forward pass call `cpu::matmul_f32` directly with no
-/// per-image transpose.
+/// patch matmul; storing the kernel in `[in × out]` row-major
+/// matches the layout `cpu::matmul_f32(a, b, c, m, n, k)` reads
+/// for `B` (the function does standard `C = A · B`, NOT `A · B^T`),
+/// so the forward pass calls it directly with no per-image
+/// transpose.
 pub struct PatchEmbedWeights {
-    /// Row-major `[n_embd × in_dim]` kernel ready for GEMV. Built
+    /// Row-major `[in_dim × n_embd]` kernel ready for matmul. Built
     /// from `v.patch_embd.weight` once at load time.
     pub conv_w: Vec<f32>,
     /// `v.patch_embd.bias` — `[n_embd]`.
@@ -283,17 +284,24 @@ impl VisionEncoderWeights {
         let p = config.patch_size;
         let in_dim = 3 * p * p;
         let out_dim = config.n_embd;
-        // Row-major destination `[out_dim × in_dim]` where
-        // `in_dim` flattens `(c, kh, kw)`. Source GGUF stride:
+        // Row-major destination `[in_dim × out_dim]` where rows are
+        // input flat-index (`c*p² + kh*p + kw`) and cols are output
+        // channels (oc). This is the layout `cpu::matmul_f32` reads
+        // for its `B` argument when computing `C = A · B` standard
+        // (NOT `A · B^T` — the function name is plain `matmul_f32`,
+        // its docs/test confirm `c[i*n+j] = Σ_k a[i*k+k]·b[k*n+j]`).
+        // Building the kernel directly in this layout means the
+        // forward pass can call `matmul_f32(patches, conv_w, …)` with
+        // no per-image transpose. Source GGUF stride:
         // `linear(kw, kh, c, oc) = kw + p·kh + p²·c + p²·3·oc`.
-        let mut conv_w = vec![0f32; out_dim * in_dim];
+        let mut conv_w = vec![0f32; in_dim * out_dim];
         for oc in 0..out_dim {
             for c in 0..3 {
                 for kh in 0..p {
                     for kw in 0..p {
                         let src = kw + p * kh + p * p * c + p * p * 3 * oc;
-                        let dst_in_idx = c * p * p + kh * p + kw;
-                        conv_w[oc * in_dim + dst_in_idx] = raw[src];
+                        let in_idx = c * p * p + kh * p + kw;
+                        conv_w[in_idx * out_dim + oc] = raw[src];
                     }
                 }
             }
@@ -462,13 +470,13 @@ impl VisionEncoderWeights {
 
     /// Patch embed forward: a Conv2D with kernel=patch_size and
     /// stride=patch_size is mathematically equivalent to a per-
-    /// patch GEMV — we extract each `patch_size × patch_size × 3`
+    /// patch matmul — we extract each `patch_size × patch_size × 3`
     /// chunk as a `3·patch_size²`-dim vector and matmul against
-    /// the kernel pre-transposed at load time to row-major
-    /// `[n_embd × in_dim]`. The patch-input layout `(c, kh, kw)`
-    /// (c outermost, kw innermost) matches the loader's
-    /// row-layout for `conv_w`; the GEMV is just two matrices
-    /// multiplied with no per-call transpose.
+    /// the kernel pre-transposed at load time into row-major
+    /// `[in_dim × n_embd]`. The patch-input layout `(c, kh, kw)`
+    /// matches the kernel's input flat-index, and the
+    /// `[in × out]` kernel layout matches what `cpu::matmul_f32`
+    /// reads for its `B` argument (standard `C = A · B`).
     fn patch_embed_forward(&self, image: &[f32]) -> Vec<f32> {
         let cfg = &self.config;
         let p = cfg.patch_size;
@@ -477,13 +485,12 @@ impl VisionEncoderWeights {
         let out_dim = cfg.n_embd;
         debug_assert_eq!(
             self.patch_embed.conv_w.len(),
-            out_dim * in_dim,
-            "patch_embed.conv_w length should be out_dim*in_dim after load-time transpose"
+            in_dim * out_dim,
+            "patch_embed.conv_w length should be in_dim*out_dim after load-time transpose"
         );
 
         // Build per-patch input vectors `[n_patches × in_dim]`,
-        // matching the loader's `(c, kh, kw)` row-layout for
-        // `conv_w`.
+        // matching the kernel's `(c, kh, kw)` input flat-index.
         let h_stride = cfg.image_size;
         let c_stride = cfg.image_size * cfg.image_size;
         let n_patches = cfg.n_patches;
@@ -503,9 +510,9 @@ impl VisionEncoderWeights {
             }
         }
 
-        // [n_patches, in_dim] · [n_embd, in_dim]^T → [n_patches, n_embd].
-        // `matmul_f32(a, b, c, m, n, k)` computes `c = a · b^T`
-        // where a is `[m × k]`, b is `[n × k]`, c is `[m × n]`.
+        // patches `[n_patches × in_dim]` · conv_w `[in_dim × n_embd]`
+        // → out `[n_patches × n_embd]`. `matmul_f32(a, b, c, m, n, k)`
+        // computes `c[i,j] = Σ_p a[i,p]·b[p,j]` — standard `C = A · B`.
         let mut out = vec![0f32; n_patches * out_dim];
         crate::backend::cpu::matmul_f32(
             &patches,
@@ -637,7 +644,7 @@ impl VisionEncoderWeights {
             for (f, b) in ff_row.iter_mut().zip(block.ffn_up_b.iter()) {
                 *f += *b;
             }
-            crate::backend::cpu::gelu_erf_inplace(ff_row);
+            crate::backend::cpu::gelu_inplace(ff_row);
             // ffn_down: [n_embd × n_ff]
             let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
             block.ffn_down_w.gemv(ff_row, down_row);
@@ -671,7 +678,7 @@ impl VisionEncoderWeights {
             for (m, b) in mid_row.iter_mut().zip(p.mm1_b.iter()) {
                 *m += *b;
             }
-            crate::backend::cpu::gelu_erf_inplace(mid_row);
+            crate::backend::cpu::gelu_inplace(mid_row);
             let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
             p.mm2_w.gemv(mid_row, out_row);
             for (o, b) in out_row.iter_mut().zip(p.mm2_b.iter()) {
@@ -803,7 +810,13 @@ fn load_vit_block(
     let ln2_w = vec_f32("ln2.weight")?;
     let ln2_b = vec_f32("ln2.bias")?;
 
-    // FFN (GELU activation between up and down).
+    // FFN (tanh-approx GELU activation between up and down — the
+    // mmproj GGUF carries `clip.use_gelu = true`, which in
+    // llama.cpp's `clip.cpp` selects `FFN_GELU` → `ggml_gelu`,
+    // i.e. the tanh approximation. Matching that exactly matters:
+    // the erf-form GELU drifts by ~1e-3 per call which compounds
+    // over 12 layers + the projector and silently degrades
+    // semantic-image-token quality.
     let ffn_up_w = weight_f32("ffn_up.weight")?;
     let ffn_up_b = vec_f32("ffn_up.bias")?;
     let ffn_down_w = weight_f32("ffn_down.weight")?;
