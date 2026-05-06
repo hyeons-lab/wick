@@ -928,7 +928,7 @@ fn load_text_model(
 ) -> Result<Box<dyn Model>, WickError> {
     match cfg.backend {
         BackendPreference::Auto => load_text_model_auto(gguf, path, cfg.context_size),
-        BackendPreference::Cpu => model::load_model(gguf, cfg.context_size)
+        BackendPreference::Cpu => model::load_model(gguf, path, cfg.context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}"))),
         #[cfg(feature = "gpu")]
         BackendPreference::Gpu => model::load_model_gpu(gguf, cfg.context_size)
@@ -965,7 +965,7 @@ fn load_text_model_auto(
     // opt in explicitly via `BackendPreference::Gpu`.
     if path.is_none() {
         tracing::debug!("wick::engine: no path available (from_bytes); using CPU backend (auto)");
-        return model::load_model(gguf, context_size)
+        return model::load_model(gguf, None, context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")));
     }
 
@@ -1002,14 +1002,14 @@ fn load_text_model_auto(
         let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
             WickError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
         })?;
-        model::load_model(gguf_for_cpu, context_size)
+        model::load_model(gguf_for_cpu, Some(p), context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")))
     }
 
     #[cfg(not(feature = "gpu"))]
     {
         tracing::debug!("wick::engine: using CPU backend (auto)");
-        model::load_model(gguf, context_size)
+        model::load_model(gguf, path, context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")))
     }
 }

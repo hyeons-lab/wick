@@ -1,10 +1,12 @@
 // LFM2 / LFM2.5 hybrid conv+attention model.
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
-use crate::kv_cache::{InferenceState, LayerState};
+use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
 use crate::turboquant;
@@ -59,10 +61,44 @@ pub struct Lfm2Model {
     // Pre-resolved quantized weight refs
     embd_ref: WeightRef,
     layer_refs: Vec<LayerWeightRefs>,
+    /// Identifier passed into `KvPrefixCache::new`. CPU prefixes the
+    /// caller-supplied id with `"cpu:"` so disk-cache files don't
+    /// collide with Metal's f16-byte snapshots of the same model file
+    /// (model_fingerprint doesn't include element width). Empty string
+    /// when constructed via `from_gguf` (path-less case): warm cache
+    /// still works, but disk-cache files for different path-less
+    /// from_bytes loads of distinct models would namespace-collide —
+    /// acceptable since `from_bytes` is documented as "testing".
+    model_id: String,
+    /// Two-tier prefix cache (warm in-memory + cold on-disk via
+    /// FlatBuffers). Replaced wholesale by `Model::configure_cache`.
+    /// Defaults to `KvCacheConfig::default()` (warm-only) at
+    /// construction time so warm hits work without explicit config.
+    prefix_cache: Mutex<KvPrefixCache>,
 }
 
 impl Lfm2Model {
+    /// Construct without a model identifier. Equivalent to
+    /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
+    /// works after `Model::configure_cache`; disk cache (when
+    /// configured) would namespace-collide between path-less loads of
+    /// different models, which is acceptable for the `from_bytes`
+    /// testing use case the doc calls out.
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
+        Self::from_gguf_with_id(gguf, context_size, String::new())
+    }
+
+    /// Construct with an explicit model identifier (typically the GGUF
+    /// file path) used to namespace prefix-cache entries. The id is
+    /// prefixed with `"cpu:"` before being fed to `model_fingerprint`
+    /// so CPU and Metal can share a `--cache-dir` without their
+    /// disk-cache files (different element widths: CPU=f32, Metal=f16)
+    /// colliding.
+    pub fn from_gguf_with_id(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
         ensure!(context_size > 0, "context_size must be > 0");
         let prefix = "lfm2";
 
@@ -248,6 +284,12 @@ impl Lfm2Model {
             });
         }
 
+        let prefix_cache = Mutex::new(KvPrefixCache::new(
+            crate::kv_cache::KvCacheConfig::default(),
+            &config,
+            &format!("cpu:{model_id}"),
+        ));
+
         Ok(Self {
             gguf,
             config,
@@ -259,6 +301,8 @@ impl Lfm2Model {
             conv_weights,
             embd_ref,
             layer_refs,
+            model_id,
+            prefix_cache,
         })
     }
 
@@ -2167,6 +2211,47 @@ impl Lfm2Model {
 
         logits
     }
+
+    /// Lock-free body of `Model::forward_prefill` — does the actual
+    /// embed + layer loop without consulting the prefix cache.
+    /// `forward_prefill` wraps this with cache lookup/insert; cache
+    /// hits bypass embedding the prefix tokens entirely and re-enter
+    /// here with `start_pos = prefix_len` to prefill only the suffix.
+    pub(crate) fn forward_prefill_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill_inner requires at least one token"
+        );
+
+        // Embed all tokens → hidden[hs × n] with stride n (token j at
+        // indices [j, n+j, 2n+j, ...]). Layer loop + output projection
+        // is shared with `forward_prefill_from_embeddings` via
+        // `prefill_layers_and_logits`.
+        let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
+        for (j, &token_id) in tokens.iter().enumerate() {
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
+            for i in 0..hs {
+                hidden[i * n + j] = emb_buf[i];
+            }
+        }
+
+        self.prefill_layers_and_logits(hidden, n, start_pos, state)
+    }
 }
 
 impl Model for Lfm2Model {
@@ -2269,34 +2354,60 @@ impl Model for Lfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let cfg = &self.config;
-        let hs = cfg.hidden_size;
-        let n = tokens.len();
         assert!(
             !tokens.is_empty(),
             "forward_prefill requires at least one token"
         );
 
-        // Embed all tokens → hidden[hs × n] with stride n (token j at
-        // indices [j, n+j, 2n+j, ...]). Layer loop + output projection
-        // is shared with `forward_prefill_from_embeddings` via
-        // `prefill_layers_and_logits`.
-        let mut hidden = vec![0.0f32; hs * n];
-        let mut emb_buf = vec![0.0f32; hs];
-        for (j, &token_id) in tokens.iter().enumerate() {
-            let token_id = token_id as usize;
-            assert!(
-                token_id < self.embd_ref.m,
-                "token_id {token_id} out of range for vocab size {}",
-                self.embd_ref.m
-            );
-            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
-            for i in 0..hs {
-                hidden[i * n + j] = emb_buf[i];
+        // Cache participation gates:
+        // - `start_pos == 0`: only on a fresh prefill. Continuation
+        //   prefills (chunked / mid-sequence) carry KV state from
+        //   the prior chunk so a cache restore would clobber it.
+        // - `!state.is_compressed()`: TurboQuant-compressed caches
+        //   don't fit `LayerSnapshot::Attention { k_data, v_data }`
+        //   cleanly; same gate the n_keep shift uses.
+        let cache_eligible = start_pos == 0 && !state.is_compressed();
+
+        if cache_eligible {
+            let hit = self
+                .prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned")
+                .find_longest_prefix(tokens);
+            if let Some((snapshot, prefix_len)) = hit {
+                // Keep at least one token for the suffix prefill so we
+                // always run a forward pass that produces logits.
+                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                if use_len > 0 {
+                    state.restore(&snapshot);
+                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                    if let Some(snap) = state.snapshot() {
+                        self.prefix_cache
+                            .lock()
+                            .expect("prefix_cache mutex poisoned")
+                            .insert(tokens, snap);
+                    }
+                    return logits;
+                }
             }
         }
 
-        self.prefill_layers_and_logits(hidden, n, start_pos, state)
+        let logits = self.forward_prefill_inner(tokens, start_pos, state);
+        if cache_eligible && let Some(snap) = state.snapshot() {
+            self.prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned")
+                .insert(tokens, snap);
+        }
+        logits
+    }
+
+    fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        *self
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned") =
+            KvPrefixCache::new(config, &self.config, &format!("cpu:{}", self.model_id));
     }
 
     fn forward_prefill_from_embeddings(

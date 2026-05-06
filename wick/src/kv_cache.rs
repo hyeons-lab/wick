@@ -398,6 +398,89 @@ impl InferenceState {
         })
     }
 
+    /// Capture the current inference state as a `StateSnapshot` suitable
+    /// for the KV prefix cache. CPU-flavored: f32 KV caches are byte-cast
+    /// via `bytemuck`; conv buffers are byte-cast wholesale. Returns
+    /// `None` when any layer is compressed (TurboQuant) — those layouts
+    /// don't fit the plain `LayerSnapshot::Attention { k_data, v_data }`
+    /// shape and the prefix cache gates on uncompressed states.
+    pub fn snapshot(&self) -> Option<StateSnapshot> {
+        if self.is_compressed() {
+            return None;
+        }
+        let layers: Vec<LayerSnapshot> = self
+            .layers
+            .iter()
+            .map(|l| match l {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } => LayerSnapshot::Attention {
+                    k_data: bytemuck::cast_slice(key_cache).to_vec(),
+                    v_data: bytemuck::cast_slice(value_cache).to_vec(),
+                },
+                LayerState::Conv { buffer } => LayerSnapshot::Conv {
+                    buffer: bytemuck::cast_slice(buffer).to_vec(),
+                },
+            })
+            .collect();
+        Some(StateSnapshot {
+            layers,
+            seq_len: self.seq_len,
+        })
+    }
+
+    /// Restore a previously captured `StateSnapshot` into this state's
+    /// f32 caches. Inverse of [`Self::snapshot`]. Asserts that the
+    /// snapshot's layer count matches; byte-length must be a multiple
+    /// of 4 (one f32 per 4 bytes).
+    pub fn restore(&mut self, snapshot: &StateSnapshot) {
+        assert_eq!(
+            snapshot.layers.len(),
+            self.layers.len(),
+            "snapshot layer count {} doesn't match state layer count {}",
+            snapshot.layers.len(),
+            self.layers.len()
+        );
+        // `bytemuck::cast_slice::<u8, f32>` requires 4-byte alignment of
+        // the source, which `Vec<u8>` doesn't guarantee. Decode element-
+        // wise so we don't depend on the snapshot's allocator alignment.
+        fn decode_f32_into(dst: &mut Vec<f32>, src: &[u8]) {
+            assert!(
+                src.len() % 4 == 0,
+                "snapshot byte length {} not a multiple of 4",
+                src.len()
+            );
+            dst.clear();
+            dst.reserve(src.len() / 4);
+            for chunk in src.chunks_exact(4) {
+                dst.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+
+        for (layer, snap) in self.layers.iter_mut().zip(snapshot.layers.iter()) {
+            match (layer, snap) {
+                (
+                    LayerState::Attention {
+                        key_cache,
+                        value_cache,
+                        ..
+                    },
+                    LayerSnapshot::Attention { k_data, v_data },
+                ) => {
+                    decode_f32_into(key_cache, k_data);
+                    decode_f32_into(value_cache, v_data);
+                }
+                (LayerState::Conv { buffer }, LayerSnapshot::Conv { buffer: snap_buf }) => {
+                    decode_f32_into(buffer, snap_buf);
+                }
+                _ => panic!("snapshot layer kind doesn't match state layer kind"),
+            }
+        }
+        self.seq_len = snapshot.seq_len;
+    }
+
     /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
     /// layer, slide the tail down, and re-apply RoPE so each shifted
     /// cell's stored K encodes its new absolute position rather than
@@ -967,4 +1050,134 @@ pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
         buf.extend_from_slice(&(*k as u64).to_le_bytes());
     }
     fnv1a_u64(&buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config(n_layers: usize, hidden_size: usize) -> ModelConfig {
+        ModelConfig {
+            architecture: "lfm2".into(),
+            n_layers,
+            hidden_size,
+            intermediate_size: hidden_size * 2,
+            n_heads: 4,
+            n_kv_heads: 2,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-5,
+            block_types: (0..n_layers)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        BlockType::Attention
+                    } else {
+                        BlockType::GatedConv
+                    }
+                })
+                .collect(),
+            conv_kernel_size: Some(3),
+            kv_heads_per_layer: (0..n_layers)
+                .map(|i| if i % 2 == 0 { 2 } else { 0 })
+                .collect(),
+        }
+    }
+
+    /// Snapshot then restore on a populated `InferenceState` must
+    /// reproduce the exact same byte-level contents — the prefix
+    /// cache's correctness depends on this round-trip being lossless.
+    #[test]
+    fn snapshot_restore_round_trip_attention_and_conv() {
+        let cfg = tiny_config(4, 16);
+        let mut state = InferenceState::from_config(&cfg);
+
+        // Populate attention layer 0's KV with deterministic values
+        // that fit kv_dim = n_kv_heads * head_dim = 2 * 4 = 8.
+        if let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &mut state.layers[0]
+        {
+            for i in 0..16 {
+                key_cache.push(i as f32 * 0.5);
+                value_cache.push(-(i as f32) * 0.25);
+            }
+        }
+        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+            for v in buffer.iter_mut() {
+                *v = 0.7;
+            }
+        }
+        state.seq_len = 2;
+
+        let snap = state.snapshot().expect("uncompressed state must snapshot");
+
+        // Drop the existing KV by recreating, then restore.
+        let mut fresh = InferenceState::from_config(&cfg);
+        fresh.restore(&snap);
+
+        match (&fresh.layers[0], &state.layers[0]) {
+            (
+                LayerState::Attention {
+                    key_cache: kr,
+                    value_cache: vr,
+                    ..
+                },
+                LayerState::Attention {
+                    key_cache: ko,
+                    value_cache: vo,
+                    ..
+                },
+            ) => {
+                assert_eq!(kr, ko, "key_cache must round-trip exactly");
+                assert_eq!(vr, vo, "value_cache must round-trip exactly");
+            }
+            _ => panic!("expected attention layer 0"),
+        }
+        match (&fresh.layers[1], &state.layers[1]) {
+            (LayerState::Conv { buffer: br }, LayerState::Conv { buffer: bo }) => {
+                assert_eq!(br, bo, "conv buffer must round-trip exactly")
+            }
+            _ => panic!("expected conv layer 1"),
+        }
+        assert_eq!(fresh.seq_len, state.seq_len);
+    }
+
+    /// Empty (no-prefill-yet) state must still round-trip — Vec<u8>
+    /// length zero on both sides.
+    #[test]
+    fn snapshot_restore_round_trip_empty_state() {
+        let cfg = tiny_config(2, 8);
+        let state = InferenceState::from_config(&cfg);
+        let snap = state.snapshot().expect("empty state still snapshots");
+        let mut fresh = InferenceState::from_config(&cfg);
+        fresh.restore(&snap);
+        assert_eq!(fresh.seq_len, 0);
+    }
+
+    /// `is_compressed()` returning true blocks snapshot creation —
+    /// the prefix cache gates on this so callers don't accidentally
+    /// store TurboQuant-shaped data into a `LayerSnapshot::Attention
+    /// { k_data, v_data }` that doesn't model compressed layouts.
+    #[test]
+    fn snapshot_returns_none_for_compressed_state() {
+        let cfg = tiny_config(2, 8);
+        let mut state = InferenceState::from_config(&cfg);
+        // Synthesize a compressed key cache so `is_compressed()` fires.
+        // We don't need it functional — just non-None — for this gate
+        // test.
+        if let LayerState::Attention {
+            compressed_keys, ..
+        } = &mut state.layers[0]
+        {
+            *compressed_keys = Some(CompressedKeyCache::new(2, 4, 16));
+        }
+        assert!(state.is_compressed());
+        assert!(
+            state.snapshot().is_none(),
+            "compressed state must refuse to snapshot"
+        );
+    }
 }

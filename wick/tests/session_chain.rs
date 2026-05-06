@@ -90,7 +90,7 @@ fn stochastic_generate_is_chainable_without_append() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
     let mut session = make_session(
@@ -142,7 +142,7 @@ fn greedy_chain_requires_append_tokens() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
     let mut session = make_session(
@@ -199,7 +199,7 @@ fn no_kv_gap_after_bounded_generate_greedy() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
     let mut session = make_session(
@@ -267,7 +267,7 @@ fn reset_reseeds_sampler_for_reproducibility() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("Tell me a story about");
 
     let mut session = make_session(
@@ -315,7 +315,7 @@ fn position_handle_observes_progress() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
     let mut session = make_session(
@@ -372,7 +372,7 @@ fn stochastic_split_matches_single_call_under_seed() {
 
     let baseline = {
         let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, 4096).unwrap());
+        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, None, 4096).unwrap());
         let mut session = Session::new(
             model,
             Arc::clone(&tokenizer),
@@ -390,7 +390,7 @@ fn stochastic_split_matches_single_call_under_seed() {
 
     let split = {
         let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
-        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, 4096).unwrap());
+        let model: Arc<dyn Model> = Arc::from(wick::model::load_model(gguf, None, 4096).unwrap());
         let mut session = Session::new(
             model,
             Arc::clone(&tokenizer),
@@ -431,7 +431,7 @@ fn position_updates_per_token_during_decode() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let prompt_toks = tokenizer.encode("The capital of France is");
 
     let mut session = make_session(
@@ -502,7 +502,7 @@ fn append_embeddings_advances_position_and_sets_logits() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 4096).unwrap();
+    let model = wick::model::load_model(gguf, None, 4096).unwrap();
     let hidden_size = model.config().hidden_size;
 
     // append_embeddings is the soft-token path used by audio /
@@ -572,8 +572,8 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
 
     let gguf_a = wick::gguf::GgufFile::open(&model_path).unwrap();
     let gguf_b = wick::gguf::GgufFile::open(&model_path).unwrap();
-    let model_a = wick::model::load_model(gguf_a, 4096).unwrap();
-    let model_b = wick::model::load_model(gguf_b, 4096).unwrap();
+    let model_a = wick::model::load_model(gguf_a, None, 4096).unwrap();
+    let model_b = wick::model::load_model(gguf_b, None, 4096).unwrap();
     let cfg = model_a.config().clone();
     let hidden_size = cfg.hidden_size;
 
@@ -835,7 +835,7 @@ fn append_audio_text_only_returns_unsupported_modality() {
     };
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model = wick::model::load_model(gguf, None, 1024).unwrap();
     let mut session = make_session(model, tokenizer, SessionConfig::default());
 
     let pcm = vec![0.0f32; 16_000];
@@ -857,7 +857,7 @@ fn append_audio_without_encoder_returns_backend_error() {
     };
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model = wick::model::load_model(gguf, None, 1024).unwrap();
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
     let mut session = Session::new(
@@ -913,7 +913,7 @@ fn append_audio_wrong_sample_rate_returns_backend_error() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model = wick::model::load_model(gguf, None, 1024).unwrap();
     // The LFM2.5-Audio encoder targets 2048-dim hidden, but our
     // fallback model is LFM2-VL-450M (1024-dim). Patch the encoder's
     // config to match the LLM so the dim-mismatch guard doesn't
@@ -977,7 +977,7 @@ fn append_audio_end_to_end() {
 
     let primary_gguf = wick::gguf::GgufFile::open(&primary).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&primary_gguf).unwrap();
-    let model = wick::model::load_model(primary_gguf, 2048).unwrap();
+    let model = wick::model::load_model(primary_gguf, None, 2048).unwrap();
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
     let mut session = Session::new(
@@ -1072,7 +1072,7 @@ fn reset_preserves_attached_audio_encoder() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model = wick::model::load_model(gguf, None, 1024).unwrap();
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
     let mut session = Session::new(
@@ -1149,7 +1149,7 @@ fn append_audio_dimension_mismatch_returns_backend_error() {
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
-    let model = wick::model::load_model(gguf, 1024).unwrap();
+    let model = wick::model::load_model(gguf, None, 1024).unwrap();
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
     let mut session = Session::new(
@@ -1412,7 +1412,7 @@ fn asr_real_audio_matches_input_phrase() {
 
     let primary_gguf = wick::gguf::GgufFile::open(&primary).unwrap();
     let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&primary_gguf).unwrap();
-    let model = wick::model::load_model(primary_gguf, 4096).unwrap();
+    let model = wick::model::load_model(primary_gguf, None, 4096).unwrap();
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer_arc = Arc::new(tokenizer);
     let mut session = Session::new(
