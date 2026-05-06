@@ -48,6 +48,7 @@
 
 pub(crate) mod download;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -453,6 +454,127 @@ fn hash_matches(dest: &Path, url: &str, expected_hash: &str) -> bool {
     }
 }
 
+/// HuggingFace model-info endpoint for the LeapBundles repo. The
+/// response carries a `siblings` array listing every file in the
+/// repo (one round-trip), which `list_leap_bundles` walks to build
+/// the bundle/quant catalog.
+const LEAP_BUNDLES_API_URL: &str = "https://huggingface.co/api/models/LiquidAI/LeapBundles";
+
+/// HTTP timeout for `list_leap_bundles`. The HF model-info endpoint
+/// returns a few KB of JSON — anything past 30 s is a stalled
+/// connection (captive portal, network glitch) rather than a slow
+/// response. Matches `HEAD_TIMEOUT` in `download.rs`.
+const LIST_BUNDLES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One bundle entry in the LeapBundles catalog: a directory at
+/// `LiquidAI/LeapBundles/<name>/` plus the per-quant manifests
+/// (`<quant>.json`) Liquid publishes inside it.
+///
+/// Returned by [`list_leap_bundles`]; both `name` and `quants` are
+/// sorted ascending so output is stable across runs even if the
+/// HF API reorders its `siblings` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeapBundleEntry {
+    pub name: String,
+    pub quants: Vec<String>,
+}
+
+/// List bundles published on `LiquidAI/LeapBundles`.
+///
+/// Single GET to the HuggingFace model-info endpoint; groups the
+/// returned `siblings` array by directory to surface
+/// `<bundle>/<quant>` pairs. Top-level files (`README.md`,
+/// `.gitattributes`, the `*.bundle` blobs Liquid publishes for
+/// their own packaging tool) are ignored — only entries shaped
+/// as `<bundle>/<quant>.json` count, which is the schema the
+/// rest of `wick` consumes via [`leap_bundles_manifest_url`].
+///
+/// Network: blocking GET with a 30 s timeout (see
+/// [`LIST_BUNDLES_TIMEOUT`]) so a captive portal or stalled
+/// connection surfaces as an error instead of hanging the CLI.
+/// No retry. Caller errors surface as [`WickError::Backend`] with
+/// the underlying reqwest message.
+pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, WickError> {
+    // Build a one-shot client per call. `list_leap_bundles` runs at
+    // most once per CLI invocation, so the cost is well below the
+    // network round-trip; sharing a `Client` with `BundleRepo`
+    // would force callers (FFI consumers, tests) to thread it
+    // through, and the API stays simpler this way.
+    let client = Client::builder()
+        .timeout(LIST_BUNDLES_TIMEOUT)
+        .build()
+        .map_err(|e| WickError::Backend(format!("list-bundles client build failed: {e}")))?;
+    let body = client
+        .get(LEAP_BUNDLES_API_URL)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+        .map_err(|e| WickError::Backend(format!("list-bundles HTTP failed: {e}")))?;
+    parse_leap_bundles(&body)
+}
+
+/// Parse a HuggingFace model-info JSON body into the bundle catalog.
+/// Split out from [`list_leap_bundles`] so the grouping/filtering
+/// logic is unit-testable without a live HTTP round-trip.
+fn parse_leap_bundles(body: &str) -> Result<Vec<LeapBundleEntry>, WickError> {
+    #[derive(serde::Deserialize)]
+    struct Sibling {
+        rfilename: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        siblings: Vec<Sibling>,
+    }
+    let resp: Resp = serde_json::from_str(body)
+        .map_err(|e| WickError::Backend(format!("list-bundles JSON parse failed: {e}")))?;
+
+    // BTreeMap/BTreeSet sort by key; the iter() walk that follows
+    // produces a stable lexicographic ordering of bundles + quants.
+    let mut by_bundle: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for sib in resp.siblings {
+        // Only `<bundle>/<quant>.json` shapes count. Everything
+        // else (top-level `*.bundle` blobs, `.gitattributes`,
+        // `README.md`, nested-deeper paths) is silently dropped —
+        // those aren't consumable by `from_bundle_id` and
+        // surfacing them would confuse users.
+        let Some((dir, file)) = sib.rfilename.split_once('/') else {
+            continue;
+        };
+        let Some(quant) = file.strip_suffix(".json") else {
+            continue;
+        };
+        if quant.contains('/') {
+            // Nested deeper than `<bundle>/<quant>.json` — not
+            // part of LeapBundles' schema today; skip rather than
+            // mis-display.
+            continue;
+        }
+        // Both segments must survive the same allowlist that
+        // `leap_bundles_manifest_url` enforces — otherwise we'd
+        // surface entries that `from_bundle_id` would reject at
+        // resolve time. Today every entry passes this check, but
+        // a future HF entry with non-ASCII or whitespace would
+        // get filtered cleanly here instead of producing a
+        // confusing post-list `--bundle-id` failure.
+        if validate_path_segment("bundle_id", dir).is_err()
+            || validate_path_segment("quant", quant).is_err()
+        {
+            continue;
+        }
+        by_bundle
+            .entry(dir.to_string())
+            .or_default()
+            .insert(quant.to_string());
+    }
+    Ok(by_bundle
+        .into_iter()
+        .map(|(name, quants)| LeapBundleEntry {
+            name,
+            quants: quants.into_iter().collect(),
+        })
+        .collect())
+}
+
 /// Build the canonical manifest URL for a LeapBundles entry.
 ///
 /// The LeapBundles repo on HuggingFace is a flat catalog at
@@ -827,5 +949,76 @@ mod tests {
         assert!(leap_bundles_manifest_url("LFM2?x", "Q4_0").is_err());
         assert!(leap_bundles_manifest_url("LFM2#x", "Q4_0").is_err());
         assert!(leap_bundles_manifest_url("LFM2%2E", "Q4_0").is_err());
+    }
+
+    /// `parse_leap_bundles` groups `<bundle>/<quant>.json` siblings
+    /// into bundle entries with sorted quants, drops top-level
+    /// blobs / READMEs, and rejects deeper-nested paths so a future
+    /// schema change is visible instead of silently misrendered.
+    #[test]
+    fn parse_leap_bundles_groups_siblings() {
+        let body = r#"{
+            "siblings": [
+                {"rfilename": ".gitattributes"},
+                {"rfilename": "README.md"},
+                {"rfilename": "LFM2-1.2B-8da4w_output_8da8w-seq_4096.bundle"},
+                {"rfilename": "LFM2-1.2B-GGUF/Q8_0.json"},
+                {"rfilename": "LFM2-1.2B-GGUF/Q4_0.json"},
+                {"rfilename": "LFM2-1.2B-GGUF/Q4_K_M.json"},
+                {"rfilename": "LFM2-2.6B-GGUF/Q4_0.json"},
+                {"rfilename": "LFM2-2.6B-GGUF/notes/extra.json"},
+                {"rfilename": "LFM2-2.6B-GGUF/extras.txt"}
+            ]
+        }"#;
+        let entries = parse_leap_bundles(body).unwrap();
+        assert_eq!(entries.len(), 2, "expected 2 bundles, got {entries:?}");
+        // BTreeMap → ascending bundle name order.
+        assert_eq!(entries[0].name, "LFM2-1.2B-GGUF");
+        assert_eq!(entries[0].quants, vec!["Q4_0", "Q4_K_M", "Q8_0"]);
+        assert_eq!(entries[1].name, "LFM2-2.6B-GGUF");
+        // `extras.txt` (wrong suffix) and `notes/extra.json`
+        // (deeper-nested) both filtered out.
+        assert_eq!(entries[1].quants, vec!["Q4_0"]);
+    }
+
+    #[test]
+    fn parse_leap_bundles_rejects_malformed_json() {
+        let err = parse_leap_bundles("not json at all").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("JSON parse failed"), "got: {msg}");
+    }
+
+    /// Empty `siblings` is a valid response shape (e.g. an empty
+    /// repo) and should yield an empty catalog rather than an
+    /// error.
+    #[test]
+    fn parse_leap_bundles_empty_siblings_is_ok() {
+        let entries = parse_leap_bundles(r#"{"siblings": []}"#).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    /// Entries whose bundle / quant segment would fail
+    /// `validate_path_segment` are dropped silently — surfacing
+    /// them would mislead users since `from_bundle_id` rejects
+    /// the same characters at resolve time. Today's catalog has
+    /// none of these, but the filter is forward-compatible with
+    /// any HF schema drift toward whitespace / non-ASCII names.
+    #[test]
+    fn parse_leap_bundles_drops_invalid_path_segments() {
+        let body = r#"{
+            "siblings": [
+                {"rfilename": "Good-Bundle-GGUF/Q4_0.json"},
+                {"rfilename": "Has Space-GGUF/Q4_0.json"},
+                {"rfilename": "Good-Bundle-GGUF/Q 0.json"},
+                {"rfilename": "Has?Reserved/Q4_0.json"},
+                {"rfilename": "Café-GGUF/Q4_0.json"}
+            ]
+        }"#;
+        let entries = parse_leap_bundles(body).unwrap();
+        assert_eq!(entries.len(), 1, "expected only the valid entry");
+        assert_eq!(entries[0].name, "Good-Bundle-GGUF");
+        // The invalid quant `Q 0` got filtered, leaving the one
+        // good `Q4_0` quant.
+        assert_eq!(entries[0].quants, vec!["Q4_0"]);
     }
 }

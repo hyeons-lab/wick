@@ -174,10 +174,13 @@ enum Command {
         )]
         model: Option<String>,
 
-        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
-        /// with `--quant` for auto-download from
+        /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
+        /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
+        /// automatically if missing). Pairs with `--quant` for
+        /// auto-download from
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
-        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        /// `--cache-dir` (default `$HOME/.cache/wick`). Use
+        /// `wick list-bundles` to discover available IDs.
         #[arg(long, requires = "quant")]
         bundle_id: Option<String>,
 
@@ -339,10 +342,13 @@ enum Command {
         )]
         model: Option<String>,
 
-        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
-        /// with `--quant` for auto-download from
+        /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
+        /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
+        /// automatically if missing). Pairs with `--quant` for
+        /// auto-download from
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
-        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        /// `--cache-dir` (default `$HOME/.cache/wick`). Use
+        /// `wick list-bundles` to discover available IDs.
         #[arg(long, requires = "quant")]
         bundle_id: Option<String>,
 
@@ -443,10 +449,13 @@ enum Command {
         )]
         model: Option<String>,
 
-        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
-        /// with `--quant` for auto-download from
+        /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
+        /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
+        /// automatically if missing). Pairs with `--quant` for
+        /// auto-download from
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
-        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        /// `--cache-dir` (default `$HOME/.cache/wick`). Use
+        /// `wick list-bundles` to discover available IDs.
         #[arg(long, requires = "quant")]
         bundle_id: Option<String>,
 
@@ -507,6 +516,20 @@ enum Command {
         #[arg(long, default_value_t = 512)]
         ubatch_size: u32,
     },
+
+    /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
+    ///
+    /// Discovery surface for the `--bundle-id` / `--quant` flags on
+    /// `wick run` / `wick chat` / `wick bench`. Hits the HF
+    /// model-info API once and prints sorted bundle names; pass
+    /// `--quants` to also surface available quantization labels per
+    /// bundle.
+    ListBundles {
+        /// Also print available quantizations under each bundle,
+        /// space-separated and indented.
+        #[arg(long)]
+        quants: bool,
+    },
 }
 
 /// Load a `WickEngine` from a path that may be a bare `.gguf`, a `.json`
@@ -526,6 +549,40 @@ enum ModelSpec<'a> {
         quant: &'a str,
         cache_dir: PathBuf,
     },
+}
+
+/// Suffix appended to bare bundle IDs so users can type
+/// `--bundle-id LFM2.5-1.2B-Instruct` instead of
+/// `--bundle-id LFM2.5-1.2B-Instruct-GGUF`. Every entry in
+/// `LiquidAI/LeapBundles` today ends in `-GGUF` (the directory
+/// names are derived from the upstream model + format pair). When
+/// other formats land we'll revisit, but for the present catalog
+/// this is a pure UX win.
+const LEAP_BUNDLE_GGUF_SUFFIX: &str = "-GGUF";
+
+/// Append `-GGUF` to `input` if it isn't already present. The
+/// canonical bundle ID on `LiquidAI/LeapBundles` is the HF
+/// directory name (always `<base>-GGUF` today), and the library
+/// `wick::bundle::leap_bundles_manifest_url` interpolates that
+/// verbatim into the URL — so normalization belongs at the CLI
+/// boundary where the typo-friendly bare form is accepted.
+///
+/// Idempotent: passing `LFM2-1.2B-GGUF` returns the same string.
+fn normalize_bundle_id(input: &str) -> String {
+    if input.ends_with(LEAP_BUNDLE_GGUF_SUFFIX) {
+        input.to_string()
+    } else {
+        format!("{input}{LEAP_BUNDLE_GGUF_SUFFIX}")
+    }
+}
+
+/// Inverse of [`normalize_bundle_id`] for display: strip a trailing
+/// `-GGUF` so `wick list-bundles` shows the same form users type.
+/// `strip_suffix` returns `None` when the suffix isn't present,
+/// preserving the original name (a future non-GGUF bundle would
+/// just display verbatim).
+fn display_bundle_id(name: &str) -> &str {
+    name.strip_suffix(LEAP_BUNDLE_GGUF_SUFFIX).unwrap_or(name)
 }
 
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
@@ -562,9 +619,15 @@ fn resolve_engine(
             let cache = cache_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(default_cache_dir);
+            // Append `-GGUF` if the user didn't include it. Keeps
+            // `--bundle-id LFM2.5-1.2B-Instruct` and the explicit
+            // `--bundle-id LFM2.5-1.2B-Instruct-GGUF` both valid;
+            // the URL Liquid actually publishes always has the
+            // suffix.
+            let normalized = normalize_bundle_id(id);
             load_engine_from_spec(
                 ModelSpec::Bundle {
-                    id,
+                    id: &normalized,
                     quant: q,
                     cache_dir: cache,
                 },
@@ -1469,6 +1532,26 @@ fn main() -> Result<()> {
             let ids = tok.encode(&text);
             println!("{ids:?}");
         }
+        Command::ListBundles { quants } => {
+            // One HTTP round-trip; sorted output. Quants are
+            // space-joined on a single indented line per bundle —
+            // compact enough to fit in a terminal width even for
+            // bundles with several quant variants, and grep-able.
+            //
+            // Display strip: every entry in the live catalog ends
+            // in `-GGUF`. Trim the suffix on output so what's
+            // shown matches what users type at `--bundle-id`
+            // (`normalize_bundle_id` re-appends the suffix on the
+            // way back in). `display_bundle_id` is a no-op for
+            // any future non-GGUF entry that ships.
+            let entries = wick::bundle::list_leap_bundles()?;
+            for entry in entries {
+                println!("{}", display_bundle_id(&entry.name));
+                if quants {
+                    println!("  {}", entry.quants.join("  "));
+                }
+            }
+        }
         Command::Chat {
             model,
             bundle_id,
@@ -1858,7 +1941,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, read_wav_pcm16_mono, resample_linear, resolve_engine, split_at_marker, write_wav,
+        Cli, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
+        resolve_engine, split_at_marker, write_wav,
     };
     use clap::Parser;
 
@@ -2190,6 +2274,42 @@ mod tests {
             r.is_err(),
             "expected partial bundle args (quant only) to error"
         );
+    }
+
+    /// `normalize_bundle_id` appends `-GGUF` when missing and is
+    /// idempotent when the suffix is already present. The CLI
+    /// applies this in `resolve_engine` so users can type either
+    /// form at `--bundle-id`.
+    #[test]
+    fn normalize_bundle_id_appends_when_missing() {
+        assert_eq!(
+            normalize_bundle_id("LFM2.5-1.2B-Instruct"),
+            "LFM2.5-1.2B-Instruct-GGUF"
+        );
+        assert_eq!(normalize_bundle_id("Qwen3-1.7B"), "Qwen3-1.7B-GGUF");
+    }
+
+    #[test]
+    fn normalize_bundle_id_is_idempotent() {
+        assert_eq!(
+            normalize_bundle_id("LFM2-1.2B-GGUF"),
+            "LFM2-1.2B-GGUF",
+            "must not double-append"
+        );
+    }
+
+    /// `display_bundle_id` strips the trailing `-GGUF` for
+    /// presentation (matches what users type at `--bundle-id`)
+    /// and is a no-op for any future entry without the suffix.
+    #[test]
+    fn display_bundle_id_strips_gguf_suffix() {
+        assert_eq!(display_bundle_id("LFM2-1.2B-GGUF"), "LFM2-1.2B");
+        assert_eq!(
+            display_bundle_id("LFM2.5-1.2B-Instruct-GGUF"),
+            "LFM2.5-1.2B-Instruct"
+        );
+        // Hypothetical future non-GGUF bundle: passes through.
+        assert_eq!(display_bundle_id("LFM3-MLX"), "LFM3-MLX");
     }
 
     /// `split_at_marker` happy path: a marker in the middle of a
