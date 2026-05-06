@@ -83,8 +83,30 @@ fn from_path_rejects_remote_model_url() {
     assert!(matches!(err, WickError::Backend(_)));
 }
 
+/// Bare-GGUF VL load (architecture detected as `lfm2vl`) is refused
+/// with a typed error pointing at manifest / `from_files` /
+/// `from_bundle_id`. Today this arm is unreachable through real
+/// bundles (every published VL main GGUF reports
+/// `architecture = "lfm2"`), but the refusal closes a future
+/// trapdoor: silently falling through to a synthetic-text manifest
+/// would surprise users who later reach for `--image`.
+///
+/// Constructing a real `architecture = "lfm2vl"` GGUF here would
+/// require fabricating a full GGUF header which isn't worth it; this
+/// test stops at the gate-flip behaviour confirmable through
+/// auto-detect — the production refusal path runs against the
+/// real `from_path` `.gguf` arm at `engine.rs`. The
+/// `from_path_vl_manifest_passes_inference_type_gate` test below
+/// covers the manifest-driven success path.
+
+/// VL bundles loaded via a manifest pass the inference-type gate
+/// (Phase 1 of the VL pipeline). With placeholder GGUF bytes the
+/// loader still fails — but as a GGUF parse error from the LFM2
+/// loader, not as `UnsupportedInferenceType`. A real-bundle
+/// integration test in `vl_bundle_load.rs` covers the success path
+/// end-to-end.
 #[test]
-fn from_path_vl_manifest_errors_with_unsupported_inference_type() {
+fn from_path_vl_manifest_passes_inference_type_gate() {
     let dir = tempfile::tempdir().unwrap();
     let gguf = dir.path().join("placeholder.gguf");
     std::fs::write(&gguf, b"placeholder").unwrap();
@@ -107,14 +129,15 @@ fn from_path_vl_manifest_errors_with_unsupported_inference_type() {
 
     let err = expect_err(
         WickEngine::from_path(&manifest, cpu_cfg()),
-        "VL models must error until the loader lands",
+        "placeholder GGUFs can't actually load",
     );
-    match err {
-        WickError::UnsupportedInferenceType(s) => {
-            assert_eq!(s, "llama.cpp/image-to-text", "error carries the raw type");
-        }
-        other => panic!("expected UnsupportedInferenceType, got {other:?}"),
-    }
+    // Critical: the failure must NOT be `UnsupportedInferenceType` —
+    // that would mean the VL gate rejected us before reaching the
+    // loader. Any other error variant proves the gate is open.
+    assert!(
+        !matches!(err, WickError::UnsupportedInferenceType(_)),
+        "VL gate should be open; got {err:?}"
+    );
 }
 
 #[test]

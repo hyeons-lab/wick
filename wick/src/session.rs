@@ -170,11 +170,23 @@ impl ModalityCapabilities {
     /// Derive capabilities from a manifest's `inference_type`. Unknown
     /// variants fall back to text-only so a bundle we don't understand
     /// at least reports safe minimums.
+    ///
+    /// **VL bundles report text-only today**, not `text_and_image_in`,
+    /// because `Session::append_image` is hardcoded to return
+    /// `UnsupportedModality` until the vision encoder forward pass +
+    /// preprocessor land in a follow-up phase. Reporting `image_in =
+    /// true` would lie to UI/FFI consumers gating on
+    /// `engine.capabilities()` — they'd see "supports images", call
+    /// `append_image`, and get a runtime error. The capability flips
+    /// to `text_and_image_in` in the same PR that wires the image
+    /// path end-to-end.
     pub fn from_inference_type(it: &crate::manifest::InferenceType) -> Self {
         use crate::manifest::InferenceType::*;
         match it {
             LlamaCppTextToText => Self::text_only(),
-            LlamaCppImageToText => Self::text_and_image_in(),
+            // TODO(VL pipeline): flip to `Self::text_and_image_in()`
+            // when `Session::append_image` actually accepts images.
+            LlamaCppImageToText => Self::text_only(),
             LlamaCppLfm2AudioV1 => Self::text_and_audio(),
             Unknown(_) => Self::text_only(),
         }
@@ -1031,8 +1043,16 @@ mod tests {
         assert!(audio.audio_in && audio.audio_out);
         assert!(!audio.image_in);
 
+        // VL reports text-only today even though the inference_type
+        // is `LlamaCppImageToText`. `Session::append_image` errors
+        // with `UnsupportedModality` until the image path lights up;
+        // capabilities follow what the engine can actually do.
         let vl = ModalityCapabilities::from_inference_type(&InferenceType::LlamaCppImageToText);
-        assert!(vl.text_in && vl.text_out && vl.image_in);
+        assert!(vl.text_in && vl.text_out);
+        assert!(
+            !vl.image_in,
+            "VL must report image_in=false until append_image is wired"
+        );
         assert!(!vl.audio_in && !vl.audio_out);
 
         // Unknown variants fall back to text-only so an unfamiliar bundle

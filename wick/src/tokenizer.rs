@@ -93,8 +93,15 @@ impl BpeTokenizer {
         let bos_id = gguf.get_u32("tokenizer.ggml.bos_token_id");
         let eos_id = gguf.get_u32("tokenizer.ggml.eos_token_id");
 
-        // Extract chat template
-        let chat_template = gguf.get_str("tokenizer.chat_template").map(String::from);
+        // Extract chat template. Pre-strip Jinja2 `{% generation %}`
+        // / `{% endgeneration %}` block markers at load time so the
+        // stored template is already minijinja-compatible — saves
+        // re-running the regex on every render. The block is a
+        // training-time loss-masking marker that's a no-op at
+        // inference; see `strip_generation_markers` for details.
+        let chat_template = gguf
+            .get_str("tokenizer.chat_template")
+            .map(|raw| strip_generation_markers(raw).into_owned());
 
         // Select pretokenizer based on model type
         let pre_type = gguf.get_str("tokenizer.ggml.pre").unwrap_or("gpt2");
@@ -338,6 +345,9 @@ pub fn apply_chat_template(
         .chat_template()
         .context("model has no chat template")?;
 
+    // Template is already cleaned of `{% generation %}` /
+    // `{% endgeneration %}` block markers at `BpeTokenizer::from_gguf`
+    // load time, so feed it directly to minijinja.
     let mut env = minijinja::Environment::new();
     env.add_template("chat", template_str)
         .context("invalid chat template")?;
@@ -365,6 +375,34 @@ pub fn apply_chat_template(
     };
 
     tmpl.render(ctx).context("rendering chat template")
+}
+
+/// Remove `{% generation %}` / `{% endgeneration %}` markers (and
+/// the `{%- … -%}` whitespace-stripping variants) from a chat
+/// template. The block is a no-op at inference time — it exists so
+/// trainers can mask the assistant's reply for loss computation —
+/// but the tag isn't a built-in minijinja construct so it has to be
+/// stripped before `add_template` will accept the template.
+///
+/// Called once at `BpeTokenizer::from_gguf` load time; the cleaned
+/// string is stored as the canonical chat template so renders skip
+/// this work. Returns `Cow::Borrowed` (no allocation) when the
+/// template has no markers.
+fn strip_generation_markers(template: &str) -> std::borrow::Cow<'_, str> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // `\{%-?\s*(?:end)?generation\b\s*-?%\}` — match optional
+        // `-` for whitespace control on either side, allow inner
+        // whitespace, and capture both the opening and closing
+        // forms. The `\b` after `generation` is explicit about the
+        // word boundary so a hypothetical `{% generation_count %}`
+        // (a variable name in a future template) wouldn't match —
+        // today `\s*` would already block it but `\b` is the
+        // honest expression of the constraint.
+        Regex::new(r"\{%-?\s*(?:end)?generation\b\s*-?%\}").expect("static regex must compile")
+    });
+    re.replace_all(template, "")
 }
 
 // ── GPT-2 byte-to-unicode mapping ──────────────────────────────────────────
@@ -762,5 +800,70 @@ mod tests {
 
         let result = apply_chat_template(&tok, &messages, true).unwrap();
         assert_eq!(result, "user: Hello!\nassistant: ");
+    }
+
+    /// `strip_generation_markers` removes `{% generation %}` /
+    /// `{% endgeneration %}` block tags (with all whitespace-control
+    /// variants) and leaves the contained content untouched. Same
+    /// shape as the LFM2.5-VL chat template.
+    #[test]
+    fn strip_generation_markers_removes_all_variants() {
+        let cases = [
+            ("{% generation %}", ""),
+            ("{%- generation -%}", ""),
+            ("{%- generation %}", ""),
+            ("{% generation -%}", ""),
+            ("{% endgeneration %}", ""),
+            ("{%- endgeneration -%}", ""),
+            ("a{% generation %}b{% endgeneration %}c", "abc"),
+            (
+                "before{%- generation -%}inside{%- endgeneration -%}after",
+                "beforeinsideafter",
+            ),
+            ("no markers here", "no markers here"),
+        ];
+        for (input, want) in cases {
+            let got = strip_generation_markers(input);
+            assert_eq!(&*got, want, "input: {input:?}");
+        }
+    }
+
+    /// LFM2.5-VL chat template (carrying `{% generation %}` blocks)
+    /// must render without erroring once the markers are stripped.
+    /// `BpeTokenizer::from_gguf` runs the strip at load time and
+    /// stores the cleaned template; this test mirrors that step on
+    /// a hand-built tokenizer so we cover the marker shape end-to-
+    /// end without needing a real GGUF.
+    #[test]
+    fn chat_template_with_generation_block_renders() {
+        let mut tok = make_test_tokenizer();
+        let raw = "{% for msg in messages %}\
+             {%- if msg.role == 'assistant' -%}\
+             {%- generation -%}{{ msg.role }}: {{ msg.content }}\n{%- endgeneration -%}\
+             {%- else -%}{{ msg.role }}: {{ msg.content }}\n{%- endif -%}\
+             {% endfor %}";
+        // Mirror the `from_gguf` load-time clean step.
+        tok.chat_template = Some(strip_generation_markers(raw).into_owned());
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Hello!".to_string(),
+            },
+        ];
+        let got = apply_chat_template(&tok, &messages, false).unwrap();
+        // The `{%- … -%}` whitespace-stripping variants eat the
+        // surrounding newlines; the assertion checks that rendering
+        // succeeded AND the user/assistant content lands in order
+        // (i.e. the `{% generation %}` block was passthrough, not a
+        // syntax error). Newline behavior is governed by the
+        // template's strip markers, not by the generation block.
+        assert!(
+            got.contains("user: Hi") && got.contains("assistant: Hello!"),
+            "expected user+assistant content; got {got:?}"
+        );
     }
 }

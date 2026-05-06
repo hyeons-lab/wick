@@ -225,12 +225,16 @@ impl Manifest {
     }
 
     /// Is this manifest's inference type currently supported for loading?
-    /// `true` for text + audio; `false` for VL (parser OK, loader v2) +
-    /// Unknown. Consumers can probe before constructing a `WickEngine`.
+    /// `true` for text, audio, and VL (Phase 1+ — VL bundles load
+    /// text-only against the LFM2 LLM half until image input wires up
+    /// in a follow-up); `false` for `Unknown`. Consumers can probe
+    /// before constructing a `WickEngine`.
     pub fn is_loadable(&self) -> bool {
         matches!(
             self.inference_type,
-            InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1
+            InferenceType::LlamaCppTextToText
+                | InferenceType::LlamaCppLfm2AudioV1
+                | InferenceType::LlamaCppImageToText
         )
     }
 

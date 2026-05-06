@@ -60,10 +60,13 @@ fn parses_vl_manifest_with_aux_mmproj() {
     assert!(m.files.audio_decoder.is_none());
     assert!(m.files.audio_tokenizer.is_none());
 
-    // VL is parsed OK but NOT loadable in v1.
+    // VL bundles are loadable as of Phase 1: the LFM2 LLM half
+    // loads text-only and the mmproj is mmapped for follow-up
+    // phases. Image input still errors with `UnsupportedModality`
+    // until the rest of the pipeline lands.
     assert!(
-        !m.is_loadable(),
-        "VL should parse but fail at load time until the VL loader lands"
+        m.is_loadable(),
+        "VL bundles must load text-only after Phase 1"
     );
 }
 

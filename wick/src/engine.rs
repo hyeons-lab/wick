@@ -25,9 +25,12 @@
 //!   CLI today) that drive `wick::audio_engine::generate_audio`
 //!   directly. Unified `Session::append_audio` wiring lands in a
 //!   follow-up.
-//! - VL models (`llama.cpp/image-to-text`): parsed but rejected at load
-//!   with [`WickError::UnsupportedInferenceType`]. The VL loader lands
-//!   in a future phase.
+//! - VL models (`llama.cpp/image-to-text`): the LLM half (plain
+//!   `architecture = "lfm2"` GGUF) loads via the existing text path;
+//!   the mmproj GGUF is mmaped and exposed via
+//!   [`Self::vision_encoder_gguf`] for follow-up phases. Image input
+//!   isn't wired yet — `Session::append_image` lands in a later
+//!   phase. Today VL bundles work text-only.
 //! - Remote manifests: `from_path` only resolves local paths in v1. A
 //!   manifest whose `load_time_parameters.model` looks like an HTTP(S)
 //!   URL is rejected with a typed error pointing at Phase 1.6's
@@ -189,6 +192,15 @@ pub struct WickEngine {
     /// being affected). Auto-attached to every Session returned by
     /// [`Self::new_session`].
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Vision-encoder mmproj GGUF, eagerly mmapped from
+    /// `manifest.files.multimodal_projector` when the inference_type
+    /// is `LlamaCppImageToText`. `None` for text / audio bundles, or
+    /// when the mmproj fails to open (warned, not fatal — text-only
+    /// chat against a VL bundle still works without it). Phase 1 of
+    /// the VL pipeline only mmaps the file; later phases consume it
+    /// to construct typed `VisionEncoderWeights` and run the ViT
+    /// forward pass.
+    vision_encoder_gguf: Option<Arc<GgufFile>>,
 }
 
 impl WickEngine {
@@ -210,25 +222,33 @@ impl WickEngine {
         } else if has_extension(path, "json") {
             Self::from_manifest_file(path, cfg)
         } else if has_extension(path, "gguf") {
-            // Bare `.gguf` → peek at `general.architecture` and fail
-            // early for known non-text arches (VL, audio) so the caller
-            // gets the `UnsupportedInferenceType` error they'd see with
-            // a manifest, not a mid-load "unsupported architecture"
-            // failure from the text loader. Unknown arches fall back
-            // to text (auto-detect's existing policy).
+            // Bare `.gguf` → peek at `general.architecture`. Text +
+            // audio go through the synthetic-text manifest path; aux
+            // files for audio (mmproj) are manifest-driven and
+            // consumers who need them must load via manifest or
+            // `from_files`. VL is refused at this gate because a
+            // bare GGUF can't possibly carry the vision tower —
+            // silently downgrading to text would surprise users who
+            // later reach for `--image`. Today this arm is
+            // unreachable (every published VL main GGUF reports
+            // `architecture = "lfm2"` and auto-detect lands on
+            // text); if Liquid ever ships `architecture = "lfm2vl"`
+            // the typed error tells the user what to do. Unknown
+            // arches fall back to text per auto-detect's existing
+            // policy.
             let detected = auto_detect_inference_type(path)?;
             match detected {
                 InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => {
-                    // Audio loads the same text LLM under the hood today
-                    // (aux files are manifest-driven). Proceed with the
-                    // synthetic text manifest; audio consumers who need
-                    // the aux files must load via manifest or `from_files`.
                     let manifest = Manifest::synthetic_text(path);
                     Self::from_manifest(manifest, cfg)
                 }
-                InferenceType::LlamaCppImageToText => Err(WickError::UnsupportedInferenceType(
-                    detected.as_str().to_string(),
-                )),
+                InferenceType::LlamaCppImageToText => Err(WickError::Backend(format!(
+                    "bare-GGUF VL load is not supported (file `{}`); load via a \
+                     `.json` manifest, a directory containing one, \
+                     `from_files`, or `from_bundle_id` so the vision mmproj \
+                     can be attached",
+                    path.display()
+                ))),
                 // `auto_detect_inference_type` defaults unknown arches to
                 // Text, so this arm is unreachable today — matched for
                 // exhaustiveness if the policy changes.
@@ -384,15 +404,20 @@ impl WickEngine {
             add_bos_token,
             quantization,
         );
-        // Eager mmproj load for audio bundles. Gated on `path.is_some()`
-        // because hermetic constructors (`from_bytes` / `from_reader`)
-        // shouldn't surreptitiously open filesystem paths even if the
-        // manifest mentions one — that would violate the no-filesystem
-        // contract. Failure here is non-fatal: warn and leave the
-        // encoder unset so text generation still works on a partly-
-        // broken bundle.
+        // Eager mmproj load for audio + VL bundles. Gated on
+        // `path.is_some()` because hermetic constructors
+        // (`from_bytes` / `from_reader`) shouldn't surreptitiously
+        // open filesystem paths even if the manifest mentions one —
+        // that would violate the no-filesystem contract. Failure
+        // here is non-fatal: warn and leave the encoder unset so
+        // text generation still works on a partly-broken bundle.
         let audio_encoder = if path.is_some() {
             try_load_audio_encoder(&manifest)
+        } else {
+            None
+        };
+        let vision_encoder_gguf = if path.is_some() {
+            try_load_vision_encoder_gguf(&manifest)
         } else {
             None
         };
@@ -403,6 +428,7 @@ impl WickEngine {
             metadata,
             config: cfg,
             audio_encoder,
+            vision_encoder_gguf,
         })
     }
 
@@ -477,6 +503,25 @@ impl WickEngine {
     /// computations (encoding embeddings without an LLM forward).
     pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>> {
         self.audio_encoder.as_ref()
+    }
+
+    /// Borrow the eagerly-mmapped vision-encoder mmproj GGUF, if
+    /// any. `Some` for VL bundles loaded from filesystem paths via
+    /// `from_path`, `from_files`, or `from_bundle_id`. Hermetic
+    /// constructors (`from_bytes`, `from_reader`) skip the eager
+    /// mmap to keep the no-filesystem contract, so they always
+    /// return `None` here.
+    ///
+    /// **Provisional API.** Phase 1 of the VL pipeline exposes the
+    /// raw `Arc<GgufFile>` because typed weights aren't parsed yet.
+    /// Phase 2 will introduce a typed `VisionEncoderWeights` plus a
+    /// `vision_encoder()` accessor that becomes the primary entry
+    /// point; this `_gguf` accessor will stay around as a raw-bytes
+    /// escape hatch for advanced consumers but isn't where most
+    /// callers should land in the long run. Today, image input
+    /// still errors; text-only chat against a VL bundle works.
+    pub fn vision_encoder_gguf(&self) -> Option<&Arc<GgufFile>> {
+        self.vision_encoder_gguf.as_ref()
     }
 
     /// Modality capabilities reported by the loaded model, derived from
@@ -880,17 +925,55 @@ fn try_load_audio_encoder(_manifest: &Manifest) -> Option<Arc<AudioEncoderWeight
     None
 }
 
+/// Phase-1 VL loader: open the mmproj GGUF and stash it as an
+/// `Arc<GgufFile>` for later phases to parse into typed
+/// `VisionEncoderWeights`. Mirrors `try_load_audio_encoder`'s
+/// shape; failure is non-fatal so a VL bundle with a missing or
+/// broken mmproj still works for text-only chat (the gate has
+/// already accepted the LLM half).
+#[cfg(feature = "mmap")]
+fn try_load_vision_encoder_gguf(manifest: &Manifest) -> Option<Arc<GgufFile>> {
+    if !matches!(manifest.inference_type, InferenceType::LlamaCppImageToText) {
+        return None;
+    }
+    let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
+    let path = Path::new(mmproj_path);
+    match GgufFile::open(path) {
+        Ok(g) => Some(Arc::new(g)),
+        Err(e) => {
+            tracing::warn!(
+                target: "wick::engine",
+                path = %path.display(),
+                error = %format!("{e:#}"),
+                "vision mmproj GGUF failed to open; image input will surface \
+                 as 'no vision encoder attached' once that path lands. \
+                 Text-only chat against this bundle still works."
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "mmap"))]
+fn try_load_vision_encoder_gguf(_manifest: &Manifest) -> Option<Arc<GgufFile>> {
+    None
+}
+
 /// Shared gate for the set of `InferenceType`s the engine can actually
-/// load today. Returns `Ok(())` for text + LFM2-audio; returns
-/// `WickError::UnsupportedInferenceType` for VL and anything unknown.
+/// load today. Returns `Ok(())` for text, LFM2-audio, and VL; returns
+/// `WickError::UnsupportedInferenceType` only for unrecognised arches.
 /// Unconditional so both the mmap-backed path (pre-file-open) and the
 /// in-memory paths (`from_bytes` / `from_reader`) use the same rule.
+///
+/// Note: VL bundles load the LLM half (plain LFM2) but image input
+/// (`Session::append_image`) is not yet wired — phase 1 of the VL
+/// pipeline only opens the gate and mmaps the mmproj GGUF. Calling
+/// generate against a VL bundle today behaves as text-only chat.
 fn check_inference_type_supported(it: &InferenceType) -> Result<(), WickError> {
     match it {
-        InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => Ok(()),
-        InferenceType::LlamaCppImageToText => {
-            Err(WickError::UnsupportedInferenceType(it.as_str().to_string()))
-        }
+        InferenceType::LlamaCppTextToText
+        | InferenceType::LlamaCppLfm2AudioV1
+        | InferenceType::LlamaCppImageToText => Ok(()),
         InferenceType::Unknown(s) => Err(WickError::UnsupportedInferenceType(s.clone())),
     }
 }
