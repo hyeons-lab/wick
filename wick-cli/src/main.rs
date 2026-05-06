@@ -440,7 +440,12 @@ enum Command {
         quant: Option<String>,
 
         /// Cache root for `--bundle-id` downloads. Default:
-        /// `$HOME/.cache/wick`. No-op when `--model` is used.
+        /// `$HOME/.cache/wick`. Used only for bundle download
+        /// caching; bench's KV prefix cache is the engine default
+        /// (warm-only, in-memory) regardless of this flag —
+        /// `wick run --cache-dir <d>` is the right entrypoint
+        /// for KV-cache-aware benchmarks. No-op when `--model`
+        /// is used.
         #[arg(long)]
         cache_dir: Option<String>,
 
