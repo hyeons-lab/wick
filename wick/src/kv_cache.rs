@@ -403,48 +403,48 @@ impl InferenceState {
     /// via `bytemuck`; conv buffers are byte-cast wholesale. Compressed
     /// (TurboQuant) attention layers are encoded into the
     /// `LayerSnapshot::AttentionCompressed { keys, values }` byte slots
-    /// via `turboquant::encode_compressed_*`. Mixed states (some layers
-    /// compressed, some not) are supported — each layer dispatches
-    /// independently.
+    /// via `turboquant::encode_compressed_*`.
+    ///
+    /// Returns `None` when an attention layer's compression is
+    /// **mixed** — i.e. exactly one of `compressed_keys` /
+    /// `compressed_values` is `Some`. The on-disk
+    /// `AttentionCompressed { keys, values }` shape models both
+    /// sides as encoded blobs; a single-side-compressed layer
+    /// would lose the uncompressed side's f32 data on snapshot.
+    /// `KvCompression::TurboQuant { keys: bool, values: bool }`
+    /// has both bools as debug knobs; the production config sets
+    /// both to `true`. Treating mixed as not-snapshotted is
+    /// conservative + correct — caller falls back to a cold prefill
+    /// for that turn.
     pub fn snapshot(&self) -> Option<StateSnapshot> {
-        let layers: Vec<LayerSnapshot> = self
-            .layers
-            .iter()
-            .map(|l| match l {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            match l {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
                     compressed_keys,
                     compressed_values,
                 } => {
-                    if compressed_keys.is_some() || compressed_values.is_some() {
-                        // TurboQuant path. Today both sides are
-                        // typically compressed together (the
-                        // `KvCompression::TurboQuant { keys: true,
-                        // values: true }` config); single-side
-                        // compression would still encode the present
-                        // side and leave the other slot empty.
-                        let keys = compressed_keys
-                            .as_ref()
-                            .map(crate::turboquant::encode_compressed_keys)
-                            .unwrap_or_default();
-                        let values = compressed_values
-                            .as_ref()
-                            .map(crate::turboquant::encode_compressed_values)
-                            .unwrap_or_default();
-                        LayerSnapshot::AttentionCompressed { keys, values }
-                    } else {
-                        LayerSnapshot::Attention {
+                    let snap = match (compressed_keys, compressed_values) {
+                        (None, None) => LayerSnapshot::Attention {
                             k_data: bytemuck::cast_slice(key_cache).to_vec(),
                             v_data: bytemuck::cast_slice(value_cache).to_vec(),
-                        }
-                    }
+                        },
+                        (Some(k), Some(v)) => LayerSnapshot::AttentionCompressed {
+                            keys: crate::turboquant::encode_compressed_keys(k),
+                            values: crate::turboquant::encode_compressed_values(v),
+                        },
+                        // Mixed-mode: refuse the whole snapshot.
+                        (Some(_), None) | (None, Some(_)) => return None,
+                    };
+                    layers.push(snap);
                 }
-                LayerState::Conv { buffer } => LayerSnapshot::Conv {
+                LayerState::Conv { buffer } => layers.push(LayerSnapshot::Conv {
                     buffer: bytemuck::cast_slice(buffer).to_vec(),
-                },
-            })
-            .collect();
+                }),
+            }
+        }
         Some(StateSnapshot {
             layers,
             seq_len: self.seq_len,
@@ -503,25 +503,34 @@ impl InferenceState {
                     },
                     LayerSnapshot::AttentionCompressed { keys, values },
                 ) => {
-                    // Restore compressed caches. Live state must have
-                    // matching `Some(_)` slots — otherwise the model
-                    // wasn't initialized with TurboQuant and we'd be
-                    // dropping data on the floor. Empty blobs (single-
-                    // side compression) leave the corresponding slot
-                    // untouched.
-                    if !keys.is_empty() {
-                        let decoded = crate::turboquant::decode_compressed_keys(keys)
-                            .expect("invalid TQK1 blob in snapshot");
-                        *compressed_keys = Some(decoded);
-                    }
-                    if !values.is_empty() {
-                        let decoded = crate::turboquant::decode_compressed_values(values)
-                            .expect("invalid TQV1 blob in snapshot");
-                        *compressed_values = Some(decoded);
-                    }
+                    // The live state's compressed slots must already
+                    // be allocated by `from_config_with_compression`;
+                    // we don't allocate them here because the
+                    // associated rotation/scratch state lives
+                    // elsewhere on `InferenceState` and would be
+                    // missing. A `None` slot means the live state
+                    // isn't TurboQuant-configured; the caller
+                    // should have detected the incompatibility
+                    // before calling restore (see `LayerSnapshot::is_compressed`
+                    // + the lookup-time gate in `Lfm2Model::forward_prefill`).
+                    assert!(
+                        compressed_keys.is_some() && compressed_values.is_some(),
+                        "AttentionCompressed snapshot restored into a live state \
+                         missing compressed slots — caller must gate on \
+                         `LayerSnapshot::is_compressed()` matching \
+                         `LayerState::is_compressed()`"
+                    );
+                    *compressed_keys = Some(
+                        crate::turboquant::decode_compressed_keys(keys)
+                            .expect("invalid TQK1 blob in snapshot"),
+                    );
+                    *compressed_values = Some(
+                        crate::turboquant::decode_compressed_values(values)
+                            .expect("invalid TQV1 blob in snapshot"),
+                    );
                     // f32 caches are unused under compression; clear
-                    // them so any stale data from a previous
-                    // uncompressed restore can't leak.
+                    // them so stale data from a prior uncompressed
+                    // restore can't leak.
                     key_cache.clear();
                     value_cache.clear();
                 }
@@ -701,16 +710,16 @@ pub enum LayerSnapshot {
         k_data: Vec<u8>,
         v_data: Vec<u8>,
     },
-    /// TurboQuant-compressed attention layer. `keys` is the encoded
-    /// `CompressedKeyCache` (magic "TQK1"); `values` is the encoded
-    /// `CompressedValueCache` (magic "TQV1"). When only one side is
-    /// compressed (e.g. `KvCompression::TurboQuant { keys: true,
-    /// values: false }`), the f32 byte slot is empty in the encoded
-    /// blob's namespace and the raw f32 bytes live in the matching
-    /// dual `Attention` field. Today's `Lfm2Model::forward_prefill`
-    /// gates on uniform compression so this isn't exercised; v2
-    /// could split into separate variants per side if mixed-mode
-    /// becomes a use case.
+    /// TurboQuant-compressed attention layer with **both** sides
+    /// compressed. `keys` is the encoded `CompressedKeyCache` (magic
+    /// "TQK1"); `values` is the encoded `CompressedValueCache` (magic
+    /// "TQV1"). Mixed-mode (only one side compressed) is not modeled
+    /// here — `InferenceState::snapshot` returns `None` for such
+    /// states because the alternate side's f32 data has no slot in
+    /// this variant. v2 could add per-side variants if a real
+    /// mixed-mode workload turns up; today the production config
+    /// (`KvCompression::TurboQuant { keys: true, values: true }`)
+    /// is uniform.
     AttentionCompressed {
         keys: Vec<u8>,
         values: Vec<u8>,
@@ -718,6 +727,18 @@ pub enum LayerSnapshot {
     Conv {
         buffer: Vec<u8>,
     },
+}
+
+impl LayerSnapshot {
+    /// `true` iff this snapshot was captured from a TurboQuant-
+    /// compressed attention layer. Callers about to invoke
+    /// [`InferenceState::restore`] should check that this matches
+    /// the target's per-layer compression mode — `restore` panics
+    /// on a compression-mode mismatch (e.g. compressed snapshot
+    /// into an uncompressed live state).
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, LayerSnapshot::AttentionCompressed { .. })
+    }
 }
 
 impl StateSnapshot {
@@ -730,6 +751,15 @@ impl StateSnapshot {
                 LayerSnapshot::Conv { buffer } => buffer.len(),
             })
             .sum()
+    }
+
+    /// `true` iff any attention layer in this snapshot is
+    /// compressed. Used by `Lfm2Model::forward_prefill` to skip
+    /// snapshots whose compression mode doesn't match the live
+    /// state — treat as cache miss instead of panicking on
+    /// `restore`.
+    pub fn is_compressed(&self) -> bool {
+        self.layers.iter().any(LayerSnapshot::is_compressed)
     }
 }
 
@@ -1047,10 +1077,18 @@ impl KvPrefixCache {
                     });
                 }
                 2 => {
-                    layers.push(LayerSnapshot::AttentionCompressed {
-                        keys: l.k_data()?.bytes().to_vec(),
-                        values: l.v_data()?.bytes().to_vec(),
-                    });
+                    let keys = l.k_data()?.bytes().to_vec();
+                    let values = l.v_data()?.bytes().to_vec();
+                    // Validate the encoded blob shape at load time so a
+                    // corrupted disk entry surfaces as a cache miss
+                    // (return None) rather than a panic later in
+                    // `InferenceState::restore`'s `decode_*().expect(...)`.
+                    if crate::turboquant::decode_compressed_keys(&keys).is_none()
+                        || crate::turboquant::decode_compressed_values(&values).is_none()
+                    {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::AttentionCompressed { keys, values });
                 }
                 _ => return None,
             }

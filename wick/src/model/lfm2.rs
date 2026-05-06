@@ -2374,19 +2374,36 @@ impl Model for Lfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Keep at least one token for the suffix prefill so we
-                // always run a forward pass that produces logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
-                    state.restore(&snapshot);
-                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                    if let Some(snap) = state.snapshot() {
-                        self.prefix_cache
-                            .lock()
-                            .expect("prefix_cache mutex poisoned")
-                            .insert(tokens, snap);
+                // Compatibility gate: a snapshot's compression mode
+                // must match the live state. Cross-mode restores
+                // would panic in `InferenceState::restore` (compressed
+                // snapshot into a `None`-slot live state, or
+                // uncompressed snapshot into a TurboQuant-configured
+                // live state with mismatched scratch/rotation shape).
+                // Treat as cache miss + fall through to cold prefill.
+                // Today `model_fingerprint` doesn't include the
+                // compression flags, so a `--cache-dir` shared
+                // between TurboQuant and uncompressed runs of the
+                // same model file relies on this gate; future v2
+                // could fold compression into the fingerprint.
+                if snapshot.is_compressed() != state.is_compressed() {
+                    // skip; fall through to cold prefill.
+                } else {
+                    // Keep at least one token for the suffix prefill
+                    // so we always run a forward pass that produces
+                    // logits.
+                    let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                    if use_len > 0 {
+                        state.restore(&snapshot);
+                        let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                        if let Some(snap) = state.snapshot() {
+                            self.prefix_cache
+                                .lock()
+                                .expect("prefix_cache mutex poisoned")
+                                .insert(tokens, snap);
+                        }
+                        return logits;
                     }
-                    return logits;
                 }
             }
         }

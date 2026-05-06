@@ -1138,8 +1138,11 @@ pub fn decode_compressed_keys(buf: &[u8]) -> Option<CompressedKeyCache> {
     let n_kv_heads = h.n_kv_heads as usize;
     let head_dim = h.head_dim as usize;
     let seq_len = h.seq_len as usize;
-    if head_dim % 8 != 0 {
-        return None; // jl_bytes = head_dim / 8 must be integer
+    // Reject corrupted headers up front: jl_bytes = head_dim/8 must
+    // be integer, polar packs 4 elements per byte (head_dim/4), and
+    // head_dim must be > 0.
+    if head_dim == 0 || head_dim % 8 != 0 {
+        return None;
     }
     let polar_per = head_dim / 4;
     let jl_per = head_dim / 8;
@@ -1239,6 +1242,11 @@ pub fn decode_compressed_values(buf: &[u8]) -> Option<CompressedValueCache> {
     let n_kv_heads = h.n_kv_heads as usize;
     let head_dim = h.head_dim as usize;
     let seq_len = h.seq_len as usize;
+    // Reject corrupted headers up front: PolarQuant packs 4 elements
+    // per byte so head_dim must be divisible by 4 (and >0).
+    if head_dim == 0 || head_dim % 4 != 0 {
+        return None;
+    }
     let polar_per = head_dim / 4;
     let body_len = n_kv_heads * (seq_len * polar_per + 2 * seq_len);
     if buf.len() != Tq1Header::SIZE + body_len {
