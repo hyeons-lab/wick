@@ -423,6 +423,30 @@ fn vl_bundle_appends_synthetic_image() {
     );
     let decoded = tokenizer.decode(&sink.0);
     eprintln!("vl smoke decoded output: {decoded:?}");
+    // Post-image output must look like English: at least 60% ASCII
+    // letters/spaces (catches "lots of unicode + punctuation"
+    // garbage from a broken encoder), and at least one space
+    // (catches a single long unbroken token sequence). These bars
+    // would have failed the pre-fix output ("complex and abstract
+    // scene" passed because it *was* English — the fix that
+    // mattered was switching from generic to scene-specific). The
+    // live test's main correctness gate remains the eprintln
+    // dump + manual review on first run; the assertion only
+    // catches gross structural regressions.
+    let total = decoded.chars().count() as f32;
+    let alpha_or_space = decoded
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .count() as f32;
+    assert!(total > 0.0, "decoded text is empty");
+    assert!(
+        alpha_or_space / total >= 0.6,
+        "post-image output mostly non-letters: {decoded:?}"
+    );
+    assert!(
+        decoded.contains(' '),
+        "post-image output has no spaces — single unbroken token: {decoded:?}"
+    );
     let alpha_count = decoded.chars().filter(char::is_ascii_alphabetic).count();
     assert!(
         alpha_count >= 4,

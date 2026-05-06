@@ -856,7 +856,26 @@ impl Session {
         let img_tokens = encoder
             .encode_image(&pixels)
             .map_err(|e| WickError::Backend(format!("encode_image: {e:#}")))?;
+        // Sanity-check the encoder output shape before handing off
+        // to `append_embeddings`. Integer division below would
+        // silently truncate a non-multiple length and surface as a
+        // less actionable mismatch error from `append_embeddings`.
+        if img_tokens.len() % proj_dim != 0 {
+            return Err(WickError::Backend(format!(
+                "Session::append_image: encode_image returned {} f32s, \
+                 not a multiple of projection_dim ({proj_dim}) — encoder \
+                 produced a malformed image-token tensor",
+                img_tokens.len(),
+            )));
+        }
         let n_tokens = img_tokens.len() / proj_dim;
+        if n_tokens == 0 {
+            return Err(WickError::Backend(
+                "Session::append_image: encoder produced zero image tokens \
+                 (preprocess + encode succeeded but yielded an empty tensor)"
+                    .into(),
+            ));
+        }
         self.append_embeddings(&img_tokens, n_tokens)
     }
 

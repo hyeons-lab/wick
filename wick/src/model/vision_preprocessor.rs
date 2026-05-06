@@ -42,23 +42,25 @@ pub fn preprocess_image(bytes: &[u8], cfg: &VisionEncoderConfig) -> Result<Vec<f
 
     // Resize to image_size × image_size with bilinear (triangle)
     // filter. CLIP-family inputs are square; aspect-preserving
-    // resize would mismatch the model's expectations.
+    // resize would mismatch the model's expectations. Convert to
+    // `RgbImage` directly in each branch — going through
+    // `DynamicImage::ImageRgb8` and a second `.to_rgb8()` would
+    // double-copy the buffer for the already-correct-size case.
     let target = cfg.image_size as u32;
-    let resized = if img.width() == target && img.height() == target {
-        img
+    let rgb = if img.width() == target && img.height() == target {
+        img.into_rgb8()
     } else {
-        image::DynamicImage::ImageRgb8(image::imageops::resize(
+        image::imageops::resize(
             &img.to_rgb8(),
             target,
             target,
             image::imageops::FilterType::Triangle,
-        ))
+        )
     };
 
     // Normalize: NCHW f32, `(rgb / 255 - mean) / std` per
     // channel. Channel-first layout `[c, h, w]` so the encoder's
     // `image[c * H * W + h * W + w]` indexing reads correctly.
-    let rgb = resized.to_rgb8();
     let h = rgb.height() as usize;
     let w = rgb.width() as usize;
     debug_assert_eq!(h, cfg.image_size);
