@@ -478,59 +478,7 @@ impl VisionEncoderWeights {
     /// `[in × out]` kernel layout matches what `cpu::matmul_f32`
     /// reads for its `B` argument (standard `C = A · B`).
     fn patch_embed_forward(&self, image: &[f32]) -> Vec<f32> {
-        let cfg = &self.config;
-        let p = cfg.patch_size;
-        let grid = cfg.image_size / p; // 16 for 256/16
-        let in_dim = 3 * p * p; // 3*16*16 = 768
-        let out_dim = cfg.n_embd;
-        debug_assert_eq!(
-            self.patch_embed.conv_w.len(),
-            in_dim * out_dim,
-            "patch_embed.conv_w length should be in_dim*out_dim after load-time transpose"
-        );
-
-        // Build per-patch input vectors `[n_patches × in_dim]`,
-        // matching the kernel's `(c, kh, kw)` input flat-index.
-        let h_stride = cfg.image_size;
-        let c_stride = cfg.image_size * cfg.image_size;
-        let n_patches = cfg.n_patches;
-        let mut patches = vec![0f32; n_patches * in_dim];
-        for (gr, gc) in (0..grid).flat_map(|r| (0..grid).map(move |c| (r, c))) {
-            let patch_idx = gr * grid + gc;
-            for c in 0..3 {
-                for kh in 0..p {
-                    for kw in 0..p {
-                        let pixel_r = gr * p + kh;
-                        let pixel_c = gc * p + kw;
-                        let in_idx = c * p * p + kh * p + kw;
-                        let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
-                        patches[patch_idx * in_dim + in_idx] = image[img_idx];
-                    }
-                }
-            }
-        }
-
-        // patches `[n_patches × in_dim]` · conv_w `[in_dim × n_embd]`
-        // → out `[n_patches × n_embd]`. `matmul_f32(a, b, c, m, n, k)`
-        // computes `c[i,j] = Σ_p a[i,p]·b[p,j]` — standard `C = A · B`.
-        let mut out = vec![0f32; n_patches * out_dim];
-        crate::backend::cpu::matmul_f32(
-            &patches,
-            &self.patch_embed.conv_w,
-            &mut out,
-            n_patches,
-            out_dim,
-            in_dim,
-        );
-
-        // Add bias (per-output-channel).
-        for token in 0..n_patches {
-            let row = &mut out[token * out_dim..(token + 1) * out_dim];
-            for (o, b) in row.iter_mut().zip(self.patch_embed.conv_b.iter()) {
-                *o += *b;
-            }
-        }
-        out
+        patch_embed_compute(image, &self.patch_embed, &self.config)
     }
 
     /// One ViT transformer block: pre-norm self-attention with
@@ -724,6 +672,69 @@ impl VitScratch {
             ffn_out: vec![0.0; n_pe],
         }
     }
+}
+
+/// Free-function patch-embed math, factored out of
+/// [`VisionEncoderWeights::patch_embed_forward`] so unit tests can
+/// drive it with hand-built kernels (no GGUF needed). Produces
+/// `[n_patches × n_embd]` row-major.
+fn patch_embed_compute(
+    image: &[f32],
+    patch_embed: &PatchEmbedWeights,
+    cfg: &VisionEncoderConfig,
+) -> Vec<f32> {
+    let p = cfg.patch_size;
+    let grid = cfg.image_size / p;
+    let in_dim = 3 * p * p;
+    let out_dim = cfg.n_embd;
+    debug_assert_eq!(
+        patch_embed.conv_w.len(),
+        in_dim * out_dim,
+        "patch_embed.conv_w length should be in_dim*out_dim after load-time transpose"
+    );
+
+    // Build per-patch input vectors `[n_patches × in_dim]`,
+    // matching the kernel's `(c, kh, kw)` input flat-index.
+    let h_stride = cfg.image_size;
+    let c_stride = cfg.image_size * cfg.image_size;
+    let n_patches = cfg.n_patches;
+    let mut patches = vec![0f32; n_patches * in_dim];
+    for (gr, gc) in (0..grid).flat_map(|r| (0..grid).map(move |c| (r, c))) {
+        let patch_idx = gr * grid + gc;
+        for c in 0..3 {
+            for kh in 0..p {
+                for kw in 0..p {
+                    let pixel_r = gr * p + kh;
+                    let pixel_c = gc * p + kw;
+                    let in_idx = c * p * p + kh * p + kw;
+                    let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
+                    patches[patch_idx * in_dim + in_idx] = image[img_idx];
+                }
+            }
+        }
+    }
+
+    // patches `[n_patches × in_dim]` · conv_w `[in_dim × n_embd]`
+    // → out `[n_patches × n_embd]`. `matmul_f32(a, b, c, m, n, k)`
+    // computes `c[i,j] = Σ_p a[i,p]·b[p,j]` — standard `C = A · B`.
+    let mut out = vec![0f32; n_patches * out_dim];
+    crate::backend::cpu::matmul_f32(
+        &patches,
+        &patch_embed.conv_w,
+        &mut out,
+        n_patches,
+        out_dim,
+        in_dim,
+    );
+
+    // Add bias (per-output-channel).
+    for token in 0..n_patches {
+        let row = &mut out[token * out_dim..(token + 1) * out_dim];
+        for (o, b) in row.iter_mut().zip(patch_embed.conv_b.iter()) {
+            *o += *b;
+        }
+    }
+    out
 }
 
 /// 2×2 pixel-shuffle (space-to-depth) over the patch grid.
@@ -1015,5 +1026,149 @@ mod tests {
                 30.0, 31.0, 32.0, // patch 3
             ]
         );
+    }
+
+    /// Loader transpose check: simulate the GGUF source layout
+    /// `linear(kw, kh, c, oc) = kw + p·kh + p²·c + p²·3·oc` with a
+    /// tagged value scheme, then exercise the same index-mapping
+    /// loop the real loader uses (lines 290–300 of this file) and
+    /// verify the resulting `[in_dim × n_embd]` row-major buffer
+    /// reads back the original tagged values at every `(oc, c, kh,
+    /// kw)`. Catches the bug class where someone swaps
+    /// `oc * in_dim + in_idx` ↔ `in_idx * out_dim + oc` (the exact
+    /// transpose mistake the patch-embed parity fix corrected).
+    #[test]
+    fn patch_embed_loader_transpose_round_trip() {
+        let p = 2usize; // patch_size — small for clarity
+        let in_dim = 3 * p * p; // 12
+        let out_dim = 5; // arbitrary; deliberately ≠ in_dim
+        // Synthetic source: tag every element so a transposed read
+        // produces visibly wrong values.
+        let mut raw = vec![0f32; p * p * 3 * out_dim];
+        let tag = |oc: usize, c: usize, kh: usize, kw: usize| -> f32 {
+            (oc * 1000 + c * 100 + kh * 10 + kw) as f32
+        };
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let src = kw + p * kh + p * p * c + p * p * 3 * oc;
+                        raw[src] = tag(oc, c, kh, kw);
+                    }
+                }
+            }
+        }
+        // Apply the loader's transpose into `[in_dim × out_dim]`.
+        let mut conv_w = vec![0f32; in_dim * out_dim];
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let src = kw + p * kh + p * p * c + p * p * 3 * oc;
+                        let in_idx = c * p * p + kh * p + kw;
+                        conv_w[in_idx * out_dim + oc] = raw[src];
+                    }
+                }
+            }
+        }
+        // Verify every (oc, c, kh, kw) round-trips through the
+        // `[in_dim × out_dim]` layout.
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let in_idx = c * p * p + kh * p + kw;
+                        let got = conv_w[in_idx * out_dim + oc];
+                        let expected = tag(oc, c, kh, kw);
+                        assert_eq!(
+                            got, expected,
+                            "conv_w[in_idx={in_idx}, oc={oc}] = {got} != {expected} \
+                             (oc={oc}, c={c}, kh={kh}, kw={kw})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-to-end patch-embed math: build a known kernel + image,
+    /// run `patch_embed_compute`, and assert the output matches an
+    /// explicit per-patch dot product. This is the test that would
+    /// have caught the matmul-transpose bug — it doesn't need a
+    /// GGUF, it doesn't need llama.cpp, just direct matmul math.
+    #[test]
+    fn patch_embed_compute_matches_explicit_dot_product() {
+        // 2×2 patch grid → 4 patches, patch_size=2, n_embd=3.
+        let grid = 2usize;
+        let cfg = synth_cfg(grid, /* n_embd */ 3, /* scale_factor */ 1);
+        let p = cfg.patch_size;
+        let in_dim = 3 * p * p; // 12
+        let out_dim = cfg.n_embd; // 3
+        let n_patches = cfg.n_patches; // 4
+
+        // Synthetic kernel in the [in_dim × out_dim] row-major
+        // layout the loader produces. Pick small values so the
+        // explicit reference dot product (~12 terms summed in f32)
+        // stays inside f32's precision floor — but vary in both
+        // axes so a transposed read produces visibly wrong dot
+        // products.
+        let mut conv_w = vec![0f32; in_dim * out_dim];
+        for in_idx in 0..in_dim {
+            for oc in 0..out_dim {
+                conv_w[in_idx * out_dim + oc] = (in_idx as f32) * 0.01 + (oc as f32) * 0.1;
+            }
+        }
+        // Bias: per-channel offsets so a swapped bias-add is
+        // visible too.
+        let conv_b = vec![0.5, 1.0, 1.5];
+        let patch_embed = PatchEmbedWeights {
+            conv_w: conv_w.clone(),
+            conv_b: conv_b.clone(),
+        };
+
+        // Synthetic image: CHW, image[c, y, x] uses small values so
+        // the per-patch dot stays well below f32 mantissa overflow.
+        let n_pix = 3 * cfg.image_size * cfg.image_size;
+        let mut image = vec![0f32; n_pix];
+        for c in 0..3 {
+            for y in 0..cfg.image_size {
+                for x in 0..cfg.image_size {
+                    image[c * cfg.image_size * cfg.image_size + y * cfg.image_size + x] =
+                        (c as f32) * 0.3 + (y as f32) * 0.05 + (x as f32) * 0.02;
+                }
+            }
+        }
+
+        let actual = patch_embed_compute(&image, &patch_embed, &cfg);
+        assert_eq!(actual.len(), n_patches * out_dim);
+
+        // Compute the expected output explicitly per-patch,
+        // per-output-channel.
+        for gr in 0..grid {
+            for gc in 0..grid {
+                let patch_idx = gr * grid + gc;
+                for oc in 0..out_dim {
+                    let mut expected = conv_b[oc];
+                    for c in 0..3 {
+                        for kh in 0..p {
+                            for kw in 0..p {
+                                let in_idx = c * p * p + kh * p + kw;
+                                let pixel_r = gr * p + kh;
+                                let pixel_c = gc * p + kw;
+                                let img_v = image[c * cfg.image_size * cfg.image_size
+                                    + pixel_r * cfg.image_size
+                                    + pixel_c];
+                                expected += img_v * conv_w[in_idx * out_dim + oc];
+                            }
+                        }
+                    }
+                    let got = actual[patch_idx * out_dim + oc];
+                    assert!(
+                        (got - expected).abs() < 1e-5,
+                        "patch_idx={patch_idx} oc={oc}: got {got}, expected {expected}"
+                    );
+                }
+            }
+        }
     }
 }

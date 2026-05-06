@@ -344,16 +344,22 @@ fn vl_bundle_appends_synthetic_image() {
     // image-marker placement. The model was trained on inputs of
     // the form
     //   <bos><|im_start|>user\n<|image_start|>[N image embeds]<|image_end|>TEXT<|im_end|>\n<|im_start|>assistant\n
-    // (token ids 498 / 499 for `<|image_start|>` / `<|image_end|>`,
-    // confirmed against llama.cpp's `mtmd-cli` verbose log).
     // Splicing image embeddings outside that envelope (e.g.
     // before the BOS) leaves the LLM unable to interpret them as
     // visual content, so the smoke covers the proper wrapping.
     // A higher-level helper that walks `<image>` markers in the
     // chat-template output is still slice 2/3 work.
-    const IMG_START: u32 = 498;
-    const IMG_END: u32 = 499;
     let tokenizer = engine.tokenizer();
+    // Look the marker token ids up at runtime so this test stays
+    // robust against vocab shifts across LFM2-VL variants
+    // (e.g. 1.6B vs 450M) — hardcoded ids would silently produce
+    // valid English but the wrong wrapping.
+    let img_start = tokenizer
+        .special_token_id("<|image_start|>")
+        .expect("LFM2-VL tokenizer must define <|image_start|>");
+    let img_end = tokenizer
+        .special_token_id("<|image_end|>")
+        .expect("LFM2-VL tokenizer must define <|image_end|>");
     // Render the same chat template the public API would, then
     // splice tokens around the user-text portion. Easier than
     // hand-building the full prefix string.
@@ -383,13 +389,13 @@ fn vl_bundle_appends_synthetic_image() {
         .append_tokens(&prefix_tokens)
         .expect("append_tokens prefix");
     session
-        .append_tokens(&[IMG_START])
+        .append_tokens(&[img_start])
         .expect("append <|image_start|>");
     session
         .append_image(&img_bytes)
         .expect("append_image should succeed end-to-end");
     session
-        .append_tokens(&[IMG_END])
+        .append_tokens(&[img_end])
         .expect("append <|image_end|>");
     session
         .append_tokens(&suffix_tokens)

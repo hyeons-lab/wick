@@ -161,13 +161,35 @@ impl MmapWeight {
     /// downstream computations without crashing. The cost is one
     /// branch-predictable comparison per call, dominated by the
     /// GEMV that follows.
+    ///
+    /// **Use this only when the tensor is statically known to be
+    /// F32.** For tensors that may be quantised at runtime
+    /// (embedding tables in `mostly_q*` GGUFs, projector weights,
+    /// etc.) call [`Self::dequantize_row`] for per-row reads or
+    /// [`Self::try_as_f32`] for an Option-returning variant.
     pub fn as_f32(&self) -> &[f32] {
         assert_eq!(
             self.dtype,
             DType::F32,
-            "MmapWeight::as_f32 called on non-F32 tensor"
+            "MmapWeight::as_f32 called on non-F32 tensor — \
+             use dequantize_row(idx, dst) for per-row reads or \
+             try_as_f32() if a None-on-quantised return is acceptable"
         );
         bytemuck::cast_slice(self.data())
+    }
+
+    /// Non-panicking version of [`Self::as_f32`]: returns
+    /// `Some(&[f32])` only when the tensor is actually F32, `None`
+    /// otherwise. Use this at call sites where the dtype isn't
+    /// guaranteed (e.g. embedding tables that happen to be F32 in
+    /// some configurations and Q4_0/Q8_0 in others) and a graceful
+    /// fall-through to `dequantize_row` is preferable to a panic.
+    pub fn try_as_f32(&self) -> Option<&[f32]> {
+        if self.dtype == DType::F32 {
+            Some(bytemuck::cast_slice(self.data()))
+        } else {
+            None
+        }
     }
 
     /// `y = self · x` where `self` is `[rows × cols]` and `x` is
@@ -200,7 +222,19 @@ impl MmapWeight {
     pub fn dequantize_row(&self, row_idx: usize, dst: &mut [f32]) {
         assert_eq!(dst.len(), self.cols);
         assert!(row_idx < self.rows);
-        let row_bytes = (self.cols / self.dtype.block_size()) * self.dtype.block_bytes();
+        let block_size = self.dtype.block_size();
+        // Quantised dtypes (Q4_0, Q8_0, …) pack `block_size` elements
+        // per block; if `cols` isn't a multiple, integer division
+        // would silently truncate the trailing partial block, so any
+        // dst[…tail] would stay zero and the caller would never know.
+        // F32 has block_size=1 so the assertion is trivially true.
+        assert_eq!(
+            self.cols % block_size,
+            0,
+            "dequantize_row: cols ({}) must be a multiple of dtype block_size ({block_size})",
+            self.cols,
+        );
+        let row_bytes = (self.cols / block_size) * self.dtype.block_bytes();
         let offset = row_idx * row_bytes;
         let bytes = &self.data()[offset..offset + row_bytes];
         match self.dtype {
@@ -245,5 +279,167 @@ impl MmapWeight {
         let bytes = self.data();
         let slice = &bytes[offset..offset + n_rows * row_bytes];
         crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quant::{BlockQ4_0, BlockQ8_0};
+
+    /// Round-trip an F32 row: build an `[in_dim × out_dim]` table
+    /// of known values, dequantize a specific row, assert it matches.
+    /// F32 is the trivial-correctness path; this is a sanity test
+    /// for the new `dequantize_row` API.
+    #[test]
+    fn dequantize_row_f32_round_trip() {
+        let rows = 5;
+        let cols = 8;
+        let mut data = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                data.push((r * 100 + c) as f32);
+            }
+        }
+        let w = MmapWeight::from_owned_f32(data, rows, cols);
+        let mut row = vec![0f32; cols];
+        w.dequantize_row(3, &mut row);
+        let expected: Vec<f32> = (0..cols).map(|c| (3 * 100 + c) as f32).collect();
+        assert_eq!(row, expected);
+    }
+
+    /// F16 widening: build a row of known f16 values, dequantize,
+    /// assert each f32 matches the original f16 (within f16's
+    /// representable precision).
+    #[test]
+    fn dequantize_row_f16_widens_correctly() {
+        let cols = 4;
+        let bytes: Vec<u8> = [1.5f32, -0.25, 100.0, 0.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let w = MmapWeight::from_owned_bytes(bytes, DType::F16, 1, cols);
+        let mut row = vec![0f32; cols];
+        w.dequantize_row(0, &mut row);
+        assert!((row[0] - 1.5).abs() < 1e-3);
+        assert!((row[1] - -0.25).abs() < 1e-3);
+        assert!((row[2] - 100.0).abs() < 1e-1);
+        assert_eq!(row[3], 0.0);
+    }
+
+    /// BF16 widening — symmetric to the F16 test.
+    #[test]
+    fn dequantize_row_bf16_widens_correctly() {
+        let cols = 4;
+        let bytes: Vec<u8> = [1.0f32, -2.0, 0.5, -0.5]
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let w = MmapWeight::from_owned_bytes(bytes, DType::BF16, 1, cols);
+        let mut row = vec![0f32; cols];
+        w.dequantize_row(0, &mut row);
+        assert!((row[0] - 1.0).abs() < 1e-2);
+        assert!((row[1] - -2.0).abs() < 1e-2);
+        assert!((row[2] - 0.5).abs() < 1e-2);
+        assert!((row[3] - -0.5).abs() < 1e-2);
+    }
+
+    /// Q4_0 dispatch: hand-build a single 32-element block with a
+    /// known scale (`d`) and a known quant pattern (qs[0]
+    /// little-nibble = 9 → dequant value (9-8)·d = d), then check
+    /// `dequantize_row` returns the right values.
+    #[test]
+    fn dequantize_row_q4_0_dispatch() {
+        // 32 elements per block, one block total.
+        let cols = 32;
+        // d = 0.5 in f16.
+        let d = half::f16::from_f32(0.5);
+        let block = BlockQ4_0 {
+            d: d.to_bits(),
+            // qs[0] = 0x09 → low nibble 9 (= +1 after offset), high
+            // nibble 0 (= -8 after offset).
+            // qs[1] = 0xff → low 15 (= +7), high 15 (= +7).
+            // Remaining bytes = 0x88 → both nibbles 8 → 0 each.
+            qs: {
+                let mut q = [0x88u8; 16];
+                q[0] = 0x09;
+                q[1] = 0xff;
+                q
+            },
+        };
+        let mut bytes = Vec::with_capacity(std::mem::size_of::<BlockQ4_0>());
+        bytes.extend_from_slice(&block.d.to_le_bytes());
+        bytes.extend_from_slice(&block.qs);
+        let w = MmapWeight::from_owned_bytes(bytes, DType::Q4_0, 1, cols);
+        let mut row = vec![0f32; cols];
+        w.dequantize_row(0, &mut row);
+        // Q4_0 layout: low nibbles fill positions 0..16, high nibbles fill 16..32.
+        assert!((row[0] - 0.5).abs() < 1e-4, "row[0] = {}", row[0]); // 1·0.5
+        assert!((row[16] - -4.0).abs() < 1e-4, "row[16] = {}", row[16]); // -8·0.5
+        assert!((row[1] - 3.5).abs() < 1e-4, "row[1] = {}", row[1]); // 7·0.5
+        assert!((row[17] - 3.5).abs() < 1e-4, "row[17] = {}", row[17]); // 7·0.5
+        // All remaining (0x88 → both nibbles 8 → 0 after offset).
+        for &v in &row[2..16] {
+            assert!(v.abs() < 1e-4);
+        }
+        for &v in &row[18..32] {
+            assert!(v.abs() < 1e-4);
+        }
+    }
+
+    /// Q8_0 dispatch: simple block with d=1.0 and quants =
+    /// [-128, -1, 0, 1, …, 27], should dequantize to those exact
+    /// values.
+    #[test]
+    fn dequantize_row_q8_0_dispatch() {
+        let cols = 32;
+        let d = half::f16::from_f32(1.0);
+        let mut quants = [0i8; 32];
+        quants[0] = -128;
+        quants[1] = -1;
+        quants[2] = 0;
+        for (i, q) in quants.iter_mut().enumerate().skip(3) {
+            *q = (i as i8) - 3; // 0..29
+        }
+        let block = BlockQ8_0 {
+            delta: d.to_bits(),
+            quants,
+        };
+        let mut bytes = Vec::with_capacity(std::mem::size_of::<BlockQ8_0>());
+        bytes.extend_from_slice(&block.delta.to_le_bytes());
+        bytes.extend_from_slice(bytemuck::cast_slice::<i8, u8>(&block.quants));
+        let w = MmapWeight::from_owned_bytes(bytes, DType::Q8_0, 1, cols);
+        let mut row = vec![0f32; cols];
+        w.dequantize_row(0, &mut row);
+        assert!((row[0] - -128.0).abs() < 1e-3);
+        assert!((row[1] - -1.0).abs() < 1e-3);
+        assert!((row[2] - 0.0).abs() < 1e-3);
+        for (i, &v) in row.iter().enumerate().skip(3) {
+            assert!((v - ((i - 3) as f32)).abs() < 1e-3);
+        }
+    }
+
+    /// Misalignment guard: cols % block_size != 0 must panic with a
+    /// clear message rather than silently truncating the trailing
+    /// partial block.
+    #[test]
+    #[should_panic(expected = "must be a multiple of dtype block_size")]
+    fn dequantize_row_panics_on_unaligned_cols() {
+        // Q4_0 wants cols % 32 == 0; pass 30 to force the panic.
+        let bytes = vec![0u8; std::mem::size_of::<BlockQ4_0>()];
+        let w = MmapWeight::from_owned_bytes(bytes, DType::Q4_0, 1, 30);
+        let mut row = vec![0f32; 30];
+        w.dequantize_row(0, &mut row);
+    }
+
+    /// `try_as_f32` returns `Some` on F32, `None` on quantised.
+    #[test]
+    fn try_as_f32_dispatches_on_dtype() {
+        let f32_w = MmapWeight::from_owned_f32(vec![1.0, 2.0, 3.0, 4.0], 1, 4);
+        assert!(f32_w.try_as_f32().is_some());
+
+        let q4_bytes = vec![0u8; std::mem::size_of::<BlockQ4_0>()];
+        let q4_w = MmapWeight::from_owned_bytes(q4_bytes, DType::Q4_0, 1, 32);
+        assert!(q4_w.try_as_f32().is_none());
     }
 }
