@@ -1635,20 +1635,27 @@ impl GpuLfm2Model {
     /// to fence stale state. Without this an FFI / long-lived
     /// process that reuses the same `GpuLfm2Model` across multiple
     /// `Session`s would drift on conv state.
+    ///
+    /// Uses wgpu's native `clear_buffer` so the zero fill happens
+    /// GPU-side — no CPU-allocated zero buffer, no CPU→GPU upload.
+    /// One encoder, one submit, regardless of layer count.
     fn zero_conv_buffers_locked(&self) {
         let cfg = &self.config;
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zero_conv_buffers"),
+            });
         for i in 0..cfg.n_layers {
             if cfg.block_types[i] == BlockType::GatedConv
                 && let Some(conv_buf) = self.gpu_state.conv_buffers[i].as_ref()
             {
-                let byte_len = conv_buf.size() as usize;
-                // `queue.write_buffer` requires `data.len() % COPY_BUFFER_ALIGNMENT == 0`;
-                // wgpu sets that to 4 and conv buffers are sized as
-                // `d_conv * hidden_size * 4` (f32) so the modulus holds.
-                let zeros = vec![0u8; byte_len];
-                self.ctx.queue.write_buffer(conv_buf, 0, &zeros);
+                // `None` size = clear entire buffer.
+                enc.clear_buffer(conv_buf, 0, None);
             }
         }
+        self.ctx.queue.submit(Some(enc.finish()));
     }
 }
 
