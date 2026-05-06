@@ -1753,6 +1753,20 @@ impl Model for GpuLfm2Model {
             KvPrefixCache::new(config, &self.config, &format!("wgpu:{}", self.model_id));
     }
 
+    /// Public Model trait surface for `_locked` snapshot/restore so
+    /// external state-management callers (FFI / parity harness)
+    /// can drive the prefix cache directly without going through
+    /// `forward_prefill`. Mirrors `MetalLfm2Model`'s overrides.
+    fn snapshot_state(&self) -> StateSnapshot {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.snapshot_state_locked()
+    }
+
+    fn restore_state(&self, snapshot: &StateSnapshot) {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.restore_state_locked(snapshot);
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

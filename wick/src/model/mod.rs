@@ -285,11 +285,29 @@ pub trait Model: Send + Sync {
     fn configure_cache(&self, _config: crate::kv_cache::KvCacheConfig) {}
 
     /// Snapshot the current KV and conv state for prefix caching.
+    ///
+    /// Implemented by GPU backends whose state lives on the model
+    /// instance (`MetalLfm2Model`, `GpuLfm2Model`) — they take
+    /// `infer_lock` then delegate to a private `_locked` body that
+    /// reads GPU buffers into byte vectors.
+    ///
+    /// **Not implemented by CPU `Lfm2Model`** — its state lives on
+    /// the caller's `InferenceState`, not on the model, so the
+    /// argument-less trait signature can't be honored. CPU
+    /// consumers should call `InferenceState::snapshot` directly
+    /// (added in PR #119); the prefix cache integration inside
+    /// `Lfm2Model::forward_prefill` does this internally without
+    /// going through the trait.
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
         unimplemented!("snapshot_state not supported by this backend")
     }
 
     /// Restore a previously snapshotted state. Sets internal seq_len.
+    ///
+    /// Same backend asymmetry as [`Self::snapshot_state`]: GPU
+    /// backends override + lock internally; CPU's
+    /// `InferenceState::restore` is the equivalent caller-side
+    /// API.
     fn restore_state(&self, _snapshot: &crate::kv_cache::StateSnapshot) {
         unimplemented!("restore_state not supported by this backend")
     }
