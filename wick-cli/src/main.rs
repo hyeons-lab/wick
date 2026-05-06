@@ -1559,7 +1559,13 @@ fn main() -> Result<()> {
                 // Mitigations would be `\\` escape or a `/say <text>`
                 // form; not worth the complexity for v1.
                 if user.starts_with('/') {
-                    match user.as_str() {
+                    // Trim trailing whitespace so commands like "/help "
+                    // or "/exit\t" still dispatch correctly. The user's
+                    // line preserves leading/trailing spaces inside a
+                    // chat message (intentional for indented prompts),
+                    // but a bare command shouldn't be defeated by a
+                    // stray space that's hard to see.
+                    match user.trim_end() {
                         "/exit" | "/quit" => break,
                         "/help" => {
                             eprintln!("Commands:");
@@ -1578,26 +1584,26 @@ fn main() -> Result<()> {
                             // (the prefix cache will hit if the
                             // resulting render matches a cached
                             // prefill).
-                            let preserved_system =
-                                history.first().filter(|m| m.role == "system").cloned();
-                            history.clear();
-                            if let Some(sys) = preserved_system {
-                                history.push(sys);
+                            let had_system = history.first().is_some_and(|m| m.role == "system");
+                            if had_system {
+                                history.truncate(1);
+                            } else {
+                                history.clear();
                             }
                             session.reset();
                             eprintln!(
                                 "(history cleared{})",
-                                if history.is_empty() {
-                                    ""
-                                } else {
+                                if had_system {
                                     "; system prompt preserved"
+                                } else {
+                                    ""
                                 }
                             );
                             continue;
                         }
-                        _ => {
+                        other => {
                             eprintln!(
-                                "unknown command: {user}. Type /help for available commands."
+                                "unknown command: {other}. Type /help for available commands."
                             );
                             continue;
                         }
