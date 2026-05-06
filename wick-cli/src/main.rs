@@ -318,7 +318,13 @@ enum Command {
     /// the model's chat template per turn, and streams the assistant
     /// reply to stdout. The Session is kept alive across turns so
     /// the engine's prefix cache accelerates each successive prefill.
-    /// Type `/exit` (or `/quit`, or send EOF / Ctrl+D) to leave.
+    ///
+    /// Slash commands (a line starting with `/` is interpreted as a
+    /// command, not sent to the model):
+    /// - `/help` — list available commands.
+    /// - `/clear` — reset history; the system prompt (if any) is
+    ///   preserved.
+    /// - `/exit`, `/quit`, EOF (Ctrl+D) — leave the REPL.
     Chat {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
@@ -1522,7 +1528,7 @@ fn main() -> Result<()> {
             // resolved backend.
             eprintln!(
                 "wick chat (ctx={context_size}, max_tokens/turn={max_tokens}). \
-                 Send EOF (Ctrl+D) or type `/exit` to quit."
+                 Type `/help` for commands, `/exit` or EOF (Ctrl+D) to quit."
             );
             if !history.is_empty() {
                 eprintln!("(system prompt active)");
@@ -1546,8 +1552,62 @@ fn main() -> Result<()> {
                 if user.trim().is_empty() {
                     continue;
                 }
-                if user == "/exit" || user == "/quit" {
-                    break;
+                // Slash-command dispatch. A leading `/` puts the line
+                // into command mode; we never send it to the model.
+                // Trade-off: legit user messages that genuinely start
+                // with `/` (e.g. a Unix path) are unreachable today.
+                // Mitigations would be `\\` escape or a `/say <text>`
+                // form; not worth the complexity for v1.
+                if user.starts_with('/') {
+                    // Trim trailing whitespace so commands like "/help "
+                    // or "/exit\t" still dispatch correctly. The user's
+                    // line preserves leading/trailing spaces inside a
+                    // chat message (intentional for indented prompts),
+                    // but a bare command shouldn't be defeated by a
+                    // stray space that's hard to see.
+                    match user.trim_end() {
+                        "/exit" | "/quit" => break,
+                        "/help" => {
+                            eprintln!("Commands:");
+                            eprintln!(
+                                "  /clear          Clear conversation history (system prompt is preserved)"
+                            );
+                            eprintln!("  /help           Show this help");
+                            eprintln!("  /exit, /quit    Exit the REPL");
+                            continue;
+                        }
+                        "/clear" => {
+                            // Reset history but preserve the initial
+                            // system message if one was set via
+                            // `--system`. Drop the engine session's
+                            // KV state so the next turn starts cold
+                            // (the prefix cache will hit if the
+                            // resulting render matches a cached
+                            // prefill).
+                            let had_system = history.first().is_some_and(|m| m.role == "system");
+                            if had_system {
+                                history.truncate(1);
+                            } else {
+                                history.clear();
+                            }
+                            session.reset();
+                            eprintln!(
+                                "(history cleared{})",
+                                if had_system {
+                                    "; system prompt preserved"
+                                } else {
+                                    ""
+                                }
+                            );
+                            continue;
+                        }
+                        other => {
+                            eprintln!(
+                                "unknown command: {other}. Type /help for available commands."
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 history.push(wick::tokenizer::ChatMessage {
