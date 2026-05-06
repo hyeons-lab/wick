@@ -25,12 +25,16 @@
 //! assembled assistant text gets emitted to scrollback and the input
 //! line returns to its empty prompt.
 //!
-//! Slash commands (`/help`, `/clear`, `/exit`, `/quit`) match the
-//! line-based REPL exactly. `/help` and `/clear` feedback also goes
-//! to scrollback via `insert_before` so it doesn't get lost in
+//! Slash commands (`/help`, `/clear`, `/save <path>`,
+//! `/system <text>`, `/exit`, `/quit`) match the line-based REPL
+//! exactly — same dispatch logic, same `crate::write_transcript`
+//! helper for `/save`. Status output (help text, "history
+//! cleared", "saved N messages", error reports) is emitted to
+//! scrollback via `insert_before` so it doesn't get lost in
 //! viewport refreshes.
 
 use std::io::{self, Stdout, Write};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -362,26 +366,59 @@ fn dispatch_user_input(
         // Trim trailing whitespace before matching so commands like
         // `/help ` or `/exit\t` still dispatch — same fix as the
         // line-REPL slash dispatch (PR #125 review).
-        match line.trim_end() {
+        //
+        // Split on the first whitespace so commands with arguments
+        // (`/save out.txt`, `/system You are ...`) dispatch on the
+        // verb only.
+        let trimmed = line.trim_end();
+        let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (trimmed, ""),
+        };
+        // Trailing-arg policy mirrors the line REPL: no-arg
+        // commands reject extras strictly so a typo like
+        // `/clear save` doesn't silently wipe the conversation.
+        if !rest.is_empty() && matches!(cmd, "/exit" | "/quit" | "/help" | "/clear") {
+            emit_status_to_scrollback(terminal, &format!("{cmd} takes no arguments — type /help"))?;
+            emit_blank_line(terminal)?;
+            return Ok(KeyAction::Continue);
+        }
+        match cmd {
             "/exit" | "/quit" => return Ok(KeyAction::Exit),
             "/help" => {
-                emit_status_to_scrollback(terminal, "Commands: /clear  /help  /exit  /quit")?;
+                // One status line per command — keeps a wide list
+                // readable on an 80-col terminal where a single
+                // concatenated line wraps awkwardly.
+                emit_status_to_scrollback(terminal, "Commands:")?;
+                emit_status_to_scrollback(
+                    terminal,
+                    "  /clear           Clear conversation history (system prompt preserved)",
+                )?;
+                emit_status_to_scrollback(
+                    terminal,
+                    "  /system <text>   Replace (or set) the system prompt; empty arg removes it",
+                )?;
+                emit_status_to_scrollback(
+                    terminal,
+                    "  /save <path>     Save the conversation transcript to a file",
+                )?;
+                emit_status_to_scrollback(terminal, "  /help            Show this help")?;
+                emit_status_to_scrollback(terminal, "  /exit, /quit     Exit the REPL")?;
                 emit_blank_line(terminal)?;
                 return Ok(KeyAction::Continue);
             }
             "/clear" => {
                 // Preserve the system prompt (if any) by truncating
                 // to the first message rather than clear+clone+push.
-                // The worker is stateless w.r.t. history, so no
-                // explicit reset signal is needed — the next turn
-                // ships the smaller history.
+                // The worker is stateless w.r.t. history and runs
+                // `session.reset()` itself at the start of each
+                // turn, so no explicit reset signal is needed.
                 let had_system = state.history.first().is_some_and(|m| m.role == "system");
                 if had_system {
                     state.history.truncate(1);
                 } else {
                     state.history.clear();
                 }
-                state.pending = None;
                 emit_status_to_scrollback(
                     terminal,
                     if had_system {
@@ -390,6 +427,59 @@ fn dispatch_user_input(
                         "history cleared"
                     },
                 )?;
+                emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+            "/save" => {
+                if rest.is_empty() {
+                    emit_status_to_scrollback(terminal, "usage: /save <path>")?;
+                    emit_blank_line(terminal)?;
+                    return Ok(KeyAction::Continue);
+                }
+                // "messages" is the honest unit (a "turn" is
+                // colloquially user+assistant; `len()` counts the
+                // system message as one entry).
+                let msg = match crate::write_transcript(&state.history, Path::new(rest)) {
+                    Ok(()) => format!(
+                        "saved {} message{} to {rest}",
+                        state.history.len(),
+                        if state.history.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(e) => format!("error: /save failed: {e}"),
+                };
+                emit_status_to_scrollback(terminal, &msg)?;
+                emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+            "/system" => {
+                // Empty arg removes the system message (the
+                // user-facing off-switch). Non-empty arg replaces
+                // or inserts at index 0. `state.pending` is
+                // already `None` here (the worker can't be
+                // generating — `handle_key` blocks all input
+                // dispatch while `state.generating` is true), so
+                // we don't touch it.
+                if rest.is_empty() {
+                    let removed = state.history.first().is_some_and(|m| m.role == "system");
+                    if removed {
+                        state.history.remove(0);
+                        emit_status_to_scrollback(terminal, "system prompt removed")?;
+                    } else {
+                        emit_status_to_scrollback(terminal, "no system prompt was set")?;
+                    }
+                    emit_blank_line(terminal)?;
+                    return Ok(KeyAction::Continue);
+                }
+                let new_msg = ChatMessage {
+                    role: "system".into(),
+                    content: rest.to_string(),
+                };
+                if state.history.first().is_some_and(|m| m.role == "system") {
+                    state.history[0] = new_msg;
+                } else {
+                    state.history.insert(0, new_msg);
+                }
+                emit_status_to_scrollback(terminal, "system prompt updated")?;
                 emit_blank_line(terminal)?;
                 return Ok(KeyAction::Continue);
             }

@@ -585,6 +585,41 @@ fn display_bundle_id(name: &str) -> &str {
     name.strip_suffix(LEAP_BUNDLE_GGUF_SUFFIX).unwrap_or(name)
 }
 
+/// Write the chat history to `path` as a plain-text transcript:
+/// one block per message shaped `<role>: <content>\n`, separated
+/// by a blank line. Multi-line content is written verbatim (no
+/// escaping) so it round-trips through `cat` / `less` cleanly.
+///
+/// **Format is for human reading, not round-trip parsing.** Content
+/// containing a literal `\nassistant: …` line would render as a
+/// fake turn header on read-back. A future `/load` command would
+/// need a structured format (JSON Lines) instead — out of scope
+/// for this v1 dump.
+///
+/// Used by both the line REPL and the inline TUI's `/save` command.
+/// I/O errors propagate; the caller surfaces them as a status line
+/// without killing the REPL.
+fn write_transcript(history: &[wick::tokenizer::ChatMessage], path: &Path) -> std::io::Result<()> {
+    use std::io::{BufWriter, Write};
+    // Buffer the writes so a long conversation doesn't pay one
+    // syscall per `writeln!` (each turn issues up to two: the
+    // blank separator and the role+content line). `BufWriter`
+    // flushes on drop, but we call `flush()` explicitly so any
+    // late I/O error surfaces here instead of being silently
+    // swallowed by the destructor.
+    let f = std::fs::File::create(path)?;
+    let mut w = BufWriter::new(f);
+    for (i, msg) in history.iter().enumerate() {
+        if i > 0 {
+            // Blank line between turns.
+            writeln!(w)?;
+        }
+        writeln!(w, "{}: {}", msg.role, msg.content)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
 /// unset: `$HOME/.cache/wick` when `$HOME` is set, otherwise
 /// `<TMPDIR>/.cache/wick`. Shared between the `BundleRepo` (downloads land
@@ -1683,32 +1718,72 @@ fn main() -> Result<()> {
                     // chat message (intentional for indented prompts),
                     // but a bare command shouldn't be defeated by a
                     // stray space that's hard to see.
-                    match user.trim_end() {
-                        "/exit" | "/quit" => break,
+                    //
+                    // Split on the first whitespace so commands with
+                    // arguments (`/save out.txt`, `/system You are ...`)
+                    // dispatch on the verb only — `rest.trim()` covers
+                    // any extra whitespace between verb and argument.
+                    let trimmed = user.trim_end();
+                    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+                        Some((c, r)) => (c, r.trim()),
+                        None => (trimmed, ""),
+                    };
+                    // Trailing-arg policy: commands that don't take
+                    // an argument reject extras strictly so a typo
+                    // like `/clear save` doesn't silently wipe the
+                    // conversation when the user meant `/save`.
+                    let reject_extra_args = |verb: &str| -> bool {
+                        if !rest.is_empty() {
+                            eprintln!(
+                                "{verb} takes no arguments. Type /help for available commands."
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    match cmd {
+                        "/exit" | "/quit" => {
+                            if reject_extra_args(cmd) {
+                                continue;
+                            }
+                            break;
+                        }
                         "/help" => {
+                            if reject_extra_args(cmd) {
+                                continue;
+                            }
                             eprintln!("Commands:");
                             eprintln!(
-                                "  /clear          Clear conversation history (system prompt is preserved)"
+                                "  /clear           Clear conversation history (system prompt preserved)"
                             );
-                            eprintln!("  /help           Show this help");
-                            eprintln!("  /exit, /quit    Exit the REPL");
+                            eprintln!(
+                                "  /system <text>   Replace (or set) the system prompt; empty arg removes it"
+                            );
+                            eprintln!(
+                                "  /save <path>     Save the conversation transcript to a file"
+                            );
+                            eprintln!("  /help            Show this help");
+                            eprintln!("  /exit, /quit     Exit the REPL");
                             continue;
                         }
                         "/clear" => {
+                            if reject_extra_args(cmd) {
+                                continue;
+                            }
                             // Reset history but preserve the initial
                             // system message if one was set via
-                            // `--system`. Drop the engine session's
-                            // KV state so the next turn starts cold
-                            // (the prefix cache will hit if the
-                            // resulting render matches a cached
-                            // prefill).
+                            // `--system`. The per-turn loop calls
+                            // `session.reset()` itself before the next
+                            // prefill, so we don't need an explicit
+                            // reset here — the next turn will see the
+                            // truncated history and start clean.
                             let had_system = history.first().is_some_and(|m| m.role == "system");
                             if had_system {
                                 history.truncate(1);
                             } else {
                                 history.clear();
                             }
-                            session.reset();
                             eprintln!(
                                 "(history cleared{})",
                                 if had_system {
@@ -1717,6 +1792,54 @@ fn main() -> Result<()> {
                                     ""
                                 }
                             );
+                            continue;
+                        }
+                        "/save" => {
+                            if rest.is_empty() {
+                                eprintln!("usage: /save <path>");
+                                continue;
+                            }
+                            // `len()` counts the system message as
+                            // one of the saved entries; "messages"
+                            // is the honest label (a "turn" is
+                            // colloquially user+assistant).
+                            match write_transcript(&history, Path::new(rest)) {
+                                Ok(()) => eprintln!(
+                                    "(saved {} message{} to {rest})",
+                                    history.len(),
+                                    if history.len() == 1 { "" } else { "s" }
+                                ),
+                                Err(e) => eprintln!("error: /save failed: {e}"),
+                            }
+                            continue;
+                        }
+                        "/system" => {
+                            // Empty arg removes the system message
+                            // (the user-facing off-switch). Non-empty
+                            // arg replaces or inserts at index 0.
+                            // Either way, the per-turn loop's own
+                            // `session.reset()` will flush KV state
+                            // before the next prefill.
+                            if rest.is_empty() {
+                                let removed = history.first().is_some_and(|m| m.role == "system");
+                                if removed {
+                                    history.remove(0);
+                                    eprintln!("(system prompt removed)");
+                                } else {
+                                    eprintln!("(no system prompt was set)");
+                                }
+                                continue;
+                            }
+                            let new_msg = wick::tokenizer::ChatMessage {
+                                role: "system".into(),
+                                content: rest.to_string(),
+                            };
+                            if history.first().is_some_and(|m| m.role == "system") {
+                                history[0] = new_msg;
+                            } else {
+                                history.insert(0, new_msg);
+                            }
+                            eprintln!("(system prompt updated)");
                             continue;
                         }
                         other => {
@@ -1942,7 +2065,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         Cli, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, split_at_marker, write_wav,
+        resolve_engine, split_at_marker, write_transcript, write_wav,
     };
     use clap::Parser;
 
@@ -2310,6 +2433,65 @@ mod tests {
         );
         // Hypothetical future non-GGUF bundle: passes through.
         assert_eq!(display_bundle_id("LFM3-MLX"), "LFM3-MLX");
+    }
+
+    /// `write_transcript` round-trips a small history: one block
+    /// per turn shaped `<role>: <content>\n`, blank line between
+    /// turns, trailing newline at file end. Multi-line content
+    /// passes through verbatim (no escaping).
+    #[test]
+    fn write_transcript_round_trips_basic() {
+        use wick::tokenizer::ChatMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.txt");
+        let history = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Hello!".into(),
+            },
+        ];
+        write_transcript(&history, &path).unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        let want = "system: You are helpful.\n\nuser: Hi\n\nassistant: Hello!\n";
+        assert_eq!(got, want);
+    }
+
+    /// Empty history → empty file (still creates the file). Lets
+    /// `/save` succeed before any turns and overwrite with a
+    /// transcript later.
+    #[test]
+    fn write_transcript_empty_history_writes_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        write_transcript(&[], &path).unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!(got.is_empty(), "expected empty file, got {got:?}");
+    }
+
+    /// Multi-line content (code blocks, paragraph breaks)
+    /// round-trips verbatim. We don't escape `\n` because the
+    /// transcript is for human reading; users can compare side
+    /// by side with the rendered chat.
+    #[test]
+    fn write_transcript_handles_multiline_content() {
+        use wick::tokenizer::ChatMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: "line one\nline two\nline three".into(),
+        }];
+        write_transcript(&history, &path).unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, "assistant: line one\nline two\nline three\n");
     }
 
     /// `split_at_marker` happy path: a marker in the middle of a
