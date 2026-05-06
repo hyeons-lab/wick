@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -85,6 +85,69 @@ impl ModalitySink for ChatSink<'_> {
         self.buffer.push_str(&piece);
     }
     fn on_done(&mut self, _reason: FinishReason) {}
+}
+
+/// `BundleRepo` progress callback that renders a single-line live status to
+/// stderr while bundle files stream in. Prevents a multi-MB cache-miss
+/// download from looking like a hung process when `wick chat --bundle-id`
+/// runs the first time.
+///
+/// Trait throttling is handled by the library (~1 call per 256 KB written +
+/// once at end-of-stream) so this just formats and rewrites the line.
+/// Multiple files in one resolve (manifest.json then the GGUF) are
+/// distinguished by `url`; on a URL change we emit a newline first so the
+/// previous file's final progress line stays visible.
+#[derive(Debug, Default)]
+struct CliDownloadProgress {
+    last_url: Mutex<Option<String>>,
+    /// `true` once `on_progress` has been called at least once. Used by
+    /// the caller to decide whether to emit a trailing newline after the
+    /// resolve — cache hits never call back, so an unconditional newline
+    /// would leak a blank line on every silent resolve.
+    printed_any: AtomicBool,
+}
+
+impl CliDownloadProgress {
+    fn printed_any(&self) -> bool {
+        self.printed_any.load(Ordering::Relaxed)
+    }
+}
+
+impl wick::bundle::DownloadProgress for CliDownloadProgress {
+    fn on_progress(&self, url: &str, bytes: u64, total: Option<u64>) {
+        self.printed_any.store(true, Ordering::Relaxed);
+        // URL transition → seal the prior line with a newline so it stays
+        // legible after the next file's progress overwrites the position.
+        {
+            let mut guard = self
+                .last_url
+                .lock()
+                .expect("CliDownloadProgress lock poisoned");
+            let new_file = guard.as_deref() != Some(url);
+            if new_file {
+                if guard.is_some() {
+                    eprintln!();
+                }
+                *guard = Some(url.to_string());
+            }
+        }
+
+        let filename = url.rsplit('/').next().unwrap_or(url);
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let line = match total {
+            Some(t) if t > 0 => {
+                let total_mb = t as f64 / (1024.0 * 1024.0);
+                let pct = ((bytes * 100) / t).min(100);
+                format!("\rDownloading {filename}: {pct:>3}% ({mb:>6.1} / {total_mb:.1} MiB)")
+            }
+            // No Content-Length — chunked-transfer or HEAD-less stream.
+            // Show bytes downloaded only.
+            _ => format!("\rDownloading {filename}: {mb:>6.1} MiB"),
+        };
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(line.as_bytes());
+        let _ = err.flush();
+    }
 }
 
 #[derive(Parser)]
@@ -281,11 +344,29 @@ enum Command {
         quant: Option<String>,
 
         /// Cache root: shared between `--bundle-id` downloads
-        /// (under `<dir>/huggingface.co/...`) and (future) KV
-        /// prefix cache files (under `<dir>/kv/`). Default:
-        /// `$HOME/.cache/wick`.
+        /// (under `<dir>/huggingface.co/...`) and the KV prefix
+        /// cache (under `<dir>/kv/`). Default: `$HOME/.cache/wick`.
+        /// The disk-tier prefix cache survives process restarts —
+        /// useful for mobile / FFI consumers that get killed and
+        /// resumed; on next launch the historical conversation
+        /// prefix rehydrates instead of re-prefilling cold.
         #[arg(long)]
         cache_dir: Option<String>,
+
+        /// Max warm (in-memory) prefix-cache size in MB. Default 256.
+        #[arg(long, default_value_t = 256)]
+        cache_warm_mb: u64,
+
+        /// Max cold (disk) prefix-cache size in GB. Default 10.
+        /// Only consumed when `--cache-dir` (or default) is writable.
+        #[arg(long, default_value_t = 10)]
+        cache_disk_gb: u64,
+
+        /// Disable the KV prefix cache entirely. Bundle downloads
+        /// still use `--cache-dir` (this flag only gates the KV
+        /// prefix cache, not the bundle store).
+        #[arg(long)]
+        no_cache: bool,
 
         /// Optional system prompt pinned at the head of the
         /// conversation. Carried through every turn unchanged.
@@ -491,8 +572,15 @@ fn load_engine_from_spec(
                 "Resolving bundle `{id}` (quant `{quant}`) into cache `{}`…",
                 cache_dir.display()
             );
-            let repo = wick::bundle::BundleRepo::new(cache_dir);
-            WickEngine::from_bundle_id(
+            // Concrete `Arc<CliDownloadProgress>` first so we can check
+            // `printed_any` after the resolve; coerce to `Arc<dyn ...>`
+            // only at the BundleRepo call site.
+            let progress = Arc::new(CliDownloadProgress::default());
+            let repo = wick::bundle::BundleRepo::with_progress(
+                cache_dir,
+                progress.clone() as Arc<dyn wick::bundle::DownloadProgress>,
+            );
+            let engine = WickEngine::from_bundle_id(
                 id,
                 quant,
                 EngineConfig {
@@ -500,7 +588,15 @@ fn load_engine_from_spec(
                     backend,
                     bundle_repo: Some(repo),
                 },
-            )?
+            )?;
+            // Seal the final progress line — but only if any progress
+            // actually printed. Cache hits resolve without firing the
+            // callback, and an unconditional newline would leak a blank
+            // line on every silent resolve.
+            if progress.printed_any() {
+                eprintln!();
+            }
+            engine
         }
     };
     eprintln!(
@@ -514,6 +610,48 @@ fn load_engine_from_spec(
         engine.metadata().architecture,
     );
     Ok(engine)
+}
+
+/// Configure the engine's KV prefix cache from the four CLI flags shared by
+/// `Run` and `Chat`. Encapsulates the `<root>/kv` derivation rule + the
+/// `--no-cache` short-circuit so both subcommands stay in sync.
+///
+/// Behavior:
+/// - `no_cache == true` → all-zeros config (warm + cold both disabled).
+/// - explicit `--cache-dir foo` → KV files under `foo/kv` (peer of
+///   `foo/huggingface.co/...` for bundle downloads).
+/// - default `$HOME/.cache/wick/kv` when `$HOME` is set.
+/// - no `$HOME` and no `--cache-dir` → KV stays disabled (TMPDIR fallback
+///   in `default_cache_dir()` is bundle-only).
+fn configure_prefix_cache(
+    engine: &WickEngine,
+    cache_dir: Option<&str>,
+    no_cache: bool,
+    cache_warm_mb: u64,
+    cache_disk_gb: u64,
+) {
+    if no_cache {
+        engine.configure_cache(wick::kv_cache::KvCacheConfig {
+            cache_dir: None,
+            max_warm_entries: 0,
+            max_warm_bytes: 0,
+            max_cold_bytes: 0,
+        });
+        return;
+    }
+    let kv_dir: Option<PathBuf> = if let Some(d) = cache_dir {
+        Some(PathBuf::from(d).join("kv"))
+    } else if std::env::var_os("HOME").is_some() {
+        Some(default_cache_dir().join("kv"))
+    } else {
+        None
+    };
+    engine.configure_cache(wick::kv_cache::KvCacheConfig {
+        cache_dir: kv_dir,
+        max_warm_entries: 32,
+        max_warm_bytes: cache_warm_mb * 1024 * 1024,
+        max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
+    });
 }
 
 /// (p10, p50, p90, mean, stddev)
@@ -913,35 +1051,14 @@ fn main() -> Result<()> {
 
             let kv_compression = setup_kv_compression(engine.model(), &kv_cache_keys)?;
 
-            // Configure KV prefix cache.
-            if no_cache {
-                engine.configure_cache(wick::kv_cache::KvCacheConfig {
-                    cache_dir: None,
-                    max_warm_entries: 0,
-                    max_warm_bytes: 0,
-                    max_cold_bytes: 0,
-                });
-            } else {
-                // Derive `<root>/kv` consistently. Explicit `--cache-dir foo`
-                // yields `foo/kv`; default yields `$HOME/.cache/wick/kv` via
-                // the shared `default_cache_dir()` helper. KV stays disabled
-                // when `$HOME` is unset (TMPDIR fallback is bundle-only).
-                // Keeps KV files and bundle downloads (under
-                // `<root>/huggingface.co/...`) in distinct subtrees.
-                let dir: Option<PathBuf> = if let Some(d) = cache_dir {
-                    Some(PathBuf::from(d).join("kv"))
-                } else if std::env::var_os("HOME").is_some() {
-                    Some(default_cache_dir().join("kv"))
-                } else {
-                    None
-                };
-                engine.configure_cache(wick::kv_cache::KvCacheConfig {
-                    cache_dir: dir,
-                    max_warm_entries: 32,
-                    max_warm_bytes: cache_warm_mb * 1024 * 1024,
-                    max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
-                });
-            }
+            // Configure KV prefix cache (shared logic with `Chat`).
+            configure_prefix_cache(
+                &engine,
+                cache_dir.as_deref(),
+                no_cache,
+                cache_warm_mb,
+                cache_disk_gb,
+            );
 
             // Audio-input path (mutually exclusive with --vocoder via clap
             // `conflicts_with`). Skips the chat-template / token-building
@@ -1310,6 +1427,9 @@ fn main() -> Result<()> {
             bundle_id,
             quant,
             cache_dir,
+            cache_warm_mb,
+            cache_disk_gb,
+            no_cache,
             system,
             device,
             context_size,
@@ -1328,6 +1448,17 @@ fn main() -> Result<()> {
                 context_size,
             )?;
             let tokenizer = engine.tokenizer();
+
+            // Configure the KV prefix cache (shared logic with `Run`).
+            // Cross-restart disk-tier caching is the win for mobile / FFI
+            // consumers whose process can be killed and resumed.
+            configure_prefix_cache(
+                &engine,
+                cache_dir.as_deref(),
+                no_cache,
+                cache_warm_mb,
+                cache_disk_gb,
+            );
 
             // Up-front chat-template probe: fail before the user types
             // anything if the model has no template metadata. Without this,
@@ -1726,7 +1857,10 @@ mod tests {
 
     /// `chat` must also accept the full v1 flag surface together —
     /// guards against a flag rename / clap drift breaking the
-    /// documented invocation.
+    /// documented invocation. Includes the KV prefix cache flags
+    /// (`--cache-warm-mb`, `--cache-disk-gb`, `--no-cache`) so the
+    /// mobile-app "survive process restart" config path stays
+    /// parsable.
     #[test]
     fn chat_subcommand_parses_full_flags() {
         let r = Cli::try_parse_from([
@@ -1746,10 +1880,28 @@ mod tests {
             "0.5",
             "--seed",
             "42",
+            "--cache-dir",
+            "/tmp/cache",
+            "--cache-warm-mb",
+            "128",
+            "--cache-disk-gb",
+            "5",
         ]);
         assert!(
             r.is_ok(),
             "expected full `chat` flag surface to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `chat --no-cache` must parse cleanly — explicit opt-out of
+    /// the KV prefix cache for users who'd rather not write to disk.
+    #[test]
+    fn chat_subcommand_parses_no_cache() {
+        let r = Cli::try_parse_from(["wick", "chat", "--model", "/tmp/x", "--no-cache"]);
+        assert!(
+            r.is_ok(),
+            "expected `chat --no-cache` to parse, got: {:?}",
             r.err()
         );
     }
