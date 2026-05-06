@@ -931,7 +931,7 @@ fn load_text_model(
         BackendPreference::Cpu => model::load_model(gguf, path, cfg.context_size)
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}"))),
         #[cfg(feature = "gpu")]
-        BackendPreference::Gpu => model::load_model_gpu(gguf, cfg.context_size)
+        BackendPreference::Gpu => model::load_model_gpu(gguf, path, cfg.context_size)
             .map_err(|e| WickError::Backend(format!("GPU model load failed: {e}"))),
         #[cfg(not(feature = "gpu"))]
         BackendPreference::Gpu => Err(WickError::Backend(
@@ -988,7 +988,7 @@ fn load_text_model_auto(
         // Path guaranteed present (short-circuited above otherwise).
         let p = path.expect("path guaranteed by early return");
         let gguf_for_gpu = clone_gguf_like(&gguf, p)?;
-        match model::load_model_gpu(gguf_for_gpu, context_size) {
+        match model::load_model_gpu(gguf_for_gpu, Some(p), context_size) {
             Ok(m) => {
                 tracing::debug!("wick::engine: using wgpu GPU backend (auto)");
                 return Ok(m);

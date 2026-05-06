@@ -336,16 +336,28 @@ pub fn load_model(
 }
 
 /// Load a model with GPU acceleration.
+///
+/// `path` (when supplied) is used as the model identifier for prefix-cache
+/// namespacing. `None` is the path-less from_bytes case — warm cache works
+/// but disk-cache files would namespace-collide between distinct models.
 #[cfg(feature = "gpu")]
-pub fn load_model_gpu(gguf: GgufFile, context_size: usize) -> Result<Box<dyn Model>> {
+pub fn load_model_gpu(
+    gguf: GgufFile,
+    path: Option<&std::path::Path>,
+    context_size: usize,
+) -> Result<Box<dyn Model>> {
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
+    let model_id = path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf(
+        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
             gguf,
             context_size,
+            model_id,
         )?)),
         other => bail!("unsupported architecture for GPU: {other}"),
     }
