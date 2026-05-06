@@ -212,4 +212,58 @@ fn vl_bundle_loads_text_only() {
         !sink.0.is_empty(),
         "VL bundle produced zero tokens — chat template / forward / sink wiring broken"
     );
+
+    // ── Phase-2 slice 2+3: ViT + projector forward smoke. ──
+    //
+    // Feed a synthetic constant image (`[3, 256, 256]` of 0.0 —
+    // exercises every stage without needing real preprocessor
+    // output) through the full vision encoder and assert the
+    // image-token output is well-formed:
+    //   * length = n_image_tokens × projection_dim = 64 × 1024
+    //   * all values finite (catches NaN/Inf from broken
+    //     softmax / norm / projector arithmetic)
+    //   * not all zero (catches a forward path that short-
+    //     circuits without doing any real work)
+    //   * magnitudes in a sane range (catches numerical
+    //     blow-up that would still be finite)
+    //
+    // **TODO(parity):** these checks are deliberately weak —
+    // they would pass even on a forward pass that's wrong-but-
+    // plausible (e.g. a kernel-stride bug producing scrambled
+    // values). Strong correctness gate (parity vs llama.cpp's
+    // `clip.cpp` on a real image, with strict numerical
+    // tolerance) lands in Phase 3 alongside the image
+    // preprocessor + real fixture. Two known assumptions also
+    // need verification then: (1) GELU variant — wick uses
+    // `cpu::gelu_erf_inplace` (erf-form), llama.cpp's
+    // `ggml_gelu` is the tanh approximation; ~1e-5
+    // per-element drift if mismatched. (2) Pixel-shuffle 2×2
+    // ordering — wick concatenates source patches in
+    // `(sr·sf + sc)` row-major order; clip.cpp's traversal
+    // direction needs a reference vector to confirm.
+    let ve = engine
+        .vision_encoder()
+        .expect("vision_encoder still attached");
+    let n_pix = 3 * ve.config.image_size * ve.config.image_size;
+    let zeros = vec![0.0f32; n_pix];
+    let img_tokens = ve
+        .encode_image(&zeros)
+        .expect("encode_image should succeed on a zero-input image");
+    let expected_n = (ve.config.n_patches / (ve.config.scale_factor * ve.config.scale_factor))
+        * ve.config.projection_dim;
+    assert_eq!(img_tokens.len(), expected_n, "image-token output length");
+    assert!(
+        img_tokens.iter().all(|v| v.is_finite()),
+        "encode_image produced non-finite values"
+    );
+    let max_abs = img_tokens.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    assert!(
+        max_abs > 0.0,
+        "encode_image returned all zeros — forward likely short-circuited"
+    );
+    assert!(
+        max_abs < 1e3,
+        "encode_image returned implausibly large values (max abs = {max_abs}) — \
+         numerical blow-up somewhere in the pipeline"
+    );
 }

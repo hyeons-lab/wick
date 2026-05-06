@@ -164,19 +164,19 @@ impl VisionEncoderConfig {
     }
 }
 
-/// Patch-embed Conv2D weights. The kernel is stored 4D
-/// `[patch_size, patch_size, 3, n_embd]` per the GGUF layout; the
-/// loader keeps it raw so the forward pass can reinterpret it
-/// without a copy.
+/// Patch-embed Conv2D weights, pre-transposed at load time into
+/// row-major `[n_embd × in_dim]` where `in_dim = 3·patch_size²`.
+/// The conv-with-stride-equal-to-kernel-size collapses to a per-
+/// patch GEMV, so storing the kernel as a plain `[out × in]`
+/// matrix (rather than the 4D GGUF layout `[kw, kh, ic, oc]`)
+/// lets the forward pass call `cpu::matmul_f32` directly with no
+/// per-image transpose.
 pub struct PatchEmbedWeights {
-    /// `v.patch_embd.weight` — flattened conv kernel.
+    /// Row-major `[n_embd × in_dim]` kernel ready for GEMV. Built
+    /// from `v.patch_embd.weight` once at load time.
     pub conv_w: Vec<f32>,
     /// `v.patch_embd.bias` — `[n_embd]`.
     pub conv_b: Vec<f32>,
-    /// Original GGUF shape (`[patch_size, patch_size, 3, n_embd]`).
-    /// Preserved for the forward pass; not used at load time
-    /// beyond the shape sanity check below.
-    pub shape: Vec<usize>,
 }
 
 /// One ViT block's weight set. Pre-norm self-attention + GELU MLP
@@ -253,10 +253,17 @@ impl VisionEncoderWeights {
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         let config = VisionEncoderConfig::from_gguf(gguf)?;
 
-        // Patch embed Conv2D kernel `[patch_size, patch_size, 3,
-        // n_embd]` — kept raw so the forward pass can reinterpret
-        // without a copy. Validate the shape so a future schema
-        // change surfaces here, not during inference.
+        // Patch embed Conv2D kernel `[kw, kh, ic, oc]` in GGUF
+        // layout — `kw` innermost (stride 1), `oc` outermost
+        // (stride `kw·kh·ic`), matching the same convention
+        // `F32Weight::from_tensor` uses for 2D shapes (rightmost-
+        // in-shape is the outermost axis).
+        //
+        // The forward pass treats Conv2D-with-stride-equal-to-
+        // kernel-size as a per-patch GEMV against a
+        // `[n_embd × (3·patch_size²)]` matrix; transpose into
+        // that row-major layout once here so `encode_image`
+        // doesn't have to rebuild it on every call.
         let patch_t = gguf
             .get_tensor("v.patch_embd.weight")
             .context("loading v.patch_embd.weight")?;
@@ -272,17 +279,33 @@ impl VisionEncoderWeights {
             config.patch_size,
             config.n_embd,
         );
-        let patch_embed = PatchEmbedWeights {
-            conv_w: patch_t.to_f32_vec(),
-            conv_b: load_vec_f32(gguf, "v.patch_embd.bias")?,
-            shape: patch_shape,
-        };
+        let raw = patch_t.to_f32_vec();
+        let p = config.patch_size;
+        let in_dim = 3 * p * p;
+        let out_dim = config.n_embd;
+        // Row-major destination `[out_dim × in_dim]` where
+        // `in_dim` flattens `(c, kh, kw)`. Source GGUF stride:
+        // `linear(kw, kh, c, oc) = kw + p·kh + p²·c + p²·3·oc`.
+        let mut conv_w = vec![0f32; out_dim * in_dim];
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let src = kw + p * kh + p * p * c + p * p * 3 * oc;
+                        let dst_in_idx = c * p * p + kh * p + kw;
+                        conv_w[oc * in_dim + dst_in_idx] = raw[src];
+                    }
+                }
+            }
+        }
+        let conv_b = load_vec_f32(gguf, "v.patch_embd.bias")?;
         anyhow::ensure!(
-            patch_embed.conv_b.len() == config.n_embd,
+            conv_b.len() == config.n_embd,
             "v.patch_embd.bias len ({}) != n_embd ({})",
-            patch_embed.conv_b.len(),
+            conv_b.len(),
             config.n_embd,
         );
+        let patch_embed = PatchEmbedWeights { conv_w, conv_b };
 
         // Position embedding `[n_patches × n_embd]`. MmapWeight
         // would also work but the forward pass treats this as a
@@ -383,6 +406,354 @@ impl VisionEncoderWeights {
             projector,
         })
     }
+
+    /// Run the vision encoder + projector on a normalised image.
+    ///
+    /// Input: `[3 × image_size × image_size]` f32 in NCHW layout
+    /// (RGB, already normalised via `image_mean` / `image_std`
+    /// from `config`). The image preprocessor (decode + resize +
+    /// normalize) is the caller's responsibility for now;
+    /// `Session::append_image` (next slice) wires that up.
+    ///
+    /// Output: `[n_image_tokens × projection_dim]` f32 = `[64,
+    /// 1024]` for LFM2.5-VL-450M. Ready to splice into the LFM2
+    /// token stream at `<image>` placeholders.
+    ///
+    /// Pipeline (per `project_vl_architecture.md`):
+    /// `image → patch_embed → +position_embed → 12 × ViT block
+    /// → post_ln → pixel-shuffle 2×2 → mm.1+GELU → mm.2`.
+    pub fn encode_image(&self, image: &[f32]) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        let n_pix = 3 * cfg.image_size * cfg.image_size;
+        anyhow::ensure!(
+            image.len() == n_pix,
+            "encode_image: input length {} != 3*image_size² ({n_pix})",
+            image.len()
+        );
+
+        // 1. Patch embed: [3, H, W] → [n_patches, n_embd]
+        let mut tokens = self.patch_embed_forward(image);
+
+        // 2. Add learnable position embeddings.
+        debug_assert_eq!(self.position_embed.len(), cfg.n_patches * cfg.n_embd);
+        for (t, p) in tokens.iter_mut().zip(self.position_embed.iter()) {
+            *t += *p;
+        }
+
+        // 3. 12 × ViT block. Allocate scratch once and reuse.
+        let mut scratch = VitScratch::new(cfg);
+        for block in &self.blocks {
+            self.vit_block_forward(&mut tokens, block, &mut scratch);
+        }
+
+        // 4. post_ln (per token).
+        for t in 0..cfg.n_patches {
+            let row = &mut tokens[t * cfg.n_embd..(t + 1) * cfg.n_embd];
+            crate::backend::cpu::layer_norm_inplace(row, &self.post_ln_w, &self.post_ln_b, cfg.eps);
+        }
+
+        // 5. Pixel-shuffle 2×2: 16×16 patches → 8×8 = 64 tokens
+        //    with 4× channel inflation (768 → 3072).
+        let pooled = pixel_shuffle_2x2(&tokens, cfg);
+
+        // 6. Projector: mm.1 (3072 → 2048) + GELU + mm.2 (2048 → 1024).
+        Ok(self.projector_forward(&pooled, cfg))
+    }
+
+    /// Patch embed forward: a Conv2D with kernel=patch_size and
+    /// stride=patch_size is mathematically equivalent to a per-
+    /// patch GEMV — we extract each `patch_size × patch_size × 3`
+    /// chunk as a `3·patch_size²`-dim vector and matmul against
+    /// the kernel pre-transposed at load time to row-major
+    /// `[n_embd × in_dim]`. The patch-input layout `(c, kh, kw)`
+    /// (c outermost, kw innermost) matches the loader's
+    /// row-layout for `conv_w`; the GEMV is just two matrices
+    /// multiplied with no per-call transpose.
+    fn patch_embed_forward(&self, image: &[f32]) -> Vec<f32> {
+        let cfg = &self.config;
+        let p = cfg.patch_size;
+        let grid = cfg.image_size / p; // 16 for 256/16
+        let in_dim = 3 * p * p; // 3*16*16 = 768
+        let out_dim = cfg.n_embd;
+        debug_assert_eq!(
+            self.patch_embed.conv_w.len(),
+            out_dim * in_dim,
+            "patch_embed.conv_w length should be out_dim*in_dim after load-time transpose"
+        );
+
+        // Build per-patch input vectors `[n_patches × in_dim]`,
+        // matching the loader's `(c, kh, kw)` row-layout for
+        // `conv_w`.
+        let h_stride = cfg.image_size;
+        let c_stride = cfg.image_size * cfg.image_size;
+        let n_patches = cfg.n_patches;
+        let mut patches = vec![0f32; n_patches * in_dim];
+        for (gr, gc) in (0..grid).flat_map(|r| (0..grid).map(move |c| (r, c))) {
+            let patch_idx = gr * grid + gc;
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let pixel_r = gr * p + kh;
+                        let pixel_c = gc * p + kw;
+                        let in_idx = c * p * p + kh * p + kw;
+                        let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
+                        patches[patch_idx * in_dim + in_idx] = image[img_idx];
+                    }
+                }
+            }
+        }
+
+        // [n_patches, in_dim] · [n_embd, in_dim]^T → [n_patches, n_embd].
+        // `matmul_f32(a, b, c, m, n, k)` computes `c = a · b^T`
+        // where a is `[m × k]`, b is `[n × k]`, c is `[m × n]`.
+        let mut out = vec![0f32; n_patches * out_dim];
+        crate::backend::cpu::matmul_f32(
+            &patches,
+            &self.patch_embed.conv_w,
+            &mut out,
+            n_patches,
+            out_dim,
+            in_dim,
+        );
+
+        // Add bias (per-output-channel).
+        for token in 0..n_patches {
+            let row = &mut out[token * out_dim..(token + 1) * out_dim];
+            for (o, b) in row.iter_mut().zip(self.patch_embed.conv_b.iter()) {
+                *o += *b;
+            }
+        }
+        out
+    }
+
+    /// One ViT transformer block: pre-norm self-attention with
+    /// residual + pre-norm GELU MLP with residual. In-place on
+    /// `tokens` so the residual chain stays in one buffer.
+    fn vit_block_forward(
+        &self,
+        tokens: &mut [f32],
+        block: &VitBlockWeights,
+        scratch: &mut VitScratch,
+    ) {
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let n_head = cfg.n_head;
+        let head_dim = n_embd / n_head;
+        let n_tokens = cfg.n_patches;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // ── Pre-attention ──
+        // Copy tokens into `pre_norm` so we can LN it without
+        // clobbering the residual.
+        scratch.pre_norm.copy_from_slice(tokens);
+        for t in 0..n_tokens {
+            let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+            crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
+        }
+
+        // Q/K/V projections per token. Each is [n_embd × n_embd]
+        // (12 heads × 64 head_dim = 768).
+        for t in 0..n_tokens {
+            let pre_row = &scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+            let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
+            let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
+            let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
+            block.q_w.gemv(pre_row, q_row);
+            block.k_w.gemv(pre_row, k_row);
+            block.v_w.gemv(pre_row, v_row);
+            // Add per-head biases.
+            for (q, b) in q_row.iter_mut().zip(block.q_b.iter()) {
+                *q += *b;
+            }
+            for (k, b) in k_row.iter_mut().zip(block.k_b.iter()) {
+                *k += *b;
+            }
+            for (v, b) in v_row.iter_mut().zip(block.v_b.iter()) {
+                *v += *b;
+            }
+        }
+
+        // Multi-head scaled dot-product attention.
+        // Q/K/V are [n_tokens × (n_head·head_dim)]; we view them
+        // as [n_head, n_tokens, head_dim] by indexing into the
+        // contiguous buffer. `attn_out` and `scores` live in
+        // `VitScratch` so they're allocated once per
+        // `encode_image` call instead of per block.
+        for h in 0..n_head {
+            for q_idx in 0..n_tokens {
+                let q_off = q_idx * n_embd + h * head_dim;
+                let q = &scratch.q[q_off..q_off + head_dim];
+                // Compute attention scores for this query against
+                // every key in this head.
+                for (k_idx, score) in scratch.scores.iter_mut().enumerate() {
+                    let k_off = k_idx * n_embd + h * head_dim;
+                    let k = &scratch.k[k_off..k_off + head_dim];
+                    let dot: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+                    *score = dot * scale;
+                }
+                // Softmax over the n_tokens scores.
+                crate::backend::cpu::softmax_inplace(&mut scratch.scores);
+                // Weighted sum of V: `attn_out[q_idx, h, :] =
+                // Σ_k scores[k] * v[k, h, :]`.
+                let out_off = q_idx * n_embd + h * head_dim;
+                let out_slice = &mut scratch.attn_out[out_off..out_off + head_dim];
+                out_slice.iter_mut().for_each(|v| *v = 0.0);
+                for (k_idx, &s) in scratch.scores.iter().enumerate() {
+                    let v_off = k_idx * n_embd + h * head_dim;
+                    let v = &scratch.v[v_off..v_off + head_dim];
+                    for (o, vv) in out_slice.iter_mut().zip(v) {
+                        *o += s * vv;
+                    }
+                }
+            }
+        }
+
+        // Output projection + bias + residual add.
+        for t in 0..n_tokens {
+            let attn_row = &scratch.attn_out[t * n_embd..(t + 1) * n_embd];
+            let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
+            block.o_w.gemv(attn_row, proj_row);
+            for (o, b) in proj_row.iter_mut().zip(block.o_b.iter()) {
+                *o += *b;
+            }
+            // Residual: tokens += proj.
+            let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
+            for (tk, p) in tok_row.iter_mut().zip(proj_row.iter()) {
+                *tk += *p;
+            }
+        }
+
+        // ── MLP ──
+        scratch.pre_norm.copy_from_slice(tokens);
+        for t in 0..n_tokens {
+            let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+            crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
+        }
+        let n_ff = cfg.n_ff;
+        for t in 0..n_tokens {
+            let pre_row = &scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+            let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
+            block.ffn_up_w.gemv(pre_row, ff_row);
+            for (f, b) in ff_row.iter_mut().zip(block.ffn_up_b.iter()) {
+                *f += *b;
+            }
+            crate::backend::cpu::gelu_erf_inplace(ff_row);
+            // ffn_down: [n_embd × n_ff]
+            let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
+            block.ffn_down_w.gemv(ff_row, down_row);
+            for (d, b) in down_row.iter_mut().zip(block.ffn_down_b.iter()) {
+                *d += *b;
+            }
+            // Residual.
+            let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
+            for (tk, d) in tok_row.iter_mut().zip(down_row.iter()) {
+                *tk += *d;
+            }
+        }
+    }
+
+    /// Projector forward: pixel-shuffled `[64, 3072]` → `mm.1`
+    /// (3072 → 2048) + GELU → `mm.2` (2048 → 1024). Output:
+    /// `[64, 1024]` flattened.
+    fn projector_forward(&self, pooled: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
+        let p = &self.projector;
+        let in_dim = p.mm1_w.cols;
+        let mid_dim = p.mm1_w.rows; // intermediate (e.g., 2048)
+        let out_dim = cfg.projection_dim;
+        let n_tokens = pooled.len() / in_dim;
+
+        let mut mid = vec![0f32; n_tokens * mid_dim];
+        let mut out = vec![0f32; n_tokens * out_dim];
+        for t in 0..n_tokens {
+            let in_row = &pooled[t * in_dim..(t + 1) * in_dim];
+            let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
+            p.mm1_w.gemv(in_row, mid_row);
+            for (m, b) in mid_row.iter_mut().zip(p.mm1_b.iter()) {
+                *m += *b;
+            }
+            crate::backend::cpu::gelu_erf_inplace(mid_row);
+            let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
+            p.mm2_w.gemv(mid_row, out_row);
+            for (o, b) in out_row.iter_mut().zip(p.mm2_b.iter()) {
+                *o += *b;
+            }
+        }
+        out
+    }
+}
+
+/// Per-block scratch buffers for the ViT forward pass. Allocated
+/// once per `encode_image` and reused across all 12 blocks; sizes
+/// are derived from the encoder config (n_patches, n_embd, n_ff).
+struct VitScratch {
+    pre_norm: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    /// Attention output `[n_tokens × n_embd]` — reused across all
+    /// 12 blocks (was previously allocated per block).
+    attn_out: Vec<f32>,
+    /// Per-query attention scores `[n_tokens]` — softmax target
+    /// reused for every (head, query) pair.
+    scores: Vec<f32>,
+    attn_proj: Vec<f32>,
+    ffn_mid: Vec<f32>,
+    ffn_out: Vec<f32>,
+}
+
+impl VitScratch {
+    fn new(cfg: &VisionEncoderConfig) -> Self {
+        let n_pe = cfg.n_patches * cfg.n_embd;
+        let n_pf = cfg.n_patches * cfg.n_ff;
+        Self {
+            pre_norm: vec![0.0; n_pe],
+            q: vec![0.0; n_pe],
+            k: vec![0.0; n_pe],
+            v: vec![0.0; n_pe],
+            attn_out: vec![0.0; n_pe],
+            scores: vec![0.0; cfg.n_patches],
+            attn_proj: vec![0.0; n_pe],
+            ffn_mid: vec![0.0; n_pf],
+            ffn_out: vec![0.0; n_pe],
+        }
+    }
+}
+
+/// 2×2 pixel-shuffle (space-to-depth) over the patch grid.
+/// Reshapes `[grid × grid, n_embd]` → `[(grid/2) × (grid/2),
+/// n_embd · 4]` by concatenating each 2×2 patch group's
+/// channels in row-major order. Matches llama.cpp's
+/// `clip.cpp` LFM2 projector convention.
+fn pixel_shuffle_2x2(tokens: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
+    let grid = cfg.image_size / cfg.patch_size; // e.g. 16
+    let sf = cfg.scale_factor; // 2
+    debug_assert!(
+        sf > 0 && grid % sf == 0,
+        "patch grid size ({grid}) must be a multiple of scale_factor ({sf})"
+    );
+    let new_grid = grid / sf;
+    let n_embd = cfg.n_embd;
+    let new_dim = n_embd * sf * sf;
+    let n_out = new_grid * new_grid;
+    let mut out = vec![0f32; n_out * new_dim];
+    for or in 0..new_grid {
+        for oc in 0..new_grid {
+            let dst_off = (or * new_grid + oc) * new_dim;
+            // Walk the sf×sf source patches in (row-major) order
+            // — must match clip.cpp's traversal.
+            for sr in 0..sf {
+                for sc in 0..sf {
+                    let in_r = or * sf + sr;
+                    let in_c = oc * sf + sc;
+                    let src_off = (in_r * grid + in_c) * n_embd;
+                    let chan_base = (sr * sf + sc) * n_embd;
+                    out[dst_off + chan_base..dst_off + chan_base + n_embd]
+                        .copy_from_slice(&tokens[src_off..src_off + n_embd]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Read `[f32; 3]` from a GGUF f32-array metadata key. Errors if
@@ -540,4 +911,96 @@ fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
         tensor.shape().len()
     );
     Ok(tensor.to_f32_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth_cfg(grid: usize, n_embd: usize, scale_factor: usize) -> VisionEncoderConfig {
+        let patch_size = 16;
+        let image_size = grid * patch_size;
+        VisionEncoderConfig {
+            n_layer: 1,
+            n_embd,
+            n_ff: n_embd * 4,
+            n_head: 1,
+            eps: 1e-6,
+            image_size,
+            patch_size,
+            n_patches: grid * grid,
+            projection_dim: n_embd,
+            scale_factor,
+            image_mean: [0.0; 3],
+            image_std: [1.0; 3],
+        }
+    }
+
+    /// `pixel_shuffle_2x2` reshapes a 4×4 grid of single-channel
+    /// "tokens" into a 2×2 grid of 4-channel tokens, with the
+    /// per-token channels concatenated in row-major order over
+    /// the source 2×2 group. Verifying via a tagged input
+    /// (`patch_idx + 0.1·channel`) catches any mis-orderings
+    /// of the inner 2×2 traversal — exactly the bug-class that
+    /// would silently produce visually-OK but semantically-
+    /// wrong projector input.
+    #[test]
+    fn pixel_shuffle_2x2_reshapes_grid_in_row_major_order() {
+        // 4×4 patch grid, n_embd=1, scale_factor=2.
+        // Output should be a 2×2 grid with n_embd=4.
+        let cfg = synth_cfg(4, 1, 2);
+        let n_in = cfg.n_patches * cfg.n_embd; // 16 * 1 = 16
+        let mut tokens = vec![0f32; n_in];
+        for (i, t) in tokens.iter_mut().enumerate() {
+            *t = i as f32; // patch i has value i
+        }
+        let pooled = pixel_shuffle_2x2(&tokens, &cfg);
+        // 4 output tokens, each with 4 channels.
+        assert_eq!(pooled.len(), 4 * 4);
+
+        // Source patch indices grouped by 2×2 in the 4×4 grid:
+        //   [0]=(0,0) [1]=(0,1) | [2]=(0,2) [3]=(0,3)
+        //   [4]=(1,0) [5]=(1,1) | [6]=(1,2) [7]=(1,3)
+        //   ─────────────────────┼─────────────────────
+        //   [8]=(2,0) [9]=(2,1) | [10]=(2,2) [11]=(2,3)
+        //   [12]=(3,0)[13]=(3,1)| [14]=(3,2)[15]=(3,3)
+        // Output token (0,0) = patches [0,1,4,5] in (sr*sf+sc) order.
+        // Output token (0,1) = patches [2,3,6,7].
+        // Output token (1,0) = patches [8,9,12,13].
+        // Output token (1,1) = patches [10,11,14,15].
+        assert_eq!(&pooled[0..4], &[0.0, 1.0, 4.0, 5.0]);
+        assert_eq!(&pooled[4..8], &[2.0, 3.0, 6.0, 7.0]);
+        assert_eq!(&pooled[8..12], &[8.0, 9.0, 12.0, 13.0]);
+        assert_eq!(&pooled[12..16], &[10.0, 11.0, 14.0, 15.0]);
+    }
+
+    /// Multi-channel pixel-shuffle: each source patch carries
+    /// `n_embd` values that survive in-order in the output.
+    #[test]
+    fn pixel_shuffle_2x2_preserves_per_patch_channels() {
+        // 2×2 patch grid, n_embd=3, scale_factor=2 → single
+        // output token with 12 channels.
+        let cfg = synth_cfg(2, 3, 2);
+        // Patch i has channels [i*10, i*10+1, i*10+2].
+        let mut tokens = vec![0f32; 4 * 3];
+        for i in 0..4 {
+            for c in 0..3 {
+                tokens[i * 3 + c] = (i * 10 + c) as f32;
+            }
+        }
+        let pooled = pixel_shuffle_2x2(&tokens, &cfg);
+        assert_eq!(pooled.len(), 12);
+        // Output token gets patches in (sr=0,sc=0), (0,1), (1,0),
+        // (1,1) order — i.e. patches 0, 1, 2, 3 in the 2×2 grid.
+        // Each contributes its 3 channels in order.
+        assert_eq!(
+            pooled,
+            vec![
+                0.0, 1.0, 2.0, // patch 0
+                10.0, 11.0, 12.0, // patch 1
+                20.0, 21.0, 22.0, // patch 2
+                30.0, 31.0, 32.0, // patch 3
+            ]
+        );
+    }
 }
