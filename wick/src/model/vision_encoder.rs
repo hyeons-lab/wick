@@ -78,10 +78,16 @@ pub struct VisionEncoderConfig {
     pub image_size: usize,
     /// Square patch side length in pixels (typically 16).
     pub patch_size: usize,
-    /// Number of patches per image (`(image_size / patch_size)^2`).
-    /// Derived, not read — kept here so the forward pass doesn't
-    /// recompute it.
-    pub n_patches: usize,
+    /// Number of patches in the **trained** position-grid:
+    /// `(image_size / patch_size)²`. This is the row count of the
+    /// `position_embd.weight` tensor — the size at which the model
+    /// was trained. The **runtime** patch count is `grid_w *
+    /// grid_h` after dynamic-resolution resize and is computed
+    /// per-call by the preprocessor; when those don't match the
+    /// trained grid, position embeddings are bilinearly
+    /// interpolated to the dynamic dims (mirrors llama.cpp's
+    /// `clip_graph::resize_position_embeddings`).
+    pub n_trained_patches: usize,
     /// Projector output dimension; matches the LLM's
     /// `embedding_length` so projected image tokens drop straight
     /// into the LFM2 stream.
@@ -96,6 +102,20 @@ pub struct VisionEncoderConfig {
     pub image_mean: [f32; 3],
     /// Per-channel std for image normalisation.
     pub image_std: [f32; 3],
+    /// Lower bound on resized image area in pixels for the
+    /// dynamic-resolution preprocessor. Equal to
+    /// `n_tokens_min · (patch_size · scale_factor)²`. For LFM2-VL:
+    /// `64 · 32² = 65 536` (= 256² square baseline).
+    /// Source: llama.cpp's
+    /// `clip_model.h::set_limit_image_tokens(64, 256)` for
+    /// `PROJECTOR_TYPE_LFM2`. Hardcoded since no GGUF metadata
+    /// key surfaces it.
+    pub image_min_pixels: usize,
+    /// Upper bound on resized image area in pixels.
+    /// `n_tokens_max · (patch_size · scale_factor)² = 256 · 32² =
+    /// 262 144` (= 512² square baseline) for LFM2-VL. Inputs above
+    /// this band are scaled down preserving aspect ratio.
+    pub image_max_pixels: usize,
 }
 
 impl VisionEncoderConfig {
@@ -136,7 +156,7 @@ impl VisionEncoderConfig {
             patch_size > 0 && image_size % patch_size == 0,
             "image_size ({image_size}) must be a positive multiple of patch_size ({patch_size})"
         );
-        let n_patches = (image_size / patch_size).pow(2);
+        let n_trained_patches = (image_size / patch_size).pow(2);
 
         let projection_dim =
             gguf.get_u32(KEY_PROJECTION_DIM)
@@ -144,8 +164,23 @@ impl VisionEncoderConfig {
         let scale_factor =
             gguf.get_u32(KEY_SCALE_FACTOR)
                 .with_context(|| format!("missing `{KEY_SCALE_FACTOR}`"))? as usize;
+        anyhow::ensure!(
+            scale_factor > 0,
+            "scale_factor ({scale_factor}) must be > 0; a zero or missing value would \
+             collapse the pixel band and trip a divide-by-zero in `pixel_shuffle`",
+        );
         let image_mean = read_rgb_array(gguf, KEY_IMAGE_MEAN)?;
         let image_std = read_rgb_array(gguf, KEY_IMAGE_STD)?;
+
+        // LFM2-VL dynamic-resolution bounds, hardcoded per
+        // `clip_model.h::set_limit_image_tokens(64, 256)`. The
+        // `(min, max) = (64, 256) tokens` band converts to pixel
+        // bounds via `n_tokens · (patch_size · scale_factor)²`.
+        let n_tokens_min: usize = 64;
+        let n_tokens_max: usize = 256;
+        let pixels_per_token = (patch_size * scale_factor).pow(2);
+        let image_min_pixels = n_tokens_min * pixels_per_token;
+        let image_max_pixels = n_tokens_max * pixels_per_token;
 
         Ok(Self {
             n_layer,
@@ -155,11 +190,13 @@ impl VisionEncoderConfig {
             eps,
             image_size,
             patch_size,
-            n_patches,
+            n_trained_patches,
             projection_dim,
             scale_factor,
             image_mean,
             image_std,
+            image_min_pixels,
+            image_max_pixels,
         })
     }
 }
@@ -315,11 +352,13 @@ impl VisionEncoderWeights {
         );
         let patch_embed = PatchEmbedWeights { conv_w, conv_b };
 
-        // Position embedding `[n_patches × n_embd]`. MmapWeight
-        // would also work but the forward pass treats this as a
-        // plain matrix of patch-position rows; keep it as a flat
-        // Vec<f32> so the indexing reads as
-        // `position_embed[p * n_embd + i]`.
+        // Position embedding `[n_trained_patches × n_embd]`. The
+        // tensor stores embeddings for the *trained* grid only;
+        // dynamic-resolution inputs interpolate this into a
+        // per-call dynamic grid via [`interpolate_pos_embed_2d`].
+        // MmapWeight would also work but treating it as a flat
+        // Vec<f32> keeps the indexing readable
+        // (`position_embed[p * n_embd + i]`).
         let pos_t = gguf
             .get_tensor("v.position_embd.weight")
             .context("loading v.position_embd.weight")?;
@@ -327,10 +366,10 @@ impl VisionEncoderWeights {
         anyhow::ensure!(
             pos_shape.len() == 2
                 && pos_shape[0] == config.n_embd
-                && pos_shape[1] == config.n_patches,
-            "v.position_embd.weight shape {pos_shape:?} != [n_embd={}, n_patches={}]",
+                && pos_shape[1] == config.n_trained_patches,
+            "v.position_embd.weight shape {pos_shape:?} != [n_embd={}, n_trained_patches={}]",
             config.n_embd,
-            config.n_patches,
+            config.n_trained_patches,
         );
         let position_embed = pos_t.to_f32_vec();
 
@@ -415,57 +454,116 @@ impl VisionEncoderWeights {
         })
     }
 
-    /// Run the vision encoder + projector on a normalised image.
+    /// Run the vision encoder + projector on a preprocessed image
+    /// at the dynamic patch grid the preprocessor selected.
     ///
-    /// Input: `[3 × image_size × image_size]` f32 in NCHW layout
-    /// (RGB, already normalised via `image_mean` / `image_std`
-    /// from `config`). The image preprocessor (decode + resize +
-    /// normalize) is the caller's responsibility for now;
-    /// `Session::append_image` (next slice) wires that up.
+    /// `pixels` is `[3 × target_h × target_w]` f32 NCHW
+    /// (RGB, normalised via `image_mean` / `image_std`).
+    /// `(grid_w, grid_h)` are the patch-grid dimensions:
+    /// `target_w / patch_size` × `target_h / patch_size`. The
+    /// preprocessor returns these as part of `PreprocessedImage`.
     ///
-    /// Output: `[n_image_tokens × projection_dim]` f32 = `[64,
-    /// 1024]` for LFM2.5-VL-450M. Ready to splice into the LFM2
-    /// token stream at `<image>` placeholders.
+    /// Output: `[n_image_tokens × projection_dim]` f32 where
+    /// `n_image_tokens = (grid_w / scale_factor) · (grid_h /
+    /// scale_factor)`. For a 1024×771 input on LFM2.5-VL-450M
+    /// (target 576×416 → grid 36×26): 18·13 = 234 image tokens
+    /// of 1024 dims each.
     ///
-    /// Pipeline (per `project_vl_architecture.md`):
-    /// `image → patch_embed → +position_embed → 12 × ViT block
-    /// → post_ln → pixel-shuffle 2×2 → mm.1+GELU → mm.2`.
-    pub fn encode_image(&self, image: &[f32]) -> Result<Vec<f32>> {
+    /// Pipeline:
+    /// `pixels → patch_embed → +interpolated_pos_embed → 12 × ViT
+    /// block → post_ln → pixel-shuffle 2×2 → mm.1+GELU → mm.2`.
+    pub fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         let cfg = &self.config;
-        let n_pix = 3 * cfg.image_size * cfg.image_size;
+        anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
         anyhow::ensure!(
-            image.len() == n_pix,
-            "encode_image: input length {} != 3*image_size² ({n_pix})",
-            image.len()
+            cfg.scale_factor > 0,
+            "vision encoder config has scale_factor=0; refusing to divide by zero"
         );
+        anyhow::ensure!(
+            grid_w % cfg.scale_factor == 0 && grid_h % cfg.scale_factor == 0,
+            "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
+            cfg.scale_factor,
+        );
+        // Compute target image / patch counts with overflow checks —
+        // a malformed caller (or 32-bit target like wasm32 with a
+        // huge grid) shouldn't silently wrap and bypass the
+        // pixels.len() invariant below.
+        let target_w = grid_w
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_w·patch_size overflow"))?;
+        let target_h = grid_h
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_h·patch_size overflow"))?;
+        let n_pix = target_w
+            .checked_mul(target_h)
+            .and_then(|x| x.checked_mul(3))
+            .ok_or_else(|| anyhow::anyhow!("3·target_w·target_h overflow"))?;
+        anyhow::ensure!(
+            pixels.len() == n_pix,
+            "encode_image: pixels.len() {} != 3·target_w·target_h ({n_pix})",
+            pixels.len()
+        );
+        let n_patches = grid_w
+            .checked_mul(grid_h)
+            .ok_or_else(|| anyhow::anyhow!("grid_w·grid_h overflow"))?;
 
         // 1. Patch embed: [3, H, W] → [n_patches, n_embd]
-        let mut tokens = self.patch_embed_forward(image);
+        let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
 
-        // 2. Add learnable position embeddings.
-        debug_assert_eq!(self.position_embed.len(), cfg.n_patches * cfg.n_embd);
-        for (t, p) in tokens.iter_mut().zip(self.position_embed.iter()) {
+        // 2. Add position embeddings — interpolate from the trained
+        //    grid when the dynamic grid differs.
+        let pos = self.resolved_position_embed(grid_w, grid_h);
+        debug_assert_eq!(pos.len(), n_patches * cfg.n_embd);
+        for (t, p) in tokens.iter_mut().zip(pos.iter()) {
             *t += *p;
         }
 
-        // 3. 12 × ViT block. Allocate scratch once and reuse.
-        let mut scratch = VitScratch::new(cfg);
+        // 3. 12 × ViT block. Allocate scratch sized to the dynamic
+        //    grid and reuse across blocks.
+        let mut scratch = VitScratch::new(cfg, n_patches);
         for block in &self.blocks {
-            self.vit_block_forward(&mut tokens, block, &mut scratch);
+            self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
         }
 
         // 4. post_ln (per token).
-        for t in 0..cfg.n_patches {
+        for t in 0..n_patches {
             let row = &mut tokens[t * cfg.n_embd..(t + 1) * cfg.n_embd];
             crate::backend::cpu::layer_norm_inplace(row, &self.post_ln_w, &self.post_ln_b, cfg.eps);
         }
 
-        // 5. Pixel-shuffle 2×2: 16×16 patches → 8×8 = 64 tokens
-        //    with 4× channel inflation (768 → 3072).
-        let pooled = pixel_shuffle_2x2(&tokens, cfg);
+        // 5. Pixel-shuffle scale_factor² over the dynamic grid →
+        //    `(grid_w/sf) · (grid_h/sf)` tokens with sf² channel
+        //    inflation.
+        let pooled = pixel_shuffle(&tokens, cfg, grid_w, grid_h);
 
-        // 6. Projector: mm.1 (3072 → 2048) + GELU + mm.2 (2048 → 1024).
+        // 6. Projector: mm.1 + GELU + mm.2.
         Ok(self.projector_forward(&pooled, cfg))
+    }
+
+    /// Return position embeddings for the requested dynamic patch
+    /// grid, interpolating from the trained square grid when
+    /// needed. Borrows the trained tensor directly when it matches
+    /// to avoid the f32 copy.
+    fn resolved_position_embed(&self, grid_w: usize, grid_h: usize) -> std::borrow::Cow<'_, [f32]> {
+        let cfg = &self.config;
+        let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
+        debug_assert_eq!(
+            trained_side * trained_side,
+            cfg.n_trained_patches,
+            "non-square trained pos-embed grid is not currently supported"
+        );
+        if grid_w == trained_side && grid_h == trained_side {
+            std::borrow::Cow::Borrowed(self.position_embed.as_slice())
+        } else {
+            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+                &self.position_embed,
+                trained_side,
+                trained_side,
+                grid_h,
+                grid_w,
+                cfg.n_embd,
+            ))
+        }
     }
 
     /// Patch embed forward: a Conv2D with kernel=patch_size and
@@ -477,24 +575,21 @@ impl VisionEncoderWeights {
     /// matches the kernel's input flat-index, and the
     /// `[in × out]` kernel layout matches what `cpu::matmul_f32`
     /// reads for its `B` argument (standard `C = A · B`).
-    fn patch_embed_forward(&self, image: &[f32]) -> Vec<f32> {
-        patch_embed_compute(image, &self.patch_embed, &self.config)
-    }
-
     /// One ViT transformer block: pre-norm self-attention with
     /// residual + pre-norm GELU MLP with residual. In-place on
     /// `tokens` so the residual chain stays in one buffer.
+    /// `n_tokens` is the dynamic patch count (`grid_w · grid_h`).
     fn vit_block_forward(
         &self,
         tokens: &mut [f32],
         block: &VitBlockWeights,
         scratch: &mut VitScratch,
+        n_tokens: usize,
     ) {
         let cfg = &self.config;
         let n_embd = cfg.n_embd;
         let n_head = cfg.n_head;
         let head_dim = n_embd / n_head;
-        let n_tokens = cfg.n_patches;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         // ── Pre-attention ──
@@ -638,8 +733,9 @@ impl VisionEncoderWeights {
 }
 
 /// Per-block scratch buffers for the ViT forward pass. Allocated
-/// once per `encode_image` and reused across all 12 blocks; sizes
-/// are derived from the encoder config (n_patches, n_embd, n_ff).
+/// once per `encode_image` and reused across all 12 blocks; sized
+/// to the **dynamic** patch count picked by the preprocessor
+/// (`grid_w · grid_h`), not the trained-grid count.
 struct VitScratch {
     pre_norm: Vec<f32>,
     q: Vec<f32>,
@@ -657,16 +753,16 @@ struct VitScratch {
 }
 
 impl VitScratch {
-    fn new(cfg: &VisionEncoderConfig) -> Self {
-        let n_pe = cfg.n_patches * cfg.n_embd;
-        let n_pf = cfg.n_patches * cfg.n_ff;
+    fn new(cfg: &VisionEncoderConfig, n_tokens: usize) -> Self {
+        let n_pe = n_tokens * cfg.n_embd;
+        let n_pf = n_tokens * cfg.n_ff;
         Self {
             pre_norm: vec![0.0; n_pe],
             q: vec![0.0; n_pe],
             k: vec![0.0; n_pe],
             v: vec![0.0; n_pe],
             attn_out: vec![0.0; n_pe],
-            scores: vec![0.0; cfg.n_patches],
+            scores: vec![0.0; n_tokens],
             attn_proj: vec![0.0; n_pe],
             ffn_mid: vec![0.0; n_pf],
             ffn_out: vec![0.0; n_pe],
@@ -691,20 +787,24 @@ fn patch_embed_compute(
     image: &[f32],
     patch_embed: &PatchEmbedWeights,
     cfg: &VisionEncoderConfig,
+    grid_w: usize,
+    grid_h: usize,
 ) -> Vec<f32> {
     let p = cfg.patch_size;
-    let grid = cfg.image_size / p;
     let in_dim = 3 * p * p;
     let out_dim = cfg.n_embd;
+    let target_w = grid_w * p;
+    let target_h = grid_h * p;
     debug_assert_eq!(
         patch_embed.conv_w.len(),
         in_dim * out_dim,
         "patch_embed.conv_w length should be in_dim*out_dim after load-time transpose"
     );
+    debug_assert_eq!(image.len(), 3 * target_h * target_w);
 
-    let h_stride = cfg.image_size;
-    let c_stride = cfg.image_size * cfg.image_size;
-    let n_patches = cfg.n_patches;
+    let h_stride = target_w;
+    let c_stride = target_h * target_w;
+    let n_patches = grid_w * grid_h;
 
     // Per-patch math: extract the patch_size² × 3 chunk into a
     // pre-allocated `patch` scratch, run the matmul-as-matvec
@@ -721,8 +821,8 @@ fn patch_embed_compute(
     let conv_w = &patch_embed.conv_w;
     let conv_b = &patch_embed.conv_b;
     let compute_patch = |patch: &mut [f32], patch_idx: usize, out_row: &mut [f32]| {
-        let gr = patch_idx / grid;
-        let gc = patch_idx % grid;
+        let gr = patch_idx / grid_w;
+        let gc = patch_idx % grid_w;
         for c in 0..3 {
             for kh in 0..p {
                 for kw in 0..p {
@@ -753,9 +853,8 @@ fn patch_embed_compute(
     }
     #[cfg(not(feature = "parallel"))]
     {
-        // Hoisted out of the loop: 256 × 768 × 4 bytes = 768 KB
-        // saved per encode in the single-threaded path, plus the
-        // allocator pressure.
+        // Hoisted out of the loop to avoid `n_patches` small
+        // allocations in the serial path.
         let mut patch = vec![0f32; in_dim];
         for (patch_idx, out_row) in out.chunks_mut(out_dim).enumerate() {
             compute_patch(&mut patch, patch_idx, out_row);
@@ -764,33 +863,98 @@ fn patch_embed_compute(
     out
 }
 
-/// 2×2 pixel-shuffle (space-to-depth) over the patch grid.
-/// Reshapes `[grid × grid, n_embd]` → `[(grid/2) × (grid/2),
-/// n_embd · 4]` by concatenating each 2×2 patch group's
-/// channels in row-major order. Matches llama.cpp's
-/// `clip.cpp` LFM2 projector convention.
-fn pixel_shuffle_2x2(tokens: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
-    let grid = cfg.image_size / cfg.patch_size; // e.g. 16
-    let sf = cfg.scale_factor; // 2
+/// Bilinearly interpolate position embeddings from the trained
+/// `(in_h, in_w)` square grid to a dynamic `(out_h, out_w)` grid.
+/// Mirrors llama.cpp's `clip_graph::resize_position_embeddings`
+/// (`tools/mtmd/clip.cpp:272-292`) using
+/// `ggml_interpolate(GGML_SCALE_MODE_BILINEAR)` semantics: the
+/// pixel-centre convention is `out_pixel(r, c)` samples source
+/// fractional coords
+/// `((r + 0.5) · in_h / out_h - 0.5, (c + 0.5) · in_w / out_w
+/// - 0.5)`, clamped to `[0, in_dim - 1]`. Output layout is
+/// `[out_h × out_w, n_embd]` row-major, matching the patch order
+/// `encode_image` adds against.
+fn interpolate_pos_embed_2d(
+    pos: &[f32],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+    n_embd: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(pos.len(), in_h * in_w * n_embd);
+    let mut out = vec![0f32; out_h * out_w * n_embd];
+    let scale_y = in_h as f32 / out_h as f32;
+    let scale_x = in_w as f32 / out_w as f32;
+    let in_h_max = (in_h - 1) as f32;
+    let in_w_max = (in_w - 1) as f32;
+    for or in 0..out_h {
+        for oc in 0..out_w {
+            // Source fractional coords (centre-of-pixel convention).
+            let sy = ((or as f32 + 0.5) * scale_y - 0.5).clamp(0.0, in_h_max);
+            let sx = ((oc as f32 + 0.5) * scale_x - 0.5).clamp(0.0, in_w_max);
+            let y0 = sy.floor() as usize;
+            let x0 = sx.floor() as usize;
+            let y1 = (y0 + 1).min(in_h - 1);
+            let x1 = (x0 + 1).min(in_w - 1);
+            let dy = sy - y0 as f32;
+            let dx = sx - x0 as f32;
+            let w00 = (1.0 - dy) * (1.0 - dx);
+            let w01 = (1.0 - dy) * dx;
+            let w10 = dy * (1.0 - dx);
+            let w11 = dy * dx;
+            let dst = (or * out_w + oc) * n_embd;
+            let src00 = (y0 * in_w + x0) * n_embd;
+            let src01 = (y0 * in_w + x1) * n_embd;
+            let src10 = (y1 * in_w + x0) * n_embd;
+            let src11 = (y1 * in_w + x1) * n_embd;
+            for k in 0..n_embd {
+                out[dst + k] = w00 * pos[src00 + k]
+                    + w01 * pos[src01 + k]
+                    + w10 * pos[src10 + k]
+                    + w11 * pos[src11 + k];
+            }
+        }
+    }
+    out
+}
+
+/// `cfg.scale_factor`× pixel-shuffle (space-to-depth) over a
+/// non-square patch grid.
+/// Reshapes `[grid_h · grid_w, n_embd]` →
+/// `[(grid_h/sf) · (grid_w/sf), n_embd · sf²]` by concatenating
+/// each sf×sf patch group's channels in row-major (sr, sc) order.
+/// Matches llama.cpp's `clip_graph::build_patch_merge_permute`
+/// LFM2 projector convention; both grid dims must be divisible
+/// by `cfg.scale_factor` (the preprocessor's
+/// `align_size = patch_size · scale_factor` guarantees that).
+fn pixel_shuffle(
+    tokens: &[f32],
+    cfg: &VisionEncoderConfig,
+    grid_w: usize,
+    grid_h: usize,
+) -> Vec<f32> {
+    let sf = cfg.scale_factor;
     debug_assert!(
-        sf > 0 && grid % sf == 0,
-        "patch grid size ({grid}) must be a multiple of scale_factor ({sf})"
+        sf > 0 && grid_w % sf == 0 && grid_h % sf == 0,
+        "patch grid {grid_w}×{grid_h} must be divisible by scale_factor ({sf})"
     );
-    let new_grid = grid / sf;
+    let new_w = grid_w / sf;
+    let new_h = grid_h / sf;
     let n_embd = cfg.n_embd;
     let new_dim = n_embd * sf * sf;
-    let n_out = new_grid * new_grid;
+    let n_out = new_w * new_h;
     let mut out = vec![0f32; n_out * new_dim];
-    for or in 0..new_grid {
-        for oc in 0..new_grid {
-            let dst_off = (or * new_grid + oc) * new_dim;
+    for or in 0..new_h {
+        for oc in 0..new_w {
+            let dst_off = (or * new_w + oc) * new_dim;
             // Walk the sf×sf source patches in (row-major) order
             // — must match clip.cpp's traversal.
             for sr in 0..sf {
                 for sc in 0..sf {
                     let in_r = or * sf + sr;
                     let in_c = oc * sf + sc;
-                    let src_off = (in_r * grid + in_c) * n_embd;
+                    let src_off = (in_r * grid_w + in_c) * n_embd;
                     let chan_base = (sr * sf + sc) * n_embd;
                     out[dst_off + chan_base..dst_off + chan_base + n_embd]
                         .copy_from_slice(&tokens[src_off..src_off + n_embd]);
@@ -971,6 +1135,7 @@ mod tests {
     fn synth_cfg(grid: usize, n_embd: usize, scale_factor: usize) -> VisionEncoderConfig {
         let patch_size = 16;
         let image_size = grid * patch_size;
+        let pixels_per_token = (patch_size * scale_factor).pow(2);
         VisionEncoderConfig {
             n_layer: 1,
             n_embd,
@@ -979,15 +1144,17 @@ mod tests {
             eps: 1e-6,
             image_size,
             patch_size,
-            n_patches: grid * grid,
+            n_trained_patches: grid * grid,
             projection_dim: n_embd,
             scale_factor,
             image_mean: [0.0; 3],
             image_std: [1.0; 3],
+            image_min_pixels: 64 * pixels_per_token,
+            image_max_pixels: 256 * pixels_per_token,
         }
     }
 
-    /// `pixel_shuffle_2x2` reshapes a 4×4 grid of single-channel
+    /// `pixel_shuffle` reshapes a 4×4 grid of single-channel
     /// "tokens" into a 2×2 grid of 4-channel tokens, with the
     /// per-token channels concatenated in row-major order over
     /// the source 2×2 group. Verifying via a tagged input
@@ -1000,12 +1167,12 @@ mod tests {
         // 4×4 patch grid, n_embd=1, scale_factor=2.
         // Output should be a 2×2 grid with n_embd=4.
         let cfg = synth_cfg(4, 1, 2);
-        let n_in = cfg.n_patches * cfg.n_embd; // 16 * 1 = 16
+        let n_in = cfg.n_trained_patches * cfg.n_embd; // 16 * 1 = 16
         let mut tokens = vec![0f32; n_in];
         for (i, t) in tokens.iter_mut().enumerate() {
             *t = i as f32; // patch i has value i
         }
-        let pooled = pixel_shuffle_2x2(&tokens, &cfg);
+        let pooled = pixel_shuffle(&tokens, &cfg, 4, 4);
         // 4 output tokens, each with 4 channels.
         assert_eq!(pooled.len(), 4 * 4);
 
@@ -1039,7 +1206,7 @@ mod tests {
                 tokens[i * 3 + c] = (i * 10 + c) as f32;
             }
         }
-        let pooled = pixel_shuffle_2x2(&tokens, &cfg);
+        let pooled = pixel_shuffle(&tokens, &cfg, 2, 2);
         assert_eq!(pooled.len(), 12);
         // Output token gets patches in (sr=0,sc=0), (0,1), (1,0),
         // (1,1) order — i.e. patches 0, 1, 2, 3 in the 2×2 grid.
@@ -1131,7 +1298,7 @@ mod tests {
         let p = cfg.patch_size;
         let in_dim = 3 * p * p; // 12
         let out_dim = cfg.n_embd; // 3
-        let n_patches = cfg.n_patches; // 4
+        let n_patches = cfg.n_trained_patches; // 4
 
         // Synthetic kernel in the [in_dim × out_dim] row-major
         // layout the loader produces. Pick small values so the
@@ -1166,7 +1333,7 @@ mod tests {
             }
         }
 
-        let actual = patch_embed_compute(&image, &patch_embed, &cfg);
+        let actual = patch_embed_compute(&image, &patch_embed, &cfg, grid, grid);
         assert_eq!(actual.len(), n_patches * out_dim);
 
         // Compute the expected output explicitly per-patch,
@@ -1197,5 +1364,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Identity check: interpolate from a 4×4 grid to itself
+    /// reproduces the input.
+    #[test]
+    fn interpolate_pos_embed_2d_identity() {
+        let n_embd = 3;
+        let mut input = vec![0f32; 4 * 4 * n_embd];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let out = interpolate_pos_embed_2d(&input, 4, 4, 4, 4, n_embd);
+        for (i, (a, b)) in out.iter().zip(input.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "diff at {i}: {a} vs {b}");
+        }
+    }
+
+    /// Non-square interpolation: 2×2 grid → 4×6 grid. The four
+    /// corners of the trained grid must appear unchanged at the
+    /// four corners of the output (centre-of-pixel convention
+    /// clamps the fractional source coords to `[0, in_dim - 1]`).
+    /// Catches axis swaps (out_w / out_h transposition) and
+    /// channel shuffling.
+    #[test]
+    fn interpolate_pos_embed_2d_corners_match() {
+        // Single channel, 2×2 grid with corner values 1/2/3/4.
+        let n_embd = 1;
+        let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let out = interpolate_pos_embed_2d(&input, 2, 2, 4, 6, n_embd);
+        // out[0, 0] = top-left corner of input (1.0).
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        // out[0, 5] = top-right corner of input (2.0).
+        assert!((out[5] - 2.0).abs() < 1e-5);
+        // out[3, 0] = bottom-left of input (3.0).
+        assert!((out[3 * 6] - 3.0).abs() < 1e-5);
+        // out[3, 5] = bottom-right (4.0).
+        assert!((out[3 * 6 + 5] - 4.0).abs() < 1e-5);
+    }
+
+    /// Non-square pixel-shuffle: 4×6 grid → 2×3 token grid with
+    /// scale_factor=2. Verifies the non-square traversal matches
+    /// the row-major (sr, sc) order the LFM2 projector expects.
+    #[test]
+    fn pixel_shuffle_non_square() {
+        let cfg = synth_cfg(
+            /* placeholder */ 4, /* n_embd */ 1, /* sf */ 2,
+        );
+        // 4 rows × 6 cols of single-channel tokens, value = patch_idx.
+        let grid_w = 6;
+        let grid_h = 4;
+        let n_in = grid_w * grid_h;
+        let mut tokens = vec![0f32; n_in];
+        for (i, t) in tokens.iter_mut().enumerate() {
+            *t = i as f32;
+        }
+        let pooled = pixel_shuffle(&tokens, &cfg, grid_w, grid_h);
+        // 2 × 3 = 6 output tokens, each with 4 channels.
+        assert_eq!(pooled.len(), 6 * 4);
+        // Output (0, 0) covers source patches at rows 0..2, cols 0..2:
+        //   row 0: indices [0, 1] (cols 0, 1)
+        //   row 1: indices [6, 7]
+        // (sr*sf+sc) order: (0,0)=0, (0,1)=1, (1,0)=6, (1,1)=7.
+        assert_eq!(&pooled[0..4], &[0.0, 1.0, 6.0, 7.0]);
+        // Output (0, 1) covers cols 2..4: (0,2)=2, (0,3)=3, (1,2)=8, (1,3)=9.
+        assert_eq!(&pooled[4..8], &[2.0, 3.0, 8.0, 9.0]);
+        // Output (0, 2): cols 4..6: 4, 5, 10, 11.
+        assert_eq!(&pooled[8..12], &[4.0, 5.0, 10.0, 11.0]);
+        // Output (1, 0): rows 2..4 cols 0..2: 12, 13, 18, 19.
+        assert_eq!(&pooled[12..16], &[12.0, 13.0, 18.0, 19.0]);
     }
 }

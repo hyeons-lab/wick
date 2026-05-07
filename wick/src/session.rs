@@ -877,9 +877,9 @@ impl Session {
                  The mmproj must pair with the LLM it was trained against."
             )));
         }
-        let pixels = crate::model::vision_preprocessor::preprocess_image(bytes, &encoder.config)?;
+        let pre = crate::model::vision_preprocessor::preprocess_image(bytes, &encoder.config)?;
         let img_tokens = encoder
-            .encode_image(&pixels)
+            .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
             .map_err(|e| WickError::Backend(format!("encode_image: {e:#}")))?;
         // Sanity-check the encoder output shape before handing off
         // to `append_embeddings`. Integer division below would

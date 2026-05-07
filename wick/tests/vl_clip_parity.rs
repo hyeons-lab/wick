@@ -119,9 +119,19 @@ fn vl_clip_parity_smoke() {
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("encode synthetic png");
 
-    let pixels = wick::model::vision_preprocessor::preprocess_image(&png, &encoder.config)
+    let pre = wick::model::vision_preprocessor::preprocess_image(&png, &encoder.config)
         .expect("preprocess red 256");
-    let out = encoder.encode_image(&pixels).expect("encode_image");
+    // Dynamic resize keeps 256² inputs at 256² (already at the
+    // [min, max] band's lower edge), so this captured reference
+    // remains valid: grid 16×16 → 64 image tokens.
+    assert_eq!(
+        (pre.grid_w, pre.grid_h),
+        (16, 16),
+        "256² input should stay at 16×16 patch grid in the dynamic band"
+    );
+    let out = encoder
+        .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+        .expect("encode_image");
 
     let proj_dim = encoder.config.projection_dim;
     assert_eq!(

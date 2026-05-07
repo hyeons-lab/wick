@@ -1,20 +1,25 @@
-//! Image decode + resize + normalize for VL input.
+//! Image decode + dynamic-resolution resize + normalize for VL
+//! input.
 //!
-//! Takes raw PNG / JPEG bytes and produces a `[3 × H × W]` f32
-//! NCHW tensor in the layout
+//! Takes raw PNG / JPEG bytes and produces an
+//! aspect-preserving-resized `[3 × H × W]` f32 NCHW tensor — the
+//! layout
 //! [`crate::model::vision_encoder::VisionEncoderWeights::encode_image`]
-//! expects: per-channel mean-subtracted then divided by per-channel
-//! std, with channel order R, G, B and the inner two dims being
-//! the resized image's height × width.
+//! expects. The output `(W, H)` are picked by
+//! [`calc_size_preserved_ratio`] to land within the encoder's
+//! `[image_min_pixels, image_max_pixels]` band while keeping the
+//! original aspect ratio and being divisible by
+//! `patch_size · scale_factor` (so the patch grid + 2× pixel
+//! shuffle work out cleanly).
 //!
-//! Hardcoded per `InferenceType::LlamaCppImageToText` (see
-//! `project_no_schema_extensions.md`):
-//! - target image_size: from `cfg.image_size` (256 for LFM2.5-VL).
+//! Hardcoded per `InferenceType::LlamaCppImageToText`:
 //! - mean / std: from `cfg.image_mean` / `cfg.image_std` (read at
 //!   load time from `clip.vision.image_{mean,std}` GGUF metadata).
-//! - resize filter: bilinear (`Triangle`) — adequate for the v1
-//!   end-to-end smoke; matching `clip.cpp`'s exact filter choice
-//!   is part of the deferred parity gate.
+//! - resize filter: bilinear (`Triangle`) — matches llama.cpp's
+//!   `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_LFM2`.
+//! - pixel bounds: `cfg.image_min_pixels` / `cfg.image_max_pixels`
+//!   (LFM2-VL: 65 536 / 262 144 pixels = 256² / 512² square
+//!   baselines, but inputs need not be square).
 //!
 //! Gated behind the `vl-preprocess` feature so embedded targets
 //! that only do text or raw-PCM audio input can drop the `image`
@@ -25,75 +30,147 @@
 use crate::model::vision_encoder::VisionEncoderConfig;
 use crate::session::WickError;
 
-/// Decode + resize + normalize an image into the
-/// `[3 × image_size × image_size]` f32 NCHW tensor that
-/// [`crate::model::vision_encoder::VisionEncoderWeights::encode_image`]
-/// consumes. `bytes` may be PNG or JPEG (auto-detected via
-/// `image::guess_format`); other formats fall through to a typed
-/// `Backend` error from the underlying `image` crate.
-pub fn preprocess_image(bytes: &[u8], cfg: &VisionEncoderConfig) -> Result<Vec<f32>, WickError> {
+/// Bytes the preprocessor produces — the f32 NCHW tensor plus the
+/// dynamic patch grid that the encoder needs to interpret it.
+/// `pixels.len() == 3 · target_h · target_w`.
+#[derive(Debug)]
+pub struct PreprocessedImage {
+    /// `[3 · target_h · target_w]` f32 NCHW (R/G/B, `c·H·W + y·W +
+    /// x` indexing).
+    pub pixels: Vec<f32>,
+    /// Resized image width in pixels (always a multiple of
+    /// `cfg.patch_size · cfg.scale_factor`).
+    pub target_w: usize,
+    /// Resized image height in pixels (always a multiple of
+    /// `cfg.patch_size · cfg.scale_factor`).
+    pub target_h: usize,
+    /// Patch grid width = `target_w / cfg.patch_size`.
+    pub grid_w: usize,
+    /// Patch grid height = `target_h / cfg.patch_size`.
+    pub grid_h: usize,
+}
+
+/// Pick the smallest aspect-preserving resize of `(width, height)`
+/// that lands within `[min_pixels, max_pixels]` and is divisible by
+/// `align_size` on both axes. Mirrors llama.cpp's
+/// `img_tool::calc_size_preserved_ratio` (lines 144-168 of
+/// `tools/mtmd/mtmd-image.cpp`):
+///
+/// ```text
+/// align_size = patch_size · scale_factor          (e.g. 16·2=32)
+/// w_bar = max(align, round_to_multiple(width,  align))
+/// h_bar = max(align, round_to_multiple(height, align))
+/// if h_bar · w_bar > max_pixels:
+///     β = sqrt(width · height / max_pixels)        ← scale down
+///     w_bar = max(align, floor_to_multiple(width  / β, align))
+///     h_bar = max(align, floor_to_multiple(height / β, align))
+/// elif h_bar · w_bar < min_pixels:
+///     β = sqrt(min_pixels / (width · height))      ← scale up
+///     w_bar = ceil_to_multiple(width  · β, align)
+///     h_bar = ceil_to_multiple(height · β, align)
+/// ```
+///
+/// The asymmetry (round → floor on overshoot, ceil on undershoot)
+/// is deliberate: rounding can leave you slightly over the
+/// max-pixel cap, so the corrective branch must floor.
+pub fn calc_size_preserved_ratio(
+    width: usize,
+    height: usize,
+    align_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    debug_assert!(align_size > 0);
+    debug_assert!(min_pixels <= max_pixels);
+    // `area` divides into `beta` in the scale-up branch — guard
+    // against `width == 0 || height == 0` (the `image` crate
+    // rejects zero-pixel inputs upstream, but `calc_size_preserved_ratio`
+    // is `pub` and could be called directly). Falling through with
+    // `align_size × align_size` is the smallest aligned grid the
+    // encoder can consume, which is the right "give up gracefully"
+    // answer for an empty input.
+    if width == 0 || height == 0 {
+        return (align_size, align_size);
+    }
+    let round_by = |x: f64| ((x / align_size as f64).round() as usize) * align_size;
+    let floor_by = |x: f64| ((x / align_size as f64).floor() as usize) * align_size;
+    let ceil_by = |x: f64| ((x / align_size as f64).ceil() as usize) * align_size;
+
+    let mut w_bar = align_size.max(round_by(width as f64));
+    let mut h_bar = align_size.max(round_by(height as f64));
+
+    let area = (width as f64) * (height as f64);
+    // `saturating_mul` keeps the comparison correct on 32-bit
+    // targets (wasm32) where huge inputs could overflow `usize`.
+    // Saturation pushes the value to `usize::MAX`, which routes us
+    // into the "scale down" branch — the safe direction.
+    let area_check = h_bar.saturating_mul(w_bar);
+    if area_check > max_pixels {
+        let beta = (area / max_pixels as f64).sqrt();
+        w_bar = align_size.max(floor_by((width as f64) / beta));
+        h_bar = align_size.max(floor_by((height as f64) / beta));
+    } else if area_check < min_pixels {
+        let beta = (min_pixels as f64 / area).sqrt();
+        w_bar = ceil_by((width as f64) * beta);
+        h_bar = ceil_by((height as f64) * beta);
+    }
+    (w_bar, h_bar)
+}
+
+/// Decode + dynamic-resolution resize + normalize an image into a
+/// [`PreprocessedImage`] the encoder consumes. `bytes` may be PNG
+/// or JPEG (auto-detected via `image::guess_format`); other
+/// formats fall through to a typed `Backend` error from the
+/// underlying `image` crate.
+pub fn preprocess_image(
+    bytes: &[u8],
+    cfg: &VisionEncoderConfig,
+) -> Result<PreprocessedImage, WickError> {
     if bytes.is_empty() {
         return Err(WickError::EmptyInput);
     }
 
-    // Decode → DynamicImage.
     let img = image::load_from_memory(bytes)
         .map_err(|e| WickError::Backend(format!("image decode failed: {e}")))?;
 
-    // Aspect-ratio sanity warning: this preprocessor force-resizes
-    // to a square `cfg.image_size × cfg.image_size`. For non-square
-    // inputs (especially extreme — a wide banner squashed to 256²
-    // loses most of the discriminative signal) the encoder still
-    // produces output but a downstream model that depends on
-    // dynamic-resolution features (llama.cpp's
-    // `mtmd_image_preprocessor_lfm2` resizes within the
-    // `[image_min_pixels=65536, image_max_pixels=262144]` band
-    // while preserving aspect) won't see the same input.
-    // Surface the divergence to logs so a user wondering why their
-    // 1024×400 banner produces a vague description sees the cause
-    // without reading the devlog. Threshold 1.5 picks up "panorama
-    // squashed to square" while letting normal photos through.
-    let aspect =
-        (img.width() as f32 / img.height() as f32).max(img.height() as f32 / img.width() as f32);
-    if aspect >= 1.5 {
-        tracing::warn!(
-            input_w = img.width(),
-            input_h = img.height(),
-            target_size = cfg.image_size,
-            aspect_ratio = aspect,
-            "vision_preprocessor: input aspect ratio >= 1.5 will be \
-             force-squashed to a square; encoder output will differ \
-             from llama.cpp's dynamic-resolution path. Consider \
-             centre-cropping the input to a near-square first.",
-        );
-    }
+    // Pick the resize target via llama.cpp's algorithm. align_size
+    // = patch_size · scale_factor guarantees both grid_w and
+    // grid_h are even and the 2× pixel-shuffle works out.
+    let align = cfg.patch_size * cfg.scale_factor;
+    let (target_w, target_h) = calc_size_preserved_ratio(
+        img.width() as usize,
+        img.height() as usize,
+        align,
+        cfg.image_min_pixels,
+        cfg.image_max_pixels,
+    );
+    debug_assert_eq!(target_w % cfg.patch_size, 0);
+    debug_assert_eq!(target_h % cfg.patch_size, 0);
 
-    // Resize to image_size × image_size with bilinear (triangle)
-    // filter. CLIP-family inputs are square; aspect-preserving
-    // resize would mismatch the model's expectations. Convert to
-    // `RgbImage` directly in each branch — going through
-    // `DynamicImage::ImageRgb8` and a second `.to_rgb8()` would
-    // double-copy the buffer for the already-correct-size case.
-    let target = cfg.image_size as u32;
-    let rgb = if img.width() == target && img.height() == target {
+    // Bilinear (Triangle) resize — matches llama.cpp's
+    // `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_LFM2`. Resize the
+    // `DynamicImage` (in its native pixel format) before converting
+    // to RGB — a 4096×4096 RGBA8 input would otherwise allocate a
+    // ~50 MB intermediate `to_rgb8` buffer just to throw it away on
+    // resize. Resizing first means we only `into_rgb8` the
+    // post-resize buffer, which is bounded by `image_max_pixels`.
+    let rgb = if img.width() == target_w as u32 && img.height() == target_h as u32 {
         img.into_rgb8()
     } else {
-        image::imageops::resize(
-            &img.to_rgb8(),
-            target,
-            target,
+        img.resize_exact(
+            target_w as u32,
+            target_h as u32,
             image::imageops::FilterType::Triangle,
         )
+        .into_rgb8()
     };
 
-    // Normalize: NCHW f32, `(rgb / 255 - mean) / std` per
-    // channel. Channel-first layout `[c, h, w]` so the encoder's
-    // `image[c * H * W + h * W + w]` indexing reads correctly.
+    // Normalize: NCHW f32, `(rgb / 255 - mean) / std` per channel.
     let h = rgb.height() as usize;
     let w = rgb.width() as usize;
-    debug_assert_eq!(h, cfg.image_size);
-    debug_assert_eq!(w, cfg.image_size);
-    let mut out = vec![0f32; 3 * h * w];
+    debug_assert_eq!(h, target_h);
+    debug_assert_eq!(w, target_w);
+    let mut pixels = vec![0f32; 3 * h * w];
     let raw = rgb.as_raw(); // [h * w * 3] u8 in row-major HWC
     for c in 0..3 {
         let mean = cfg.image_mean[c];
@@ -103,11 +180,17 @@ pub fn preprocess_image(bytes: &[u8], cfg: &VisionEncoderConfig) -> Result<Vec<f
                 let src = (y * w + x) * 3 + c;
                 let dst = c * h * w + y * w + x;
                 let pixel = raw[src] as f32 / 255.0;
-                out[dst] = (pixel - mean) * std_inv;
+                pixels[dst] = (pixel - mean) * std_inv;
             }
         }
     }
-    Ok(out)
+    Ok(PreprocessedImage {
+        pixels,
+        target_w: w,
+        target_h: h,
+        grid_w: w / cfg.patch_size,
+        grid_h: h / cfg.patch_size,
+    })
 }
 
 #[cfg(test)]
@@ -124,14 +207,91 @@ mod tests {
             eps: 1e-6,
             image_size: 4,
             patch_size: 2,
-            n_patches: 4,
+            n_trained_patches: 4,
             projection_dim: 1024,
             scale_factor: 2,
             // Pick non-trivial mean / std so a mean/std swap or
             // channel reorder shows up loudly in the assertions.
             image_mean: [0.5, 0.4, 0.3],
             image_std: [0.2, 0.25, 0.5],
+            // Bound the `synth_cfg` resize at exactly 4×4 = 16
+            // pixels so the original lossless solid-red test
+            // continues to land at 4×4 deterministically.
+            image_min_pixels: 16,
+            image_max_pixels: 16,
         }
+    }
+
+    /// `calc_size_preserved_ratio` round-trips llama.cpp's
+    /// reference behaviour for the LFM2-VL pug case.
+    #[test]
+    fn calc_size_preserved_ratio_pug_shape() {
+        // 1024×771 image, align=32, [min, max] = [65 536, 262 144].
+        // Expected (576, 416) — matches mtmd-cli's verbose output
+        // for the committed pug fixture.
+        let (w, h) = calc_size_preserved_ratio(1024, 771, 32, 65_536, 262_144);
+        assert_eq!((w, h), (576, 416));
+        // Patch grid: 36 × 26 = 936 patches → 18 × 13 = 234
+        // image tokens (after 2× pixel shuffle).
+        assert_eq!((w / 16) * (h / 16), 936);
+    }
+
+    /// Tiny input — must scale up to clear `min_pixels`.
+    #[test]
+    fn calc_size_preserved_ratio_scales_up_small_input() {
+        let (w, h) = calc_size_preserved_ratio(100, 100, 32, 65_536, 262_144);
+        assert!(
+            w * h >= 65_536,
+            "scaled-up area {w}×{h} = {} should ≥ min_pixels (65 536)",
+            w * h
+        );
+        assert_eq!(w % 32, 0);
+        assert_eq!(h % 32, 0);
+    }
+
+    /// Banner — must scale down preserving aspect.
+    #[test]
+    fn calc_size_preserved_ratio_clamps_huge_input() {
+        let (w, h) = calc_size_preserved_ratio(4096, 1024, 32, 65_536, 262_144);
+        assert!(
+            w * h <= 262_144,
+            "scaled-down area {w}×{h} = {} should ≤ max_pixels (262 144)",
+            w * h
+        );
+        assert_eq!(w % 32, 0);
+        assert_eq!(h % 32, 0);
+        // 4:1 input aspect should produce a wide output.
+        let aspect = w as f32 / h as f32;
+        assert!(
+            (3.5..=4.5).contains(&aspect),
+            "expected ~4:1 aspect, got {aspect}"
+        );
+    }
+
+    /// Already-aligned input within [min, max] band — output
+    /// equals input.
+    #[test]
+    fn calc_size_preserved_ratio_passes_through_when_in_band() {
+        let (w, h) = calc_size_preserved_ratio(256, 256, 32, 65_536, 262_144);
+        assert_eq!((w, h), (256, 256));
+    }
+
+    /// Zero dimensions short-circuit to `(align, align)` instead of
+    /// dividing by zero in the scale-up branch.
+    #[test]
+    fn calc_size_preserved_ratio_zero_dims_returns_align() {
+        assert_eq!(
+            calc_size_preserved_ratio(0, 100, 32, 65_536, 262_144),
+            (32, 32)
+        );
+        assert_eq!(
+            calc_size_preserved_ratio(100, 0, 32, 65_536, 262_144),
+            (32, 32)
+        );
+        assert_eq!(
+            calc_size_preserved_ratio(0, 0, 32, 65_536, 262_144),
+            (32, 32)
+        );
     }
 
     /// Synthesise a 4×4 solid red PNG, run through the
@@ -140,9 +300,6 @@ mod tests {
     ///   R: (1.0 - 0.5) / 0.2  =  2.5
     ///   G: (0.0 - 0.4) / 0.25 = -1.6
     ///   B: (0.0 - 0.3) / 0.5  = -0.6
-    /// Catches mean/std ordering bugs (channel mix-up) and
-    /// per-channel std=0 div-by-zero (cfg sanity also catches
-    /// that, but a 0 in std would explode here too).
     #[test]
     fn preprocess_solid_red_normalises_per_channel() {
         let cfg = synth_cfg();
@@ -155,27 +312,25 @@ mod tests {
             )
             .expect("encode test png");
 
-        let out = preprocess_image(&bytes, &cfg).expect("preprocess");
+        let pre = preprocess_image(&bytes, &cfg).expect("preprocess");
+        assert_eq!(pre.target_w, 4);
+        assert_eq!(pre.target_h, 4);
+        assert_eq!(pre.grid_w, 2);
+        assert_eq!(pre.grid_h, 2);
+        let out = pre.pixels;
         assert_eq!(out.len(), 3 * 4 * 4);
         let n = 4 * 4;
-        // R-channel block: indices [0, n).
         for &v in &out[0..n] {
             assert!((v - 2.5).abs() < 1e-5, "R channel: {v}");
         }
-        // G-channel block: indices [n, 2n).
         for &v in &out[n..2 * n] {
             assert!((v - (-1.6)).abs() < 1e-5, "G channel: {v}");
         }
-        // B-channel block: indices [2n, 3n).
         for &v in &out[2 * n..3 * n] {
             assert!((v - (-0.6)).abs() < 1e-5, "B channel: {v}");
         }
     }
 
-    /// `EmptyInput` on zero-byte input — gates the empty case
-    /// before we hand off to `image::load_from_memory` (which
-    /// would surface a less actionable "unable to determine
-    /// format" error).
     #[test]
     fn preprocess_empty_bytes_errors() {
         let cfg = synth_cfg();
@@ -185,9 +340,9 @@ mod tests {
         }
     }
 
-    /// Resize path: small JPEG (8×8) → resized to cfg.image_size
-    /// (4×4). Verifies the auto-detect dispatch + the resize
-    /// branch fires when input dims don't match.
+    /// Resize path: small JPEG (8×8) → resized to 4×4 (the
+    /// synth_cfg pixel band). Verifies the auto-detect dispatch +
+    /// the resize branch fires when input dims don't match.
     #[test]
     fn preprocess_jpeg_resizes_to_target() {
         let cfg = synth_cfg();
@@ -200,13 +355,12 @@ mod tests {
             )
             .expect("encode test jpeg");
 
-        let out = preprocess_image(&bytes, &cfg).expect("preprocess");
-        assert_eq!(out.len(), 3 * 4 * 4);
-        // JPEG is lossy — assert the R channel lands roughly
-        // where the lossless test does (allow 0.1 delta to
-        // absorb JPEG quantisation).
+        let pre = preprocess_image(&bytes, &cfg).expect("preprocess");
+        assert_eq!(pre.target_w, 4);
+        assert_eq!(pre.target_h, 4);
+        assert_eq!(pre.pixels.len(), 3 * 4 * 4);
         let n = 4 * 4;
-        let r_avg = out[0..n].iter().sum::<f32>() / (n as f32);
+        let r_avg = pre.pixels[0..n].iter().sum::<f32>() / (n as f32);
         assert!((r_avg - 2.5).abs() < 0.1, "R channel mean: {r_avg}");
     }
 }
