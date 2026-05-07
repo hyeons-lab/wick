@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use wick::tokenizer::BpeTokenizer;
 use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine};
@@ -245,8 +245,31 @@ enum Command {
         /// `--audio-out` (output WAV writer — not produced in
         /// audio-in mode), and `--token-ids` (audio-in builds its
         /// own KV from the encoder, not raw tokens).
-        #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "token_ids"])]
+        #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "token_ids", "image"])]
         audio_in: Option<String>,
+
+        /// Path to one or more image files (PNG / JPEG / WebP).
+        /// When set, renders the model's chat template with
+        /// multimodal content (image(s) plus optional `--prompt`)
+        /// and prefills via `Session::append_chat_with_images`.
+        /// Repeat the flag for multi-image inputs:
+        ///
+        ///   wick run -m foo.gguf --image pug.jpg --prompt "describe what you see"
+        ///   wick run -m foo.gguf --image a.jpg --image b.jpg --prompt "compare"
+        ///
+        /// `--prompt` is optional in image mode (image-only inputs
+        /// are allowed). `--system` is allowed and renders as a
+        /// system turn before the user turn carrying the image(s).
+        ///
+        /// Mutually exclusive with `--audio-in` (audio-input
+        /// pipeline), `--vocoder` / `--audio-out` (audio-output
+        /// pipeline), and `--token-ids` (raw token mode bypasses
+        /// the chat template the helper renders).
+        #[arg(
+            long,
+            conflicts_with_all = ["audio_in", "vocoder", "audio_out", "token_ids"],
+        )]
+        image: Vec<String>,
 
         /// Output WAV file for generated audio.
         #[arg(long)]
@@ -1169,6 +1192,7 @@ fn main() -> Result<()> {
             context_size,
             vocoder,
             audio_in,
+            image,
             audio_out,
             system,
             audio_temperature,
@@ -1204,6 +1228,97 @@ fn main() -> Result<()> {
                 cache_warm_mb,
                 cache_disk_gb,
             );
+
+            // Image-input path (mutually exclusive with --audio-in,
+            // --vocoder, --audio-out, --token-ids via clap
+            // `conflicts_with`). Renders the chat template with
+            // multimodal content and feeds image embeddings through
+            // `Session::append_chat_with_images` (PR #134), which
+            // walks `<image>` markers and splices in the model-
+            // specific `<|image_start|>` / `<|image_end|>` envelope.
+            if !image.is_empty() {
+                // Read all image bytes up-front so a missing /
+                // unreadable path fails before model load — there's
+                // no point spending ~1 GB of RAM on Q4_0 weights only
+                // to error on `--image not_a_real_path.jpg`.
+                let mut owned_bytes: Vec<Vec<u8>> = Vec::with_capacity(image.len());
+                for path in &image {
+                    let bytes =
+                        std::fs::read(path).with_context(|| format!("reading --image {path}"))?;
+                    eprintln!("Loaded image: {path} ({} bytes)", bytes.len());
+                    owned_bytes.push(bytes);
+                }
+
+                eprintln!(
+                    "Model: {} | {} layers | hidden={}",
+                    engine.model().config().architecture,
+                    engine.model().config().n_layers,
+                    engine.model().config().hidden_size
+                );
+
+                let mut session = engine.new_session(wick::SessionConfig {
+                    kv_compression,
+                    seed: None,
+                    ubatch_size,
+                    n_keep,
+                    ..Default::default()
+                });
+
+                // Build messages: optional system turn (single text
+                // item) + a user turn with N image items followed by
+                // the optional --prompt as text. `[Image, …, Text]`
+                // is the order LFM2-VL was trained on (matches
+                // mtmd-cli's `<image> Describe<|im_end|>` shape).
+                let mut content: Vec<wick::tokenizer::ContentItem> =
+                    std::iter::repeat_with(|| wick::tokenizer::ContentItem::Image)
+                        .take(image.len())
+                        .collect();
+                if let Some(p) = &prompt
+                    && !p.is_empty()
+                {
+                    content.push(wick::tokenizer::ContentItem::Text { text: p.clone() });
+                }
+                let mut messages = Vec::new();
+                if let Some(sys) = &system {
+                    messages.push(wick::tokenizer::ChatMessageMultimodal {
+                        role: "system".into(),
+                        content: vec![wick::tokenizer::ContentItem::Text { text: sys.clone() }],
+                    });
+                }
+                messages.push(wick::tokenizer::ChatMessageMultimodal {
+                    role: "user".into(),
+                    content,
+                });
+                let images_refs: Vec<&[u8]> = owned_bytes.iter().map(|v| v.as_slice()).collect();
+
+                let prefill_start = std::time::Instant::now();
+                session.append_chat_with_images(&messages, &images_refs, true)?;
+                let prefill_elapsed = prefill_start.elapsed();
+                let kv_after_prefill = session.position();
+                eprintln!(
+                    "Image prefill: {kv_after_prefill} KV tokens, {:.1} ms",
+                    prefill_elapsed.as_millis()
+                );
+
+                let opts = wick::GenerateOpts {
+                    max_tokens: max_tokens as u32,
+                    temperature,
+                    ..Default::default()
+                };
+                let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
+                let summary = session.generate(&opts, &mut sink)?;
+
+                let decode_tps = if summary.decode_ms > 0 {
+                    summary.tokens_generated as f64 / (summary.decode_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                eprintln!();
+                eprintln!("---");
+                eprintln!("Generated tokens: {}", summary.tokens_generated);
+                eprintln!("Decode: {:.1} tok/s", decode_tps);
+                return Ok(());
+            }
 
             // Audio-input path (mutually exclusive with --vocoder via clap
             // `conflicts_with`). Skips the chat-template / token-building
@@ -2069,7 +2184,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
+        Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
         resolve_engine, split_at_marker, write_transcript, write_wav,
     };
     use clap::Parser;
@@ -2565,6 +2680,105 @@ mod tests {
             msg.contains("--prompt") && msg.contains("--system"),
             "error should point at user-supplied text as the source: {msg}"
         );
+    }
+
+    /// `--image` accepts a single path. Confirms the flag round-trips
+    /// through clap's `Vec<String>` collector and the destructure
+    /// keeps it on `Run`.
+    #[test]
+    fn run_subcommand_parses_single_image() {
+        let r = Cli::try_parse_from([
+            "wick", "run", "--model", "/tmp/x", "--image", "pug.jpg", "--prompt", "describe",
+        ]);
+        let cli = r.expect("`run --model X --image Y --prompt Z` should parse");
+        let Command::Run { image, prompt, .. } = cli.command else {
+            panic!("expected Run subcommand, got something else");
+        };
+        assert_eq!(image, vec!["pug.jpg".to_string()]);
+        assert_eq!(prompt.as_deref(), Some("describe"));
+    }
+
+    /// `--image` collects multiple values when the flag repeats —
+    /// the multi-image path. clap default behavior for
+    /// `Vec<String>` arguments.
+    #[test]
+    fn run_subcommand_parses_multiple_images() {
+        let r = Cli::try_parse_from([
+            "wick", "run", "--model", "/tmp/x", "--image", "a.jpg", "--image", "b.jpg", "--prompt",
+            "compare",
+        ]);
+        let cli = r.expect("repeated --image should parse");
+        let Command::Run { image, .. } = cli.command else {
+            panic!("expected Run subcommand");
+        };
+        assert_eq!(image, vec!["a.jpg".to_string(), "b.jpg".to_string()]);
+    }
+
+    /// `--image` without `--prompt` parses (image-only inference is
+    /// allowed; the dispatcher constructs `[ContentItem::Image]`
+    /// content with no trailing text).
+    #[test]
+    fn run_subcommand_parses_image_without_prompt() {
+        let r = Cli::try_parse_from(["wick", "run", "--model", "/tmp/x", "--image", "pug.jpg"]);
+        assert!(
+            r.is_ok(),
+            "`run --model X --image Y` (no --prompt) should parse: {:?}",
+            r.err()
+        );
+    }
+
+    /// Clap rejects `--image` paired with the audio-in family:
+    /// these modes are mutually exclusive ways to feed non-text
+    /// input into the LLM, and combining them is a misuse, not a
+    /// feature. The conflict is declared on the flag definition
+    /// so the rejection happens at parse time, before engine load.
+    #[test]
+    fn run_subcommand_rejects_image_with_audio_in() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--model",
+            "/tmp/x",
+            "--image",
+            "a.jpg",
+            "--audio-in",
+            "b.wav",
+        ]);
+        assert!(r.is_err(), "clap should reject --image with --audio-in");
+    }
+
+    /// Same conflict family — `--image` against `--vocoder`.
+    #[test]
+    fn run_subcommand_rejects_image_with_vocoder() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--model",
+            "/tmp/x",
+            "--image",
+            "a.jpg",
+            "--vocoder",
+            "v.gguf",
+        ]);
+        assert!(r.is_err(), "clap should reject --image with --vocoder");
+    }
+
+    /// `--image` against `--token-ids` — raw-token mode bypasses
+    /// the chat template the helper renders, so combining them
+    /// would silently ignore one or the other.
+    #[test]
+    fn run_subcommand_rejects_image_with_token_ids() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "run",
+            "--model",
+            "/tmp/x",
+            "--image",
+            "a.jpg",
+            "--token-ids",
+            "1,2,3",
+        ]);
+        assert!(r.is_err(), "clap should reject --image with --token-ids");
     }
 
     /// Text mode without `--audio-in` and without `--prompt` is the
