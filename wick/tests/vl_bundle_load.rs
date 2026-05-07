@@ -117,7 +117,15 @@ fn vl_bundle_loads_text_only() {
     assert_eq!(ve.config.n_ff, 3072, "ViT FFN dim");
     assert_eq!(ve.config.image_size, 256);
     assert_eq!(ve.config.patch_size, 16);
-    assert_eq!(ve.config.n_patches, 256, "16×16 patch grid");
+    assert_eq!(
+        ve.config.n_trained_patches, 256,
+        "trained 16×16 position-grid"
+    );
+    assert_eq!(ve.config.image_min_pixels, 65_536, "LFM2-VL min-pixel band");
+    assert_eq!(
+        ve.config.image_max_pixels, 262_144,
+        "LFM2-VL max-pixel band"
+    );
     assert_eq!(ve.config.projection_dim, 1024, "matches LFM2 embed dim");
     assert_eq!(ve.config.scale_factor, 2, "pixel-shuffle factor");
     assert_eq!(ve.blocks.len(), 12);
@@ -244,13 +252,17 @@ fn vl_bundle_loads_text_only() {
     let ve = engine
         .vision_encoder()
         .expect("vision_encoder still attached");
-    let n_pix = 3 * ve.config.image_size * ve.config.image_size;
+    // Drive `encode_image` at the trained 16×16 grid (no
+    // interpolation path); zeros input verifies forward stays
+    // numerically sane.
+    let trained_side = (ve.config.n_trained_patches as f64).sqrt().round() as usize;
+    let n_pix = 3 * (trained_side * ve.config.patch_size).pow(2);
     let zeros = vec![0.0f32; n_pix];
     let img_tokens = ve
-        .encode_image(&zeros)
+        .encode_image(&zeros, trained_side, trained_side)
         .expect("encode_image should succeed on a zero-input image");
-    let expected_n = (ve.config.n_patches / (ve.config.scale_factor * ve.config.scale_factor))
-        * ve.config.projection_dim;
+    let expected_n_tokens = (trained_side / ve.config.scale_factor).pow(2);
+    let expected_n = expected_n_tokens * ve.config.projection_dim;
     assert_eq!(img_tokens.len(), expected_n, "image-token output length");
     assert!(
         img_tokens.iter().all(|v| v.is_finite()),
@@ -295,10 +307,12 @@ fn vl_bundle_appends_synthetic_image() {
     let engine = WickEngine::from_files(
         files,
         EngineConfig {
-            // The LLM context needs room for prefix tokens + 64
-            // image tokens + suffix tokens + a few generation
-            // tokens. 256 is plenty for the smoke.
-            context_size: 256,
+            // Dynamic-resolution preprocessor produces up to 256
+            // image tokens at the LFM2-VL band's upper edge.
+            // Budget: prefix tokens + 256 image + suffix + 32
+            // generation. 512 covers the worst case while keeping
+            // the test fast on CPU.
+            context_size: 512,
             backend: BackendPreference::Cpu,
             ..Default::default()
         },
@@ -410,7 +424,7 @@ fn vl_bundle_appends_synthetic_image() {
     }
     let mut sink = Collect(Vec::new());
     let opts = GenerateOpts {
-        max_tokens: 16,
+        max_tokens: 32,
         temperature: 0.0,
         ..Default::default()
     };
