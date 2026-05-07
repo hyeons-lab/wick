@@ -229,6 +229,54 @@ pub fn can_shift(
     supports_kv_shift && n_keep > 0 && !is_compressed && current_pos >= n_keep + shift_needed
 }
 
+/// One slice of a tokenized chat template, distinguishing text runs
+/// from image-marker positions. `Text { start, end }` is a half-open
+/// index range into the same `tokens` slice that
+/// [`splice_image_markers`] received; `Image` is an in-place marker
+/// that the caller should swap for the
+/// `<|image_start|>` + image embeddings + `<|image_end|>`
+/// envelope at append time.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChatTemplateSegment {
+    Text { start: usize, end: usize },
+    Image,
+}
+
+/// Walk a tokenized chat-template stream and produce a splice plan:
+/// for each contiguous run of non-marker tokens emit a
+/// [`ChatTemplateSegment::Text`] range; for each `<image>` token
+/// (id == `image_marker_id`) emit a [`ChatTemplateSegment::Image`].
+///
+/// Empty text runs (two adjacent markers, marker at start/end of
+/// stream) are elided so the segment list never carries
+/// zero-length text spans — the caller's `append_tokens(&[])`
+/// would be a no-op anyway, but keeping the segment list tight
+/// makes the unit-test assertions cleaner and the walk loop
+/// branch-free on the empty case.
+pub(crate) fn splice_image_markers(
+    tokens: &[u32],
+    image_marker_id: u32,
+) -> Vec<ChatTemplateSegment> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (i, &t) in tokens.iter().enumerate() {
+        if t == image_marker_id {
+            if i > start {
+                segments.push(ChatTemplateSegment::Text { start, end: i });
+            }
+            segments.push(ChatTemplateSegment::Image);
+            start = i + 1;
+        }
+    }
+    if start < tokens.len() {
+        segments.push(ChatTemplateSegment::Text {
+            start,
+            end: tokens.len(),
+        });
+    }
+    segments
+}
+
 /// Stateful inference session. Owns refcounted handles to the model
 /// and tokenizer — no borrow lifetime — so `Session` values can flow
 /// across an FFI boundary or be returned from a constructor without
@@ -816,26 +864,32 @@ impl Session {
     /// interpret the embeddings as visual content; the visible
     /// failure mode is a generic non-image-conditioned
     /// description (e.g. *"I see a complex and abstract scene
-    /// with various shapes…"*). Callers must either:
+    /// with various shapes…"*).
     ///
-    /// 1. Drive the marker / user-turn structure manually
-    ///    around `append_image`, e.g.
-    ///    ```ignore
-    ///    let img_start = tokenizer.special_token_id("<|image_start|>")?;
-    ///    let img_end   = tokenizer.special_token_id("<|image_end|>")?;
-    ///    session.append_tokens(&prefix_tokens)?;          // BOS + <|im_start|>user\n
-    ///    session.append_tokens(&[img_start])?;
-    ///    session.append_image(&jpeg_bytes)?;
-    ///    session.append_tokens(&[img_end])?;
-    ///    session.append_tokens(&suffix_tokens)?;          // user text + <|im_end|>\n + asst tag
-    ///    session.generate(&opts, &mut sink)?;
-    ///    ```
-    /// 2. Use a higher-level chat-template-aware helper that
-    ///    walks `<image>` placeholders (slice 2/3 follow-up;
-    ///    not yet implemented).
+    /// **Recommended path:**
+    /// [`Self::append_chat_with_images`] handles render +
+    /// marker-walk + envelope splice in one call. It's the right
+    /// path for any LFM2-VL inference driven by the standard chat
+    /// template.
+    ///
+    /// Use this method directly only when you need the manual
+    /// splice — e.g. a non-LFM2-VL model with a different envelope
+    /// convention, or custom token routing the helper doesn't
+    /// support. Manual recipe:
+    ///
+    /// ```ignore
+    /// let img_start = tokenizer.special_token_id("<|image_start|>")?;
+    /// let img_end   = tokenizer.special_token_id("<|image_end|>")?;
+    /// session.append_tokens(&prefix_tokens)?;          // BOS + <|im_start|>user\n
+    /// session.append_tokens(&[img_start])?;
+    /// session.append_image(&jpeg_bytes)?;
+    /// session.append_tokens(&[img_end])?;
+    /// session.append_tokens(&suffix_tokens)?;          // user text + <|im_end|>\n + asst tag
+    /// session.generate(&opts, &mut sink)?;
+    /// ```
     ///
     /// `wick/tests/vl_bundle_load.rs::vl_bundle_appends_synthetic_image`
-    /// is the reference integration recipe.
+    /// is the reference integration recipe (now via the helper).
     ///
     /// Errors:
     /// 1. [`WickError::EmptyInput`] when `bytes` is empty.
@@ -909,6 +963,136 @@ impl Session {
     /// it still type-checks; always returns `UnsupportedModality`.
     #[cfg(not(feature = "vl-preprocess"))]
     pub fn append_image(&mut self, _bytes: &[u8]) -> Result<(), WickError> {
+        Err(WickError::UnsupportedModality)
+    }
+
+    /// Append a multimodal chat conversation in one call: render the
+    /// chat template (which emits `<image>` markers for each
+    /// [`crate::tokenizer::ContentItem::Image`] in the messages),
+    /// then walk the resulting token stream and splice in
+    /// `<|image_start|>` + image embeddings + `<|image_end|>` for
+    /// each marker. The `images` slice maps positionally onto
+    /// `<image>` markers in render order — the order they appear in
+    /// the messages' content lists.
+    ///
+    /// This is the recommended path for VL inference: it replaces
+    /// the manual splicing example documented on
+    /// [`Self::append_image`]. The manual path stays available for
+    /// callers with non-LFM2-VL chat templates or custom token
+    /// routing.
+    ///
+    /// All validation runs *before* any [`Self::append_tokens`] /
+    /// [`Self::append_image`] call, so a failed render or a
+    /// marker-count mismatch leaves session state untouched.
+    ///
+    /// Errors:
+    /// 1. [`WickError::UnsupportedModality`] when the session
+    ///    capabilities don't include `image_in` (non-VL bundle).
+    /// 2. [`WickError::Backend`] when the model has no chat
+    ///    template, when `<image>` doesn't tokenize to a single
+    ///    token (model isn't VL-shaped), when the tokenizer is
+    ///    missing the `<|image_start|>` / `<|image_end|>` special
+    ///    tokens, or when the marker count doesn't match the
+    ///    supplied `images.len()`.
+    /// 3. Any error from [`Self::append_tokens`] /
+    ///    [`Self::append_image`] propagates once splicing begins.
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_chat_with_images(
+        &mut self,
+        messages: &[crate::tokenizer::ChatMessageMultimodal],
+        images: &[&[u8]],
+        add_generation_prompt: bool,
+    ) -> Result<(), WickError> {
+        if !self.capabilities.image_in {
+            return Err(WickError::UnsupportedModality);
+        }
+
+        // 1. Render template.
+        let rendered =
+            crate::tokenizer::apply_chat_template(&self.tokenizer, messages, add_generation_prompt)
+                .map_err(|e| WickError::Backend(format!("chat template render: {e:#}")))?;
+
+        // 2. Resolve `<image>` token id (probe once, error if not a
+        //    single token — that means the vocab doesn't actually
+        //    have `<image>` as a merged token, i.e. not a VL model).
+        let probed = self.tokenizer.encode("<image>");
+        if probed.len() != 1 {
+            return Err(WickError::Backend(format!(
+                "tokenizer doesn't have `<image>` as a single token \
+                 (got {} tokens) — model isn't VL-shaped",
+                probed.len(),
+            )));
+        }
+        let image_marker_id = probed[0];
+
+        // 3. Resolve special tokens for the image envelope.
+        let img_start = self
+            .tokenizer
+            .special_token_id("<|image_start|>")
+            .ok_or_else(|| {
+                WickError::Backend(
+                    "tokenizer missing `<|image_start|>` special token — \
+                     model isn't VL-shaped"
+                        .into(),
+                )
+            })?;
+        let img_end = self
+            .tokenizer
+            .special_token_id("<|image_end|>")
+            .ok_or_else(|| {
+                WickError::Backend(
+                    "tokenizer missing `<|image_end|>` special token — \
+                     model isn't VL-shaped"
+                        .into(),
+                )
+            })?;
+
+        // 4. Tokenize the rendered text + walk for marker positions.
+        //    Splice plan is computed eagerly so we can validate the
+        //    marker count BEFORE mutating session state.
+        let tokens = self.tokenizer.encode(&rendered);
+        let segments = splice_image_markers(&tokens, image_marker_id);
+        let marker_count = segments
+            .iter()
+            .filter(|s| matches!(s, ChatTemplateSegment::Image))
+            .count();
+        if marker_count != images.len() {
+            return Err(WickError::Backend(format!(
+                "rendered chat template has {marker_count} `<image>` \
+                 markers but caller supplied {} images",
+                images.len(),
+            )));
+        }
+
+        // 5. Walk segments and feed the session. Past this point
+        //    state is mutated; failures propagate.
+        let mut img_idx = 0;
+        for seg in &segments {
+            match *seg {
+                ChatTemplateSegment::Text { start, end } => {
+                    self.append_tokens(&tokens[start..end])?;
+                }
+                ChatTemplateSegment::Image => {
+                    self.append_tokens(&[img_start])?;
+                    self.append_image(images[img_idx])?;
+                    self.append_tokens(&[img_end])?;
+                    img_idx += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stub for builds without `vl-preprocess`. Same signature so
+    /// shared code (wasm / mobile) that conditionally calls into
+    /// VL still type-checks; always returns `UnsupportedModality`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_chat_with_images(
+        &mut self,
+        _messages: &[crate::tokenizer::ChatMessageMultimodal],
+        _images: &[&[u8]],
+        _add_generation_prompt: bool,
+    ) -> Result<(), WickError> {
         Err(WickError::UnsupportedModality)
     }
 
@@ -1222,4 +1406,111 @@ mod tests {
     // `wick/tests/session_chain.rs` (gated behind `#[ignore]` and a
     // `find_model()` helper so they skip silently when no GGUF is
     // available locally). Unit tests here stay dep-free.
+
+    /// Token stream with no `<image>` markers collapses to a single
+    /// `Text` segment covering the whole range.
+    #[test]
+    fn splice_image_markers_no_markers_one_text_run() {
+        let segs = splice_image_markers(&[1, 2, 3, 4], 99);
+        assert_eq!(segs, vec![ChatTemplateSegment::Text { start: 0, end: 4 }]);
+    }
+
+    /// Single mid-stream marker splits into Text - Image - Text.
+    #[test]
+    fn splice_image_markers_mid_stream() {
+        let segs = splice_image_markers(&[1, 2, 99, 3, 4], 99);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Text { start: 0, end: 2 },
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Text { start: 3, end: 5 },
+            ]
+        );
+    }
+
+    /// Marker at index 0: leading text run is elided so the segment
+    /// list stays tight (no zero-length spans).
+    #[test]
+    fn splice_image_markers_at_start() {
+        let segs = splice_image_markers(&[99, 1, 2], 99);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Text { start: 1, end: 3 },
+            ]
+        );
+    }
+
+    /// Marker at the final index: trailing text run is elided.
+    #[test]
+    fn splice_image_markers_at_end() {
+        let segs = splice_image_markers(&[1, 2, 99], 99);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Text { start: 0, end: 2 },
+                ChatTemplateSegment::Image,
+            ]
+        );
+    }
+
+    /// Two adjacent markers: empty-text-run between them is elided.
+    #[test]
+    fn splice_image_markers_adjacent_markers() {
+        let segs = splice_image_markers(&[1, 99, 99, 2], 99);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Text { start: 0, end: 1 },
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Text { start: 3, end: 4 },
+            ]
+        );
+    }
+
+    /// Two well-separated markers — the canonical multi-image case.
+    /// Verifies image count round-trips for caller validation.
+    #[test]
+    fn splice_image_markers_two_separated() {
+        let segs = splice_image_markers(&[1, 99, 2, 99, 3], 99);
+        let images = segs
+            .iter()
+            .filter(|s| matches!(s, ChatTemplateSegment::Image))
+            .count();
+        assert_eq!(images, 2);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Text { start: 0, end: 1 },
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Text { start: 2, end: 3 },
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Text { start: 4, end: 5 },
+            ]
+        );
+    }
+
+    /// All-marker stream — no text runs at all.
+    #[test]
+    fn splice_image_markers_all_markers() {
+        let segs = splice_image_markers(&[99, 99, 99], 99);
+        assert_eq!(
+            segs,
+            vec![
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Image,
+                ChatTemplateSegment::Image,
+            ]
+        );
+    }
+
+    /// Empty stream — empty segment list.
+    #[test]
+    fn splice_image_markers_empty() {
+        let segs = splice_image_markers(&[], 99);
+        assert!(segs.is_empty());
+    }
 }

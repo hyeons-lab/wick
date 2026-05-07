@@ -27,7 +27,7 @@ mod common;
 
 use wick::engine::{BackendPreference, EngineConfig, ModelFiles, WickEngine};
 use wick::manifest::InferenceType;
-use wick::tokenizer::ChatMessage;
+use wick::tokenizer::{ChatMessage, ChatMessageMultimodal, ContentItem};
 use wick::{FinishReason, GenerateOpts, ModalitySink};
 
 const MAIN_URL: &str =
@@ -354,66 +354,31 @@ fn vl_bundle_appends_synthetic_image() {
     let caps = engine.capabilities();
     assert!(caps.image_in, "VL capabilities must report image_in=true");
 
-    // Drive the LFM2-VL chat template manually with the correct
-    // image-marker placement. The model was trained on inputs of
-    // the form
+    // Drive the LFM2-VL chat template via the helper that walks
+    // `<image>` markers automatically (slice 3 — replaces the
+    // manual `<|im_start|>user\n` find-and-splice pattern earlier
+    // versions of this test used). The expected envelope shape
+    // remains:
     //   <bos><|im_start|>user\n<|image_start|>[N image embeds]<|image_end|>TEXT<|im_end|>\n<|im_start|>assistant\n
-    // Splicing image embeddings outside that envelope (e.g.
-    // before the BOS) leaves the LLM unable to interpret them as
-    // visual content, so the smoke covers the proper wrapping.
-    // A higher-level helper that walks `<image>` markers in the
-    // chat-template output is still slice 2/3 work.
+    // The helper's marker-position match is enforced here by the
+    // post-image generation passing — a wrong-position envelope
+    // produces non-image-conditioned generic descriptions even on
+    // an image-tuned bundle.
     let tokenizer = engine.tokenizer();
-    // Look the marker token ids up at runtime so this test stays
-    // robust against vocab shifts across LFM2-VL variants
-    // (e.g. 1.6B vs 450M) — hardcoded ids would silently produce
-    // valid English but the wrong wrapping.
-    let img_start = tokenizer
-        .special_token_id("<|image_start|>")
-        .expect("LFM2-VL tokenizer must define <|image_start|>");
-    let img_end = tokenizer
-        .special_token_id("<|image_end|>")
-        .expect("LFM2-VL tokenizer must define <|image_end|>");
-    // Render the same chat template the public API would, then
-    // splice tokens around the user-text portion. Easier than
-    // hand-building the full prefix string.
-    let messages = vec![ChatMessage {
+    let messages = vec![ChatMessageMultimodal {
         role: "user".to_string(),
-        content: "Describe what you see.".to_string(),
+        content: vec![
+            ContentItem::Image,
+            ContentItem::Text {
+                text: "Describe what you see.".to_string(),
+            },
+        ],
     }];
-    let formatted = wick::tokenizer::apply_chat_template(tokenizer, &messages, true)
-        .expect("chat template render");
-    // The rendered string ends with "<|im_start|>assistant\n".
-    // Find "<|im_start|>user\n" — the position right after that
-    // marker is where the image goes.
-    let user_marker = "<|im_start|>user\n";
-    let user_pos = formatted
-        .find(user_marker)
-        .expect("chat template missing user marker");
-    let split = user_pos + user_marker.len();
-    let prefix_text = &formatted[..split];
-    let suffix_text = &formatted[split..];
-    let prefix_tokens = tokenizer.encode(prefix_text);
-    let suffix_tokens = tokenizer.encode(suffix_text);
-    assert!(!prefix_tokens.is_empty(), "tokenized prefix is empty");
-    assert!(!suffix_tokens.is_empty(), "tokenized suffix is empty");
 
     let mut session = engine.new_session(Default::default());
     session
-        .append_tokens(&prefix_tokens)
-        .expect("append_tokens prefix");
-    session
-        .append_tokens(&[img_start])
-        .expect("append <|image_start|>");
-    session
-        .append_image(&img_bytes)
-        .expect("append_image should succeed end-to-end");
-    session
-        .append_tokens(&[img_end])
-        .expect("append <|image_end|>");
-    session
-        .append_tokens(&suffix_tokens)
-        .expect("append_tokens suffix");
+        .append_chat_with_images(&messages, &[&img_bytes], true)
+        .expect("append_chat_with_images should succeed end-to-end");
 
     struct Collect(Vec<u32>);
     impl ModalitySink for Collect {

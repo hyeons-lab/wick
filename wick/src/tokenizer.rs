@@ -324,11 +324,46 @@ impl BpeTokenizer {
 
 // ── Chat template rendering ─────────────────────────────────────────────────
 
-/// A chat message with role and content.
+/// A chat message with role and string content. The bread-and-
+/// butter shape used by every text-only call site. Multimodal
+/// callers (image / audio in chat templates) use
+/// [`ChatMessageMultimodal`] instead — both flow through
+/// [`apply_chat_template`] which is generic over `Serialize`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+/// One item in a multimodal chat message's content list. Serializes
+/// to the JSON shape LFM2-VL's chat template expects:
+/// `{"type": "text", "text": "..."}` / `{"type": "image"}`. The
+/// template's `parse_content` macro dispatches on `item.type`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ContentItem {
+    /// A plain text fragment. Rendered verbatim into the surrounding
+    /// chat template position.
+    Text { text: String },
+    /// An image placeholder. The chat template emits the literal
+    /// string `<image>` here — wick's
+    /// [`crate::session::Session::append_chat_with_images`] helper
+    /// later swaps each `<image>` for the
+    /// `<|image_start|> + image embeddings + <|image_end|>`
+    /// envelope at append time.
+    Image,
+}
+
+/// A chat message whose content is a list of typed items (text +
+/// image). Use this shape when at least one message in the
+/// conversation includes an image; for text-only conversations
+/// [`ChatMessage`] is simpler. Both serialize to a Jinja2 context
+/// the same chat template understands — the template's
+/// `parse_content` macro branches on whether `content is string`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatMessageMultimodal {
+    pub role: String,
+    pub content: Vec<ContentItem>,
 }
 
 /// Render a chat template using minijinja.
@@ -336,9 +371,15 @@ pub struct ChatMessage {
 /// The template is a Jinja2 template from the GGUF metadata.
 /// Variables available: `messages` (array of {role, content}),
 /// `bos_token`, `eos_token`, `add_generation_prompt`.
-pub fn apply_chat_template(
+///
+/// Generic over the message element type so both
+/// [`ChatMessage`] (string content) and [`ChatMessageMultimodal`]
+/// (list-of-items content) work without per-shape branching here —
+/// the chat template itself dispatches on whether `content` is a
+/// string or a list.
+pub fn apply_chat_template<M: serde::Serialize>(
     tokenizer: &BpeTokenizer,
-    messages: &[ChatMessage],
+    messages: &[M],
     add_generation_prompt: bool,
 ) -> Result<String> {
     let template_str = tokenizer
@@ -864,6 +905,77 @@ mod tests {
         assert!(
             got.contains("user: Hi") && got.contains("assistant: Hello!"),
             "expected user+assistant content; got {got:?}"
+        );
+    }
+
+    /// `apply_chat_template` renders multimodal `ChatMessageMultimodal`
+    /// messages through a Jinja2 template that mirrors LFM2-VL's
+    /// `parse_content` macro: dispatches on `content is string` vs
+    /// list-of-items, and emits literal `<image>` for items with
+    /// `type == "image"`. Both shapes flow through the same generic
+    /// render function so callers don't have to pick a branch
+    /// upstream.
+    #[test]
+    fn chat_template_multimodal_emits_image_marker() {
+        let mut tok = make_test_tokenizer();
+        // Minimal `parse_content`-shape template: handle string OR
+        // list-of-items in the same loop.
+        tok.chat_template = Some(
+            "{% for msg in messages %}\
+             {%- if msg.content is string -%}\
+                 {{ msg.role }}: {{ msg.content }}\n\
+             {%- else -%}\
+                 {{ msg.role }}: \
+                 {%- for item in msg.content -%}\
+                     {%- if item.type == 'image' -%}<image>\
+                     {%- elif item.type == 'text' -%}{{ item.text }}\
+                     {%- endif -%}\
+                 {%- endfor -%}\n\
+             {%- endif -%}\
+             {% endfor %}"
+                .to_string(),
+        );
+        // String content path: zero `<image>` markers, content
+        // rendered verbatim.
+        let text_only = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hi".to_string(),
+        }];
+        let rendered = apply_chat_template(&tok, &text_only, false).unwrap();
+        assert!(
+            rendered.contains("user: Hi"),
+            "string-content render lost the body: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("<image>"),
+            "string-content render shouldn't emit <image>: {rendered:?}"
+        );
+
+        // List-of-items content path: image item emits literal
+        // `<image>`; text item emits the text.
+        let multimodal = vec![ChatMessageMultimodal {
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::Image,
+                ContentItem::Text {
+                    text: " Describe.".to_string(),
+                },
+            ],
+        }];
+        let rendered = apply_chat_template(&tok, &multimodal, false).unwrap();
+        // `{%- for ... -%}` whitespace-strip eats the space after `:`
+        // — assert on the marker + text combination, which is what
+        // matters for the helper's downstream tokenize+walk.
+        assert!(
+            rendered.contains("<image> Describe."),
+            "list-content render didn't combine items in order: {rendered:?}"
+        );
+        // Exactly one `<image>` marker — caller will pair it with one
+        // image's bytes.
+        assert_eq!(
+            rendered.matches("<image>").count(),
+            1,
+            "expected exactly one <image> marker; got {rendered:?}"
         );
     }
 }
