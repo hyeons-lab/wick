@@ -411,6 +411,8 @@ pub mod audio_decoder;
 pub mod audio_encoder;
 pub mod audio_preprocessor;
 pub mod vision_encoder;
+#[cfg(feature = "vl-preprocess")]
+pub mod vision_preprocessor;
 pub mod weights;
 
 // Compile-time proof that `Arc<dyn Model>` is `Send + Sync`. If a new

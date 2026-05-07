@@ -38,6 +38,6 @@ pub mod turboquant;
 // `wick::session::*`.
 pub use engine::{BackendPreference, EngineConfig, ModelFiles, ModelMetadata, WickEngine};
 pub use session::{
-    FinishReason, GenerateOpts, GenerateSummary, ImageFormat, ModalityCapabilities, ModalitySink,
-    Session, SessionConfig, WickError,
+    FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink, Session,
+    SessionConfig, WickError,
 };

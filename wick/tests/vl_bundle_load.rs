@@ -267,3 +267,190 @@ fn vl_bundle_loads_text_only() {
          numerical blow-up somewhere in the pipeline"
     );
 }
+
+/// **Phase 3 slice 1 end-to-end smoke.** Synthesises an in-memory
+/// PNG, drives `Session::append_image` end-to-end (preprocess →
+/// ViT → projector → splice into LLM prefill via
+/// `append_embeddings`), generates a few tokens, and asserts the
+/// LLM produced non-degenerate text. Catches "completely broken"
+/// — pipeline runs, image embeddings get into the LLM stream, the
+/// LLM doesn't crash on them. Strong correctness gate (parity vs
+/// `clip.cpp` on a real image with strict numerical tolerance) is
+/// deferred; the LLM-output check rules out gross structural
+/// issues like NaN propagation or pixel-shuffle row/col swaps
+/// causing the LLM to produce gibberish.
+#[test]
+#[ignore = "downloads ~310 MB across two GGUFs; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+fn vl_bundle_appends_synthetic_image() {
+    if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
+        return;
+    }
+
+    let main = common::download::ensure_cached(MAIN_URL, MAIN_FILE);
+    let mmproj = common::download::ensure_cached(MMPROJ_URL, MMPROJ_FILE);
+    let mut files = ModelFiles::text(&main);
+    files.multimodal_projector = Some(mmproj);
+    files.inference_type = Some(InferenceType::LlamaCppImageToText);
+    let engine = WickEngine::from_files(
+        files,
+        EngineConfig {
+            // The LLM context needs room for prefix tokens + 64
+            // image tokens + suffix tokens + a few generation
+            // tokens. 256 is plenty for the smoke.
+            context_size: 256,
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        },
+    )
+    .expect("VL bundle load");
+
+    // Image input: prefer a real fixture at
+    // `wick/tests/fixtures/pug.jpg` (committed for end-to-end
+    // demos against an actual recognisable subject). Fall back
+    // to a synthesised solid-red 256² PNG when the fixture is
+    // missing — keeps the smoke runnable in environments that
+    // haven't checked out the fixture (also avoids hard-failing
+    // when this test runs through `--test-threads=1` on a
+    // shallow clone). The smoke only asserts the LLM produces
+    // non-degenerate text, so either input is fine for that
+    // gate; a real image just gives nicer manual output.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pug.jpg");
+    let img_bytes: Vec<u8> = if fixture.exists() {
+        std::fs::read(&fixture).expect("read pug.jpg fixture")
+    } else {
+        eprintln!(
+            "note: {} not found — falling back to a synthetic red PNG. \
+             Save a small image fixture at that path for richer manual output.",
+            fixture.display()
+        );
+        use image::{ImageBuffer, Rgb};
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |_, _| Rgb([255u8, 0, 0]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode synthetic png");
+        png
+    };
+
+    // Capabilities should now report image_in for VL bundles.
+    let caps = engine.capabilities();
+    assert!(caps.image_in, "VL capabilities must report image_in=true");
+
+    // Drive the LFM2-VL chat template manually with the correct
+    // image-marker placement. The model was trained on inputs of
+    // the form
+    //   <bos><|im_start|>user\n<|image_start|>[N image embeds]<|image_end|>TEXT<|im_end|>\n<|im_start|>assistant\n
+    // Splicing image embeddings outside that envelope (e.g.
+    // before the BOS) leaves the LLM unable to interpret them as
+    // visual content, so the smoke covers the proper wrapping.
+    // A higher-level helper that walks `<image>` markers in the
+    // chat-template output is still slice 2/3 work.
+    let tokenizer = engine.tokenizer();
+    // Look the marker token ids up at runtime so this test stays
+    // robust against vocab shifts across LFM2-VL variants
+    // (e.g. 1.6B vs 450M) — hardcoded ids would silently produce
+    // valid English but the wrong wrapping.
+    let img_start = tokenizer
+        .special_token_id("<|image_start|>")
+        .expect("LFM2-VL tokenizer must define <|image_start|>");
+    let img_end = tokenizer
+        .special_token_id("<|image_end|>")
+        .expect("LFM2-VL tokenizer must define <|image_end|>");
+    // Render the same chat template the public API would, then
+    // splice tokens around the user-text portion. Easier than
+    // hand-building the full prefix string.
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: "Describe what you see.".to_string(),
+    }];
+    let formatted = wick::tokenizer::apply_chat_template(tokenizer, &messages, true)
+        .expect("chat template render");
+    // The rendered string ends with "<|im_start|>assistant\n".
+    // Find "<|im_start|>user\n" — the position right after that
+    // marker is where the image goes.
+    let user_marker = "<|im_start|>user\n";
+    let user_pos = formatted
+        .find(user_marker)
+        .expect("chat template missing user marker");
+    let split = user_pos + user_marker.len();
+    let prefix_text = &formatted[..split];
+    let suffix_text = &formatted[split..];
+    let prefix_tokens = tokenizer.encode(prefix_text);
+    let suffix_tokens = tokenizer.encode(suffix_text);
+    assert!(!prefix_tokens.is_empty(), "tokenized prefix is empty");
+    assert!(!suffix_tokens.is_empty(), "tokenized suffix is empty");
+
+    let mut session = engine.new_session(Default::default());
+    session
+        .append_tokens(&prefix_tokens)
+        .expect("append_tokens prefix");
+    session
+        .append_tokens(&[img_start])
+        .expect("append <|image_start|>");
+    session
+        .append_image(&img_bytes)
+        .expect("append_image should succeed end-to-end");
+    session
+        .append_tokens(&[img_end])
+        .expect("append <|image_end|>");
+    session
+        .append_tokens(&suffix_tokens)
+        .expect("append_tokens suffix");
+
+    struct Collect(Vec<u32>);
+    impl ModalitySink for Collect {
+        fn on_text_tokens(&mut self, t: &[u32]) {
+            self.0.extend_from_slice(t);
+        }
+        fn on_done(&mut self, _: FinishReason) {}
+    }
+    let mut sink = Collect(Vec::new());
+    let opts = GenerateOpts {
+        max_tokens: 16,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    session
+        .generate(&opts, &mut sink)
+        .expect("generate after image+prompt");
+    assert!(
+        !sink.0.is_empty(),
+        "generated zero tokens — append_image / forward / decode wiring is broken"
+    );
+    let decoded = tokenizer.decode(&sink.0);
+    eprintln!("vl smoke decoded output: {decoded:?}");
+    // Post-image output must look like English: at least 60% ASCII
+    // letters/spaces (catches "lots of unicode + punctuation"
+    // garbage from a broken encoder), and at least one space
+    // (catches a single long unbroken token sequence). These bars
+    // would have failed the pre-fix output ("complex and abstract
+    // scene" passed because it *was* English — the fix that
+    // mattered was switching from generic to scene-specific). The
+    // live test's main correctness gate remains the eprintln
+    // dump + manual review on first run; the assertion only
+    // catches gross structural regressions.
+    let total = decoded.chars().count() as f32;
+    let alpha_or_space = decoded
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .count() as f32;
+    assert!(total > 0.0, "decoded text is empty");
+    assert!(
+        alpha_or_space / total >= 0.6,
+        "post-image output mostly non-letters: {decoded:?}"
+    );
+    assert!(
+        decoded.contains(' '),
+        "post-image output has no spaces — single unbroken token: {decoded:?}"
+    );
+    let alpha_count = decoded.chars().filter(char::is_ascii_alphabetic).count();
+    assert!(
+        alpha_count >= 4,
+        "post-image generation looks degenerate (got {decoded:?}); image embeddings \
+         likely poisoned the LLM stream"
+    );
+}

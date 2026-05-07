@@ -102,9 +102,19 @@ use std::mem::size_of;
 
 // ── Matrix multiplication ───────────────────────────────────────────────────
 
-/// Dense f32 matrix multiply: C[m,n] = A[m,k] * B[k,n] (row-major).
+/// Dense f32 matrix multiply: standard `C = A · B`, row-major.
 ///
-/// `c` must be pre-zeroed.
+/// Concretely: `c[i*n + j] = Σ_p a[i*k + p] · b[p*n + j]` for
+/// `i ∈ [0, m), j ∈ [0, n), p ∈ [0, k)`. So `b` must be in
+/// `[k × n]` row-major layout (rows are inputs, cols are outputs)
+/// — **not** `[n × k]`. This is *not* `A · Bᵀ`; for that
+/// orientation, transpose `b` at load time or use one of the
+/// `gemv_*` helpers that consumes `[rows × cols]` weight tensors
+/// directly.
+///
+/// `c` accumulates (the loop is `c += a · b`), so `c` must be
+/// pre-zeroed (or pre-filled with a broadcast bias if you want to
+/// fold the bias-add into the gemm).
 pub fn matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
@@ -771,6 +781,25 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
     const INV_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
     for v in x.iter_mut() {
         *v = 0.5 * *v * (1.0 + erff(*v * INV_SQRT_2));
+    }
+}
+
+/// tanh-approximation GELU activation in-place:
+/// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+/// This is what `ggml_gelu` (i.e. llama.cpp's default GELU) computes,
+/// and what every CLIP-family ViT trained with `clip.use_gelu = true`
+/// in the GGUF metadata expects. Differs from
+/// [`gelu_erf_inplace`] (the exact erf-form) by ~1e-3 relative around
+/// |x| ≈ 1; that gap accumulates over many MLP layers, so picking the
+/// wrong variant degrades downstream output noticeably even though
+/// each individual call looks fine.
+pub fn gelu_inplace(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    for v in x.iter_mut() {
+        let xv = *v;
+        let inner = SQRT_2_OVER_PI * (xv + COEF * xv * xv * xv);
+        *v = 0.5 * xv * (1.0 + inner.tanh());
     }
 }
 
@@ -2400,6 +2429,32 @@ mod tests {
         assert!((x[1] - 0.8413).abs() < 5e-3, "gelu(1) = {}", x[1]);
         assert!((x[2] + 0.1587).abs() < 5e-3, "gelu(-1) = {}", x[2]);
         assert!((x[3] - 1.9545).abs() < 5e-3, "gelu(2) = {}", x[3]);
+    }
+
+    #[test]
+    fn test_gelu_tanh_known_values() {
+        // tanh-approx GELU values from PyTorch's
+        // F.gelu(x, approximate="tanh") at f64 precision. Differs
+        // from the erf-form by ~1e-3 around |x|≈1 — picking up that
+        // gap is exactly the point of having two kernels.
+        //   gelu_tanh(0)  = 0
+        //   gelu_tanh(1)  ≈ 0.84119198
+        //   gelu_tanh(-1) ≈ -0.15880802
+        //   gelu_tanh(2)  ≈ 1.95459783
+        // Tolerance 1e-4 catches a constant-precision regression
+        // (e.g. someone "fixing" SQRT_2_OVER_PI to a wrong digit) —
+        // tighter than the original 5e-3 while still leaving room
+        // for the f32 vs reference-f64 rounding floor.
+        let mut x = vec![0.0f32, 1.0, -1.0, 2.0];
+        gelu_inplace(&mut x);
+        // f32 references rounded from PyTorch f64 (the underlying
+        // formula is rational-arithmetic, so f32 precision is the
+        // floor here). Tolerance 1e-4 catches a constant-precision
+        // regression while leaving room for the rounding floor.
+        assert!(x[0].abs() < 1e-6, "gelu_tanh(0) = {}", x[0]);
+        assert!((x[1] - 0.841_192).abs() < 1e-4, "gelu_tanh(1) = {}", x[1]);
+        assert!((x[2] + 0.158_808).abs() < 1e-4, "gelu_tanh(-1) = {}", x[2]);
+        assert!((x[3] - 1.954_598).abs() < 1e-4, "gelu_tanh(2) = {}", x[3]);
     }
 
     #[test]

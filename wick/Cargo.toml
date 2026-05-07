@@ -30,6 +30,10 @@ flatbuffers.workspace = true
 cblas-sys = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Image decode + resize for the VL input preprocessor. PNG + JPEG
+# only — wider format support pulls heavier transitive deps that
+# don't pay for themselves until users demand WebP/AVIF/etc.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 # BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
 # Only the provider crate for the current target is pulled in, so cross-platform
@@ -91,7 +95,6 @@ tracing-subscriber.workspace = true
 #   gpu / metal ⇒ mmap    (both backends open the GGUF via mmap today)
 #   blas        — unchanged; opt-in GEMM accelerator
 #   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)
-default = ["parallel", "mmap", "std-fs", "disk-cache"]
 parallel = ["dep:rayon"]
 std-fs = []
 mmap = ["dep:memmap2", "std-fs"]
@@ -103,3 +106,10 @@ blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
 # tightly-scoped embedded builds don't pull reqwest. (See
 # `src/bundle/mod.rs` for the verification policy.)
 remote = ["dep:reqwest", "dep:sha2", "std-fs"]
+# VL image-input preprocessor (PNG/JPEG decode + resize +
+# normalize). Default-on so the canonical VL bundles light up
+# `Session::append_image` without an extra flag; opt-out shrinks
+# wasm / embedded builds that only do text or raw-PCM audio
+# input. Pure-Rust deps — no system libpng/libjpeg required.
+vl-preprocess = ["dep:image"]
+default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess"]

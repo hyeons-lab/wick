@@ -510,6 +510,12 @@ impl WickEngine {
         if let Some(encoder) = &self.audio_encoder {
             session.attach_audio_encoder(Arc::clone(encoder));
         }
+        // Same auto-attach for the vision encoder — VL bundles
+        // populate `vision_encoder` at engine construction; cloning
+        // the Arc per session is cheap.
+        if let Some(encoder) = &self.vision_encoder {
+            session.attach_vision_encoder(Arc::clone(encoder));
+        }
         session
     }
 

@@ -170,35 +170,15 @@ impl ModalityCapabilities {
     /// Derive capabilities from a manifest's `inference_type`. Unknown
     /// variants fall back to text-only so a bundle we don't understand
     /// at least reports safe minimums.
-    ///
-    /// **VL bundles report text-only today**, not `text_and_image_in`,
-    /// because `Session::append_image` is hardcoded to return
-    /// `UnsupportedModality` until the vision encoder forward pass +
-    /// preprocessor land in a follow-up phase. Reporting `image_in =
-    /// true` would lie to UI/FFI consumers gating on
-    /// `engine.capabilities()` — they'd see "supports images", call
-    /// `append_image`, and get a runtime error. The capability flips
-    /// to `text_and_image_in` in the same PR that wires the image
-    /// path end-to-end.
     pub fn from_inference_type(it: &crate::manifest::InferenceType) -> Self {
         use crate::manifest::InferenceType::*;
         match it {
             LlamaCppTextToText => Self::text_only(),
-            // TODO(VL pipeline): flip to `Self::text_and_image_in()`
-            // when `Session::append_image` actually accepts images.
-            LlamaCppImageToText => Self::text_only(),
+            LlamaCppImageToText => Self::text_and_image_in(),
             LlamaCppLfm2AudioV1 => Self::text_and_audio(),
             Unknown(_) => Self::text_only(),
         }
     }
-}
-
-/// Image input format — scaffolded for the VL path; unused in v1.
-#[derive(Debug, Clone, Copy)]
-pub enum ImageFormat {
-    Png,
-    Jpeg,
-    RawRgb { width: u32, height: u32 },
 }
 
 /// Error type for session operations. Upstream consumers using
@@ -286,6 +266,11 @@ pub struct Session {
     /// encoder can back multiple sessions (one per concurrent
     /// generation) without re-loading the ~hundreds-of-MB weights.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Vision encoder weights, if attached. None for non-VL
+    /// sessions; populated via [`Self::attach_vision_encoder`]
+    /// before [`Self::append_image`] is called. Held by `Arc`
+    /// for the same reason as `audio_encoder`.
+    vision_encoder: Option<Arc<crate::model::vision_encoder::VisionEncoderWeights>>,
 }
 
 impl Session {
@@ -377,6 +362,7 @@ impl Session {
             capabilities,
             config,
             audio_encoder: None,
+            vision_encoder: None,
         }
     }
 
@@ -396,6 +382,22 @@ impl Session {
     /// the LLM it was trained against.
     pub fn attach_audio_encoder(&mut self, encoder: Arc<AudioEncoderWeights>) {
         self.audio_encoder = Some(encoder);
+    }
+
+    /// Attach a vision encoder so [`Self::append_image`] can encode
+    /// PNG / JPEG bytes into LLM-ready image embeddings. Callers
+    /// load the encoder from the bundle's `multimodal_projector`
+    /// GGUF via
+    /// [`crate::model::vision_encoder::VisionEncoderWeights::from_gguf`].
+    /// Mirrors [`Self::attach_audio_encoder`]'s semantics: replaces
+    /// any prior attachment, preserved across `reset()`, no
+    /// dimension check at attach time (it lives on `append_image`
+    /// where we have a real input to size against).
+    pub fn attach_vision_encoder(
+        &mut self,
+        encoder: Arc<crate::model::vision_encoder::VisionEncoderWeights>,
+    ) {
+        self.vision_encoder = Some(encoder);
     }
 
     /// What this session accepts as input / emits as output. Derived
@@ -797,10 +799,116 @@ impl Session {
         self.cancel.store(false, Ordering::Relaxed);
     }
 
-    /// Append an image input. Not supported in v1 for any currently-shipping
-    /// model; reserved API shape for the VL loader. Always returns
-    /// `UnsupportedModality` until VL support lands.
-    pub fn append_image(&mut self, _bytes: &[u8], _format: ImageFormat) -> Result<(), WickError> {
+    /// Append an image input. Decodes PNG / JPEG bytes, resizes
+    /// to the encoder's native input size, normalises with the
+    /// encoder's per-channel mean / std, runs the ViT + projector
+    /// forward to produce 64 image tokens × `projection_dim`, and
+    /// splices them into the LLM prefill stream at the current
+    /// position via [`Self::append_embeddings`].
+    ///
+    /// **Placement matters.** The model was trained on a specific
+    /// surrounding-token envelope (LFM2-VL: `<|image_start|>` /
+    /// `<|image_end|>` *inside* the user-turn opening
+    /// `<|im_start|>user\n…<|im_end|>` block). Calling
+    /// `append_image` at the wrong stream position — before the
+    /// `<bos>` token, outside the user turn, or without the
+    /// model-specific markers — leaves the LLM unable to
+    /// interpret the embeddings as visual content; the visible
+    /// failure mode is a generic non-image-conditioned
+    /// description (e.g. *"I see a complex and abstract scene
+    /// with various shapes…"*). Callers must either:
+    ///
+    /// 1. Drive the marker / user-turn structure manually
+    ///    around `append_image`, e.g.
+    ///    ```ignore
+    ///    let img_start = tokenizer.special_token_id("<|image_start|>")?;
+    ///    let img_end   = tokenizer.special_token_id("<|image_end|>")?;
+    ///    session.append_tokens(&prefix_tokens)?;          // BOS + <|im_start|>user\n
+    ///    session.append_tokens(&[img_start])?;
+    ///    session.append_image(&jpeg_bytes)?;
+    ///    session.append_tokens(&[img_end])?;
+    ///    session.append_tokens(&suffix_tokens)?;          // user text + <|im_end|>\n + asst tag
+    ///    session.generate(&opts, &mut sink)?;
+    ///    ```
+    /// 2. Use a higher-level chat-template-aware helper that
+    ///    walks `<image>` placeholders (slice 2/3 follow-up;
+    ///    not yet implemented).
+    ///
+    /// `wick/tests/vl_bundle_load.rs::vl_bundle_appends_synthetic_image`
+    /// is the reference integration recipe.
+    ///
+    /// Errors:
+    /// 1. [`WickError::EmptyInput`] when `bytes` is empty.
+    /// 2. [`WickError::UnsupportedModality`] if the session
+    ///    capabilities don't include `image_in` (non-VL bundle).
+    /// 3. [`WickError::Backend`] when no vision encoder is
+    ///    attached (text-only construction of a VL bundle, or
+    ///    test setup that skipped `attach_vision_encoder`).
+    /// 4. [`WickError::Backend`] when image decode / resize
+    ///    fails (corrupt PNG, unsupported format, etc.).
+    /// 5. [`WickError::Backend`] when the encoder's
+    ///    `projection_dim` doesn't match the LLM's `hidden_size`
+    ///    (mismatched mmproj loaded against a different LLM).
+    /// 6. [`WickError::ContextOverflow`] / [`WickError::Cancelled`]
+    ///    propagated from [`Self::append_embeddings`].
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_image(&mut self, bytes: &[u8]) -> Result<(), WickError> {
+        if bytes.is_empty() {
+            return Err(WickError::EmptyInput);
+        }
+        if !self.capabilities.image_in {
+            return Err(WickError::UnsupportedModality);
+        }
+        let Some(encoder) = self.vision_encoder.as_ref() else {
+            return Err(WickError::Backend(
+                "Session::append_image: no vision encoder attached. \
+                 Construct via WickEngine on a VL bundle so the \
+                 encoder is auto-attached, or call \
+                 attach_vision_encoder(...) in test setup."
+                    .into(),
+            ));
+        };
+        let llm_hidden = self.model.config().hidden_size;
+        let proj_dim = encoder.config.projection_dim;
+        if proj_dim != llm_hidden {
+            return Err(WickError::Backend(format!(
+                "Session::append_image: vision encoder's projection_dim \
+                 ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
+                 The mmproj must pair with the LLM it was trained against."
+            )));
+        }
+        let pixels = crate::model::vision_preprocessor::preprocess_image(bytes, &encoder.config)?;
+        let img_tokens = encoder
+            .encode_image(&pixels)
+            .map_err(|e| WickError::Backend(format!("encode_image: {e:#}")))?;
+        // Sanity-check the encoder output shape before handing off
+        // to `append_embeddings`. Integer division below would
+        // silently truncate a non-multiple length and surface as a
+        // less actionable mismatch error from `append_embeddings`.
+        if img_tokens.len() % proj_dim != 0 {
+            return Err(WickError::Backend(format!(
+                "Session::append_image: encode_image returned {} f32s, \
+                 not a multiple of projection_dim ({proj_dim}) — encoder \
+                 produced a malformed image-token tensor",
+                img_tokens.len(),
+            )));
+        }
+        let n_tokens = img_tokens.len() / proj_dim;
+        if n_tokens == 0 {
+            return Err(WickError::Backend(
+                "Session::append_image: encoder produced zero image tokens \
+                 (preprocess + encode succeeded but yielded an empty tensor)"
+                    .into(),
+            ));
+        }
+        self.append_embeddings(&img_tokens, n_tokens)
+    }
+
+    /// Stub `append_image` for builds without `vl-preprocess`. Same
+    /// signature so wasm / embedded code that conditionally calls
+    /// it still type-checks; always returns `UnsupportedModality`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_image(&mut self, _bytes: &[u8]) -> Result<(), WickError> {
         Err(WickError::UnsupportedModality)
     }
 
@@ -1043,16 +1151,10 @@ mod tests {
         assert!(audio.audio_in && audio.audio_out);
         assert!(!audio.image_in);
 
-        // VL reports text-only today even though the inference_type
-        // is `LlamaCppImageToText`. `Session::append_image` errors
-        // with `UnsupportedModality` until the image path lights up;
-        // capabilities follow what the engine can actually do.
+        // VL bundles report `text_and_image_in` now that
+        // `Session::append_image` is fully wired (Phase 3 slice 1).
         let vl = ModalityCapabilities::from_inference_type(&InferenceType::LlamaCppImageToText);
-        assert!(vl.text_in && vl.text_out);
-        assert!(
-            !vl.image_in,
-            "VL must report image_in=false until append_image is wired"
-        );
+        assert!(vl.text_in && vl.text_out && vl.image_in);
         assert!(!vl.audio_in && !vl.audio_out);
 
         // Unknown variants fall back to text-only so an unfamiliar bundle
