@@ -43,6 +43,9 @@ openblas-src = { version = "0.10", features = ["system"] }
 # stays straightforward.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
+# Cross-platform Ctrl+C handler. wick-cli installs one in the line-REPL chat
+# loop so SIGINT cancels the in-flight turn instead of killing the process.
+ctrlc = "3"
 # UniFFI for multi-language bindings (wick-ffi crate). Version pinned to
 # a 0.31.x series — bindings are ABI-stable within a minor.
 uniffi = "0.31"
