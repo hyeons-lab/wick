@@ -67,12 +67,18 @@ enum UiUpdate {
     /// in-flight user turn gets popped on the worker side; the UI
     /// surfaces the message and returns to the prompt.
     Error(String),
-    /// Worker-emitted status line — used today for "(history
-    /// truncated to fit context: dropped oldest turn pair)" so the
-    /// user can see when prefill auto-shrinks history. Routed
-    /// through `emit_status_to_scrollback` like slash-command
-    /// status messages.
-    Status(String),
+    /// Worker dropped one user+assistant pair from this turn's
+    /// local history copy after `WickError::ContextOverflow`.
+    /// UI increments `state.truncate_offset` so subsequent turns
+    /// pre-apply the same truncation at dispatch time, sparing
+    /// the worker the per-turn re-render + re-encode work that
+    /// would otherwise scale with total accumulated overshoot
+    /// (each retry redoes chat-template render AND, for
+    /// multimodal turns, runs every image through ViT+projector
+    /// from scratch — ~6 ms per image on M-class CPU). Message
+    /// is shown via `emit_status_to_scrollback` alongside the
+    /// offset bump.
+    HistoryTruncated { message: String },
     /// A `/image <url>` fetch finished. `Ok(bytes)` pushes onto
     /// `pending_images`; `Err(message)` is surfaced as a status line.
     /// Always clears `state.fetching_url` so the UI unlocks.
@@ -138,6 +144,14 @@ struct ChatState {
     /// responsive — the prior synchronous fetch could freeze
     /// the UI for up to 30s on a misbehaving server.
     fetching_url: Option<String>,
+    /// Number of oldest user+assistant pairs the worker has
+    /// confirmed dropping (via `UiUpdate::HistoryTruncated`). The
+    /// UI keeps `state.history` as the full user-typed transcript
+    /// (so `/save` writes everything the user actually said), but
+    /// pre-applies this many `truncate_oldest_turn_pair` calls
+    /// at dispatch time so the worker doesn't re-render + re-encode
+    /// the dropped pairs every turn. Reset on `/clear`.
+    truncate_offset: usize,
 }
 
 /// RAII guard that disables raw mode + emits a final newline when
@@ -231,6 +245,7 @@ fn run_inner(
         pending_images: Vec::new(),
         history_images,
         fetching_url: None,
+        truncate_offset: 0,
     };
 
     // Print system prompt + any pre-loaded history into scrollback so
@@ -332,12 +347,15 @@ fn run_inner(
                     emit_status_to_scrollback(terminal, &format!("error: {e}"))?;
                     emit_blank_line(terminal)?;
                 }
-                Ok(UiUpdate::Status(msg)) => {
-                    // Worker-emitted status line (e.g. history
-                    // truncation). Doesn't affect generating /
-                    // pending state — just surfaces a one-line note
-                    // in scrollback alongside slash-command output.
-                    emit_status_to_scrollback(terminal, &msg)?;
+                Ok(UiUpdate::HistoryTruncated { message }) => {
+                    // Worker dropped a user+assistant pair — record
+                    // the offset so subsequent turns pre-apply the
+                    // same truncation at dispatch time, sparing the
+                    // worker per-turn re-render + re-encode work.
+                    // `state.history` itself stays intact so `/save`
+                    // still writes the full user-typed transcript.
+                    state.truncate_offset = state.truncate_offset.saturating_add(1);
+                    emit_status_to_scrollback(terminal, &message)?;
                     emit_blank_line(terminal)?;
                 }
                 Ok(UiUpdate::ImageFetched { url, result }) => {
@@ -560,6 +578,10 @@ fn dispatch_user_input(
                 }
                 let pending_dropped = !state.pending_images.is_empty();
                 state.pending_images.clear();
+                // History just collapsed to (system?, soon-to-be-pushed-user) —
+                // any prior `truncate_offset` accumulated against the now-gone
+                // pairs is stale and would over-truncate the next dispatch.
+                state.truncate_offset = 0;
                 emit_status_to_scrollback(
                     terminal,
                     match (had_system, pending_dropped) {
@@ -738,8 +760,31 @@ fn dispatch_user_input(
     // Clone history + history_images for the channel send. With
     // `Arc<Vec<u8>>` storage, the per-turn channel send is a
     // refcount bump per attachment rather than a deep memcpy.
-    let history_for_worker = state.history.clone();
-    let history_images_for_worker = state.history_images.clone();
+    //
+    // Pre-apply `truncate_offset` here — once the worker has
+    // confirmed truncation of N pairs in prior turns
+    // (`UiUpdate::HistoryTruncated`), every subsequent dispatch
+    // skips them up front so the worker doesn't re-render +
+    // re-encode them only to drop them again. State.history
+    // itself stays untouched so `/save` still writes the full
+    // user-typed transcript. The worker's retry loop is the
+    // belt+suspenders for first-time overflow + future cap
+    // changes; in steady state, `truncate_offset` lets it find
+    // the prefill fits on the first attempt.
+    let mut history_for_worker = state.history.clone();
+    let mut history_images_for_worker = state.history_images.clone();
+    for _ in 0..state.truncate_offset {
+        if !crate::truncate_oldest_turn_pair(
+            &mut history_for_worker,
+            &mut history_images_for_worker,
+        ) {
+            // Drift — UI's offset claimed more pairs than the
+            // current history actually has. Stop applying further
+            // pre-truncations rather than spinning; worker's retry
+            // loop will handle any residual overflow.
+            break;
+        }
+    }
     if tx_turn
         .send(TurnRequest::Turn {
             history: history_for_worker,
@@ -851,9 +896,10 @@ fn worker_loop(
                              the prompt."
                         ));
                     }
-                    let _ = tx_update.send(UiUpdate::Status(
-                        "(history truncated to fit context: dropped oldest turn pair)".into(),
-                    ));
+                    let _ = tx_update.send(UiUpdate::HistoryTruncated {
+                        message: "(history truncated to fit context: dropped oldest turn pair)"
+                            .into(),
+                    });
                 }
                 Err(other) => break Err(format!("prefill failed: {other}")),
             }
