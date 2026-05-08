@@ -16,6 +16,25 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+// Pull `wasm-bindgen-rayon` into the link graph so its
+// `#[wasm_bindgen]`-emitted `initThreadPool` export is preserved
+// through dead-code elimination. The `pub use` of `init_thread_pool`
+// keeps rustc + LLVM from dropping the symbol; wasm-bindgen-cli
+// scans the cdylib's export table to wire the JS glue, so the
+// generated `pkg/wick_wasm.d.ts` will surface
+// `initThreadPool(numThreads): Promise<void>` without any Rust-side
+// re-export ceremony.
+//
+// JS pattern (browser, after `init()` resolves):
+//   await initThreadPool(navigator.hardwareConcurrency);
+//   // ...then drive inference normally; rayon paths are now parallel
+//
+// Browsers must serve the page with COOP `same-origin` + COEP
+// `require-corp` headers so `SharedArrayBuffer` is available;
+// without it `initThreadPool` rejects.
+#[cfg(feature = "parallel")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 // Custom TypeScript declarations injected into the generated
 // `wick_wasm.d.ts`. wasm-bindgen would otherwise type wasm-side
 // `JsValue` parameters as `any`, losing IDE completion + type

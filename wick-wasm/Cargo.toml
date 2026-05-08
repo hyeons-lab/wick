@@ -33,6 +33,10 @@ crate-type = ["cdylib", "rlib"]
 # exports need mmap / parallel / std-fs / disk-cache. Future engine /
 # session wrappers (Phase 3.x) will turn on the features they need
 # rather than dragging the desktop default-set into wasm builds.
+#
+# The opt-in `parallel` feature on this crate flips
+# `wick/parallel` on for threaded wasm builds — see the [features]
+# table below.
 wick = { path = "../wick", default-features = false }
 wasm-bindgen.workspace = true
 # Used only by the JsError mapping helper to format wick's anyhow-typed
@@ -45,6 +49,30 @@ anyhow.workspace = true
 # for the `on_text_tokens` trampoline). Already a transitive dep of
 # wasm-bindgen; declared here because we use the public types.
 js-sys = "0.3"
+
+# `wasm-bindgen-rayon` is wasm-only — it pulls in `web_sys::Worker`
+# / Node `worker_threads` glue that doesn't exist on native targets.
+# Scoping under `cfg(target_arch = "wasm32")` keeps `cargo check
+# --workspace` happy on the host even with `--features parallel`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-rayon = { workspace = true, optional = true }
+
+[features]
+# `parallel` — opt-in multi-threaded wasm build. Lights up
+# `wick/parallel` (rayon) and links `wasm-bindgen-rayon`, which
+# emits a `#[wasm_bindgen]` `initThreadPool(numThreads)` export
+# that JS callers `await` once before driving inference.
+#
+# Only useful with the matching build flags: atomics target-feature
+# + `-Z build-std=panic_abort,std`. The `wasm-web-mt` / `wasm-node-mt`
+# justfile recipes wire those in. Plain `wasm-pack build --features
+# parallel` without those flags will fail to link — that's intended,
+# the recipes are the supported entry point.
+#
+# Browsers also need cross-origin isolation (COOP `same-origin` +
+# COEP `require-corp` headers on the host page) for
+# `SharedArrayBuffer` to be available. Node has no equivalent gate.
+parallel = ["wick/parallel", "dep:wasm-bindgen-rayon"]
 
 [package.metadata.docs.rs]
 # docs.rs runs on linux x86_64 by default, which would skip the
@@ -67,7 +95,13 @@ targets = ["wasm32-unknown-unknown"]
 #   - `--enable-mutable-globals`    — required by `getrandom/js`
 #   - `--enable-nontrapping-float-to-int` — saturating float→int
 #   - `--enable-reference-types`    — `externref` (used by JS interop)
-# All five are universally supported in browsers + Node since
+#   - `--enable-threads`            — atomics + shared-memory ops
+#                                     emitted by the threaded build
+#                                     (`--features parallel`). No-op
+#                                     on single-threaded builds (no
+#                                     atomic ops in the wasm body),
+#                                     so always-on is safe.
+# All six are universally supported in browsers + Node since
 # late-2020 builds; without them, wasm-opt refuses the wasm-bindgen
 # input as "non-MVP". Pin them here so local + CI builds stay in
 # sync.
@@ -79,4 +113,5 @@ wasm-opt = [
     '--enable-mutable-globals',
     '--enable-nontrapping-float-to-int',
     '--enable-reference-types',
+    '--enable-threads',
 ]
