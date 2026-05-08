@@ -111,6 +111,13 @@ struct MetalPipelines {
     gemm_q4_0: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
     attention_prefill: ComputePipelineState,
+    /// Iter 5: head_dim-specialized prefill attention. Inner MMA loops
+    /// resolve `hd_tiles = hd/8` to a constexpr at MSL compile time, letting
+    /// the compiler fully unroll. Selected by `head_dim` in
+    /// `encode_attention_prefill_batch`; runtime fallback is the generic
+    /// `attention_prefill` pipeline above.
+    attention_prefill_hd64: ComputePipelineState,
+    attention_prefill_hd128: ComputePipelineState,
     qk_norm_rope_batch: ComputePipelineState,
     conv1d_fused_batch: ComputePipelineState,
     kv_shift_k_to_scratch: ComputePipelineState,
@@ -333,6 +340,10 @@ impl MetalLfm2Model {
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
             attention_prefill: ctx
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill")?,
+            attention_prefill_hd64: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64")?,
+            attention_prefill_hd128: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd128")?,
             qk_norm_rope_batch: ctx
                 .create_pipeline(shaders::QK_NORM_ROPE_BATCH, "qk_norm_rope_batch")?,
             conv1d_fused_batch: ctx
@@ -1973,7 +1984,17 @@ impl MetalLfm2Model {
             q_stride,
             out_stride,
         ];
-        enc.set_compute_pipeline_state(&self.pipelines.attention_prefill);
+        // Iter 5: dispatch the head_dim-specialized variant when one
+        // exists; fall back to the runtime kernel for any other head_dim
+        // (LLaMA-class models, future LFM2 sizes, etc.). The specialized
+        // kernels resolve the inner-loop bounds + simdgroup_load strides
+        // to constexpr, enabling full unroll of the QK^T and V-MMA loops.
+        let pipeline = match head_dim {
+            64 => &self.pipelines.attention_prefill_hd64,
+            128 => &self.pipelines.attention_prefill_hd128,
+            _ => &self.pipelines.attention_prefill,
+        };
+        enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(q_buf), 0);
         enc.set_buffer(1, Some(k_cache), 0);
         enc.set_buffer(2, Some(v_cache), 0);

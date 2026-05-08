@@ -1,27 +1,29 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Iter 4 — MMA prefill attention with C=64 + fp16 Q/K/V.
+// Iter 5 — Per-head-dim specialization on top of Iter 4 (C=64 + fp16 MMA).
 //
-// Builds on Iter 3 (#22). Two coordinated changes vs Iter 3:
+// The kernel body is wrapped in a `template<uint HD_CONST>` helper. When
+// HD_CONST > 0 the inner-loop bounds (`hd_tiles = hd/8`, `dim_tiles = hd/8`)
+// + the simdgroup_load stride argument resolve to constexpr at MSL compile
+// time, letting the compiler fully unroll the QK^T and V-MMA loops and
+// generate matrix-load instructions with statically-known stride.
 //
-// 1. `C` bumped 32 → 64. Score matrix becomes [Q_PER_TG × C] = [8 × 64]
-//    = 8 tiles of 8×8, one per simdgroup — all 8 SGs are busy during
-//    QK^T scoring (Iter 3 had only 4 SGs active).
+// HD_CONST=0 keeps the runtime path used for any head_dim outside the
+// dispatched-specialization set; in that path the ternary collapses to
+// `params.head_dim` and the body matches Iter 4 exactly.
 //
-// 2. Q, K, V staged in threadgroup memory as `half` instead of `float`
-//    and loaded into `simdgroup_half8x8` matrices. Scores matrix and
-//    output accumulator remain fp32 (standard flash-attention precision
-//    shape). This halves TG memory for q_tg and kv_tile, keeping total
-//    shmem at ~13.1 KB for hd=64 (unchanged from Iter 3 despite C
-//    doubling) and ~24.1 KB for hd=128.
+// Three entry points:
+//   `attention_prefill`        — runtime fallback (HD_CONST=0)
+//   `attention_prefill_hd64`   — LFM2-VL-450M / LFM2.5-VL-450M
+//   `attention_prefill_hd128`  — LFM2.5-VL-1.6B / LFM2.5-Audio-1.5B
+// Host-side dispatch picks the specialized variant by head_dim;
+// see `encode_attention_prefill_batch`.
 //
-// Empirical results vs Iter 3 at p=4096 on M1 Max (5-run median):
-//   450M-Q4_0 (hd=64):  prefill 5663 → 6184 tok/s (+9.2%)
-//                       attn_kernel 338k → 281k µs (−17%)
-//   1.6B-Q4_0 (hd=128): attn_kernel 640k → 549k µs (−14%)
-// The end-to-end gain on 1.6B is within measurement noise because
-// non-attention phases dominate its total wall time.
+// Iter 4 background (carried over):
+//   `C` is 64; Q, K, V stage as half in threadgroup memory; score matrix
+//   and output accumulator remain fp32 (standard flash-attention precision
+//   shape). Total shmem stays at ~13.1 KB for hd=64 / ~24.1 KB for hd=128.
 //
 // Mixed-precision MMA overloads in use (confirmed supported on M1+):
 //   - QK^T:  simdgroup_multiply_accumulate(float8x8, half8x8, half8x8, float8x8)
@@ -52,19 +54,23 @@ struct PrefillAttnParams {
     uint out_stride;
 };
 
-kernel void attention_prefill(
-    const device float* q_batch [[buffer(0)]],
-    const device half*  k_cache [[buffer(1)]],
-    const device half*  v_cache [[buffer(2)]],
-    device float* out_batch [[buffer(3)]],
-    constant PrefillAttnParams& params [[buffer(4)]],
-    threadgroup char* shmem [[threadgroup(0)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_idx [[threadgroup_position_in_grid]]
+// Templated helper — when HD_CONST > 0, `hd` collapses to that constant at
+// compile time and the inner loops fully unroll. HD_CONST=0 (used by the
+// runtime fallback) keeps the body identical to Iter 4.
+template<uint HD_CONST>
+inline void attention_prefill_impl(
+    const device float* q_batch,
+    const device half*  k_cache,
+    const device half*  v_cache,
+    device float*       out_batch,
+    constant PrefillAttnParams& params,
+    threadgroup char*   shmem,
+    uint tid,
+    uint tg_idx
 ) {
     const uint n_heads = params.n_heads;
     const uint n_kv_heads = params.n_kv_heads;
-    const uint hd = params.head_dim;
+    const uint hd = (HD_CONST > 0) ? HD_CONST : params.head_dim;
     const uint kv_dim = params.kv_dim;
     const uint start_pos = params.start_pos;
     const uint n_queries = params.n_queries;
@@ -310,4 +316,53 @@ kernel void attention_prefill(
             out_batch[out_idx] = out_tg[q * hd + d] * inv_sum;
         }
     }
+}
+
+// === Entry points =========================================================
+//
+// Three kernels that share the same body. The runtime kernel
+// (`attention_prefill`) handles any head_dim; the specialized kernels
+// (hd=64, hd=128) let the compiler constant-propagate the head_dim through
+// the inner MMA loops.
+
+kernel void attention_prefill(
+    const device float* q_batch [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out_batch [[buffer(3)]],
+    constant PrefillAttnParams& params [[buffer(4)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_idx [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_impl<0>(q_batch, k_cache, v_cache, out_batch, params,
+                              shmem, tid, tg_idx);
+}
+
+kernel void attention_prefill_hd64(
+    const device float* q_batch [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out_batch [[buffer(3)]],
+    constant PrefillAttnParams& params [[buffer(4)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_idx [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_impl<64>(q_batch, k_cache, v_cache, out_batch, params,
+                               shmem, tid, tg_idx);
+}
+
+kernel void attention_prefill_hd128(
+    const device float* q_batch [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out_batch [[buffer(3)]],
+    constant PrefillAttnParams& params [[buffer(4)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_idx [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_impl<128>(q_batch, k_cache, v_cache, out_batch, params,
+                                shmem, tid, tg_idx);
 }
