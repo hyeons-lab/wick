@@ -389,6 +389,74 @@ just wasm-node   # CommonJS Node  → wick-wasm/pkg-nodejs/
 Requires `wasm-pack` (`cargo install wasm-pack`) and `wasm-opt`
 (macOS: `brew install binaryen`; linux: `apt-get install binaryen`).
 
+## Multi-threaded build
+
+Threaded variants light up `wick`'s rayon paths (batched prefill
+GEMM, parallel GEMV row sweeps, dequant_rows_to_f32) on wasm via
+`wasm-bindgen-rayon`. The generated package surfaces an
+`initThreadPool(numThreads)` JS export that callers `await` once
+before driving inference.
+
+```sh
+just wasm-web-mt    # browser ESM + threads → wick-wasm/pkg-web-mt/
+just wasm-node-mt   # CommonJS Node + threads → wick-wasm/pkg-nodejs-mt/
+```
+
+Both recipes set the atomics target-feature, the
+shared-memory/import-memory link args, and `-Z build-std=panic_abort,std`
+together. Single-threaded `wasm`/`wasm-web`/`wasm-node` recipes are
+unchanged. `--target bundler` is intentionally not provided —
+`wasm-bindgen-rayon` doesn't have canonical bundler-side worker glue.
+
+Extra prerequisite (single-threaded builds don't need this): the
+`rust-src` rustup component for `-Z build-std`:
+
+```sh
+rustup component add rust-src
+```
+
+### Browser usage
+
+```js
+import init, { initThreadPool, WickEngine } from './wick_wasm.js';
+
+await init();
+await initThreadPool(navigator.hardwareConcurrency);
+// ...drive inference normally; rayon paths now run on the worker pool
+```
+
+The host page **must** be served with cross-origin isolation headers
+so the browser hands out a real `SharedArrayBuffer`:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Without these `initThreadPool` rejects with a `SharedArrayBuffer is
+not defined` error. Most static-file dev servers don't set them by
+default — see the `wasm-bindgen-rayon` README for snippets covering
+Vite, webpack-dev-server, `http-server`, and similar tools.
+
+### Node usage
+
+`pkg-nodejs-mt/` ships as a CommonJS module, so top-level `await`
+isn't available — wrap the init in an async IIFE (or run the
+snippet from a `.mjs` / `"type": "module"` ESM file):
+
+```js
+const { initThreadPool, WickEngine } = require('@hyeonslab/wick-wasm');
+const os = require('os');
+
+(async () => {
+    await initThreadPool(os.cpus().length);
+    // ...drive inference normally; rayon paths now run on worker_threads
+})();
+```
+
+Node has no equivalent of the browser's COOP/COEP gate — the
+threaded build runs out-of-the-box on `worker_threads`.
+
 ## License
 
 Apache-2.0 OR MIT, matching the rest of the wick workspace.

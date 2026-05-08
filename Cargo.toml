@@ -67,6 +67,15 @@ web-time = "1"
 # normal "regenerate the JS glue" upgrade dance, not a code-level
 # rewrite. Only consumed by `wick-wasm`; native crates don't pull it.
 wasm-bindgen = "0.2"
+# Worker-pool init shim that lights up rayon on `wasm32-unknown-unknown`.
+# Provides a `#[wasm_bindgen]` `init_thread_pool(num_threads)` export
+# that JS callers `await` once before any rayon work; under the hood
+# it spawns Web Workers (browser) or `worker_threads` (Node) and
+# attaches them to rayon's global pool. Only consumed by `wick-wasm`
+# behind its opt-in `parallel` feature — single-threaded wasm builds
+# don't pull this in. Pinned to 1.x; the crate is ABI-stable within
+# a major.
+wasm-bindgen-rayon = "1"
 
 [profile.release]
 lto = "thin"

@@ -260,6 +260,99 @@ wasm-node:
     @echo "--- wick-wasm/pkg-nodejs/ ---"
     @ls -lh wick-wasm/pkg-nodejs/
 
+# ── Multi-threaded wasm builds ──────────────────────────────────────────
+#
+# Threaded variants light up `wick`'s rayon paths (batched prefill
+# GEMM, parallel GEMV row sweeps, dequant_rows_to_f32) on the wasm
+# target via `wasm-bindgen-rayon`. The generated package surfaces a
+# `initThreadPool(numThreads)` JS export that callers `await` once
+# before driving inference.
+#
+# Three things turn this on together — none of them are useful
+# without the others:
+#   1. `--features parallel` on `wick-wasm` enables `wick/parallel`
+#      (rayon) and links `wasm-bindgen-rayon` (the JS thread-pool
+#      shim).
+#   2. `RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals"`
+#      makes rustc emit atomic ops + thread-local storage
+#      instructions. bulk-memory and mutable-globals are already
+#      enabled by wasm-opt; the rustflags entry forces them on at
+#      compile time too because atomics requires both.
+#   3. `-Z build-std=panic_abort,std` rebuilds std with atomics on.
+#      The precompiled std rustup ships isn't built with atomics,
+#      so anything that touches a sync primitive (rayon definitely
+#      does) fails to link without this. Requires the `rust-src`
+#      rustup component (`rustup component add rust-src --toolchain
+#      $(cat rust-toolchain.toml | grep channel | cut -d'"' -f2)`)
+#      and a nightly toolchain — both already in
+#      `rust-toolchain.toml`.
+#
+# Browsers also need cross-origin isolation (COOP `same-origin` +
+# COEP `require-corp` headers on the host page) for
+# `SharedArrayBuffer`. Node has no equivalent gate.
+#
+# `--target bundler` is intentionally not provided — `wasm-bindgen-rayon`
+# doesn't have canonical bundler-side worker glue, so we ship `web` +
+# `nodejs` only.
+#
+# Link-arg breakdown (all required, none optional):
+#   --shared-memory          memory definition gets the SHARED flag.
+#                            Without it the linker emits non-shared memory
+#                            even with `+atomics`, and Web Workers can't
+#                            see the same heap.
+#   --import-memory          memory comes from JS (`env.memory`) instead
+#                            of being defined inside the wasm. Required
+#                            because each Web Worker creates its own
+#                            wasm instance and they all need to share
+#                            the same `WebAssembly.Memory` — the only
+#                            way to do that is to import it.
+#   --max-memory=<bytes>     shared memory must declare a max. 4 GB
+#                            (`4294967296`) is the wasm32 ceiling and
+#                            matches what `wasm-bindgen-rayon`'s docs
+#                            recommend.
+#   --export=__wasm_init_tls + __tls_size + __tls_align + __tls_base
+#                            wasm-bindgen-cli's threading transform
+#                            looks these up by name in the export
+#                            table. LLD generates them when shared
+#                            memory is on but doesn't auto-export them
+#                            — without these four flags wasm-bindgen
+#                            fails with `failed to find __wasm_init_tls`.
+WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" + \
+    " -C link-arg=--shared-memory" + \
+    " -C link-arg=--import-memory" + \
+    " -C link-arg=--max-memory=4294967296" + \
+    " -C link-arg=--export=__wasm_init_tls" + \
+    " -C link-arg=--export=__tls_size" + \
+    " -C link-arg=--export=__tls_align" + \
+    " -C link-arg=--export=__tls_base"
+
+# Build the `--target web` threaded variant — `pkg-web-mt/`.
+# Browser consumers `await initThreadPool(navigator.hardwareConcurrency)`
+# once after `await init()` resolves; subsequent `Session.generate`
+# calls run rayon work on the worker pool.
+wasm-web-mt:
+    RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
+    wasm-pack build wick-wasm \
+        --target web --release \
+        --scope hyeonslab --out-dir pkg-web-mt \
+        -- --features parallel \
+        -Z build-std=panic_abort,std
+    @echo "--- wick-wasm/pkg-web-mt/ ---"
+    @ls -lh wick-wasm/pkg-web-mt/
+
+# Build the `--target nodejs` threaded variant — `pkg-nodejs-mt/`.
+# Node consumers `await initThreadPool(os.cpus().length)` once before
+# driving inference; the pool is backed by `worker_threads`.
+wasm-node-mt:
+    RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
+    wasm-pack build wick-wasm \
+        --target nodejs --release \
+        --scope hyeonslab --out-dir pkg-nodejs-mt \
+        -- --features parallel \
+        -Z build-std=panic_abort,std
+    @echo "--- wick-wasm/pkg-nodejs-mt/ ---"
+    @ls -lh wick-wasm/pkg-nodejs-mt/
+
 # Clean build artifacts
 clean:
     cargo clean

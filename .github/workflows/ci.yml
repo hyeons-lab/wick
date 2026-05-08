@@ -210,6 +210,132 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  wick-wasm-pack-mt:
+    # Multi-threaded wasm-pack build. Mirrors `wick-wasm-pack`
+    # above but flips on the `parallel` feature + the
+    # `wasm-bindgen-rayon` thread-pool shim, so the resulting
+    # package surfaces an `initThreadPool(numThreads)` JS export
+    # that callers `await` once before driving inference. Only
+    # `web` and `nodejs` targets are exercised — `wasm-bindgen-rayon`
+    # doesn't have canonical bundler-side worker glue, so a
+    # bundler-target threaded build is unsupported upstream.
+    #
+    # Build flags break down identically to the `wasm-web-mt` /
+    # `wasm-node-mt` justfile recipes; if those go stale this
+    # job catches it.
+    name: Wick-Wasm Pack MT (${{ matrix.target }})
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [web, nodejs]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: wasm32-unknown-unknown
+          # `rust-src` is required for `-Z build-std`; the std
+          # rebuild is what makes atomics-aware sync primitives
+          # (Mutex/Arc/Atomic*) link against an atomics-built std.
+          # Without this component the build fails before reaching
+          # the linker.
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'v0.14.0'
+      - name: Install binaryen (provides wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Build wick-wasm npm package (threaded)
+        # Flag breakdown lives in the justfile next to
+        # `WASM_MT_RUSTFLAGS`. Keep this command in lockstep —
+        # if a flag changes there it must change here too.
+        run: |
+          RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+            -C link-arg=--shared-memory \
+            -C link-arg=--import-memory \
+            -C link-arg=--max-memory=4294967296 \
+            -C link-arg=--export=__wasm_init_tls \
+            -C link-arg=--export=__tls_size \
+            -C link-arg=--export=__tls_align \
+            -C link-arg=--export=__tls_base" \
+          wasm-pack build wick-wasm \
+            --target ${{ matrix.target }} \
+            --release \
+            --scope hyeonslab \
+            --out-dir pkg-${{ matrix.target }}-mt \
+            -- --features parallel \
+            -Z build-std=panic_abort,std
+      - name: Verify threaded artifact has shared memory + initThreadPool
+        # Two-pronged sanity check that catches the most common
+        # silent regression: the build succeeds but produces a
+        # wasm without shared memory (i.e. atomics weren't applied
+        # correctly) or without the JS thread-pool entry point
+        # (i.e. wasm-bindgen-rayon got DCE'd out).
+        run: |
+          set -euo pipefail
+          PKG=wick-wasm/pkg-${{ matrix.target }}-mt
+          WASM=$PKG/wick_wasm_bg.wasm
+          DTS=$PKG/wick_wasm.d.ts
+          # `wasm-objdump` ships in `wabt`; `binaryen` (already
+          # installed above for `wasm-opt`) doesn't include it,
+          # so we install wabt here only — keeps the main
+          # wick-wasm-pack job's install step lean.
+          sudo apt-get install -y wabt
+          MEM_LINE=$(wasm-objdump -j Import -x "$WASM" | grep '^ - memory\[0\]' || true)
+          if ! echo "$MEM_LINE" | grep -q 'shared'; then
+            echo "::error::$WASM imports memory without 'shared' flag — atomics build is broken"
+            echo "Memory import line: $MEM_LINE"
+            exit 1
+          fi
+          if ! grep -q 'initThreadPool' "$DTS"; then
+            echo "::error::$DTS missing initThreadPool export — wasm-bindgen-rayon got DCE'd"
+            exit 1
+          fi
+          echo "$WASM: shared memory + initThreadPool present — OK"
+      - name: Check threaded .wasm size budget
+        # Threaded wasm is bigger than the single-threaded body
+        # because the std rebuild includes atomics-aware sync
+        # primitives + TLS init. ~2.3 MB measured locally for
+        # both targets; 3 MB budget gives ~30% headroom for std
+        # / wasm-bindgen-rayon churn before this needs a bump.
+        # Crossing the budget is intentional sometimes (a real
+        # new capability, not a regression) — when it happens,
+        # justify in the PR description and bump `BUDGET_KB`
+        # here in the same commit.
+        run: |
+          set -euo pipefail
+          PKG=wick-wasm/pkg-${{ matrix.target }}-mt
+          WASM=$PKG/wick_wasm_bg.wasm
+          SIZE_BYTES=$(wc -c < "$WASM")
+          BUDGET_KB=3072  # 3 MB — threaded body is ~30% larger than st
+          BUDGET_BYTES=$((BUDGET_KB * 1024))
+          SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
+          {
+            echo "## Wick-Wasm Pack MT output (${{ matrix.target }})"
+            echo
+            echo "**\`$WASM\`: ${SIZE_KB} KB / ${BUDGET_KB} KB budget**"
+            echo
+            echo '```'
+            ls -lh "$PKG/"
+            echo '```'
+          } >> "$SUMMARY"
+          if [ "$SIZE_BYTES" -gt "$BUDGET_BYTES" ]; then
+            echo "::error file=.github/workflows/ci.yml::$WASM is ${SIZE_KB} KB (${SIZE_BYTES} B), over the ${BUDGET_KB} KB (${BUDGET_BYTES} B) budget. If this is intentional (new capability, not a regression), bump BUDGET_KB in the same commit and justify in the PR description."
+            exit 1
+          fi
+          echo "$WASM: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wick-wasm-pkg-${{ matrix.target }}-mt
+          path: wick-wasm/pkg-${{ matrix.target }}-mt/
+          if-no-files-found: error
+          retention-days: 30
+
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under
     # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`

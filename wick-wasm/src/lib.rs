@@ -16,6 +16,14 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+// Pull `wasm-bindgen-rayon` into the link graph so its
+// `#[wasm_bindgen]`-emitted `initThreadPool` export survives
+// dead-code elimination and reaches the generated `wick_wasm.d.ts`.
+// JS init pattern + COOP/COEP requirement live in
+// `wick-wasm/README.md`'s "Multi-threaded build" section.
+#[cfg(feature = "parallel")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 // Custom TypeScript declarations injected into the generated
 // `wick_wasm.d.ts`. wasm-bindgen would otherwise type wasm-side
 // `JsValue` parameters as `any`, losing IDE completion + type
