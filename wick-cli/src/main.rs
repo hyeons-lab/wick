@@ -2153,19 +2153,120 @@ fn main() -> Result<()> {
                                 eprintln!("usage: /image <path-or-url>");
                                 continue;
                             }
-                            if image_source::looks_like_url(rest) {
-                                eprintln!("(downloading {rest}...)");
+                            // Path branch: synchronous fs read; this arm is
+                            // intentionally not cancellable. SIGINT during
+                            // a path read falls to the at-prompt handler
+                            // branch and exits — fine for the typical
+                            // sub-second local read; less ideal for a slow
+                            // network mount or a 50 MB max-size read where
+                            // the read itself could take long enough to
+                            // matter, but the threading machinery isn't
+                            // worth it for a path that's blocking-by-design.
+                            if !image_source::looks_like_url(rest) {
+                                match image_source::load(rest, image_source::MAX_IMAGE_BYTES) {
+                                    Ok(bytes) => {
+                                        eprintln!(
+                                            "(image attached: {rest}, {} bytes; sends with next message)",
+                                            bytes.len()
+                                        );
+                                        pending_images.push(std::sync::Arc::new(bytes));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("error: /image {rest}: {e:#}");
+                                    }
+                                }
+                                continue;
                             }
-                            match image_source::load(rest, image_source::MAX_IMAGE_BYTES) {
+                            // URL branch: spawn the fetch on a background
+                            // thread and poll for the result with short
+                            // timeouts so SIGINT during the wait can flip
+                            // the cancel atomic and break us out.
+                            // `intercepting=true` for the wait span — same
+                            // discipline as around prefill / generate
+                            // (PR #140) so the SIGINT handler routes
+                            // Ctrl+C to cancel instead of process-exit. The
+                            // orphan fetch thread continues until reqwest
+                            // resolves the request (≤30s timeout); its
+                            // eventual `tx.send` returns SendError silently
+                            // when the receiver is dropped.
+                            //
+                            // Hoist `intercepting=true` BEFORE any URL-
+                            // branch work (eprintln, channel setup, thread
+                            // spawn) — a SIGINT in the gap between branch
+                            // entry and the store would otherwise route to
+                            // the at-prompt handler branch and exit. Same
+                            // race PR #140's review caught for the
+                            // prefill/generate span.
+                            intercepting.store(true, Ordering::Relaxed);
+                            eprintln!("(downloading {rest}...)");
+                            let url = rest.to_string();
+                            let url_for_thread = url.clone();
+                            let (tx, rx) =
+                                std::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>();
+                            std::thread::spawn(move || {
+                                // catch_unwind so a panic inside rustls /
+                                // tokio (rare but possible) becomes a
+                                // surfaced error instead of dropping the
+                                // sender silently and stranding the REPL
+                                // forever waiting on `rx`.
+                                let result = std::panic::catch_unwind(|| {
+                                    image_source::load(
+                                        &url_for_thread,
+                                        image_source::MAX_IMAGE_BYTES,
+                                    )
+                                });
+                                let payload = match result {
+                                    Ok(Ok(bytes)) => Ok(bytes),
+                                    Ok(Err(e)) => Err(format!("{e:#}")),
+                                    Err(_) => Err("image fetch panicked".to_string()),
+                                };
+                                let _ = tx.send(payload);
+                            });
+                            let outcome: std::result::Result<Vec<u8>, String> = loop {
+                                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                                    Ok(thread_result) => break thread_result,
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                        if cancel.load(Ordering::Relaxed) {
+                                            break Err("cancelled".into());
+                                        }
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                        // Should be unreachable given
+                                        // `catch_unwind` above; defense
+                                        // branch surfaces an error rather
+                                        // than busy-looping.
+                                        break Err("image fetch thread died unexpectedly".into());
+                                    }
+                                }
+                            };
+                            let fetch_sigint = sigint_fired.swap(false, Ordering::Relaxed);
+                            intercepting.store(false, Ordering::Relaxed);
+                            // Cancel-state hygiene: a SIGINT during the wait
+                            // sets BOTH `cancel` and `sigint_fired`. If the
+                            // fetch happened to complete first
+                            // (recv_timeout returned Ok before our cancel
+                            // poll observed it), the Ok arm below would
+                            // surface the bytes — but `cancel` would stay
+                            // set and the next session call would hit a
+                            // stale cancel. Clear it whenever SIGINT fired,
+                            // regardless of outcome. Matches the generate
+                            // path's discipline (PR #140 review).
+                            if fetch_sigint {
+                                cancel.store(false, Ordering::Relaxed);
+                            }
+                            match outcome {
                                 Ok(bytes) => {
                                     eprintln!(
-                                        "(image attached: {rest}, {} bytes; sends with next message)",
+                                        "(image attached: {url}, {} bytes; sends with next message)",
                                         bytes.len()
                                     );
                                     pending_images.push(std::sync::Arc::new(bytes));
                                 }
-                                Err(e) => {
-                                    eprintln!("error: /image {rest}: {e:#}");
+                                Err(_) if fetch_sigint => {
+                                    eprintln!("(cancelled)");
+                                }
+                                Err(msg) => {
+                                    eprintln!("error: /image {url}: {msg}");
                                 }
                             }
                             continue;
