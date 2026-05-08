@@ -252,18 +252,27 @@ fn run_inner(
                     }
                 }
                 Ok(UiUpdate::Done(reason)) => {
-                    if let Some(text) = state.pending.take() {
-                        // Commit the assistant turn to scrollback so
-                        // it stays visible after the viewport
-                        // redraws.
-                        emit_message_to_scrollback(terminal, "assistant", &text)?;
-                        emit_blank_line(terminal)?;
-                        state.history.push(ChatMessage {
-                            role: "assistant".into(),
-                            content: text,
-                        });
-                        state.history_images.push(Vec::new());
-                    }
+                    // Always commit the assistant turn, mirroring
+                    // the line REPL's `history.push(...content:
+                    // sink.into_text())` after every successful
+                    // generate. `Session::generate` can legitimately
+                    // produce zero text tokens (e.g. first sampled
+                    // token is EOS) — `state.pending` is `Some("")`
+                    // from the dispatch initializer in that case
+                    // and `take().unwrap_or_default()` collapses
+                    // both that and any future code path that left
+                    // it `None` to an empty assistant message.
+                    // Skipping the push would leave two consecutive
+                    // user turns in `history` and break subsequent
+                    // chat-template rendering.
+                    let text = state.pending.take().unwrap_or_default();
+                    emit_message_to_scrollback(terminal, "assistant", &text)?;
+                    emit_blank_line(terminal)?;
+                    state.history.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: text,
+                    });
+                    state.history_images.push(Vec::new());
                     // Drain pending images only after a full-turn
                     // success (worker finished prefill AND
                     // generate, assistant text just committed). On
