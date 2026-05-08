@@ -54,7 +54,10 @@ use unicode_width::UnicodeWidthChar;
 use wick::tokenizer::{BpeTokenizer, ChatMessage};
 use wick::{FinishReason, GenerateOpts, ModalitySink, Session};
 
-/// Updates flowing from the inference worker thread to the UI.
+/// Updates flowing from the inference worker thread to the UI. The
+/// `ImageFetched` variant is also delivered from a `/image <url>`
+/// fetch thread (not the inference worker) — the channel is shared
+/// so the UI sees both kinds of async results in the same drain loop.
 enum UiUpdate {
     /// Decoded text — append to the in-flight assistant reply.
     Chunk(String),
@@ -64,6 +67,13 @@ enum UiUpdate {
     /// in-flight user turn gets popped on the worker side; the UI
     /// surfaces the message and returns to the prompt.
     Error(String),
+    /// A `/image <url>` fetch finished. `Ok(bytes)` pushes onto
+    /// `pending_images`; `Err(message)` is surfaced as a status line.
+    /// Always clears `state.fetching_url` so the UI unlocks.
+    ImageFetched {
+        url: String,
+        result: std::result::Result<Vec<u8>, String>,
+    },
 }
 
 /// User-driven turns dispatched from the UI to the worker. The full
@@ -116,6 +126,12 @@ struct ChatState {
     /// follow-ups across many turns, not just its own turn-1
     /// description.
     history_images: Vec<Vec<std::sync::Arc<Vec<u8>>>>,
+    /// `Some(url)` while a `/image <url>` fetch is running on a
+    /// background thread. Locks input dispatch the same way
+    /// `generating` does, but renders / Ctrl+C / exit stay
+    /// responsive — the prior synchronous fetch could freeze
+    /// the UI for up to 30s on a misbehaving server.
+    fetching_url: Option<String>,
 }
 
 /// RAII guard that disables raw mode + emits a final newline when
@@ -208,6 +224,7 @@ fn run_inner(
         last_finish: None,
         pending_images: Vec::new(),
         history_images,
+        fetching_url: None,
     };
 
     // Print system prompt + any pre-loaded history into scrollback so
@@ -225,8 +242,17 @@ fn run_inner(
 
     let worker_tokenizer = tokenizer;
     let worker_opts = opts.clone();
+    // Clone for the worker so the UI keeps an owned `Sender` to pass to
+    // `/image <url>` fetch threads (and to `handle_key`).
+    let worker_tx_update = tx_update.clone();
     let worker_handle = thread::spawn(move || {
-        worker_loop(session, worker_tokenizer, worker_opts, rx_turn, tx_update);
+        worker_loop(
+            session,
+            worker_tokenizer,
+            worker_opts,
+            rx_turn,
+            worker_tx_update,
+        );
     });
 
     'outer: loop {
@@ -300,6 +326,35 @@ fn run_inner(
                     emit_status_to_scrollback(terminal, &format!("error: {e}"))?;
                     emit_blank_line(terminal)?;
                 }
+                Ok(UiUpdate::ImageFetched { url, result }) => {
+                    // Background `/image <url>` fetch returned. If the
+                    // user already left the TUI or hit `/clear` we'd
+                    // still get here (the channel doesn't know about
+                    // state); apply the result regardless — `/clear`
+                    // dropped the previous `pending_images`, but a
+                    // late-arriving fetch is fine to attach.
+                    state.fetching_url = None;
+                    match result {
+                        Ok(bytes) => {
+                            emit_status_to_scrollback(
+                                terminal,
+                                &format!(
+                                    "(image attached: {url}, {} bytes; sends with next message)",
+                                    bytes.len()
+                                ),
+                            )?;
+                            emit_blank_line(terminal)?;
+                            state.pending_images.push(std::sync::Arc::new(bytes));
+                        }
+                        Err(e) => {
+                            emit_status_to_scrollback(
+                                terminal,
+                                &format!("error: /image {url}: {e}"),
+                            )?;
+                            emit_blank_line(terminal)?;
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break 'outer,
             }
@@ -310,7 +365,7 @@ fn run_inner(
         }
         match crossterm::event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
-                match handle_key(k, &mut state, &tx_turn, &cancel, terminal)? {
+                match handle_key(k, &mut state, &tx_turn, &tx_update, &cancel, terminal)? {
                     KeyAction::Continue => {}
                     KeyAction::Exit => break 'outer,
                 }
@@ -334,6 +389,7 @@ fn handle_key(
     k: KeyEvent,
     state: &mut ChatState,
     tx_turn: &Sender<TurnRequest>,
+    tx_update: &Sender<UiUpdate>,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
 ) -> Result<KeyAction> {
@@ -342,6 +398,12 @@ fn handle_key(
     //   TUI. The worker observes `cancel` between tokens, returns
     //   `Cancelled`, and `state.generating` flips to false on the
     //   next `UiUpdate::Done` drain.
+    // - mid-image-fetch → exit. `reqwest::blocking` doesn't expose a
+    //   mid-read cancel, so the fetch thread keeps running until it
+    //   finishes or hits its 30s timeout; the eventual `tx_update`
+    //   send no-ops once the channel is dropped on exit. Treating
+    //   fetch as "idle for exit purposes" gives the user a way out
+    //   of a stuck download without waiting for the timeout.
     // - idle → exit the TUI cleanly.
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d'))
@@ -353,8 +415,9 @@ fn handle_key(
         return Ok(KeyAction::Exit);
     }
 
-    if state.generating {
-        // No editing while a turn is in flight; only Ctrl+C above.
+    if state.generating || state.fetching_url.is_some() {
+        // No editing while a turn is in flight or an image is
+        // downloading; only Ctrl+C above.
         return Ok(KeyAction::Continue);
     }
 
@@ -383,7 +446,7 @@ fn handle_key(
             if line.trim().is_empty() {
                 return Ok(KeyAction::Continue);
             }
-            return dispatch_user_input(line, state, tx_turn, terminal);
+            return dispatch_user_input(line, state, tx_turn, tx_update, terminal);
         }
         KeyCode::Backspace if state.cursor > 0 => {
             let prev = prev_char_boundary(&state.input, state.cursor);
@@ -415,6 +478,7 @@ fn dispatch_user_input(
     line: String,
     state: &mut ChatState,
     tx_turn: &Sender<TurnRequest>,
+    tx_update: &Sender<UiUpdate>,
     terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
 ) -> Result<KeyAction> {
     if line.starts_with('/') {
@@ -520,37 +584,66 @@ fn dispatch_user_input(
             "/image" => {
                 // Arg is a filesystem path or `http(s)://` URL;
                 // `image_source::load` resolves both with the same 50 MB
-                // cap. URL fetch blocks the UI thread, so emit a
-                // pre-fetch hint so the user knows where the latency is
-                // going.
+                // cap. Path reads are fast and stay synchronous; URL
+                // fetches dispatch to a background thread so the UI
+                // keeps rendering / responds to Ctrl+C while the fetch
+                // is in flight (a misbehaving server can otherwise
+                // freeze the TUI for up to the 30s timeout).
                 if rest.is_empty() {
                     emit_status_to_scrollback(terminal, "usage: /image <path-or-url>")?;
                     emit_blank_line(terminal)?;
                     return Ok(KeyAction::Continue);
                 }
-                if crate::image_source::looks_like_url(rest) {
-                    emit_status_to_scrollback(terminal, &format!("(downloading {rest}...)"))?;
-                }
-                match crate::image_source::load(rest, crate::image_source::MAX_IMAGE_BYTES) {
-                    Ok(bytes) => {
-                        emit_status_to_scrollback(
-                            terminal,
-                            &format!(
-                                "(image attached: {rest}, {} bytes; sends with next message)",
-                                bytes.len()
-                            ),
-                        )?;
-                        emit_blank_line(terminal)?;
-                        state.pending_images.push(std::sync::Arc::new(bytes));
+                if !crate::image_source::looks_like_url(rest) {
+                    match crate::image_source::load(rest, crate::image_source::MAX_IMAGE_BYTES) {
+                        Ok(bytes) => {
+                            emit_status_to_scrollback(
+                                terminal,
+                                &format!(
+                                    "(image attached: {rest}, {} bytes; sends with next message)",
+                                    bytes.len()
+                                ),
+                            )?;
+                            emit_blank_line(terminal)?;
+                            state.pending_images.push(std::sync::Arc::new(bytes));
+                        }
+                        Err(e) => {
+                            emit_status_to_scrollback(
+                                terminal,
+                                &format!("error: /image {rest}: {e:#}"),
+                            )?;
+                            emit_blank_line(terminal)?;
+                        }
                     }
-                    Err(e) => {
-                        emit_status_to_scrollback(
-                            terminal,
-                            &format!("error: /image {rest}: {e:#}"),
-                        )?;
-                        emit_blank_line(terminal)?;
-                    }
+                    return Ok(KeyAction::Continue);
                 }
+
+                // URL branch: serial — only one in-flight fetch at a
+                // time. Concurrent fetches would race on
+                // `pending_images` ordering and the
+                // `state.fetching_url` lock; sequential is simpler and
+                // matches typical user input cadence.
+                if state.fetching_url.is_some() {
+                    emit_status_to_scrollback(
+                        terminal,
+                        "(another image fetch is still in flight; please wait)",
+                    )?;
+                    emit_blank_line(terminal)?;
+                    return Ok(KeyAction::Continue);
+                }
+                emit_status_to_scrollback(terminal, &format!("(downloading {rest}...)"))?;
+                emit_blank_line(terminal)?;
+                let url = rest.to_string();
+                state.fetching_url = Some(url.clone());
+                let tx = tx_update.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        crate::image_source::load(&url, crate::image_source::MAX_IMAGE_BYTES)
+                            .map_err(|e| format!("{e:#}"));
+                    // Errors here mean the UI dropped the receiver
+                    // (clean exit) — drop the result silently.
+                    let _ = tx.send(UiUpdate::ImageFetched { url, result });
+                });
                 return Ok(KeyAction::Continue);
             }
             "/system" => {
@@ -914,6 +1007,8 @@ fn draw_hint(frame: &mut ratatui::Frame, area: Rect, state: &ChatState) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let text = if state.generating {
         String::from("generating… Ctrl+C to cancel")
+    } else if let Some(url) = &state.fetching_url {
+        format!("downloading {url}… Ctrl+C to exit")
     } else if let Some(reason) = &state.last_finish {
         format!("↵ send · /help · Ctrl+C to exit  ·  last turn: {reason:?}")
     } else {

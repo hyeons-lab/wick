@@ -249,14 +249,19 @@ enum Command {
         #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "token_ids", "image"])]
         audio_in: Option<String>,
 
-        /// Path to one or more image files (PNG or JPEG).
-        /// When set, renders the model's chat template with
-        /// multimodal content (image(s) plus optional `--prompt`)
-        /// and prefills via `Session::append_chat_with_images`.
-        /// Repeat the flag for multi-image inputs:
+        /// Image source for one or more inputs (PNG or JPEG).
+        /// Each value is either a filesystem path or an
+        /// `http(s)://` URL — URLs are downloaded over HTTPS with
+        /// a 30s timeout and the same 50 MB cap as filesystem
+        /// inputs. When set, renders the model's chat template
+        /// with multimodal content (image(s) plus optional
+        /// `--prompt`) and prefills via
+        /// `Session::append_chat_with_images`. Repeat the flag for
+        /// multi-image inputs:
         ///
         ///   wick run -m foo.gguf --image pug.jpg --prompt "describe what you see"
         ///   wick run -m foo.gguf --image a.jpg --image b.jpg --prompt "compare"
+        ///   wick run -m foo.gguf --image https://example.com/a.jpg --prompt "describe"
         ///
         /// `--prompt` is optional in image mode (image-only inputs
         /// are allowed). `--system` is allowed and renders as a
@@ -268,6 +273,7 @@ enum Command {
         /// the chat template the helper renders).
         #[arg(
             long,
+            value_name = "PATH-OR-URL",
             conflicts_with_all = ["audio_in", "vocoder", "audio_out", "token_ids"],
         )]
         image: Vec<String>,

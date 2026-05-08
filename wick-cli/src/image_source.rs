@@ -83,8 +83,9 @@ fn load_url(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         );
     }
 
-    let initial_capacity =
-        usize::try_from(response.content_length().unwrap_or(0).min(max_bytes)).unwrap_or(0);
+    // The pre-flight ensure! above guarantees `content_length <= max_bytes`
+    // when present, so no second cap is needed here.
+    let initial_capacity = usize::try_from(response.content_length().unwrap_or(0)).unwrap_or(0);
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     loop {
@@ -105,9 +106,48 @@ fn load_url(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read as IoRead, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     use super::*;
+
+    /// Bind a one-shot HTTP/1.1 server on `127.0.0.1:0`, write the supplied
+    /// raw bytes (status line + headers + body) to the first incoming
+    /// connection, and close. Returns the URL of the server's root, ready to
+    /// pass to [`load`].
+    ///
+    /// The drained-request read is just enough to satisfy the client (HTTP
+    /// keepalive isn't a concern — the connection closes after one
+    /// response). Any test that needs to assert on the request line can
+    /// extend this to a channel-returning variant.
+    fn one_shot_server(response_bytes: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read a single buffer's worth of the request — enough to
+                // unblock the client's `send()`. We don't parse it.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response_bytes);
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    fn build_response(status_line: &str, headers: &[&str], body: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(status_line.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        for h in headers {
+            buf.extend_from_slice(h.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(body);
+        buf
+    }
 
     #[test]
     fn classifier_accepts_http_and_https() {
@@ -148,10 +188,11 @@ mod tests {
 
     #[test]
     fn load_path_rejects_non_regular() {
-        // /dev/null exists on every supported target and is not a regular
-        // file. /dev/zero also works but reads unbounded data — exactly the
-        // hazard this guard prevents.
-        let err = load("/dev/null", MAX_IMAGE_BYTES).unwrap_err();
+        // A directory exists on every supported target (Unix + Windows) and
+        // is non-regular — exercises the same `is_file()` reject branch as
+        // a Unix `/dev/zero` / FIFO without platform-gating.
+        let dir = tempfile::tempdir().unwrap();
+        let err = load(dir.path().to_str().unwrap(), MAX_IMAGE_BYTES).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("not a regular file"), "unexpected error: {s}");
     }
@@ -161,5 +202,69 @@ mod tests {
         let err = load("/this/path/should/not/exist.jpg", MAX_IMAGE_BYTES).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("stat image source"), "unexpected error: {s}");
+    }
+
+    #[test]
+    fn load_url_200_returns_body_bytes() {
+        let body = b"hello world";
+        let response = build_response(
+            "HTTP/1.1 200 OK",
+            &[
+                &format!("Content-Length: {}", body.len()),
+                "Connection: close",
+            ],
+            body,
+        );
+        let url = one_shot_server(response);
+        let bytes = load(&url, MAX_IMAGE_BYTES).unwrap();
+        assert_eq!(bytes, body);
+    }
+
+    #[test]
+    fn load_url_4xx_surfaces_http_error() {
+        let response = build_response(
+            "HTTP/1.1 404 Not Found",
+            &["Content-Length: 0", "Connection: close"],
+            &[],
+        );
+        let url = one_shot_server(response);
+        let err = load(&url, MAX_IMAGE_BYTES).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("404"), "unexpected error: {s}");
+    }
+
+    #[test]
+    fn load_url_pre_flight_rejects_oversize_content_length() {
+        // Server announces a body larger than the cap. Helper bails BEFORE
+        // streaming any body bytes — the body in the response is irrelevant
+        // (and short, to avoid blocking the test on connection buffering).
+        let response = build_response(
+            "HTTP/1.1 200 OK",
+            &["Content-Length: 100000", "Connection: close"],
+            &[],
+        );
+        let url = one_shot_server(response);
+        let err = load(&url, 1024).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("Content-Length"), "unexpected error: {s}");
+    }
+
+    #[test]
+    fn load_url_streaming_guard_rejects_when_content_length_missing() {
+        // No Content-Length header — body is delimited by connection close.
+        // Server sends 5000 bytes; helper's streaming guard with a 1024-byte
+        // cap must bail on the first read iteration without OOMing.
+        let response = build_response(
+            "HTTP/1.1 200 OK",
+            &["Connection: close"],
+            &vec![0xABu8; 5000],
+        );
+        let url = one_shot_server(response);
+        let err = load(&url, 1024).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("exceeds the 1024 byte cap"),
+            "unexpected error: {s}"
+        );
     }
 }
