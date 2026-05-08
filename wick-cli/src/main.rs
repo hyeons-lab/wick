@@ -10,6 +10,7 @@ use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngi
 
 mod chat_tui;
 mod image_source;
+mod signal;
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
 ///
@@ -1845,6 +1846,23 @@ fn main() -> Result<()> {
 
             let stdin = std::io::stdin();
             let cancel = session.cancel_handle();
+            // SIGINT during a turn → flip the session's cancel atomic so
+            // prefill / generate unwind cleanly; SIGINT at the prompt →
+            // exit the process. `intercepting` distinguishes the two and
+            // is toggled around every prefill / generate call below.
+            // `sigint_fired` is set IN ADDITION to `cancel` so the REPL
+            // can tell "user pressed Ctrl+C" (stay alive) from "ChatSink
+            // self-cancelled because stdout went away" (exit) — both
+            // flip the session's cancel flag.
+            // The TUI path takes a different branch above and never
+            // reaches this code; raw mode handles Ctrl+C as a key event.
+            let intercepting = std::sync::Arc::new(AtomicBool::new(false));
+            let sigint_fired = std::sync::Arc::new(AtomicBool::new(false));
+            signal::install_line_repl_handler(
+                std::sync::Arc::clone(&cancel),
+                std::sync::Arc::clone(&intercepting),
+                std::sync::Arc::clone(&sigint_fired),
+            )?;
             loop {
                 eprint!("user> ");
                 std::io::stderr().flush().ok();
@@ -2080,6 +2098,12 @@ fn main() -> Result<()> {
                 // of "render fresh, reset, prefill" is worth the lookup.
                 session.reset();
                 let any_images = history_images.iter().any(|v| !v.is_empty());
+                // SIGINT during prefill should cancel the in-flight call,
+                // not kill the REPL. Toggle the shared `intercepting`
+                // flag the SIGINT handler reads; flip it back as soon as
+                // the call returns so a Ctrl+C between prefill and
+                // generate-line-printing falls through to process exit.
+                intercepting.store(true, Ordering::Relaxed);
                 let prefill_outcome: Result<(), String> = if any_images {
                     // Multimodal prefill: synthesize multimodal
                     // messages by zipping history with
@@ -2125,13 +2149,28 @@ fn main() -> Result<()> {
                         Err(e) => Err(format!("chat-template render failed: {e}")),
                     }
                 };
+                intercepting.store(false, Ordering::Relaxed);
+                // `swap(false)` reads-and-clears so we know whether SIGINT
+                // fired during THIS call and the flag is fresh for the
+                // next one. `cancel.load()` separately tells us whether
+                // the session reported cancellation (could be SIGINT or
+                // a future BrokenPipe-during-prefill, though the latter
+                // doesn't happen today).
+                let prefill_sigint = sigint_fired.swap(false, Ordering::Relaxed);
                 if let Err(msg) = prefill_outcome {
-                    eprintln!("error: {msg}");
+                    if prefill_sigint {
+                        eprintln!("(cancelled)");
+                    } else {
+                        eprintln!("error: {msg}");
+                    }
                     history.pop();
                     history_images.pop();
-                    // Leave pending state intact so the user can
-                    // retype the prompt without re-attaching the
-                    // image.
+                    // Defense: clear the cancel atomic so the next turn
+                    // doesn't carry stale state into the inner handler
+                    // check before `session.reset()` clears it. Leave
+                    // pending state intact so the user can retype the
+                    // prompt without re-attaching the image.
+                    cancel.store(false, Ordering::Relaxed);
                     continue;
                 }
 
@@ -2139,12 +2178,21 @@ fn main() -> Result<()> {
                 std::io::stderr().flush().ok();
 
                 let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
-                let summary = match session.generate(&opts, &mut sink) {
+                intercepting.store(true, Ordering::Relaxed);
+                let generate_result = session.generate(&opts, &mut sink);
+                intercepting.store(false, Ordering::Relaxed);
+                let generate_sigint = sigint_fired.swap(false, Ordering::Relaxed);
+                let summary = match generate_result {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("\nerror: generate failed: {e}");
+                        if generate_sigint {
+                            eprintln!("\n(cancelled)");
+                        } else {
+                            eprintln!("\nerror: generate failed: {e}");
+                        }
                         history.pop();
                         history_images.pop();
+                        cancel.store(false, Ordering::Relaxed);
                         // Same retry semantics as the prefill-error
                         // path: leave pending images intact. The
                         // next turn will run `session.reset()` which
@@ -2154,7 +2202,18 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                eprintln!();
+                // Mark a SIGINT-truncated turn before pushing it into
+                // history so the user can see in scrollback that the
+                // assistant reply was interrupted (otherwise it just
+                // looks like the model trailed off mid-sentence). Only
+                // emits when the SIGINT path produced an Ok summary —
+                // i.e. the worker observed cancel between tokens and
+                // returned cleanly with FinishReason::Cancelled.
+                if generate_sigint {
+                    eprintln!("\n(cancelled)");
+                } else {
+                    eprintln!();
+                }
                 history.push(wick::tokenizer::ChatMessage {
                     role: "assistant".into(),
                     content: sink.into_text(),
@@ -2171,10 +2230,21 @@ fn main() -> Result<()> {
                 // is gone (BrokenPipe — the user piped us into `head` or
                 // similar). Without this we'd keep prompting + decoding
                 // even though nothing reaches the terminal anymore.
+                // SIGINT cancellation also flips `cancel`, but we want to
+                // stay in the REPL after Ctrl+C — `generate_sigint`
+                // tells the two apart.
                 if matches!(summary.finish_reason, wick::FinishReason::Cancelled)
                     && cancel.load(Ordering::Relaxed)
+                    && !generate_sigint
                 {
                     break;
+                }
+                // Clear the cancel flag if SIGINT set it on a successful
+                // turn — `session.reset()` at the top of the next turn
+                // clears it too, but this keeps the inner cancel-load
+                // checks fresh.
+                if generate_sigint {
+                    cancel.store(false, Ordering::Relaxed);
                 }
             }
         }
