@@ -1214,6 +1214,16 @@ fn main() -> Result<()> {
             let image_bytes: Vec<Vec<u8>> = image
                 .iter()
                 .map(|path| {
+                    // Reject non-regular files (e.g. `/dev/zero`,
+                    // FIFOs) before reading — `std::fs::read` would
+                    // otherwise block / consume unbounded memory on
+                    // these. The 50 MB byte-cap on `/image` in chat
+                    // doesn't apply here (CLI users pick the file
+                    // explicitly) but the unbounded-read concern is
+                    // identical.
+                    let meta =
+                        std::fs::metadata(path).with_context(|| format!("stat --image {path}"))?;
+                    anyhow::ensure!(meta.is_file(), "--image {path}: not a regular file");
                     let bytes =
                         std::fs::read(path).with_context(|| format!("reading --image {path}"))?;
                     eprintln!("Loaded image: {path} ({} bytes)", bytes.len());
@@ -2012,7 +2022,18 @@ fn main() -> Result<()> {
                             // is 262 144 pixels = ~1 MB raw RGB);
                             // anything past 50 MB is a misuse.
                             const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+                            // Reject non-regular files BEFORE the size
+                            // cap: special files like `/dev/zero` and
+                            // FIFOs report `len() == 0` from
+                            // `metadata()` but `std::fs::read` would
+                            // then read unbounded data and OOM the
+                            // REPL. `is_file()` is a metadata-level
+                            // check so it doesn't add an extra syscall.
                             match std::fs::metadata(rest) {
+                                Ok(meta) if !meta.is_file() => {
+                                    eprintln!("error: /image {rest}: not a regular file",);
+                                    continue;
+                                }
                                 Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
                                     eprintln!(
                                         "error: /image {rest}: file is {} bytes, larger than the 50 MB cap",

@@ -74,11 +74,14 @@ enum UiUpdate {
 ///
 /// `images` carries any pending `/image <path>` attachments for the
 /// final user turn. Empty → text path; non-empty → multimodal path
-/// via `Session::append_chat_with_images`.
+/// via `Session::append_chat_with_images`. `Arc<Vec<u8>>` (not bare
+/// `Vec<u8>`) so cloning the pending vec for the channel send is a
+/// refcount bump per attachment rather than a deep memcpy of up to
+/// 50 MB per image.
 enum TurnRequest {
     Turn {
         history: Vec<ChatMessage>,
-        images: Vec<Vec<u8>>,
+        images: Vec<std::sync::Arc<Vec<u8>>>,
     },
     Shutdown,
 }
@@ -101,7 +104,11 @@ struct ChatState {
     /// assistant message commits, and on `/clear`. Preserved on
     /// `UiUpdate::Error` so the user can retry without
     /// re-attaching.
-    pending_images: Vec<Vec<u8>>,
+    ///
+    /// `Arc<Vec<u8>>` (not bare `Vec<u8>`) so the per-turn
+    /// channel send only bumps refcounts instead of memcpy'ing
+    /// up to N × 50 MB of image bytes.
+    pending_images: Vec<std::sync::Arc<Vec<u8>>>,
 }
 
 /// RAII guard that disables raw mode + emits a final newline when
@@ -492,7 +499,21 @@ fn dispatch_user_input(
                 // accidental multi-GB inputs that would OOM the
                 // REPL on `std::fs::read`.
                 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+                // Reject non-regular files BEFORE the size cap:
+                // special files like `/dev/zero` and FIFOs report
+                // `len() == 0` from `metadata()` but `std::fs::read`
+                // would then read unbounded data and OOM the REPL.
+                // `is_file()` is a metadata-level check so it
+                // doesn't add an extra syscall.
                 match std::fs::metadata(rest) {
+                    Ok(meta) if !meta.is_file() => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!("error: /image {rest}: not a regular file"),
+                        )?;
+                        emit_blank_line(terminal)?;
+                        return Ok(KeyAction::Continue);
+                    }
                     Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
                         emit_status_to_scrollback(
                             terminal,
@@ -524,7 +545,7 @@ fn dispatch_user_input(
                             ),
                         )?;
                         emit_blank_line(terminal)?;
-                        state.pending_images.push(bytes);
+                        state.pending_images.push(std::sync::Arc::new(bytes));
                     }
                     Err(e) => {
                         emit_status_to_scrollback(
@@ -589,12 +610,12 @@ fn dispatch_user_input(
     state.pending = Some(String::new());
     state.generating = true;
     state.last_finish = None;
-    // Clone pending images for the worker rather than moving — on
-    // send-error we'd otherwise need to put the Vec back. ~1 MB
-    // typical, 50 MB max guard; negligible vs ~6 ms encode and
-    // hundreds of ms generate. Pending images are drained on
-    // `UiUpdate::Done` after the assistant message commits, so
-    // the UI-side copy stays valid until then.
+    // Clone the pending-images vec for the channel send — `Arc`
+    // makes this a refcount bump per attachment rather than a
+    // memcpy. The UI-side copy stays valid until pending images
+    // are drained on `UiUpdate::Done` after the assistant message
+    // commits; on send-error the UI-side `pending_images` is
+    // intact so the user can retry without re-attaching.
     let images = state.pending_images.clone();
     if tx_turn
         .send(TurnRequest::Turn {
@@ -664,7 +685,10 @@ fn worker_loop(
                     }],
                 })
                 .collect();
-            let user_text = history.last().map(|m| m.content.clone()).unwrap_or_default();
+            let user_text = history
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
             let mut content: Vec<wick::tokenizer::ContentItem> =
                 vec![wick::tokenizer::ContentItem::Image; images.len()];
             if !user_text.is_empty() {
