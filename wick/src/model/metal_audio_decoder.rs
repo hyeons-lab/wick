@@ -9,6 +9,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
@@ -116,8 +117,7 @@ pub struct MetalAudioDecoder {
 }
 
 impl MetalAudioDecoder {
-    pub fn from_gguf(gguf: &GgufFile, _vocoder_path: &Path) -> Result<Self> {
-        // Also load the CPU decoder weights for depthformer config
+    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
         let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
         let ctx = MetalContext::new()?;
 
