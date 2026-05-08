@@ -9,6 +9,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
@@ -116,8 +117,12 @@ pub struct MetalAudioDecoder {
 }
 
 impl MetalAudioDecoder {
-    pub fn from_gguf(gguf: &GgufFile, _vocoder_path: &Path) -> Result<Self> {
-        // Also load the CPU decoder weights for depthformer config
+    pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
+        // Also load the CPU decoder weights for depthformer config.
+        // `AudioDecoderWeights::from_gguf` was migrated to `&Arc<GgufFile>`
+        // in PR #130 (MmapWeight refactor); Metal's call site missed the
+        // update because `--features metal` isn't in CI's build matrix
+        // (the Apple XCFramework job builds iOS, not native macOS metal).
         let cpu_dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(gguf)?;
         let ctx = MetalContext::new()?;
 
