@@ -176,8 +176,24 @@ pub struct MetalLfm2Model {
     logits_buf: Buffer,
     argmax_token_buf: Buffer,
     argmax_params_buf: Buffer,
+    /// Output of the gated-conv `in_proj` GEMV: `3*hs` floats laid
+    /// out as `[x | c | b]` (each component `hs` floats wide):
+    ///   bytes `0           ..   hs*4` → x  (gate input)
+    ///   bytes `hs*4        .. 2*hs*4` → c  (post-conv gate)
+    ///   bytes `2*hs*4      .. 3*hs*4` → b  (pre-conv mul factor)
+    /// The `conv1d_fused` shader and its `encode_conv1d_fused`
+    /// caller both depend on this layout. Also matches the
+    /// prefill-side `conv1d_fused_batch.metal` shader's
+    /// `proj_stride = 3*hs`.
     conv_proj_buf: Buffer,
+    /// Unused since the conv1d fusion went live: the fused shader
+    /// computes `bx` inline in registers. Allocated for historical
+    /// reasons; safe to remove in a follow-up cleanup that
+    /// tightens the buffer-allocation tier.
     conv_bx_buf: Buffer,
+    /// Unused since the conv1d fusion went live: the fused shader
+    /// writes its result directly into `conv_gate_buf` without
+    /// going through this scratch.
     conv_out_buf: Buffer,
     conv_gate_buf: Buffer,
     /// Pre-allocated batch buffers for prefill. Sized for max_seq_len tokens.
