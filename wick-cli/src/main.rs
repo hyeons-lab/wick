@@ -1779,23 +1779,32 @@ fn main() -> Result<()> {
             });
 
             let mut history: Vec<wick::tokenizer::ChatMessage> = Vec::new();
+            // Parallel to `history`: each entry holds the images
+            // attached to the corresponding turn (empty for
+            // system / assistant / text-only user). Used to
+            // re-render the conversation as multimodal on every
+            // turn so the model has actual pixel access for
+            // multi-turn fine-grained follow-ups, not just its
+            // own turn-1 description. `Arc<Vec<u8>>` keeps the
+            // per-turn re-flatten cheap.
+            let mut history_images: Vec<Vec<std::sync::Arc<Vec<u8>>>> = Vec::new();
             if let Some(sys) = system {
                 history.push(wick::tokenizer::ChatMessage {
                     role: "system".into(),
                     content: sys,
                 });
+                history_images.push(Vec::new());
             }
 
             // Image attachments collected via `/image <path>` for the
-            // NEXT user turn. Drains on a successful turn AND on
-            // `/clear`. Image context grounds only the immediate
-            // follow-up turn — subsequent turns re-render history
-            // as text-only and rely on the assistant's prior reply
-            // for context. Multi-turn re-feed (re-encoding the
-            // image every turn so the model retains visual context
-            // across many follow-ups) is a follow-up — see plan
-            // `000120-01`'s "Out of scope".
-            let mut pending_images: Vec<Vec<u8>> = Vec::new();
+            // NEXT user turn. On send, a clone of this vec moves
+            // into `history_images[user_idx]` so every subsequent
+            // turn re-feeds the same images through the encoder.
+            // `pending_images` itself drains on a successful turn
+            // AND on `/clear`. `Arc<Vec<u8>>` keeps the
+            // pending → history_images copy cheap (refcount bump,
+            // not memcpy).
+            let mut pending_images: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
 
             let opts = wick::GenerateOpts {
                 max_tokens: max_tokens as u32,
@@ -1929,8 +1938,10 @@ fn main() -> Result<()> {
                             let had_system = history.first().is_some_and(|m| m.role == "system");
                             if had_system {
                                 history.truncate(1);
+                                history_images.truncate(1);
                             } else {
                                 history.clear();
+                                history_images.clear();
                             }
                             // `/clear` also drops any pending image
                             // attachments — staying-attached across a
@@ -1984,6 +1995,7 @@ fn main() -> Result<()> {
                                 let removed = history.first().is_some_and(|m| m.role == "system");
                                 if removed {
                                     history.remove(0);
+                                    history_images.remove(0);
                                     eprintln!("(system prompt removed)");
                                 } else {
                                     eprintln!("(no system prompt was set)");
@@ -1996,8 +2008,12 @@ fn main() -> Result<()> {
                             };
                             if history.first().is_some_and(|m| m.role == "system") {
                                 history[0] = new_msg;
+                                // history_images[0] stays as empty
+                                // Vec — system messages never have
+                                // image attachments.
                             } else {
                                 history.insert(0, new_msg);
+                                history_images.insert(0, Vec::new());
                             }
                             eprintln!("(system prompt updated)");
                             continue;
@@ -2053,7 +2069,7 @@ fn main() -> Result<()> {
                                         "(image attached: {rest}, {} bytes; sends with next message)",
                                         bytes.len()
                                     );
-                                    pending_images.push(bytes);
+                                    pending_images.push(std::sync::Arc::new(bytes));
                                 }
                                 Err(e) => {
                                     eprintln!("error: /image read failed for {rest}: {e}");
@@ -2070,58 +2086,56 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // History stores the typed text only — image
-                // attachments are NOT inlined as `[image: <path>]`
-                // markers because the model sees that string
-                // verbatim on follow-up turns and gets confused
-                // ("I can't see the image you're referring to").
-                // Multi-turn re-feed (re-encoding the actual image
-                // every turn so the model retains visual context) is
-                // a follow-up; see plan `000120-01`'s "Out of scope".
-                // Until then, transcripts via `/save` lose the
-                // image-attachment record by design — using
-                // `/image <path>` is enough of a hint while the chat
-                // is live.
+                // History stores typed user text; images attached
+                // via `/image` move into `history_images[i]`
+                // aligned with the new user turn. Every subsequent
+                // turn re-renders the whole conversation as
+                // multimodal (when any turn has images) so the
+                // model has actual pixel access for fine-grained
+                // follow-ups, not just its turn-1 description.
                 history.push(wick::tokenizer::ChatMessage {
                     role: "user".into(),
                     content: user.clone(),
                 });
+                history_images.push(pending_images.clone());
 
                 // Re-render the full conversation per turn and rely on
                 // the engine's prefix cache for fast turn-N+1 prefill.
                 // Delta-prefill is a future optimization; the simplicity
                 // of "render fresh, reset, prefill" is worth the lookup.
                 session.reset();
-                let prefill_outcome: Result<(), String> = if !pending_images.is_empty() {
-                    // Multimodal prefill: convert prior history into
-                    // text-only multimodal entries, append the new
-                    // user turn as `[Image*N, Text(user)?]`, and feed
-                    // through `Session::append_chat_with_images`. The
-                    // last `history` entry is the text-only user line
-                    // we just pushed; the helper rebuilds it here as
-                    // a multimodal shape with the image content
-                    // items in front.
-                    let mut messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
-                        [..history.len() - 1]
+                let any_images = history_images.iter().any(|v| !v.is_empty());
+                let prefill_outcome: Result<(), String> = if any_images {
+                    // Multimodal prefill: synthesize multimodal
+                    // messages by zipping history with
+                    // history_images. Each user turn that had
+                    // attachments rebuilds as
+                    // `[Image*N, Text(content)?]`; turns without
+                    // attachments rebuild as `[Text(content)]`.
+                    // Image bytes flatten across all turns in
+                    // document order, matching the chat template's
+                    // `<image>` marker walk.
+                    let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
                         .iter()
-                        .map(|m| wick::tokenizer::ChatMessageMultimodal {
-                            role: m.role.clone(),
-                            content: vec![wick::tokenizer::ContentItem::Text {
-                                text: m.content.clone(),
-                            }],
+                        .zip(history_images.iter())
+                        .map(|(msg, imgs)| {
+                            let mut content: Vec<wick::tokenizer::ContentItem> =
+                                vec![wick::tokenizer::ContentItem::Image; imgs.len()];
+                            if !msg.content.is_empty() {
+                                content.push(wick::tokenizer::ContentItem::Text {
+                                    text: msg.content.clone(),
+                                });
+                            }
+                            wick::tokenizer::ChatMessageMultimodal {
+                                role: msg.role.clone(),
+                                content,
+                            }
                         })
                         .collect();
-                    let mut content: Vec<wick::tokenizer::ContentItem> =
-                        vec![wick::tokenizer::ContentItem::Image; pending_images.len()];
-                    if !user.is_empty() {
-                        content.push(wick::tokenizer::ContentItem::Text { text: user.clone() });
-                    }
-                    messages.push(wick::tokenizer::ChatMessageMultimodal {
-                        role: "user".into(),
-                        content,
-                    });
-                    let images_refs: Vec<&[u8]> =
-                        pending_images.iter().map(|v| v.as_slice()).collect();
+                    let images_refs: Vec<&[u8]> = history_images
+                        .iter()
+                        .flat_map(|v| v.iter().map(|a| a.as_slice()))
+                        .collect();
                     session
                         .append_chat_with_images(&messages, &images_refs, true)
                         .map_err(|e| format!("append_chat_with_images failed: {e}"))
@@ -2139,6 +2153,7 @@ fn main() -> Result<()> {
                 if let Err(msg) = prefill_outcome {
                     eprintln!("error: {msg}");
                     history.pop();
+                    history_images.pop();
                     // Leave pending state intact so the user can
                     // retype the prompt without re-attaching the
                     // image.
@@ -2154,6 +2169,7 @@ fn main() -> Result<()> {
                     Err(e) => {
                         eprintln!("\nerror: generate failed: {e}");
                         history.pop();
+                        history_images.pop();
                         // Same retry semantics as the prefill-error
                         // path: leave pending images intact. The
                         // next turn will run `session.reset()` which
@@ -2168,10 +2184,12 @@ fn main() -> Result<()> {
                     role: "assistant".into(),
                     content: sink.into_text(),
                 });
-                // Image attachment is consumed by a turn that
-                // produced an assistant reply — drain only here so
-                // either a prefill OR generate error preserves
-                // pending state for the user's retry.
+                history_images.push(Vec::new());
+                // Image attachments for THIS user turn already
+                // moved into `history_images` at send time, so
+                // they're permanent for the rest of the session
+                // (until `/clear`). Drain `pending_images` itself
+                // — it's the holding pen for the NEXT turn.
                 pending_images.clear();
 
                 // Stop the REPL if the sink flipped cancel because stdout
