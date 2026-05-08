@@ -1884,9 +1884,9 @@ impl MetalLfm2Model {
     }
 
     /// Fused: bx = x * b → conv1d(bx, state) → output = c * conv_out.
-    /// Combines 3 dispatches into 1.
+    /// Combines 3 dispatches into 1; used by the decode-time
+    /// gated-conv block.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     fn encode_conv1d_fused(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -4039,13 +4039,24 @@ impl MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
-        let phs = &self.params.elementwise_hs;
         {
             let lw = &self.layers[i];
 
             if cfg.block_types[i] == BlockType::GatedConv {
                 let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
 
+                // Decode-time gated-conv block, fused.
+                // 1. rmsnorm + 2. in_proj GEMV produce conv_proj_buf =
+                //    [x | c | b] (each `hs` floats, in that order).
+                // 3. conv1d_fused does:
+                //    bx = x*b → conv1d MAC + rolling-buf update → c*sum
+                //    in one dispatch, writing conv_gate_buf.
+                // 4. out_proj GEMV with residual add into hidden_buf.
+                //
+                // 4 dispatches per gated-conv layer (was 6: bx-mul,
+                // conv1d, c-out-mul replaced by the single fused
+                // shader). LFM2 has 10 conv layers per step → -20
+                // dispatches per decode token.
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
                 self.encode_gemv_weight(
                     enc,
@@ -4053,32 +4064,18 @@ impl MetalLfm2Model {
                     &self.normed_buf,
                     &self.conv_proj_buf,
                 );
-                self.encode_mul_out(
+                self.encode_conv1d_fused(
                     enc,
                     &self.conv_proj_buf,
                     0,
                     &self.conv_proj_buf,
                     (2 * hs * 4) as u64,
-                    &self.conv_bx_buf,
-                    phs,
-                    hs32,
-                );
-                self.encode_conv1d(
-                    enc,
-                    &self.conv_bx_buf,
-                    conv_buf,
-                    lw.conv_weight.as_ref().unwrap(),
-                    &self.conv_out_buf,
-                    hs32,
-                );
-                self.encode_mul_out(
-                    enc,
                     &self.conv_proj_buf,
                     (hs * 4) as u64,
-                    &self.conv_out_buf,
-                    0,
+                    conv_buf,
+                    lw.conv_weight.as_ref().unwrap(),
                     &self.conv_gate_buf,
-                    phs,
+                    0,
                     hs32,
                 );
                 self.encode_gemv_weight_accumulate(
@@ -4337,7 +4334,6 @@ impl MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
-        let phs = &self.params.elementwise_hs;
 
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
@@ -4345,6 +4341,8 @@ impl MetalLfm2Model {
             if cfg.block_types[i] == BlockType::GatedConv {
                 let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
 
+                // conv_pre: rmsnorm + in_proj. The b*x mul that used
+                // to live here is now folded into conv1d_fused.
                 self.gpu_sampled_pass(timer, cb, "conv_pre", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
                     self.encode_gemv_weight(
@@ -4353,34 +4351,23 @@ impl MetalLfm2Model {
                         &self.normed_buf,
                         &self.conv_proj_buf,
                     );
-                    self.encode_mul_out(
+                });
+                // conv1d_fused (one dispatch: bx + conv1d + c*out) +
+                // out_proj residual. Saves 2 dispatches vs the prior
+                // 3-shader chain.
+                self.gpu_sampled_pass(timer, cb, "conv1d", |enc| {
+                    self.encode_conv1d_fused(
                         enc,
                         &self.conv_proj_buf,
                         0,
                         &self.conv_proj_buf,
                         (2 * hs * 4) as u64,
-                        &self.conv_bx_buf,
-                        phs,
-                        hs32,
-                    );
-                });
-                self.gpu_sampled_pass(timer, cb, "conv1d", |enc| {
-                    self.encode_conv1d(
-                        enc,
-                        &self.conv_bx_buf,
-                        conv_buf,
-                        lw.conv_weight.as_ref().unwrap(),
-                        &self.conv_out_buf,
-                        hs32,
-                    );
-                    self.encode_mul_out(
-                        enc,
                         &self.conv_proj_buf,
                         (hs * 4) as u64,
-                        &self.conv_out_buf,
-                        0,
+                        conv_buf,
+                        lw.conv_weight.as_ref().unwrap(),
                         &self.conv_gate_buf,
-                        phs,
+                        0,
                         hs32,
                     );
                     self.encode_gemv_weight_accumulate(
@@ -4494,7 +4481,6 @@ impl MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
-        let phs = &self.params.elementwise_hs;
 
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
@@ -4502,7 +4488,9 @@ impl MetalLfm2Model {
             if cfg.block_types[i] == BlockType::GatedConv {
                 let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
 
-                // conv_pre: rmsnorm + in_proj + b*x mul.
+                // conv_pre: rmsnorm + in_proj. The `b*x` mul that used to
+                // live here is now folded into `conv1d_fused` (Step 1 of
+                // that shader), saving one dispatch per layer.
                 self.profile_segment(timer, "conv_pre", |enc| {
                     self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
                     self.encode_gemv_weight(
@@ -4511,35 +4499,27 @@ impl MetalLfm2Model {
                         &self.normed_buf,
                         &self.conv_proj_buf,
                     );
-                    self.encode_mul_out(
+                });
+                // conv1d_fused (one dispatch: bx mul + conv1d + c*out mul)
+                // + out_proj residual. Saves 2 dispatches per gated-conv
+                // layer vs the prior 3-shader chain. Layout in
+                // `conv_proj_buf` is [x | c | b], each `hs` floats wide:
+                // x at offset 0, c at offset hs*4, b at offset 2*hs*4.
+                // Output goes directly into conv_gate_buf for out_proj
+                // to consume with a residual add.
+                self.profile_segment(timer, "conv1d", |enc| {
+                    self.encode_conv1d_fused(
                         enc,
                         &self.conv_proj_buf,
                         0,
                         &self.conv_proj_buf,
                         (2 * hs * 4) as u64,
-                        &self.conv_bx_buf,
-                        phs,
-                        hs32,
-                    );
-                });
-                // conv1d + c*out + out_proj residual.
-                self.profile_segment(timer, "conv1d", |enc| {
-                    self.encode_conv1d(
-                        enc,
-                        &self.conv_bx_buf,
-                        conv_buf,
-                        lw.conv_weight.as_ref().unwrap(),
-                        &self.conv_out_buf,
-                        hs32,
-                    );
-                    self.encode_mul_out(
-                        enc,
                         &self.conv_proj_buf,
                         (hs * 4) as u64,
-                        &self.conv_out_buf,
-                        0,
+                        conv_buf,
+                        lw.conv_weight.as_ref().unwrap(),
                         &self.conv_gate_buf,
-                        phs,
+                        0,
                         hs32,
                     );
                     self.encode_gemv_weight_accumulate(
