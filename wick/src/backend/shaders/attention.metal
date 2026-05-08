@@ -8,6 +8,17 @@ using namespace metal;
 // MAX_SEQ_LEN caps the per-head attention window. If you exceed this,
 // raise it (tradeoff: 4 bytes per slot per active threadgroup of shared
 // memory, which is plentiful on Apple GPUs).
+//
+// Iter 5 (decode mirror of PR #146 prefill specialization): the body
+// is templated on `HD_CONST`. When HD_CONST > 0 the compiler folds
+// `head_dim` to a literal, fully unrolling the Phase-1 Q·K inner loop
+// (`hd4 = head_dim/4`), dead-code-eliminating the wrong-branch arms
+// of the Phase-3 dims_per_lane switch, and constant-propagating the
+// `partials_tg` row stride. Three kernel entry points:
+//   - `attention`        — HD_CONST=0, runtime fallback
+//   - `attention_hd64`   — HD_CONST=64  (LFM2-VL-450M / LFM2.5-VL-450M)
+//   - `attention_hd128`  — HD_CONST=128 (LFM2.5-VL-1.6B / Audio-1.5B)
+// The Rust side selects the entry point by head_dim at dispatch time.
 
 // Caps per-TG threadgroup memory. 4096 scores = 16 KB; total TG memory
 // ≈ 20.6 KB (within Apple Silicon's 32 KB limit). For seq_len > 4096,
@@ -26,18 +37,26 @@ struct Params {
     uint _pad1;
 };
 
-kernel void attention(
-    const device float* q [[buffer(0)]],
-    const device half* k_cache [[buffer(1)]],
-    const device half* v_cache [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant Params& params [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
+template<uint HD_CONST>
+inline void attention_impl(
+    const device float* q,
+    const device half* k_cache,
+    const device half* v_cache,
+    device float* out,
+    constant Params& params,
+    threadgroup float* scores,        // [MAX_SEQ_LEN]
+    threadgroup float* q_shared,      // [MAX_HEAD_DIM]
+    threadgroup float* sg_val,        // [8]
+    threadgroup float* partials_tg,   // [8 * MAX_HEAD_DIM]
+    uint tid,
+    uint head
 ) {
     uint n_heads = params.n_heads;
     uint n_kv_heads = params.n_kv_heads;
-    uint head_dim = params.head_dim;
+    // When HD_CONST > 0 the ternary folds to a literal; subsequent
+    // uses of `head_dim` see a constexpr and the compiler unrolls
+    // the dependent inner loops + folds threadgroup-memory strides.
+    uint head_dim = (HD_CONST > 0) ? HD_CONST : params.head_dim;
     uint kv_dim = params.kv_dim;
     uint seq_len = params.seq_len;
     float scale = as_type<float>(params.scale_bits);
@@ -47,9 +66,6 @@ kernel void attention(
     uint kv_h_offset = kv_head * head_dim;
     uint q_offset = head * head_dim;
 
-    threadgroup float scores[MAX_SEQ_LEN];
-    threadgroup float q_shared[MAX_HEAD_DIM];
-    threadgroup float sg_val[8];
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5u;
 
@@ -195,7 +211,6 @@ kernel void attention(
 
     // Reduce partials across simdgroups via threadgroup memory.
     // Layout: partials_tg[sg_id × head_dim + d]
-    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
     for (uint i = 0u; i < dims_per_lane; i++) {
         uint d = simd_lane * dims_per_lane + i;
         if (d < head_dim) {
@@ -218,4 +233,58 @@ kernel void attention(
             }
         }
     }
+}
+
+kernel void attention(
+    const device float* q [[buffer(0)]],
+    const device half* k_cache [[buffer(1)]],
+    const device half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scores[MAX_SEQ_LEN];
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    attention_impl<0>(q, k_cache, v_cache, out, params,
+                      scores, q_shared, sg_val, partials_tg,
+                      tid, head);
+}
+
+kernel void attention_hd64(
+    const device float* q [[buffer(0)]],
+    const device half* k_cache [[buffer(1)]],
+    const device half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scores[MAX_SEQ_LEN];
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    attention_impl<64>(q, k_cache, v_cache, out, params,
+                       scores, q_shared, sg_val, partials_tg,
+                       tid, head);
+}
+
+kernel void attention_hd128(
+    const device float* q [[buffer(0)]],
+    const device half* k_cache [[buffer(1)]],
+    const device half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scores[MAX_SEQ_LEN];
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    attention_impl<128>(q, k_cache, v_cache, out, params,
+                        scores, q_shared, sg_val, partials_tg,
+                        tid, head);
 }
