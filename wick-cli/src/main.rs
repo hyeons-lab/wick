@@ -9,6 +9,7 @@ use wick::tokenizer::BpeTokenizer;
 use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine};
 
 mod chat_tui;
+mod image_source;
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
 ///
@@ -1205,28 +1206,23 @@ fn main() -> Result<()> {
             ubatch_size,
             n_keep,
         } => {
-            // Read `--image` bytes BEFORE engine load so a missing /
-            // unreadable path fails fast — engine load can spend
+            // Resolve `--image` arguments BEFORE engine load so a missing
+            // file / unreachable URL fails fast — engine load can spend
             // ~1 GB of RAM on Q4_0 weights and a typo'd `--image
-            // not_a_path.jpg` shouldn't pay that cost. Empty vec
-            // when the flag isn't set; the image branch later
-            // checks `image_bytes.is_empty()`.
+            // not_a_path.jpg` shouldn't pay that cost. Each arg may be a
+            // filesystem path or an `http(s)://` URL; the 50 MB cap rejects
+            // unbounded inputs uniformly across both branches. Empty vec
+            // when the flag isn't set; the image branch later checks
+            // `image_bytes.is_empty()`.
             let image_bytes: Vec<Vec<u8>> = image
                 .iter()
-                .map(|path| {
-                    // Reject non-regular files (e.g. `/dev/zero`,
-                    // FIFOs) before reading — `std::fs::read` would
-                    // otherwise block / consume unbounded memory on
-                    // these. The 50 MB byte-cap on `/image` in chat
-                    // doesn't apply here (CLI users pick the file
-                    // explicitly) but the unbounded-read concern is
-                    // identical.
-                    let meta =
-                        std::fs::metadata(path).with_context(|| format!("stat --image {path}"))?;
-                    anyhow::ensure!(meta.is_file(), "--image {path}: not a regular file");
-                    let bytes =
-                        std::fs::read(path).with_context(|| format!("reading --image {path}"))?;
-                    eprintln!("Loaded image: {path} ({} bytes)", bytes.len());
+                .map(|arg| {
+                    if image_source::looks_like_url(arg) {
+                        eprintln!("Downloading image: {arg}");
+                    }
+                    let bytes = image_source::load(arg, image_source::MAX_IMAGE_BYTES)
+                        .with_context(|| format!("--image {arg}"))?;
+                    eprintln!("Loaded image: {arg} ({} bytes)", bytes.len());
                     Ok::<_, anyhow::Error>(bytes)
                 })
                 .collect::<Result<_>>()?;
@@ -1796,7 +1792,7 @@ fn main() -> Result<()> {
                 history_images.push(Vec::new());
             }
 
-            // Image attachments collected via `/image <path>` for the
+            // Image attachments collected via `/image <path-or-url>` for the
             // NEXT user turn. On send, a clone of this vec moves
             // into `history_images[user_idx]` so every subsequent
             // turn re-feeds the same images through the encoder.
@@ -1918,7 +1914,7 @@ fn main() -> Result<()> {
                                 "  /save <path>     Save the conversation transcript to a file"
                             );
                             eprintln!(
-                                "  /image <path>    Attach an image to the next user turn (repeat for multi-image)"
+                                "  /image <path-or-url>    Attach an image (file path or http(s):// URL) to the next user turn (repeat for multi-image)"
                             );
                             eprintln!("  /help            Show this help");
                             eprintln!("  /exit, /quit     Exit the REPL");
@@ -2019,51 +2015,24 @@ fn main() -> Result<()> {
                             continue;
                         }
                         "/image" => {
-                            // Attach an image to the NEXT user turn.
-                            // Multi-image: re-issue the command, e.g.
+                            // Attach an image to the NEXT user turn. The
+                            // arg is a filesystem path or an `http(s)://`
+                            // URL — `image_source::load` resolves both with
+                            // the same 50 MB cap and the same special-file
+                            // rejection. Multi-image: re-issue the command:
                             //   /image a.jpg
-                            //   /image b.jpg
+                            //   /image https://.../b.jpg
                             //   compare these two
-                            // Pending state drains after the next
-                            // successful turn OR on `/clear`.
+                            // Pending state drains after the next successful
+                            // turn OR on `/clear`.
                             if rest.is_empty() {
-                                eprintln!("usage: /image <path>");
+                                eprintln!("usage: /image <path-or-url>");
                                 continue;
                             }
-                            // Sanity-cap on file size so a typo'd
-                            // `/image /var/log/something.bin` doesn't
-                            // OOM the REPL on a multi-GB file.
-                            // Real PNG / JPEG inputs for VL are well
-                            // under 50 MB (LFM2-VL's max input band
-                            // is 262 144 pixels = ~1 MB raw RGB);
-                            // anything past 50 MB is a misuse.
-                            const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-                            // Reject non-regular files BEFORE the size
-                            // cap: special files like `/dev/zero` and
-                            // FIFOs report `len() == 0` from
-                            // `metadata()` but `std::fs::read` would
-                            // then read unbounded data and OOM the
-                            // REPL. `is_file()` is a metadata-level
-                            // check so it doesn't add an extra syscall.
-                            match std::fs::metadata(rest) {
-                                Ok(meta) if !meta.is_file() => {
-                                    eprintln!("error: /image {rest}: not a regular file",);
-                                    continue;
-                                }
-                                Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
-                                    eprintln!(
-                                        "error: /image {rest}: file is {} bytes, larger than the 50 MB cap",
-                                        meta.len(),
-                                    );
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("error: /image stat failed for {rest}: {e}");
-                                    continue;
-                                }
+                            if image_source::looks_like_url(rest) {
+                                eprintln!("(downloading {rest}...)");
                             }
-                            match std::fs::read(rest) {
+                            match image_source::load(rest, image_source::MAX_IMAGE_BYTES) {
                                 Ok(bytes) => {
                                     eprintln!(
                                         "(image attached: {rest}, {} bytes; sends with next message)",
@@ -2072,7 +2041,7 @@ fn main() -> Result<()> {
                                     pending_images.push(std::sync::Arc::new(bytes));
                                 }
                                 Err(e) => {
-                                    eprintln!("error: /image read failed for {rest}: {e}");
+                                    eprintln!("error: /image {rest}: {e:#}");
                                 }
                             }
                             continue;

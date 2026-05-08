@@ -101,7 +101,7 @@ struct ChatState {
     generating: bool,
     /// Last finish reason — surfaced briefly in the hint line.
     last_finish: Option<FinishReason>,
-    /// Image bytes attached via `/image <path>`; the next user
+    /// Image bytes attached via `/image <path-or-url>`; the next user
     /// turn copies these into `history_images[user_idx]` (cheap
     /// refcount bump per attachment) and drains
     /// `pending_images` on success. Preserved on
@@ -459,7 +459,7 @@ fn dispatch_user_input(
                 )?;
                 emit_status_to_scrollback(
                     terminal,
-                    "  /image <path>    Attach an image to the next user turn (repeat for multi-image)",
+                    "  /image <path-or-url>    Attach an image (file path or http(s):// URL) to the next user turn (repeat for multi-image)",
                 )?;
                 emit_status_to_scrollback(terminal, "  /help            Show this help")?;
                 emit_status_to_scrollback(terminal, "  /exit, /quit     Exit the REPL")?;
@@ -518,53 +518,20 @@ fn dispatch_user_input(
                 return Ok(KeyAction::Continue);
             }
             "/image" => {
+                // Arg is a filesystem path or `http(s)://` URL;
+                // `image_source::load` resolves both with the same 50 MB
+                // cap. URL fetch blocks the UI thread, so emit a
+                // pre-fetch hint so the user knows where the latency is
+                // going.
                 if rest.is_empty() {
-                    emit_status_to_scrollback(terminal, "usage: /image <path>")?;
+                    emit_status_to_scrollback(terminal, "usage: /image <path-or-url>")?;
                     emit_blank_line(terminal)?;
                     return Ok(KeyAction::Continue);
                 }
-                // Real LFM2-VL inputs are ~1 MB raw RGB; 50 MB is
-                // generous but rejects clearly malicious /
-                // accidental multi-GB inputs that would OOM the
-                // REPL on `std::fs::read`.
-                const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-                // Reject non-regular files BEFORE the size cap:
-                // special files like `/dev/zero` and FIFOs report
-                // `len() == 0` from `metadata()` but `std::fs::read`
-                // would then read unbounded data and OOM the REPL.
-                // `is_file()` is a metadata-level check so it
-                // doesn't add an extra syscall.
-                match std::fs::metadata(rest) {
-                    Ok(meta) if !meta.is_file() => {
-                        emit_status_to_scrollback(
-                            terminal,
-                            &format!("error: /image {rest}: not a regular file"),
-                        )?;
-                        emit_blank_line(terminal)?;
-                        return Ok(KeyAction::Continue);
-                    }
-                    Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
-                        emit_status_to_scrollback(
-                            terminal,
-                            &format!(
-                                "error: /image {rest}: file is {} bytes, larger than the 50 MB cap",
-                                meta.len()
-                            ),
-                        )?;
-                        emit_blank_line(terminal)?;
-                        return Ok(KeyAction::Continue);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        emit_status_to_scrollback(
-                            terminal,
-                            &format!("error: /image stat failed for {rest}: {e}"),
-                        )?;
-                        emit_blank_line(terminal)?;
-                        return Ok(KeyAction::Continue);
-                    }
+                if crate::image_source::looks_like_url(rest) {
+                    emit_status_to_scrollback(terminal, &format!("(downloading {rest}...)"))?;
                 }
-                match std::fs::read(rest) {
+                match crate::image_source::load(rest, crate::image_source::MAX_IMAGE_BYTES) {
                     Ok(bytes) => {
                         emit_status_to_scrollback(
                             terminal,
@@ -579,7 +546,7 @@ fn dispatch_user_input(
                     Err(e) => {
                         emit_status_to_scrollback(
                             terminal,
-                            &format!("error: /image read failed for {rest}: {e}"),
+                            &format!("error: /image {rest}: {e:#}"),
                         )?;
                         emit_blank_line(terminal)?;
                     }

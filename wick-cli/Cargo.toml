@@ -20,6 +20,11 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `/image` and `--image` accept `http(s)://` URLs in addition to filesystem
+# paths; reqwest::blocking handles the fetch. Already in the build via
+# `wick/remote`'s `BundleRepo`, but listed directly so the CLI's HTTP support
+# doesn't depend on whichever transitive feature happens to enable it.
+reqwest.workspace = true
 # Terminal UI for `wick chat`. Auto-engaged when stdin+stdout are TTYs;
 # `--no-tui` falls back to the line-based REPL. crossterm is ratatui's
 # default backend on macOS / Linux / Windows.
