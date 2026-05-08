@@ -440,12 +440,18 @@ Vite, webpack-dev-server, `http-server`, and similar tools.
 
 ### Node usage
 
+`pkg-nodejs-mt/` ships as a CommonJS module, so top-level `await`
+isn't available — wrap the init in an async IIFE (or run the
+snippet from a `.mjs` / `"type": "module"` ESM file):
+
 ```js
 const { initThreadPool, WickEngine } = require('@hyeonslab/wick-wasm');
 const os = require('os');
 
-await initThreadPool(os.cpus().length);
-// ...
+(async () => {
+    await initThreadPool(os.cpus().length);
+    // ...drive inference normally; rayon paths now run on worker_threads
+})();
 ```
 
 Node has no equivalent of the browser's COOP/COEP gate — the
