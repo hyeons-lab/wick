@@ -2052,7 +2052,10 @@ mod tests {
         let kv_dim = n_kv_heads * head_dim;
         let n_queries: u32 = 5;
         let start_pos: u32 = 3;
-        let max_seq = start_pos + n_queries; // = 8
+        // Tight `max_seq` (exactly `start_pos + n_queries`): the last
+        // workgroup's `seq_len = pos_q + 1u = max_seq`, exercising the
+        // boundary of the clamp added to address the PR review feedback.
+        let max_seq = start_pos + n_queries;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let q_stride = n_heads * head_dim;

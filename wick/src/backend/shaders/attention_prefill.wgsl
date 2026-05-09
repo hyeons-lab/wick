@@ -22,6 +22,14 @@
 // Constraint (matches `attention.wgsl`): seq_len ≤ 65536 and
 // `head_dim` is the per-head dimension implied by `params.head_dim`.
 //
+// Contract: caller MUST pass `max_seq ≥ start_pos + n_queries`. The K/V
+// cache must contain valid entries for positions `[0, start_pos +
+// n_queries)`, and `scores_buf` is sized `n_queries × n_heads × max_seq`.
+// As a defensive belt against caller mismatches, the shader clamps
+// `seq_len = min(pos_q + 1, max_seq)` — under-sized `max_seq` produces
+// truncated (incorrect) attention rather than an OOB read, but the
+// expected caller behavior is to size everything consistently.
+//
 // Bind group 0:
 //   @binding(0) q_batch:    array<f32>    n_queries × q_stride floats
 //   @binding(1) k_cache:    array<f32>    seq_len × kv_dim floats
@@ -63,9 +71,13 @@ fn attention_prefill(
     let q_stride = params[8];
     let out_stride = params[9];
 
-    // Causal seq_len for this query — attend over [0..pos_q].
+    // Causal seq_len for this query — attend over [0..pos_q]. Clamp
+    // against `max_seq` so a caller passing inconsistent params can
+    // only cause silent attention-window truncation, never an OOB read
+    // of `k_cache` / `v_cache` / `scores_buf` (which are all sized to
+    // `max_seq`-multiples).
     let pos_q = start_pos + q_idx;
-    let seq_len = pos_q + 1u;
+    let seq_len = min(pos_q + 1u, max_seq);
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
