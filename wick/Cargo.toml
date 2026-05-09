@@ -70,6 +70,27 @@ web-time.workspace = true
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["js"] }
 
+# wgpu on wasm32: the WebGPU backend types (`wgpu::Buffer` etc.) wrap
+# JS objects, which are not thread-safe. wgpu's
+# `fragile-send-sync-non-atomic-wasm` adds Send+Sync impls **only when
+# the `atomics` target-feature is OFF** (single-threaded wasm — JS is
+# single-threaded by default, so the impls are sound there). When
+# `atomics` is ON (multi-threaded wasm via wasm-bindgen-rayon, where
+# real concurrency exists), the impls disappear and wgpu types stay
+# `!Sync`, surfacing the threading mistake at compile time instead of
+# runtime UB.
+#
+# Without this feature, our `Model: Send + Sync` bound rejects
+# `GpuLfm2Model` on wasm. We always-on it for wasm32; threaded wasm
+# builds (which set `atomics` via the `wasm-web-mt` / `wasm-node-mt`
+# justfile recipes' RUSTFLAGS) will still fail to satisfy the bound,
+# which is the right outcome — multi-threaded wgpu wasm needs wgpu
+# pinned to a dedicated worker, not naively shared across threads.
+[target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
+workspace = true
+optional = true
+features = ["fragile-send-sync-non-atomic-wasm"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
@@ -92,14 +113,20 @@ tracing-subscriber.workspace = true
 # Feature deps:
 #   mmap        ⇒ std-fs  (memory-mapping a file needs a filesystem path)
 #   disk-cache  ⇒ std-fs  (writing the cold KV tier needs std::fs)
-#   gpu / metal ⇒ mmap    (both backends open the GGUF via mmap today)
+#   gpu         — wgpu compute. Independent of `mmap` after PR 4.1 — the
+#                 model loader accepts an already-parsed `GgufFile`
+#                 regardless of whether the bytes came from `open` (mmap)
+#                 or `from_bytes` (in-memory, e.g. wasm). Auto-dispatch
+#                 backend retry still requires `mmap` (re-opens the file
+#                 between backends) — see `clone_gguf_like` cfg gate.
+#   metal       ⇒ mmap    (re-opens GGUF via mmap)
 #   blas        — unchanged; opt-in GEMM accelerator
 #   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)
 parallel = ["dep:rayon"]
 std-fs = []
 mmap = ["dep:memmap2", "std-fs"]
 disk-cache = ["std-fs"]
-gpu = ["dep:wgpu", "dep:pollster", "mmap"]
+gpu = ["dep:wgpu", "dep:pollster"]
 metal = ["dep:metal", "dep:objc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
 # BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and

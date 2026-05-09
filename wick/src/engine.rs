@@ -1132,7 +1132,12 @@ fn load_text_model_auto(
         }
     }
 
-    #[cfg(feature = "gpu")]
+    // Auto-dispatch's gpu retry needs `mmap` to re-open the GGUF
+    // between attempts. With gpu enabled but mmap disabled (e.g. the
+    // wasm wgpu build), the auto path skips gpu and falls through to
+    // CPU; users wanting gpu must opt in via `BackendPreference::Gpu`,
+    // which doesn't need the re-open helper.
+    #[cfg(all(feature = "gpu", feature = "mmap"))]
     {
         // Path guaranteed present (short-circuited above otherwise).
         let p = path.expect("path guaranteed by early return");
@@ -1155,7 +1160,7 @@ fn load_text_model_auto(
             .map_err(|e| WickError::Backend(format!("CPU model load failed: {e}")))
     }
 
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(all(feature = "gpu", feature = "mmap")))]
     {
         tracing::debug!("wick::engine: using CPU backend (auto)");
         model::load_model(gguf, path, context_size)
@@ -1165,8 +1170,14 @@ fn load_text_model_auto(
 
 /// Re-open a GGUF from its path. The Metal and wgpu loaders consume
 /// `GgufFile` by value, so the auto-dispatch path has to freshly map
-/// the file for each backend it tries.
-#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "gpu"))]
+/// the file for each backend it tries. Requires `mmap` (the only
+/// supported re-open path); the explicit `BackendPreference::Gpu`
+/// arm uses the caller-supplied `GgufFile` directly and doesn't need
+/// this helper.
+#[cfg(all(
+    feature = "mmap",
+    any(all(feature = "metal", target_os = "macos"), feature = "gpu")
+))]
 fn clone_gguf_like(_: &GgufFile, path: &Path) -> Result<GgufFile, WickError> {
     GgufFile::open(path)
         .map_err(|e| WickError::Backend(format!("reopening `{}`: {e}", path.display())))

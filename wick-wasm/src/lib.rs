@@ -255,6 +255,14 @@ impl WickEngine {
         // future EngineConfig fields (e.g. `bundle_repo` when the
         // `remote` feature is on) without a compile break — only the
         // two we actually want to override are spelled out.
+        // `..default()` is intentionally retained for forward
+        // compatibility — clippy's `needless_update` only fires under
+        // feature combos where `EngineConfig` happens to collapse to
+        // exactly the two listed fields (e.g. wasm32 minimal builds).
+        // Adding a feature later that introduces a new field would
+        // otherwise compile-break this constructor; the spread keeps
+        // it future-proof.
+        #[allow(clippy::needless_update)]
         let cfg = wick::EngineConfig {
             context_size: context_size.unwrap_or(4096) as usize,
             backend: wick::BackendPreference::Cpu,

@@ -74,6 +74,26 @@ wasm-bindgen-rayon = { workspace = true, optional = true }
 # `SharedArrayBuffer` to be available. Node has no equivalent gate.
 parallel = ["wick/parallel", "dep:wasm-bindgen-rayon"]
 
+# `wgpu` — opt-in WebGPU compute backend. Turns on `wick/gpu`, which
+# pulls in the wgpu compute pipelines so Q4_0 LFM2 prefill + decode
+# can run on the GPU. Track B PR 4.1 (wasm wiring; not Track A —
+# Track A is the kernel-parity work that already shipped in
+# #151/#154/#156/#157): this PR only wires the cargo feature so the
+# build succeeds with `gpu` enabled on wasm32; no wgpu init /
+# dispatch surface is exposed through wick-wasm yet. The async init
+# + sync-forward shim that lets JS callers run inference on the GPU
+# is Track B PR 4.2.
+#
+# Note: cannot be combined with `parallel` today. The
+# `fragile-send-sync-non-atomic-wasm` feature on wgpu only lights up
+# its Send+Sync impls when the `atomics` target-feature is OFF; the
+# threaded build sets `atomics` (via `wasm-web-mt` / `wasm-node-mt`)
+# and wgpu types stop being Sync, breaking the `Model: Send + Sync`
+# bound. A multi-threaded wgpu wasm build would need to run wgpu on
+# a dedicated worker (atomics-free per-worker) or wait for upstream
+# wgpu to ship atomics-safe Send+Sync — both are post-PR-4.2 work.
+wgpu = ["wick/gpu"]
+
 [package.metadata.docs.rs]
 # docs.rs runs on linux x86_64 by default, which would skip the
 # `cfg(target_arch = "wasm32")` lib-level guard and produce empty

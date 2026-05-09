@@ -408,7 +408,10 @@ impl GgufFile {
         // Derive a stable byte view of the backing. NonNull from a slice
         // of at least one byte is guaranteed non-null; for a zero-byte
         // buffer we bail early with a nicer error than the "magic
-        // mismatch" below would produce.
+        // mismatch" below would produce. The lint is only correct when
+        // `mmap` is off (single-arm match); kept as `match` so adding a
+        // future `Backing` variant can't go unnoticed.
+        #[allow(clippy::infallible_destructuring_match)]
         let data_slice: &[u8] = match &backing {
             #[cfg(feature = "mmap")]
             Backing::Mmap(m) => m,
