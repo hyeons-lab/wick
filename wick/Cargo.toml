@@ -72,16 +72,20 @@ getrandom = { workspace = true, features = ["js"] }
 
 # wgpu on wasm32: the WebGPU backend types (`wgpu::Buffer` etc.) wrap
 # JS objects, which are not thread-safe. wgpu's
-# `fragile-send-sync-non-atomic-wasm` adds Send+Sync impls keyed off
-# `target_feature = "atomics"` — present (so single-threaded JS sees
-# Send+Sync), absent (multi-threaded wasm with atomics) the impls are
-# skipped and the types stay !Sync, surfacing the threading mistake at
-# compile time instead of runtime UB. Without this feature, our
-# `Model: Send + Sync` bound rejects `GpuLfm2Model` on wasm. Per the
-# wgpu docs, the impls are unsound under `atomics` (which we don't set
-# for non-`parallel` wasm builds — the atomics `RUSTFLAGS` only land
-# on `--features parallel`), so use this in tandem with the existing
-# parallel-feature gating.
+# `fragile-send-sync-non-atomic-wasm` adds Send+Sync impls **only when
+# the `atomics` target-feature is OFF** (single-threaded wasm — JS is
+# single-threaded by default, so the impls are sound there). When
+# `atomics` is ON (multi-threaded wasm via wasm-bindgen-rayon, where
+# real concurrency exists), the impls disappear and wgpu types stay
+# `!Sync`, surfacing the threading mistake at compile time instead of
+# runtime UB.
+#
+# Without this feature, our `Model: Send + Sync` bound rejects
+# `GpuLfm2Model` on wasm. We always-on it for wasm32; threaded wasm
+# builds (which set `atomics` via the `wasm-web-mt` / `wasm-node-mt`
+# justfile recipes' RUSTFLAGS) will still fail to satisfy the bound,
+# which is the right outcome — multi-threaded wgpu wasm needs wgpu
+# pinned to a dedicated worker, not naively shared across threads.
 [target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
 workspace = true
 optional = true

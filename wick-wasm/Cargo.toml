@@ -76,11 +76,13 @@ parallel = ["wick/parallel", "dep:wasm-bindgen-rayon"]
 
 # `wgpu` — opt-in WebGPU compute backend. Turns on `wick/gpu`, which
 # pulls in the wgpu compute pipelines so Q4_0 LFM2 prefill + decode
-# can run on the GPU. Track A PR 4.1: this PR only wires the cargo
-# feature so the build succeeds with `gpu` enabled on wasm32; no
-# wgpu init / dispatch surface is exposed through wick-wasm yet.
-# The async init + sync-forward shim that lets JS callers run inference
-# on the GPU is PR 4.2.
+# can run on the GPU. Track B PR 4.1 (wasm wiring; not Track A —
+# Track A is the kernel-parity work that already shipped in
+# #151/#154/#156/#157): this PR only wires the cargo feature so the
+# build succeeds with `gpu` enabled on wasm32; no wgpu init /
+# dispatch surface is exposed through wick-wasm yet. The async init
+# + sync-forward shim that lets JS callers run inference on the GPU
+# is Track B PR 4.2.
 #
 # Note: cannot be combined with `parallel` today. The
 # `fragile-send-sync-non-atomic-wasm` feature on wgpu only lights up
