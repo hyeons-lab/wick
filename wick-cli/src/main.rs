@@ -1638,8 +1638,38 @@ fn main() -> Result<()> {
                 let voc_gguf = wick::gguf::GgufFile::open_arc(Path::new(vocoder_path))?;
                 let decoder_weights =
                     wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf)?;
+                {
+                    let dc = &decoder_weights.depthformer_config;
+                    let cc = &decoder_weights.decoder_config;
+                    eprintln!(
+                        "Audio decoder loaded: depthformer {}L×{}, decoder {}cb×{} vocab, LLM embd={}",
+                        dc.n_layer, dc.n_embd, cc.n_codebook, cc.n_vocab, cc.n_embd
+                    );
+                }
                 let detok_weights =
                     wick::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf)?;
+                {
+                    let cfg = &detok_weights.config;
+                    eprintln!(
+                        "Detokenizer loaded: {}L, embd={}, head={}/{}, ffn={}, conv_layers={}",
+                        cfg.n_layer,
+                        cfg.n_embd,
+                        cfg.n_head,
+                        cfg.n_head_kv,
+                        cfg.ffn_dim,
+                        cfg.layer_is_conv.iter().filter(|&&c| c).count()
+                    );
+                }
+                let gpu_df_requested = std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                if gpu_df_requested {
+                    eprintln!(
+                        "warning: WICK_GPU_DF=1 enables an experimental Metal depthformer that \
+                         currently produces incorrect codes (frame-1 immediate-end with \
+                         --audio-temperature 0; NaN-logit panic with default sampling). \
+                         The CPU depthformer is the supported path."
+                    );
+                }
 
                 #[cfg(all(feature = "metal", target_os = "macos"))]
                 let gpu_detok = {
@@ -1676,7 +1706,7 @@ fn main() -> Result<()> {
                     audio_temperature,
                     audio_top_k,
                     mode,
-                    gpu_depthformer: std::env::var("WICK_GPU_DF").as_deref() == Ok("1"),
+                    gpu_depthformer: gpu_df_requested,
                 };
 
                 #[cfg(all(feature = "metal", target_os = "macos"))]

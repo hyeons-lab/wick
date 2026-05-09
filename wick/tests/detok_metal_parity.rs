@@ -38,7 +38,7 @@ fn band_energy(log_abs: &[f32], start: usize, end: usize) -> f64 {
     log_abs[start..end].iter().map(|&v| (v as f64).exp()).sum()
 }
 
-fn load_vocoder() -> Option<(wick::gguf::GgufFile, std::path::PathBuf)> {
+fn load_vocoder() -> Option<(std::sync::Arc<wick::gguf::GgufFile>, std::path::PathBuf)> {
     let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !path.exists() {

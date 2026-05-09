@@ -201,11 +201,6 @@ impl AudioDecoderWeights {
             rms_norm_eps: 1e-5,
         };
 
-        eprintln!(
-            "Audio decoder loaded: depthformer {}L×{}, decoder {}cb×{} vocab, LLM embd={}",
-            n_layer, n_embd, n_codebook, n_vocab, n_embd_llm
-        );
-
         Ok(Self {
             depthformer_config,
             decoder_config,
@@ -779,16 +774,6 @@ impl DetokenizerWeights {
                 },
             });
         }
-
-        eprintln!(
-            "Detokenizer loaded: {}L, embd={}, head={}/{}, ffn={}, conv_layers={}",
-            n_layer,
-            n_embd,
-            n_head,
-            n_head_kv,
-            ffn_dim,
-            config.layer_is_conv.iter().filter(|&&c| c).count()
-        );
 
         Ok(Self {
             config,

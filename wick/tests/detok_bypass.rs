@@ -15,9 +15,11 @@ fn detok_bypass_backbone() {
     let n_vocab_per_cb = emb.rows / tw.config.n_codes;
     let codes = [500i32; 8];
     let mut embedding = vec![0.0f32; n];
+    let mut row = vec![0.0f32; n];
     for (j, &c) in codes.iter().enumerate() {
         let idx = j * n_vocab_per_cb + c as usize;
-        for (r, e) in embedding.iter_mut().zip(&emb.data[idx * n..(idx + 1) * n]) {
+        emb.dequantize_row(idx, &mut row);
+        for (r, e) in embedding.iter_mut().zip(&row) {
             *r += e;
         }
     }
