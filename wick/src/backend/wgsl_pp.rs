@@ -72,7 +72,7 @@ impl Preprocessor {
             &mut out,
         )?;
         if !cond.is_empty() {
-            bail!("Unclosed #if directive");
+            bail!("unclosed #if directive");
         }
         Ok(out)
     }
@@ -241,7 +241,7 @@ impl Preprocessor {
                 cond.pop().context("#endif without #if")?;
                 Ok(())
             }
-            _ => bail!("Unknown directive: #{cmd}"),
+            _ => bail!("unknown directive: #{cmd}"),
         }
     }
 
@@ -255,7 +255,7 @@ impl Preprocessor {
         out: &mut String,
     ) -> Result<()> {
         if include_stack.contains(name) {
-            bail!("Recursive include: {name}");
+            bail!("recursive include: {name}");
         }
         let source = self
             .embedded
@@ -326,34 +326,38 @@ fn expand_macros(line: &str, macros: &Macros) -> Result<String> {
 
 fn expand_internal(line: &str, macros: &Macros, visiting: &mut HashSet<String>) -> Result<String> {
     let mut out = String::with_capacity(line.len());
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if is_ident_char(c) && !c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && is_ident_char(chars[i]) {
-                i += 1;
+    let mut iter = line.char_indices().peekable();
+    while let Some((start, c)) = iter.next() {
+        if (c.is_ascii_alphabetic() || c == '_') && !c.is_ascii_digit() {
+            // Walk to the end of the identifier; record the byte index
+            // so we can slice the original string with no allocation.
+            let mut end = start + c.len_utf8();
+            while let Some(&(_, nc)) = iter.peek() {
+                if is_ident_char(nc) {
+                    end += nc.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
             }
-            let token: String = chars[start..i].iter().collect();
-            match macros.get(&token) {
-                None => out.push_str(&token),
+            let token = &line[start..end];
+            match macros.get(token) {
+                None => out.push_str(token),
                 Some(value) if value.is_empty() => {
                     // C semantics: `#define FOO` (empty value) expands to nothing.
                 }
                 Some(value) => {
-                    if visiting.contains(&token) {
-                        bail!("Recursive macro: {token}");
+                    if visiting.contains(token) {
+                        bail!("recursive macro: {token}");
                     }
-                    visiting.insert(token.clone());
+                    visiting.insert(token.to_string());
                     let expanded = expand_internal(value, macros, visiting)?;
-                    visiting.remove(&token);
+                    visiting.remove(token);
                     out.push_str(&expanded);
                 }
             }
         } else {
             out.push(c);
-            i += 1;
         }
     }
     Ok(out)
@@ -591,10 +595,11 @@ impl<'a> ExprParser<'a> {
                 v = v.wrapping_mul(rhs);
             } else if self.accept_op("/") {
                 let rhs = self.parse_unary()?;
-                v = if rhs == 0 { 0 } else { v / rhs };
+                // checked_div returns None on rhs == 0 AND on i64::MIN / -1.
+                v = v.checked_div(rhs).unwrap_or(0);
             } else if self.accept_op("%") {
                 let rhs = self.parse_unary()?;
-                v = if rhs == 0 { 0 } else { v % rhs };
+                v = v.checked_rem(rhs).unwrap_or(0);
             } else {
                 break;
             }
@@ -673,7 +678,7 @@ impl<'a> ExprParser<'a> {
             Some(value) if value.is_empty() => Ok(1),
             Some(value) => {
                 if self.visiting.contains(name) {
-                    bail!("Recursive macro in expression: {name}");
+                    bail!("recursive macro in expression: {name}");
                 }
                 self.visiting.insert(name.to_string());
                 let result = eval_expr_with(value, self.macros, self.visiting);
@@ -882,7 +887,7 @@ mod tests {
         p.add_include("a.tmpl", "#include \"b.tmpl\"\n");
         p.add_include("b.tmpl", "#include \"a.tmpl\"\n");
         let err = p.preprocess("#include \"a.tmpl\"\n", &[]).unwrap_err();
-        assert!(format!("{err}").contains("Recursive include"));
+        assert!(format!("{err}").contains("recursive include"));
     }
 
     #[test]
@@ -897,7 +902,7 @@ mod tests {
     fn macro_expansion_recursive_detected() {
         let src = "#define A B\n#define B A\nA\n";
         let err = pp().preprocess(src, &[]).unwrap_err();
-        assert!(format!("{err}").contains("Recursive macro"));
+        assert!(format!("{err}").contains("recursive macro"));
     }
 
     #[test]
@@ -910,7 +915,7 @@ mod tests {
     #[test]
     fn unclosed_if_errors() {
         let err = pp().preprocess("#if 1\nbody();\n", &[]).unwrap_err();
-        assert!(format!("{err}").contains("Unclosed"));
+        assert!(format!("{err}").contains("unclosed"));
     }
 
     #[test]
@@ -1038,7 +1043,7 @@ fn store_dst(idx: u32) -> f32 { return 0.0; }
         m.insert("A".into(), "B".into());
         m.insert("B".into(), "A".into());
         let err = eval_expr("A", &m).unwrap_err();
-        assert!(format!("{err}").contains("Recursive macro"));
+        assert!(format!("{err}").contains("recursive macro"));
     }
 
     #[test]
