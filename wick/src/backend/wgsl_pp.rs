@@ -154,6 +154,9 @@ impl Preprocessor {
             }
             "ifdef" => {
                 let name = args.trim();
+                if name.is_empty() {
+                    bail!("#ifdef: missing name");
+                }
                 let parent = cond_active(cond);
                 let value = macros.contains_key(name);
                 cond.push(Cond {
@@ -165,6 +168,9 @@ impl Preprocessor {
             }
             "ifndef" => {
                 let name = args.trim();
+                if name.is_empty() {
+                    bail!("#ifndef: missing name");
+                }
                 let parent = cond_active(cond);
                 let value = !macros.contains_key(name);
                 cond.push(Cond {
@@ -264,7 +270,7 @@ struct Cond {
 }
 
 fn cond_active(stack: &[Cond]) -> bool {
-    stack.last().map_or(true, |c| c.active)
+    stack.last().is_none_or(|c| c.active)
 }
 
 fn strip_quotes(s: &str) -> Option<&str> {
@@ -301,7 +307,11 @@ fn expand_internal(line: &str, macros: &Macros, visiting: &mut HashSet<String>) 
             }
             let token: String = chars[start..i].iter().collect();
             match macros.get(&token) {
-                Some(value) if !value.is_empty() => {
+                None => out.push_str(&token),
+                Some(value) if value.is_empty() => {
+                    // C semantics: `#define FOO` (empty value) expands to nothing.
+                }
+                Some(value) => {
                     if visiting.contains(&token) {
                         bail!("Recursive macro: {token}");
                     }
@@ -310,7 +320,6 @@ fn expand_internal(line: &str, macros: &Macros, visiting: &mut HashSet<String>) 
                     visiting.remove(&token);
                     out.push_str(&expanded);
                 }
-                _ => out.push_str(&token),
             }
         } else {
             out.push(c);
@@ -639,8 +648,7 @@ impl<'a> ExprParser<'a> {
                     bail!("Recursive macro in expression: {name}");
                 }
                 self.visiting.insert(name.to_string());
-                let value = value.clone();
-                let result = eval_expr_with(value.as_str(), self.macros, self.visiting);
+                let result = eval_expr_with(value, self.macros, self.visiting);
                 self.visiting.remove(name);
                 result
             }
@@ -1003,5 +1011,41 @@ fn store_dst(idx: u32) -> f32 { return 0.0; }
         m.insert("B".into(), "A".into());
         let err = eval_expr("A", &m).unwrap_err();
         assert!(format!("{err}").contains("Recursive macro"));
+    }
+
+    #[test]
+    fn ifdef_missing_name_errors() {
+        let err = pp()
+            .preprocess("#ifdef\nbody();\n#endif\n", &[])
+            .unwrap_err();
+        assert!(format!("{err}").contains("#ifdef: missing name"));
+    }
+
+    #[test]
+    fn ifndef_missing_name_errors() {
+        let err = pp()
+            .preprocess("#ifndef\nbody();\n#endif\n", &[])
+            .unwrap_err();
+        assert!(format!("{err}").contains("#ifndef: missing name"));
+    }
+
+    #[test]
+    fn empty_define_expands_to_empty_in_body() {
+        // C-preprocessor semantics: `#define FOO` (no value) expands to
+        // nothing in body code. Used in shaders to define feature flags
+        // that are checked via `#ifdef FOO` but never substituted.
+        let src = "#define FOO\nprefix FOO suffix\n";
+        let out = pp().preprocess(src, &[]).unwrap();
+        assert!(out.contains("prefix  suffix"), "got: {out:?}");
+        assert!(!out.contains("FOO"), "got: {out:?}");
+    }
+
+    #[test]
+    fn empty_predefined_expands_to_empty_in_body() {
+        // Same as above but for caller-passed predefines.
+        let src = "fn main() { let x = TAG; }\n";
+        let out = pp().preprocess(src, &[("TAG", "")]).unwrap();
+        assert!(out.contains("let x = ;"), "got: {out:?}");
+        assert!(!out.contains("TAG"), "got: {out:?}");
     }
 }
