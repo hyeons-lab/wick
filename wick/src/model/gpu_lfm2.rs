@@ -67,6 +67,7 @@ struct GpuPipelines {
     rope: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
     conv1d: wgpu::ComputePipeline,
+    argmax_f32: wgpu::ComputePipeline,
 }
 
 /// GPU-resident inference state (KV cache + conv rolling buffers).
@@ -116,6 +117,19 @@ pub struct GpuLfm2Model {
     attn_out_buf: wgpu::Buffer,  // [hidden_size]
     logits_buf: wgpu::Buffer,    // [vocab_size]
     scores_buf: wgpu::Buffer,    // [n_heads × max_seq_len]
+    /// 4 bytes — receives argmax(logits) as a single u32. Cached so
+    /// `forward_greedy` doesn't allocate per call. The `download_u32`
+    /// readback over this 4-byte buffer is the wasm-async-friendly
+    /// replacement for downloading `vocab_size * 4` bytes of logits.
+    argmax_out_buf: wgpu::Buffer,
+    /// Pre-uploaded `vec2<u32>{ vocab_size, 0 }` for the argmax shader.
+    /// Held to keep the buffer alive for the cached `argmax_bg`'s
+    /// reference; not directly read after construction.
+    #[allow(dead_code)]
+    argmax_params: wgpu::Buffer,
+    /// Cached bind group for the argmax kernel — bindings never change
+    /// (logits_buf, argmax_out_buf, argmax_params), so build it once.
+    argmax_bg: wgpu::BindGroup,
     // Pre-allocated shader params (avoids upload_storage per dispatch).
     rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
     elementwise_hs_params: wgpu::Buffer, // [hs, 0]
@@ -226,6 +240,7 @@ impl GpuLfm2Model {
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise", "conv1d"),
+            argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
         };
 
         // Upload weights: Q4_0 stays quantized, others dequantized to f32
@@ -398,6 +413,33 @@ impl GpuLfm2Model {
         let rope_params = ctx.create_storage_rw(5 * 4, "rope_params");
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
 
+        // Argmax I/O buffers. `argmax_params` is uploaded once with
+        // vocab_size; `argmax_out_buf` is a 4-byte sink. Bind group is
+        // built after `pipelines` exists below.
+        let argmax_out_buf = ctx.create_storage_rw(4, "argmax_out");
+        let argmax_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[config.vocab_size as u32, 0u32]),
+            "argmax_params",
+        );
+        let argmax_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("argmax_bg"),
+            layout: &pipelines.argmax_f32.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: logits_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: argmax_out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: argmax_params.as_entire_binding(),
+                },
+            ],
+        });
+
         // Build the prefix cache before constructing `Self` so we can
         // borrow `&config` here without conflicting with the upcoming
         // move of `config` into the struct literal.
@@ -427,6 +469,9 @@ impl GpuLfm2Model {
             attn_out_buf,
             logits_buf,
             scores_buf,
+            argmax_out_buf,
+            argmax_params,
+            argmax_bg,
             rmsnorm_hs_params,
             elementwise_hs_params,
             elementwise_is_params,
@@ -793,6 +838,18 @@ impl GpuLfm2Model {
     /// reentrant, so calling `Model::forward` from inside this body
     /// would deadlock.
     fn forward_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        self.forward_inner_compute(tokens, pos, state);
+        self.ctx
+            .download_f32(&self.logits_buf, self.config.vocab_size)
+    }
+
+    /// Computes one forward pass and leaves the resulting logits in
+    /// `self.logits_buf` on the GPU **without** reading them back. Caller
+    /// chooses how to consume the logits — full readback for sampling
+    /// (`forward_inner`) or a single-`u32` argmax readback for greedy
+    /// decoding (`forward_greedy_inner`). This split lets the wasm-async
+    /// path avoid the vocab-sized blocking download every step.
+    fn forward_inner_compute(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -1498,11 +1555,41 @@ impl GpuLfm2Model {
         );
         self.submit_and_wait(enc);
 
-        // 4. Update seq_len, profile, and read back logits
+        // 4. Update seq_len + profile bookkeeping. Logits are now in
+        // `logits_buf` on the GPU; the caller decides how to consume
+        // them (full readback vs. argmax-then-u32-readback).
         self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
         self.ctx.finish_profiler();
-        self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
+    }
+
+    /// Greedy single-token forward: runs the same kernels as
+    /// [`forward_inner`] but replaces the vocab-sized logits download
+    /// with a 4-byte argmax readback. Cuts per-token PCIe/USB-C
+    /// readback from `vocab_size * 4` bytes to `4` bytes — the
+    /// wasm-async-friendly path, since a 4-byte map_async still
+    /// blocks the JS event loop briefly but doesn't transfer megabytes.
+    fn forward_greedy_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        self.forward_inner_compute(tokens, pos, state);
+
+        // Encode + submit the argmax pass on its own. Could be folded
+        // into the output-projection encoder for one fewer submission,
+        // but that's a `forward_inner_compute` refactor we're keeping
+        // out of this PR.
+        let mut enc = self.new_encoder();
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("argmax"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.argmax_f32);
+            pass.set_bind_group(0, &self.argmax_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.submit_and_wait(enc);
+
+        let out = self.ctx.download_u32(&self.argmax_out_buf, 1);
+        out[0]
     }
 }
 
@@ -1525,19 +1612,14 @@ impl GpuLfm2Model {
         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
         let d_conv = kernel_size - 1;
 
-        // `download_f32` returns the FULL staging buffer's contents
-        // (it's grown to the largest historical request and reused),
-        // so the returned `Vec<f32>` may be longer than `count`.
-        // Truncate to the requested element count before slicing into
-        // a snapshot — without this the snapshot would carry stale
-        // tail bytes that downstream `write_buffer` would push past
-        // the live KV region (harmless on restore today, but bad
-        // hygiene + masks future bugs).
-        let download_exact = |buf: &wgpu::Buffer, count: usize| -> Vec<f32> {
-            let mut out = self.ctx.download_f32(buf, count);
-            out.truncate(count);
-            out
-        };
+        // `download_f32` now slices the staging buffer to exactly
+        // `count * 4` bytes, so the returned `Vec<f32>` length
+        // equals `count` directly — no truncation needed. The
+        // closure is kept as the single calling site so a future
+        // regression in `download_f32` re-introduces a single edit
+        // point, not N call sites.
+        let download_exact =
+            |buf: &wgpu::Buffer, count: usize| -> Vec<f32> { self.ctx.download_f32(buf, count) };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -1665,6 +1747,11 @@ impl Model for GpuLfm2Model {
         self.forward_inner(tokens, pos, state)
     }
 
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.forward_greedy_inner(tokens, pos, state)
+    }
+
     // forward_embedding and forward_from_embedding use default impls
     // (unimplemented). Audio generation requires Metal backend for now.
     // wgpu support would need refactoring forward() to split the layer
@@ -1709,9 +1796,20 @@ impl Model for GpuLfm2Model {
                     // splits don't drift.)
                     self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
                     state.seq_len = use_len;
+                    // Skip the per-token vocab-sized download_f32 for
+                    // every prefill step except the last — only the
+                    // final logits are returned to the caller.
+                    // `prefix_len < tokens.len()` is enforced above, so
+                    // `remaining` is always >= 1 here.
+                    let remaining = &tokens[use_len..];
+                    let last = remaining.len() - 1;
                     let mut logits = Vec::new();
-                    for (j, &token) in tokens[use_len..].iter().enumerate() {
-                        logits = self.forward_inner(&[token], use_len + j, state);
+                    for (j, &token) in remaining.iter().enumerate() {
+                        if j == last {
+                            logits = self.forward_inner(&[token], use_len + j, state);
+                        } else {
+                            self.forward_inner_compute(&[token], use_len + j, state);
+                        }
                     }
                     self.prefix_cache
                         .lock()
@@ -1732,9 +1830,24 @@ impl Model for GpuLfm2Model {
         // Sequential single-token forward via the lock-free body — calling
         // `self.forward()` here would re-acquire the (non-reentrant)
         // `infer_lock` we already hold and deadlock.
+        //
+        // For every step except the last, drive the GPU via
+        // `forward_inner_compute` so the per-token vocab-sized
+        // `download_f32` is skipped — only the final iteration's
+        // logits make it back to the caller. At p=4096 this drops
+        // 4095 vocab-sized blocking readbacks (vocab × 4 bytes ×
+        // 4095 = ~1 GB at vocab=65536). Empty `tokens` makes
+        // `last` underflow — guarded by `if !tokens.is_empty()`.
         let mut logits = Vec::new();
-        for (i, &token) in tokens.iter().enumerate() {
-            logits = self.forward_inner(&[token], start_pos + i, state);
+        if !tokens.is_empty() {
+            let last = tokens.len() - 1;
+            for (i, &token) in tokens.iter().enumerate() {
+                if i == last {
+                    logits = self.forward_inner(&[token], start_pos + i, state);
+                } else {
+                    self.forward_inner_compute(&[token], start_pos + i, state);
+                }
+            }
         }
         if start_pos == 0 {
             self.prefix_cache

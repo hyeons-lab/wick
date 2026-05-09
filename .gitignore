@@ -39,3 +39,5 @@ benchmark_results.csv
 benchmark_output.log
 wick_time.txt
 llama_time.txt
+bench_results.csv
+bench_log.txt

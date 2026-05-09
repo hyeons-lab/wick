@@ -193,7 +193,13 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..);
+        // Map only the requested `0..size` byte range, not the full
+        // staging buffer. The cached staging is sized to the largest
+        // historical request, so `slice(..)` would map+copy that
+        // entire size every call (e.g. a small `count` after a prior
+        // `vocab_size` download would still pay the vocab-sized cost
+        // and stale tail bytes would leak into the returned `Vec`).
+        let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
@@ -205,6 +211,57 @@ impl GpuContext {
 
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
+    /// Read u32 data back from a GPU buffer (blocking). Mirrors
+    /// `download_f32` but reinterprets the staging bytes as `u32`.
+    /// Used by the argmax kernel which writes `out: array<u32>`.
+    pub fn download_u32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
+        use std::sync::atomic::Ordering;
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+        let staging_guard = {
+            let mut guard = self.staging.lock().expect("staging mutex poisoned");
+            if guard.as_ref().map(|b| b.size() < size).unwrap_or(true) {
+                *guard = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("staging-download"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.staging_size.store(size, Ordering::Relaxed);
+            }
+            guard
+        };
+        let staging = staging_guard.as_ref().unwrap();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download_u32"),
+            });
+        encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        // Map only the requested `0..size` range — see download_f32
+        // above for the same reasoning. With a vocab-sized cached
+        // staging buffer, mapping the full range turns the 4-byte
+        // argmax readback into a vocab-sized copy on every greedy
+        // step, defeating the optimization.
+        let slice = staging.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("GPU readback channel closed")
+            .expect("GPU readback failed");
+
+        let data = slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
         result
@@ -347,6 +404,7 @@ pub mod shaders {
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
+    pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
@@ -1072,5 +1130,216 @@ mod tests {
             );
         }
         println!("Q4_0 GEMV {m}×{k}: all rows match");
+    }
+
+    /// Argmax kernel correctness across three shapes that exercise the
+    /// stride loop (`n > 256`), the trivial single-stride case (`n < 256`),
+    /// and the boundary (`n == 256`). Plants known maxima to verify both
+    /// the value picked and the lower-idx tie-break.
+    #[test]
+    fn test_gpu_argmax_f32() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let pipeline = ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32");
+
+        let cases: &[(usize, usize)] = &[
+            (32, 17),       // n < workgroup size; expected idx 17
+            (256, 200),     // n == workgroup size
+            (2048, 1733),   // typical multi-stride n
+            (50000, 12345), // vocab-sized
+        ];
+        for &(n, plant_idx) in cases {
+            // Build a non-monotonic vector so `cpu_argmax`-style tie-break
+            // edge cases don't accidentally pass via "highest index wins".
+            let mut x: Vec<f32> = (0..n)
+                .map(|i| ((i as i32 * 31 + 7) % 211) as f32 / 211.0)
+                .collect();
+            x[plant_idx] = 99.0; // unambiguous global max
+
+            let x_buf = ctx.upload_f32(&x, "argmax_in");
+            let out_buf = ctx.create_storage_rw(4, "argmax_out");
+            let params =
+                ctx.upload_storage(bytemuck::cast_slice(&[n as u32, 0u32]), "argmax_params");
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+
+            let out = ctx.download_u32(&out_buf, 1);
+            assert_eq!(
+                out[0] as usize, plant_idx,
+                "argmax(n={n}) returned {}, expected {plant_idx}",
+                out[0]
+            );
+        }
+
+        // Lower-index tie-break: two equal maxima, lower index must win.
+        let n: usize = 1024;
+        let mut x = vec![0.0f32; n];
+        x[100] = 5.0;
+        x[700] = 5.0; // equal-magnitude tie
+        let x_buf = ctx.upload_f32(&x, "argmax_tie_in");
+        let out_buf = ctx.create_storage_rw(4, "argmax_tie_out");
+        let params =
+            ctx.upload_storage(bytemuck::cast_slice(&[n as u32, 0u32]), "argmax_tie_params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        let out = ctx.download_u32(&out_buf, 1);
+        assert_eq!(
+            out[0], 100,
+            "tie-break: lower index must win, got {}",
+            out[0]
+        );
+    }
+
+    /// Spike: confirm WGSL `override` constants flow through the wgpu 24
+    /// pipeline-creation API on this machine. If this passes, per-head-dim
+    /// specialization in Phase 3 of the wgpu kernel-parity plan can ride on
+    /// `override` rather than separate shader files / string templating.
+    #[test]
+    fn spike_wgsl_override_constants() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // Single shader, single entry point. `HEAD_DIM` is an
+        // override-able u32 with a default value of 1; the kernel writes
+        // its current value to `out[0]` so we can read it back.
+        let src = r#"
+            override HEAD_DIM: u32 = 1u;
+            @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+            @compute @workgroup_size(1)
+            fn main() { out[0] = HEAD_DIM; }
+        "#;
+
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("override_spike"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+
+        let make_pipeline = |head_dim: u32| {
+            let mut consts: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            consts.insert("HEAD_DIM".to_string(), head_dim as f64);
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(&format!("override_spike_hd{head_dim}")),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &consts,
+                        zero_initialize_workgroup_memory: true,
+                    },
+                    cache: None,
+                })
+        };
+
+        let dispatch_and_read = |pipeline: &wgpu::ComputePipeline| -> u32 {
+            let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("override_spike_out"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                }],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+            // u32 readback via the same staging path used for f32 elsewhere.
+            let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&buf, 0, &staging, 0, 4);
+            ctx.queue.submit(Some(enc.finish()));
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).ok();
+            });
+            ctx.device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            drop(data);
+            staging.unmap();
+            v
+        };
+
+        let pipeline_64 = make_pipeline(64);
+        let pipeline_128 = make_pipeline(128);
+        let v64 = dispatch_and_read(&pipeline_64);
+        let v128 = dispatch_and_read(&pipeline_128);
+        assert_eq!(v64, 64, "override HEAD_DIM=64 not honored");
+        assert_eq!(v128, 128, "override HEAD_DIM=128 not honored");
+        println!("WGSL override spike OK: same module → HEAD_DIM={v64} and {v128}");
     }
 }
