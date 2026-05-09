@@ -501,6 +501,27 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Log .so size
+        # Per-ABI size + the artifact name reviewers will look for
+        # in the run page sidebar. Mirrors the size-summary pattern
+        # used by `wick-wasm-pack` / `apple-xcframework` so every
+        # artifact-producing job surfaces info the same way.
+        run: |
+          set -euo pipefail
+          SO=target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          ls -lh "$SO"
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
+          {
+            echo "## Android \`${{ matrix.abi }}\` artifact"
+            echo
+            echo "Release \`.so\` (post-strip, LTO):"
+            echo
+            echo '```'
+            ls -lh "$SO"
+            echo '```'
+            echo
+            echo "Download: artifact \`wick-ffi-android-${{ matrix.abi }}\` on this run page."
+          } >> "$SUMMARY"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -599,13 +620,38 @@ jobs:
         # Logs the per-slice + total size so a future regression where
         # debuginfo slips back in (or a heavyweight dep accidentally
         # gets feature-gated on) shows up as a number in the build
-        # log. No hard threshold — adjust when intentional size
-        # changes happen.
+        # log AND in the per-job summary block (so reviewers can
+        # eyeball drift directly from the run page without diving
+        # into the build log).
+        #
+        # `du -sh` output goes to both stdout (build log) and the
+        # `$GITHUB_STEP_SUMMARY` markdown file for the per-run
+        # summary. Mirrors the size-reporting pattern used by
+        # `wick-wasm-pack` / `wick-wasm-pack-mt`. Default
+        # `$GITHUB_STEP_SUMMARY` to `/dev/null` so a contributor
+        # can copy this script and run it locally — the variable
+        # only exists inside GitHub Actions and `set -u` would
+        # otherwise abort on the redirect.
         run: |
           set -euo pipefail
           XCF=target/xcframework-build/WickFFI.xcframework
           du -sh "$XCF"
           du -sh "$XCF"/*/libwick_ffi*.a
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
+          {
+            echo "## Apple XCFramework artifact"
+            echo
+            echo "Total + per-slice sizes (post-strip, release profile):"
+            echo
+            echo '```'
+            du -sh "$XCF"
+            du -sh "$XCF"/*/libwick_ffi*.a
+            echo '```'
+            echo
+            echo "Slices: \`ios-arm64\` + \`ios-arm64-simulator\` + \`macos-arm64\` (no x86_64 — Apple Silicon-only)."
+            echo
+            echo "Download: artifact \`wick-ffi-apple-xcframework\` on this run page."
+          } >> "$SUMMARY"
       - name: Swift smoke test (macOS)
         # Validates the entire pipeline end-to-end: compiles a small
         # Swift program against the freshly-built macOS staticlib +
