@@ -411,6 +411,7 @@ pub mod shaders {
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
+    pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
 }
 
@@ -2030,6 +2031,185 @@ mod tests {
                 i % n as usize,
                 reference[i],
                 batched[i]
+            );
+        }
+    }
+
+    /// `attention_prefill` parity: batched attention over N queries
+    /// matches a CPU reference (Q × K^T → causal-masked softmax → V) at
+    /// every (token, head, dim) cell. Covers GQA (n_kv_heads < n_heads),
+    /// non-zero start_pos, and a multi-query prefill.
+    #[test]
+    fn test_gpu_attention_prefill_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n_heads: u32 = 4;
+        let n_kv_heads: u32 = 2; // GQA
+        let head_dim: u32 = 32;
+        let kv_dim = n_kv_heads * head_dim;
+        let n_queries: u32 = 5;
+        let start_pos: u32 = 3;
+        // Tight `max_seq` (exactly `start_pos + n_queries`): the last
+        // workgroup's `seq_len = pos_q + 1u = max_seq`, exercising the
+        // boundary of the clamp added to address the PR review feedback.
+        let max_seq = start_pos + n_queries;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let q_stride = n_heads * head_dim;
+        let out_stride = n_heads * head_dim;
+        let group_size = n_heads / n_kv_heads;
+
+        // Build Q (per-token × per-head), K cache (max_seq × kv_dim), V cache.
+        let mut q_batch = vec![0.0f32; (n_queries * q_stride) as usize];
+        for q in 0..n_queries {
+            for h in 0..n_heads {
+                for d in 0..head_dim {
+                    let v = ((q as f32 + 1.0) * ((h as f32 + 1.0) * (d as f32 + 1.0))) * 0.013;
+                    q_batch[(q * q_stride + h * head_dim + d) as usize] = v;
+                }
+            }
+        }
+        let mut k_cache = vec![0.0f32; (max_seq * kv_dim) as usize];
+        let mut v_cache = vec![0.0f32; (max_seq * kv_dim) as usize];
+        for t in 0..max_seq {
+            for kh in 0..n_kv_heads {
+                for d in 0..head_dim {
+                    let kv = ((t as f32 + 1.0) * (kh as f32 + 1.0) * (d as f32 + 0.5)) * 0.011;
+                    let vv = ((t as f32 + 1.0) * (kh as f32 + 2.0) * (d as f32 + 1.5)) * 0.017;
+                    k_cache[(t * kv_dim + kh * head_dim + d) as usize] = kv;
+                    v_cache[(t * kv_dim + kh * head_dim + d) as usize] = vv;
+                }
+            }
+        }
+
+        // ─── CPU reference: per-query, per-head attention with causal mask ──
+        let mut ref_out = vec![0.0f32; (n_queries * out_stride) as usize];
+        for q in 0..n_queries as usize {
+            let pos_q = start_pos as usize + q;
+            let seq_len = pos_q + 1;
+            for h in 0..n_heads as usize {
+                let kv_head = h / group_size as usize;
+                let kv_h_off = kv_head * head_dim as usize;
+                let q_off = q * q_stride as usize + h * head_dim as usize;
+
+                // Q × K^T scores up to seq_len with scale.
+                let mut scores = vec![0.0f32; seq_len];
+                for t in 0..seq_len {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim as usize {
+                        dot += q_batch[q_off + d] * k_cache[t * kv_dim as usize + kv_h_off + d];
+                    }
+                    scores[t] = dot * scale;
+                }
+                // Softmax.
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max_s).exp();
+                    sum += *s;
+                }
+                let inv = 1.0f32 / sum;
+                for s in scores.iter_mut() {
+                    *s *= inv;
+                }
+                // Weighted V → output.
+                let out_off = q * out_stride as usize + h * head_dim as usize;
+                for d in 0..head_dim as usize {
+                    let mut val = 0.0f32;
+                    for t in 0..seq_len {
+                        val += scores[t] * v_cache[t * kv_dim as usize + kv_h_off + d];
+                    }
+                    ref_out[out_off + d] = val;
+                }
+            }
+        }
+
+        // ─── Batched GPU run ───────────────────────────────────────────────
+        let pipeline = ctx.create_pipeline(
+            shaders::ATTENTION_PREFILL,
+            "attention_prefill",
+            "attention_prefill",
+        );
+        let q_buf = ctx.upload_f32(&q_batch, "q");
+        let k_buf = ctx.upload_f32(&k_cache, "k");
+        let v_buf = ctx.upload_f32(&v_cache, "v");
+        let out_buf = ctx.create_storage_rw((ref_out.len() as u64) * 4, "out");
+        // Per-(query, head) scratch slab; sized to max_seq even though most
+        // queries use less.
+        let scores_buf =
+            ctx.create_storage_rw(((n_queries * n_heads * max_seq) as u64) * 4, "scores");
+        let params: [u32; 12] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            max_seq,
+            scale.to_bits(),
+            start_pos,
+            n_queries,
+            q_stride,
+            out_stride,
+            0,
+            0,
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: scores_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n_heads, n_queries, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got = ctx.download_f32(&out_buf, ref_out.len());
+
+        let tol = 1e-4f32;
+        for i in 0..ref_out.len() {
+            let diff = (ref_out[i] - got[i]).abs();
+            assert!(
+                diff < tol,
+                "attention_prefill mismatch at idx {i} \
+                 (token {}, head {}, dim {}): cpu={}, gpu={}, diff={diff}",
+                i / out_stride as usize,
+                (i % out_stride as usize) / head_dim as usize,
+                i % head_dim as usize,
+                ref_out[i],
+                got[i]
             );
         }
     }
