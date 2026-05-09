@@ -1716,13 +1716,13 @@ fn main() -> Result<()> {
                     "Breakdown: depthformer {}ms ({:.1}ms/frame), detokenizer {}ms ({:.1}ms/frame), other {}ms",
                     (result.depthformer_secs * 1000.0) as u64,
                     if result.audio_frames > 0 {
-                        result.depthformer_secs * 1000.0 / result.audio_frames as f64 * 1000.0
+                        result.depthformer_secs * 1000.0 / result.audio_frames as f64
                     } else {
                         0.0
                     },
                     (result.detokenizer_secs * 1000.0) as u64,
                     if result.audio_frames > 0 {
-                        result.detokenizer_secs * 1000.0 / result.audio_frames as f64 * 1000.0
+                        result.detokenizer_secs * 1000.0 / result.audio_frames as f64
                     } else {
                         0.0
                     },

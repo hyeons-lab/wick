@@ -258,7 +258,7 @@ pub fn generate_audio(
     let mut trailing_audio_segments: usize = 0;
     const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
 
-    loop {
+    'outer: loop {
         if generated >= config.max_tokens || pos >= model_config.max_seq_len {
             break;
         }
@@ -367,18 +367,33 @@ pub fn generate_audio(
             loop {
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
-                    FrameOutcome::End => {
-                        modality = Modality::Text;
-                        text_done = true;
-                        modality_budget = match config.mode {
-                            AudioMode::Interleaved => 6,
-                            AudioMode::Sequential => usize::MAX,
-                        };
-                        logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
-                        next_token = sampler.sample(&mut logits);
-                        pos += 1;
-                        break;
-                    }
+                    FrameOutcome::End => match config.mode {
+                        AudioMode::Sequential => {
+                            // Sequential TTS: audio is the final output.
+                            // Returning to text + forwarding TEXT_END +
+                            // resampling produces runaway garbage tokens (the
+                            // model has nothing useful left to say) until
+                            // max_tokens caps. Exit cleanly.
+                            break 'outer;
+                        }
+                        AudioMode::Interleaved => {
+                            // Interleaved: transition back to text. The
+                            // trailing-audio-segments cap
+                            // (MAX_TRAILING_AUDIO_SEGMENTS) bounds runaway
+                            // post-audio cycles in the text branch above.
+                            // Reachable here when the model emits
+                            // TOKEN_AUDIO_START explicitly (line ~273) — the
+                            // text-branch's budget-driven Interleaved block
+                            // has its own audio loop that handles End inline.
+                            modality = Modality::Text;
+                            text_done = true;
+                            modality_budget = 6;
+                            logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            next_token = sampler.sample(&mut logits);
+                            pos += 1;
+                            break;
+                        }
+                    },
                     FrameOutcome::Codes { audio_embedding } => audio_embedding,
                 };
                 modality_budget = modality_budget.saturating_sub(1);
