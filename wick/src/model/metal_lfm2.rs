@@ -106,6 +106,14 @@ struct MetalPipelines {
     attention_hd64: ComputePipelineState,
     attention_hd128: ComputePipelineState,
     flash_attention: ComputePipelineState,
+    /// Iter 5 flash mirror: head_dim-specialized flash attention. Phase-1
+    /// QK loop (runs once per tile) becomes constexpr-bound and fully
+    /// unrolls; Phase-4 `head_dim == 64u/128u` branches DCE the unreached
+    /// arms; `partials_tg` row stride folds. Selected by `head_dim` in
+    /// `encode_attention` / `encode_attention_q_offset` when `use_flash`;
+    /// runtime fallback is the generic `flash_attention` pipeline above.
+    flash_attention_hd64: ComputePipelineState,
+    flash_attention_hd128: ComputePipelineState,
     attention_gqa: ComputePipelineState,
     attention_split_compute: ComputePipelineState,
     attention_split_merge: ComputePipelineState,
@@ -335,6 +343,10 @@ impl MetalLfm2Model {
             attention_hd64: ctx.create_pipeline(shaders::ATTENTION, "attention_hd64")?,
             attention_hd128: ctx.create_pipeline(shaders::ATTENTION, "attention_hd128")?,
             flash_attention: ctx.create_pipeline(shaders::FLASH_ATTENTION, "flash_attention")?,
+            flash_attention_hd64: ctx
+                .create_pipeline(shaders::FLASH_ATTENTION, "flash_attention_hd64")?,
+            flash_attention_hd128: ctx
+                .create_pipeline(shaders::FLASH_ATTENTION, "flash_attention_hd128")?,
             attention_gqa: ctx.create_pipeline(shaders::ATTENTION_GQA, "attention_gqa")?,
             attention_split_compute: ctx
                 .create_pipeline(shaders::ATTENTION_SPLITK, "attention_split_compute")?,
@@ -1826,10 +1838,15 @@ impl MetalLfm2Model {
             128 => &self.pipelines.attention_hd128,
             _ => &self.pipelines.attention,
         };
+        let flash_attn = match head_dim {
+            64 => &self.pipelines.flash_attention_hd64,
+            128 => &self.pipelines.flash_attention_hd128,
+            _ => &self.pipelines.flash_attention,
+        };
         let (pipeline, tg_count) = if use_gqa {
             (&self.pipelines.attention_gqa, n_kv_heads as u64)
         } else if use_flash {
-            (&self.pipelines.flash_attention, n_heads as u64)
+            (flash_attn, n_heads as u64)
         } else {
             (classic_attn, n_heads as u64)
         };
@@ -1892,8 +1909,13 @@ impl MetalLfm2Model {
             128 => &self.pipelines.attention_hd128,
             _ => &self.pipelines.attention,
         };
+        let flash_attn = match head_dim {
+            64 => &self.pipelines.flash_attention_hd64,
+            128 => &self.pipelines.flash_attention_hd128,
+            _ => &self.pipelines.flash_attention,
+        };
         let (pipeline, tg_count) = if use_flash {
-            (&self.pipelines.flash_attention, n_heads as u64)
+            (flash_attn, n_heads as u64)
         } else {
             (classic_attn, n_heads as u64)
         };
