@@ -90,9 +90,17 @@ impl Preprocessor {
             let trimmed = raw_line.trim_start();
             if let Some(rest) = trimmed.strip_prefix('#') {
                 self.handle_directive(rest, macros, predefined, include_stack, cond, out)?;
+                // Emit a blank line so post-preprocessing line numbers
+                // match the source for everything outside #include
+                // expansion — WGSL compiler errors land on the right
+                // source line.
+                out.push('\n');
             } else if cond_active(cond) {
                 let expanded = expand_macros(raw_line, macros)?;
                 out.push_str(&expanded);
+                out.push('\n');
+            } else {
+                // Inactive #if branch: still emit a blank line.
                 out.push('\n');
             }
         }
@@ -142,7 +150,7 @@ impl Preprocessor {
                 if !cond_active(cond) {
                     return Ok(());
                 }
-                let name = args.trim();
+                let name = args.split_whitespace().next().unwrap_or("");
                 if name.is_empty() {
                     bail!("#undef: missing name");
                 }
@@ -153,7 +161,7 @@ impl Preprocessor {
                 Ok(())
             }
             "ifdef" => {
-                let name = args.trim();
+                let name = args.split_whitespace().next().unwrap_or("");
                 if name.is_empty() {
                     bail!("#ifdef: missing name");
                 }
@@ -167,7 +175,7 @@ impl Preprocessor {
                 Ok(())
             }
             "ifndef" => {
-                let name = args.trim();
+                let name = args.split_whitespace().next().unwrap_or("");
                 if name.is_empty() {
                     bail!("#ifndef: missing name");
                 }
@@ -1047,5 +1055,45 @@ fn store_dst(idx: u32) -> f32 { return 0.0; }
         let out = pp().preprocess(src, &[("TAG", "")]).unwrap();
         assert!(out.contains("let x = ;"), "got: {out:?}");
         assert!(!out.contains("TAG"), "got: {out:?}");
+    }
+
+    #[test]
+    fn directive_name_ignores_trailing_comment() {
+        // Trailing `// comment` on directive lines is common in shader
+        // sources. `args.split_whitespace().next()` picks just the name.
+        let src = "#ifdef VEC // enable vector path\nvec_path();\n#endif\n";
+        let out = pp().preprocess(src, &[("VEC", "")]).unwrap();
+        assert!(out.contains("vec_path()"), "got: {out:?}");
+        // Same for #ifndef and #undef.
+        let src = "#define FOO 1\n#undef FOO // turn off\nFOO\n";
+        let out = pp().preprocess(src, &[]).unwrap();
+        assert!(out.contains("FOO") && !out.contains('1'), "got: {out:?}");
+    }
+
+    #[test]
+    fn line_numbers_preserved_for_directives() {
+        // A shader with leading directives should produce output where
+        // body lines land on the same source-relative line index. WGSL
+        // compiler errors then point at the correct source line.
+        let src = "#ifdef VEC\n#define WIDTH 4\nfn body() {}\n#endif\n";
+        let out = pp().preprocess(src, &[("VEC", "")]).unwrap();
+        let lines: Vec<&str> = out.split_inclusive('\n').collect();
+        // 4 input lines → 4 output lines (3 directive newlines + body).
+        assert_eq!(lines.len(), 4, "got: {out:?}");
+        // Body is on line 3 (1-indexed), matching its source position.
+        assert!(lines[2].contains("fn body()"), "got: {out:?}");
+    }
+
+    #[test]
+    fn line_numbers_preserved_for_skipped_block() {
+        // Inactive #ifdef arm still emits blank lines so the active
+        // arm's lines stay on their original source-line index.
+        let src = "#ifdef ABSENT\nbad();\n#else\ngood();\n#endif\n";
+        let out = pp().preprocess(src, &[]).unwrap();
+        let lines: Vec<&str> = out.split_inclusive('\n').collect();
+        assert_eq!(lines.len(), 5, "got: {out:?}");
+        // `good()` is on input line 4, so it lands on output line 4.
+        assert!(lines[3].contains("good()"), "got: {out:?}");
+        assert!(!out.contains("bad()"));
     }
 }
