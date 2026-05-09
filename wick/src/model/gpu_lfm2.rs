@@ -73,6 +73,7 @@ struct GpuPipelines {
     rope: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
     conv1d: wgpu::ComputePipeline,
+    conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
     // ── Batched-prefill pipelines ─────────────────────────────────────
     rmsnorm_batch: wgpu::ComputePipeline,
@@ -153,9 +154,7 @@ pub struct GpuLfm2Model {
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
-    conv_bx_buf: wgpu::Buffer,   // [hidden_size]
-    conv_out_buf: wgpu::Buffer,  // [hidden_size]
-    conv_gate_buf: wgpu::Buffer, // [hidden_size]
+    conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
     // ── Batched-prefill scratch (sized to MAX_PREFILL_TOKENS rows) ────────
     // Mirrors MetalLfm2Model's prefill_*_buf set. Used only by the batched
     // prefill path; the per-token forward path keeps using the scalar
@@ -281,6 +280,11 @@ impl GpuLfm2Model {
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise", "conv1d"),
+            conv1d_fused: ctx.create_pipeline(
+                shaders::CONV1D_FUSED,
+                "conv1d_fused",
+                "conv1d_fused",
+            ),
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
             rmsnorm_batch: ctx.create_pipeline(
                 shaders::RMSNORM_BATCH,
@@ -424,8 +428,6 @@ impl GpuLfm2Model {
         let logits_buf = f(config.vocab_size, "logits");
         let scores_buf = f(config.n_heads * max_seq_len, "scores");
         let conv_proj_buf = f(3 * hs, "conv_proj");
-        let conv_bx_buf = f(hs, "conv_bx");
-        let conv_out_buf = f(hs, "conv_out");
         let conv_gate_buf = f(hs, "conv_gate");
 
         // Batched-prefill scratch. Sized for the worst case of
@@ -559,8 +561,6 @@ impl GpuLfm2Model {
             rope_params,
             attn_params,
             conv_proj_buf,
-            conv_bx_buf,
-            conv_out_buf,
             conv_gate_buf,
             prefill_batch_buf,
             prefill_normed_buf,
@@ -1026,58 +1026,22 @@ impl GpuLfm2Model {
                     );
                 }
 
-                // Copies: conv_proj slices → conv_bx, conv_out.
-                self.encode_copy(
-                    &mut enc,
-                    &self.conv_proj_buf,
-                    0,
-                    &self.conv_bx_buf,
-                    0,
-                    hs as u64,
-                );
-                self.encode_copy(
-                    &mut enc,
-                    &self.conv_proj_buf,
-                    (2 * hs * 4) as u64,
-                    &self.conv_out_buf,
-                    0,
-                    hs as u64,
-                );
-
-                // Pre-create BGs for passes 2 and 3.
-                let mul_p = &self.elementwise_hs_params;
-                let mul1_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.mul_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.conv_bx_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.conv_out_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: mul_p.as_entire_binding(),
-                            },
-                        ],
-                    });
+                // Pre-create BGs for passes 2 and 3. The fused conv shader reads
+                // x/c/b directly from `conv_proj_buf` at offsets 0/hs/2*hs and
+                // writes output to `conv_gate_buf` (where the post-conv out_proj
+                // gemv reads from) — replaces the prior mul1 + conv1d + mul2
+                // sequence and the three encoder copies that fed it.
                 let conv_p = &self.conv1d_params;
-                let conv_bg = self
+                let conv_fused_bg = self
                     .ctx
                     .device
                     .create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
-                        layout: &self.pipelines.conv1d.get_bind_group_layout(0),
+                        layout: &self.pipelines.conv1d_fused.get_bind_group_layout(0),
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: self.conv_bx_buf.as_entire_binding(),
+                                resource: self.conv_proj_buf.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -1089,32 +1053,11 @@ impl GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
-                                resource: self.conv_out_buf.as_entire_binding(),
+                                resource: self.conv_gate_buf.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 4,
                                 resource: conv_p.as_entire_binding(),
-                            },
-                        ],
-                    });
-                let mul2_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.mul_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.conv_gate_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.conv_out_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: mul_p.as_entire_binding(),
                             },
                         ],
                     });
@@ -1151,7 +1094,10 @@ impl GpuLfm2Model {
                         ],
                     });
 
-                // Pass 2: mul(bx) + conv1d (after copies 4-5, before copy 8).
+                // Pass 2: fused conv block (bx = x*b → conv → c*conv_out).
+                // One dispatch replaces the prior mul1 + conv1d + mul2 trio
+                // plus three encoder copies that extracted x/c/b from the
+                // proj buffer into separate per-channel buffers.
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("conv_mid"),
@@ -1159,40 +1105,18 @@ impl GpuLfm2Model {
                     });
                     self.dispatch_into(
                         &mut pass,
-                        &self.pipelines.mul_inplace,
-                        &mul1_bg,
-                        (hs32.div_ceil(256), 1, 1),
-                    );
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.conv1d,
-                        &conv_bg,
+                        &self.pipelines.conv1d_fused,
+                        &conv_fused_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                 }
 
-                // Copy c → conv_gate.
-                self.encode_copy(
-                    &mut enc,
-                    &self.conv_proj_buf,
-                    (hs * 4) as u64,
-                    &self.conv_gate_buf,
-                    0,
-                    hs as u64,
-                );
-
-                // Pass 3: mul(gate) + out_proj + add.
+                // Pass 3: out_proj + add.
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("conv_post"),
                         timestamp_writes: None,
                     });
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.mul_inplace,
-                        &mul2_bg,
-                        (hs32.div_ceil(256), 1, 1),
-                    );
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.gemv_q4_0_fast,

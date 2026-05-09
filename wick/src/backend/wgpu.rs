@@ -413,6 +413,7 @@ pub mod shaders {
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
+    pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1794,6 +1795,147 @@ mod tests {
                 "out mismatch at idx {i} (token {}, ch {}): cpu={}, gpu={}, diff={diff}",
                 i / hs,
                 i % hs,
+                ref_out[i],
+                got_out[i]
+            );
+        }
+        for i in 0..ref_rb.len() {
+            let diff = (ref_rb[i] - got_rb[i]).abs();
+            assert!(
+                diff < tol,
+                "rolling-buffer mismatch at idx {i}: cpu={}, gpu={}, diff={diff}",
+                ref_rb[i],
+                got_rb[i]
+            );
+        }
+    }
+
+    /// Single-token fused conv parity: `conv1d_fused.wgsl` (decode
+    /// path) must match the CPU reference of `bx = x*b → conv → c*sum`
+    /// plus the rolling-buffer update. Same scaffold as the batched
+    /// twin's parity test, with `n_tokens = 1` and the new shader.
+    /// Catches regressions in the body or the layout (proj packed
+    /// [x, c, b] at offsets 0/hs/2*hs).
+    #[test]
+    fn test_gpu_conv1d_fused_decode_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let hs: usize = 64;
+        let kernel_size: usize = 4;
+        let d_conv: usize = kernel_size - 1; // 3
+
+        // Single-token proj: [x | c | b], each segment hs floats.
+        let mut proj: Vec<f32> = Vec::with_capacity(3 * hs);
+        for i in 0..hs {
+            proj.push((i as f32 - 32.0) * 0.011);
+        }
+        for i in 0..hs {
+            proj.push((i as f32 + 5.0) * 0.007);
+        }
+        for i in 0..hs {
+            proj.push((i as f32 - 16.0) * 0.013);
+        }
+        // Rolling buffer (d_conv × hs) — non-zero so the conv reads
+        // real prior context, not just `bx * weight[d_conv]`.
+        let mut rb_initial: Vec<f32> = Vec::with_capacity(d_conv * hs);
+        for k in 0..d_conv {
+            for i in 0..hs {
+                rb_initial.push(((k as f32 + 1.0) * (i as f32 - 8.0)) * 0.005);
+            }
+        }
+        // Weights: hs × kernel_size, layout `weight[ch * ks + k]`.
+        let mut weight: Vec<f32> = Vec::with_capacity(hs * kernel_size);
+        for ch in 0..hs {
+            for k in 0..kernel_size {
+                weight.push(0.1 + (ch as f32 % 7.0) * 0.02 - (k as f32) * 0.03);
+            }
+        }
+
+        // ─── CPU reference ────────────────────────────────────────
+        let mut ref_out = vec![0.0f32; hs];
+        let mut ref_rb = rb_initial.clone();
+        for ch in 0..hs {
+            let x = proj[ch];
+            let c = proj[hs + ch];
+            let b = proj[2 * hs + ch];
+            let bx = x * b;
+
+            let mut sum = 0.0f32;
+            for k in 0..d_conv {
+                sum += ref_rb[k * hs + ch] * weight[ch * kernel_size + k];
+            }
+            sum += bx * weight[ch * kernel_size + d_conv];
+
+            if d_conv > 1 {
+                for k in 0..d_conv - 1 {
+                    ref_rb[k * hs + ch] = ref_rb[(k + 1) * hs + ch];
+                }
+            }
+            if d_conv > 0 {
+                ref_rb[(d_conv - 1) * hs + ch] = bx;
+            }
+
+            ref_out[ch] = c * sum;
+        }
+
+        // ─── GPU run ──────────────────────────────────────────────
+        let pipeline = ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused", "conv1d_fused");
+        let proj_buf = ctx.upload_f32(&proj, "proj");
+        let rb_buf = ctx.create_storage_rw((rb_initial.len() as u64) * 4, "rb");
+        ctx.queue
+            .write_buffer(&rb_buf, 0, bytemuck::cast_slice(&rb_initial));
+        let weight_buf = ctx.upload_f32(&weight, "weight");
+        let out_buf = ctx.create_storage_rw((ref_out.len() as u64) * 4, "out");
+        let params: [u32; 4] = [hs as u32, kernel_size as u32, d_conv as u32, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: proj_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rb_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(((hs + 255) / 256) as u32, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got_out = ctx.download_f32(&out_buf, ref_out.len());
+        let got_rb = ctx.download_f32(&rb_buf, ref_rb.len());
+
+        let tol = 1e-4f32;
+        for i in 0..ref_out.len() {
+            let diff = (ref_out[i] - got_out[i]).abs();
+            assert!(
+                diff < tol,
+                "out mismatch at ch {i}: cpu={}, gpu={}, diff={diff}",
                 ref_out[i],
                 got_out[i]
             );
