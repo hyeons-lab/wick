@@ -117,7 +117,11 @@ impl Preprocessor {
         cond: &mut Vec<Cond>,
         out: &mut String,
     ) -> Result<()> {
-        let body = body.trim();
+        // Strip trailing `// comment` so #if/#elif expressions and other
+        // directive args parse cleanly. Only strips `//` preceded by
+        // whitespace to avoid mangling URLs like `http://...` if they
+        // appear in #define values.
+        let body = strip_line_comment(body.trim());
         let mut iter = body.splitn(2, char::is_whitespace);
         let cmd = iter.next().unwrap_or("");
         let args = iter.next().unwrap_or("").trim();
@@ -291,6 +295,24 @@ fn strip_quotes(s: &str) -> Option<&str> {
     }
 }
 
+/// Strip `// comment` from the end of a directive line. Only strips
+/// `//` that's at the start of the slice or preceded by ASCII
+/// whitespace, so `#define URL "http://..."` is left alone.
+fn strip_line_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            let preceded_by_ws = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            if preceded_by_ws {
+                return s[..i].trim_end();
+            }
+        }
+        i += 1;
+    }
+    s
+}
+
 // ── Macro expansion ────────────────────────────────────────────────────────
 
 fn is_ident_char(c: char) -> bool {
@@ -388,20 +410,18 @@ fn lex_expr(input: &str) -> Result<Vec<Tok>> {
             tokens.push(Tok::RParen);
             i += 1;
         } else {
-            // Two-char ops first.
-            let two: String = chars
-                .get(i..i + 2)
-                .map(|s| s.iter().collect())
-                .unwrap_or_default();
-            let two_op = match two.as_str() {
-                "==" => Some("=="),
-                "!=" => Some("!="),
-                "<=" => Some("<="),
-                ">=" => Some(">="),
-                "&&" => Some("&&"),
-                "||" => Some("||"),
-                "<<" => Some("<<"),
-                ">>" => Some(">>"),
+            // Two-char ops first — match on the char pair to avoid
+            // allocating a String per non-ident character.
+            let next = chars.get(i + 1).copied();
+            let two_op = match (c, next) {
+                ('=', Some('=')) => Some("=="),
+                ('!', Some('=')) => Some("!="),
+                ('<', Some('=')) => Some("<="),
+                ('>', Some('=')) => Some(">="),
+                ('&', Some('&')) => Some("&&"),
+                ('|', Some('|')) => Some("||"),
+                ('<', Some('<')) => Some("<<"),
+                ('>', Some('>')) => Some(">>"),
                 _ => None,
             };
             if let Some(op) = two_op {
@@ -1082,6 +1102,34 @@ fn store_dst(idx: u32) -> f32 { return 0.0; }
         assert_eq!(lines.len(), 4, "got: {out:?}");
         // Body is on line 3 (1-indexed), matching its source position.
         assert!(lines[2].contains("fn body()"), "got: {out:?}");
+    }
+
+    #[test]
+    fn if_strips_trailing_line_comment() {
+        // `#if EXPR // comment` — comment must be stripped before
+        // lex_expr, otherwise `//` tokenizes as two division operators
+        // and the parser fails.
+        let src = "#if VERSION >= 4 // require v4+\nyes();\n#endif\n";
+        let out = pp().preprocess(src, &[("VERSION", "5")]).unwrap();
+        assert!(out.contains("yes()"), "got: {out:?}");
+    }
+
+    #[test]
+    fn elif_strips_trailing_line_comment() {
+        let src = "#if 0\nbad();\n#elif 1 // pick this\nyes();\n#endif\n";
+        let out = pp().preprocess(src, &[]).unwrap();
+        assert!(out.contains("yes()"), "got: {out:?}");
+        assert!(!out.contains("bad()"));
+    }
+
+    #[test]
+    fn line_comment_in_url_not_stripped() {
+        // `//` not preceded by whitespace (e.g. inside an URL) should
+        // be left alone — this exercises the `preceded_by_ws` check.
+        let s = "value//rest";
+        assert_eq!(strip_line_comment(s), "value//rest");
+        let s = "value // comment";
+        assert_eq!(strip_line_comment(s), "value");
     }
 
     #[test]
