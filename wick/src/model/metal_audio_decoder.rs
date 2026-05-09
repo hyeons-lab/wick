@@ -1281,7 +1281,6 @@ impl MetalDepthformer {
             prev_token = sampled;
         }
 
-        eprintln!("  codes: {codes:?}");
         codes
     }
 

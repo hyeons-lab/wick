@@ -258,7 +258,7 @@ pub fn generate_audio(
     let mut trailing_audio_segments: usize = 0;
     const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
 
-    loop {
+    'outer: loop {
         if generated >= config.max_tokens || pos >= model_config.max_seq_len {
             break;
         }
@@ -368,16 +368,11 @@ pub fn generate_audio(
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
                     FrameOutcome::End => {
-                        modality = Modality::Text;
-                        text_done = true;
-                        modality_budget = match config.mode {
-                            AudioMode::Interleaved => 6,
-                            AudioMode::Sequential => usize::MAX,
-                        };
-                        logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
-                        next_token = sampler.sample(&mut logits);
-                        pos += 1;
-                        break;
+                        // Sequential TTS: audio is the final output. Returning
+                        // to text + forwarding TEXT_END + resampling produces
+                        // runaway garbage tokens (the model has nothing useful
+                        // left to say) until max_tokens caps. Exit cleanly.
+                        break 'outer;
                     }
                     FrameOutcome::Codes { audio_embedding } => audio_embedding,
                 };

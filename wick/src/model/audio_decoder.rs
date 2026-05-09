@@ -561,7 +561,6 @@ pub fn sample_audio_frame(
         prev_token = sampled;
     }
 
-    eprintln!("  codes: {token:?}");
     token
 }
 
