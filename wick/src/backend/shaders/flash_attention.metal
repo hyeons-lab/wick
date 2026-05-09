@@ -37,6 +37,18 @@ using namespace metal;
 // next kv-head's slot in v_cache. head_dim ∈ {64, 128} hit fast paths;
 // everything else falls into the bounds-checked generic loop.
 //
+// Iter 5 (mirror of #146 prefill / #147 classic decode): the body is
+// templated on `HD_CONST`. When HD_CONST > 0 the compiler folds
+// `head_dim` to a literal — Phase-1 `for d in 0..hd4` fully unrolls
+// (was partial-unroll under runtime bound; runs once *per tile*),
+// Phase-4 head_dim==64/128 branches DCE the unreached arms, and the
+// `partials_tg[sg * head_dim + d]` row stride becomes constexpr.
+// Three kernel entry points:
+//   - `flash_attention`        — HD_CONST=0, runtime fallback
+//   - `flash_attention_hd64`   — HD_CONST=64  (450M / VL-450M)
+//   - `flash_attention_hd128`  — HD_CONST=128 (1.6B / Audio-1.5B)
+// The Rust side selects the entry point by head_dim at dispatch time.
+//
 // One threadgroup per head, 256 threads. Binding layout matches
 // attention.metal so the Rust dispatch is identical (drop-in).
 
@@ -54,18 +66,25 @@ struct Params {
     uint _pad1;
 };
 
-kernel void flash_attention(
-    const device float* q [[buffer(0)]],
-    const device half*  k_cache [[buffer(1)]],
-    const device half*  v_cache [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant Params& params [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
+template<uint HD_CONST>
+inline void flash_attention_impl(
+    const device float* q,
+    const device half*  k_cache,
+    const device half*  v_cache,
+    device float* out,
+    constant Params& params,
+    threadgroup float* q_shared,     // [MAX_HEAD_DIM]
+    threadgroup float* tile_scores,  // [TILE]
+    threadgroup float* sg_val,       // [8]
+    threadgroup float* partials_tg,  // [8 * MAX_HEAD_DIM]
+    uint tid,
+    uint head
 ) {
     uint n_heads = params.n_heads;
     uint n_kv_heads = params.n_kv_heads;
-    uint head_dim = params.head_dim;
+    // When HD_CONST > 0 the ternary folds to a literal; subsequent
+    // uses of `head_dim` see a constexpr.
+    uint head_dim = (HD_CONST > 0) ? HD_CONST : params.head_dim;
     uint kv_dim = params.kv_dim;
     uint seq_len = params.seq_len;
     float scale = as_type<float>(params.scale_bits);
@@ -77,11 +96,6 @@ kernel void flash_attention(
 
     uint simd_lane = tid & 31u;
     uint simd_id   = tid >> 5u;
-
-    threadgroup float q_shared[MAX_HEAD_DIM];
-    threadgroup float tile_scores[TILE];
-    threadgroup float sg_val[8];                     // cross-SG reduction buffer
-    threadgroup float partials_tg[8 * MAX_HEAD_DIM]; // cross-SG po reduction
 
     // Defensive early returns for dispatches that would corrupt TG memory
     // or produce NaN. The Rust side asserts these preconditions at dispatch
@@ -276,4 +290,58 @@ kernel void flash_attention(
             }
         }
     }
+}
+
+kernel void flash_attention(
+    const device float* q [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    flash_attention_impl<0>(q, k_cache, v_cache, out, params,
+                            q_shared, tile_scores, sg_val, partials_tg,
+                            tid, head);
+}
+
+kernel void flash_attention_hd64(
+    const device float* q [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    flash_attention_impl<64>(q, k_cache, v_cache, out, params,
+                             q_shared, tile_scores, sg_val, partials_tg,
+                             tid, head);
+}
+
+kernel void flash_attention_hd128(
+    const device float* q [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant Params& params [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float q_shared[MAX_HEAD_DIM];
+    threadgroup float tile_scores[TILE];
+    threadgroup float sg_val[8];
+    threadgroup float partials_tg[8 * MAX_HEAD_DIM];
+    flash_attention_impl<128>(q, k_cache, v_cache, out, params,
+                              q_shared, tile_scores, sg_val, partials_tg,
+                              tid, head);
 }
