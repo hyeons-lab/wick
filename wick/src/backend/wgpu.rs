@@ -193,7 +193,13 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..);
+        // Map only the requested `0..size` byte range, not the full
+        // staging buffer. The cached staging is sized to the largest
+        // historical request, so `slice(..)` would map+copy that
+        // entire size every call (e.g. a small `count` after a prior
+        // `vocab_size` download would still pay the vocab-sized cost
+        // and stale tail bytes would leak into the returned `Vec`).
+        let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
@@ -239,7 +245,12 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..);
+        // Map only the requested `0..size` range — see download_f32
+        // above for the same reasoning. With a vocab-sized cached
+        // staging buffer, mapping the full range turns the 4-byte
+        // argmax readback into a vocab-sized copy on every greedy
+        // step, defeating the optimization.
+        let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();

@@ -1612,19 +1612,14 @@ impl GpuLfm2Model {
         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
         let d_conv = kernel_size - 1;
 
-        // `download_f32` returns the FULL staging buffer's contents
-        // (it's grown to the largest historical request and reused),
-        // so the returned `Vec<f32>` may be longer than `count`.
-        // Truncate to the requested element count before slicing into
-        // a snapshot — without this the snapshot would carry stale
-        // tail bytes that downstream `write_buffer` would push past
-        // the live KV region (harmless on restore today, but bad
-        // hygiene + masks future bugs).
-        let download_exact = |buf: &wgpu::Buffer, count: usize| -> Vec<f32> {
-            let mut out = self.ctx.download_f32(buf, count);
-            out.truncate(count);
-            out
-        };
+        // `download_f32` now slices the staging buffer to exactly
+        // `count * 4` bytes, so the returned `Vec<f32>` length
+        // equals `count` directly — no truncation needed. The
+        // closure is kept as the single calling site so a future
+        // regression in `download_f32` re-introduces a single edit
+        // point, not N call sites.
+        let download_exact =
+            |buf: &wgpu::Buffer, count: usize| -> Vec<f32> { self.ctx.download_f32(buf, count) };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
