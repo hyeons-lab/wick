@@ -15,6 +15,12 @@ use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapsho
 use crate::model::{BlockType, Model, ModelConfig};
 use crate::tensor::DType;
 
+/// Maximum N for a single batched-prefill dispatch. Mirrors the Metal
+/// backend's `MAX_PREFILL_TOKENS = 512`. Prompts longer than this are
+/// chunked at the host side; each chunk shares the same prefill batch
+/// scratch, so the worst-case scratch footprint is bounded.
+const MAX_PREFILL_TOKENS: usize = 512;
+
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     buf: wgpu::Buffer,
@@ -68,6 +74,13 @@ struct GpuPipelines {
     attention: wgpu::ComputePipeline,
     conv1d: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
+    // ── Batched-prefill pipelines ─────────────────────────────────────
+    rmsnorm_batch: wgpu::ComputePipeline,
+    add_rmsnorm_batch: wgpu::ComputePipeline,
+    qk_norm_rope_batch: wgpu::ComputePipeline,
+    conv1d_fused_batch: wgpu::ComputePipeline,
+    gemm_q4_0: wgpu::ComputePipeline,
+    attention_prefill: wgpu::ComputePipeline,
 }
 
 /// GPU-resident inference state (KV cache + conv rolling buffers).
@@ -143,6 +156,34 @@ pub struct GpuLfm2Model {
     conv_bx_buf: wgpu::Buffer,   // [hidden_size]
     conv_out_buf: wgpu::Buffer,  // [hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size]
+    // ── Batched-prefill scratch (sized to MAX_PREFILL_TOKENS rows) ────────
+    // Mirrors MetalLfm2Model's prefill_*_buf set. Used only by the batched
+    // prefill path; the per-token forward path keeps using the scalar
+    // scratch buffers above.
+    /// `[MAX_PREFILL_TOKENS × hidden_size]` — running residual-stream
+    /// activation across layers. Last token's slice is the final input
+    /// to the output norm/projection.
+    prefill_batch_buf: wgpu::Buffer,
+    /// `[MAX_PREFILL_TOKENS × hidden_size]` — post-rmsnorm activations,
+    /// also reused as the attention output sink and as the conv1d output.
+    prefill_normed_buf: wgpu::Buffer,
+    /// `[MAX_PREFILL_TOKENS × 3 × hidden_size]` — sized to fit the
+    /// largest batched projection. For attention layers it's split into
+    /// Q (offset 0, stride hs); the K/V projections land in the gate/up
+    /// scratches because `gemm_q4_0` writes contiguously. For conv
+    /// layers the full `3 × hs` slab is the in-projection target.
+    prefill_proj_buf: wgpu::Buffer,
+    /// `[MAX_PREFILL_TOKENS × intermediate_size]` — FFN gate output;
+    /// also reused as scratch for K projections and per-(layer,FFN)
+    /// add-residual targets.
+    prefill_gate_buf: wgpu::Buffer,
+    /// `[MAX_PREFILL_TOKENS × intermediate_size]` — FFN up output;
+    /// also reused as scratch for V projections.
+    prefill_up_buf: wgpu::Buffer,
+    /// `[MAX_PREFILL_TOKENS × n_heads × max_seq_len]` — per-(query,
+    /// head) scratch slab consumed by `attention_prefill.wgsl`.
+    /// Allocated once; sized to the worst case per the model config.
+    prefill_scores_buf: wgpu::Buffer,
     // GPU state
     gpu_state: GpuState,
     /// Serializes Model trait calls on this instance. Without it, two
@@ -241,6 +282,32 @@ impl GpuLfm2Model {
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise", "conv1d"),
             argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
+            rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "rmsnorm_batch",
+                "rmsnorm_batch",
+            ),
+            add_rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "add_rmsnorm_batch",
+                "add_rmsnorm_batch",
+            ),
+            qk_norm_rope_batch: ctx.create_pipeline(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch",
+            ),
+            conv1d_fused_batch: ctx.create_pipeline(
+                shaders::CONV1D_FUSED_BATCH,
+                "conv1d_fused_batch",
+                "conv1d_fused_batch",
+            ),
+            gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0", "gemm_q4_0"),
+            attention_prefill: ctx.create_pipeline(
+                shaders::ATTENTION_PREFILL,
+                "attention_prefill",
+                "attention_prefill",
+            ),
         };
 
         // Upload weights: Q4_0 stays quantized, others dequantized to f32
@@ -360,6 +427,18 @@ impl GpuLfm2Model {
         let conv_bx_buf = f(hs, "conv_bx");
         let conv_out_buf = f(hs, "conv_out");
         let conv_gate_buf = f(hs, "conv_gate");
+
+        // Batched-prefill scratch. Sized for the worst case of
+        // `MAX_PREFILL_TOKENS` rows; chunking on the host side keeps
+        // larger prompts within this footprint.
+        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+        let prefill_batch_buf = f(hs * max_pref, "prefill_batch");
+        let prefill_normed_buf = f(hs * max_pref, "prefill_normed");
+        let prefill_proj_buf = f(3 * hs * max_pref, "prefill_proj");
+        let prefill_gate_buf = f(is * max_pref, "prefill_gate");
+        let prefill_up_buf = f(is * max_pref, "prefill_up");
+        // attention_prefill scratch: per-(query, head, time) f32 slab.
+        let prefill_scores_buf = f(max_pref * config.n_heads * max_seq_len, "prefill_scores");
 
         // Initialize GPU KV caches + conv buffers
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
@@ -483,6 +562,12 @@ impl GpuLfm2Model {
             conv_bx_buf,
             conv_out_buf,
             conv_gate_buf,
+            prefill_batch_buf,
+            prefill_normed_buf,
+            prefill_proj_buf,
+            prefill_gate_buf,
+            prefill_up_buf,
+            prefill_scores_buf,
             gpu_state,
             infer_lock: Mutex::new(()),
             prefix_cache,
@@ -1593,6 +1678,877 @@ impl GpuLfm2Model {
     }
 }
 
+// === Batched prefill — encode helpers + main method ========================
+//
+// Mirror `MetalLfm2Model::prefill_layers_and_logits` (metal_lfm2.rs:2906).
+// Uses the five batched shaders landed in PRs #154 + #156:
+//   rmsnorm_batch / add_rmsnorm_batch (PR #154)
+//   qk_norm_rope_batch                (PR #154)
+//   conv1d_fused_batch                (PR #154)
+//   gemm_q4_0                         (PR #154)
+//   attention_prefill                 (PR #156)
+//
+// Scope:
+//   * `forward_prefill_batched_locked` accepts any `start_pos`, so the
+//     dispatcher chunks long prompts through it in
+//     `min(max_seq_len, MAX_PREFILL_TOKENS)` chunks (each chunk advances
+//     `start_pos`; conv rolling state and KV cache writes carry across).
+//   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
+//   * `start_pos + n <= max_seq_len` (asserted).
+//   * All matmul weights must be Q4_0 (the LFM2 Q4_0 GGUF default).
+//     Non-Q4_0 paths fall through to the per-token loop at the dispatcher.
+//
+// The non-Q4_0 fallback (an f32 `gemm_f32` shader, or per-token gemv with
+// offset bindings) can land in a follow-up PR without disturbing this
+// contract.
+//
+// Per-dispatch overhead note: each `encode_*` helper builds a fresh
+// `wgpu::BindGroup` and uploads a small params buffer per call. The CPU
+// cost is ~1 % of total prefill time at the workloads measured in PR #157;
+// promoting the params buffers to model-resident state and caching the
+// bind groups for fixed prefill scratch buffers is a clean follow-up
+// optimization. Kept simple here so the refactor is reviewable.
+//
+// `prefill_scores_buf` size note: this scratch is sized to
+// `MAX_PREFILL_TOKENS × n_heads × max_seq_len × 4` bytes (256 MB on
+// LFM2-VL-450M / 512 MB on LFM2.5-VL-1.6B at the default 8192 context).
+// On native macOS this is fine (M1+ unified memory). For wasm / WebGPU
+// tier-1 (256 MB max storage buffer) this becomes load-bearing — the
+// proper fix is a two-pass online softmax in `attention_prefill.wgsl`
+// that doesn't materialize the full scores matrix; queued as a follow-up
+// shader PR.
+
+impl GpuLfm2Model {
+    /// Returns true iff every matmul weight on every layer is Q4_0 — the
+    /// precondition for `forward_prefill_batched_locked` to take the
+    /// batched path. Cheap O(n_layers) walk; not memoized because it's
+    /// called once per `forward_prefill` invocation.
+    fn all_matmul_weights_q4_0(&self) -> bool {
+        for lw in &self.layers {
+            let weights = [
+                Some(&lw.ffn_gate),
+                Some(&lw.ffn_up),
+                Some(&lw.ffn_down),
+                lw.attn_q.as_ref(),
+                lw.attn_k.as_ref(),
+                lw.attn_v.as_ref(),
+                lw.attn_output.as_ref(),
+                lw.conv_in_proj.as_ref(),
+                lw.conv_out_proj.as_ref(),
+            ];
+            for w in weights.into_iter().flatten() {
+                if w.dtype != DType::Q4_0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Encode `rmsnorm_batch`: dst[t, i] = src[t, i] * inv_rms(src[t]) * w[i]
+    /// for t in 0..n. Workgroup per token. Uses the binding layout shared
+    /// with `add_rmsnorm_batch`; naga drops binding 4 from the
+    /// auto-inferred layout for this entry point.
+    fn encode_rmsnorm_batch(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        dst: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        n: u32,
+        hs: u32,
+    ) {
+        let params: [u32; 4] = [hs, self.config.rms_norm_eps.to_bits(), hs, hs];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "rmsnorm_batch_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.rmsnorm_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.rmsnorm_batch,
+            &bg,
+            (n, 1, 1),
+            "rmsnorm_batch",
+        );
+    }
+
+    /// Encode `add_rmsnorm_batch`: src[t,i] += residual[t,i]; dst[t,i] =
+    /// src[t,i] * inv_rms(src[t]) * w[i]. One pass; src is read-write.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_add_rmsnorm_batch(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        dst: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        residual: &wgpu::Buffer,
+        n: u32,
+        hs: u32,
+    ) {
+        let params: [u32; 4] = [hs, self.config.rms_norm_eps.to_bits(), hs, hs];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "add_rmsnorm_batch_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.add_rmsnorm_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: residual.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.add_rmsnorm_batch,
+            &bg,
+            (n, 1, 1),
+            "add_rmsnorm_batch",
+        );
+    }
+
+    /// Encode `gemm_q4_0`: y[t * y_stride + r] = Σ_k weight[r, k] * x[t * x_stride + k].
+    /// One workgroup per (4-row block, token).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_q4_0(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        x_stride: u32,
+        y_stride: u32,
+    ) {
+        debug_assert_eq!(w.dtype, DType::Q4_0);
+        let params: [u32; 6] = [w.m, k, n, x_stride, y_stride, 0];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "gemm_q4_0_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.gemm_q4_0.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w.buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let m_groups = w.m.div_ceil(4);
+        self.encode(
+            enc,
+            &self.pipelines.gemm_q4_0,
+            &bg,
+            (m_groups, n, 1),
+            "gemm_q4_0",
+        );
+    }
+
+    /// Encode `qk_norm_rope_batch`: in-place rmsnorm + RoPE on Q (n × n_heads
+    /// × head_dim) and K (n × n_kv_heads × head_dim) at positions
+    /// `start_pos + token_idx`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_qk_norm_rope_batch(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        q_batch: &wgpu::Buffer,
+        k_batch: &wgpu::Buffer,
+        q_norm_w: &wgpu::Buffer,
+        k_norm_w: &wgpu::Buffer,
+        start_pos: u32,
+        n: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        q_stride: u32,
+        k_stride: u32,
+    ) {
+        let params: [u32; 10] = [
+            start_pos,
+            n,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            self.config.rms_norm_eps.to_bits(),
+            self.config.rope_theta.to_bits(),
+            0, // rope_type 0 = split-halves (matches existing rope.wgsl)
+            q_stride,
+            k_stride,
+        ];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "qk_norm_rope_batch_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.qk_norm_rope_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q_batch.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_batch.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: q_norm_w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: k_norm_w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let tg_count = n * (n_heads + n_kv_heads);
+        self.encode(
+            enc,
+            &self.pipelines.qk_norm_rope_batch,
+            &bg,
+            (tg_count, 1, 1),
+            "qk_norm_rope_batch",
+        );
+    }
+
+    /// Encode `conv1d_fused_batch`. One thread per channel walks all n
+    /// tokens sequentially; rolling-buffer state is in `rbuffer` and is
+    /// updated in place.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_conv1d_fused_batch(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        proj: &wgpu::Buffer,
+        rbuffer: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        n: u32,
+        hs: u32,
+    ) {
+        let kernel_size = self.config.conv_kernel_size.unwrap_or(3) as u32;
+        let d_conv = kernel_size - 1;
+        let params: [u32; 6] = [hs, kernel_size, d_conv, n, 3 * hs, hs];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "conv1d_fused_batch_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.conv1d_fused_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: proj.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: rbuffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: weight.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        let groups = hs.div_ceil(256);
+        self.encode(
+            enc,
+            &self.pipelines.conv1d_fused_batch,
+            &bg,
+            (groups, 1, 1),
+            "conv1d_fused_batch",
+        );
+    }
+
+    /// Encode `attention_prefill`. Reads Q from `q_batch`, K/V from the
+    /// model's KV caches, writes per-(token, head) output to `out_batch`.
+    /// `scores_buf` is a per-(query, head, time) scratch slab.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_attention_prefill(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        q_batch: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        out_batch: &wgpu::Buffer,
+        n: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        kv_dim: u32,
+        max_seq: u32,
+        start_pos: u32,
+        q_stride: u32,
+        out_stride: u32,
+    ) {
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 12] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            max_seq,
+            scale.to_bits(),
+            start_pos,
+            n,
+            q_stride,
+            out_stride,
+            0,
+            0,
+        ];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "attention_prefill_params");
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q_batch.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: v_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out_batch.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.prefill_scores_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.attention_prefill,
+            &bg,
+            (n_heads, n, 1),
+            "attention_prefill",
+        );
+    }
+
+    /// Batched prefill — single-pass over `n` tokens for all layers, then
+    /// final output norm + LM head on the last token only.
+    ///
+    /// Preconditions (caller-enforced):
+    ///   * `start_pos == 0`. (Continuation prefills go through the
+    ///     per-token loop.)
+    ///   * `1 <= tokens.len() <= MAX_PREFILL_TOKENS`.
+    ///   * All matmul weights on every layer are Q4_0
+    ///     (`all_matmul_weights_q4_0() == true`).
+    ///   * Caller already holds `infer_lock`.
+    ///
+    /// Mirrors `MetalLfm2Model::prefill_layers_and_logits`
+    /// (metal_lfm2.rs:2906); the Metal version is the canonical
+    /// reference for the dispatch order + buffer assignment.
+    fn forward_prefill_batched_locked(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        debug_assert!(!tokens.is_empty());
+        let n = tokens.len();
+        // Bounds checks — make a misuse fail deterministically rather
+        // than show up later as a wgpu validation error during a buffer
+        // copy or as silent out-of-bounds attention reads.
+        assert!(
+            start_pos + n <= self.gpu_state.max_seq_len,
+            "prefill start_pos {start_pos} + n {n} exceeds max_seq_len {}",
+            self.gpu_state.max_seq_len,
+        );
+        debug_assert!(
+            n <= self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS),
+            "n {n} exceeds chunk capacity (max_seq_len = {}, MAX_PREFILL_TOKENS = {MAX_PREFILL_TOKENS})",
+            self.gpu_state.max_seq_len,
+        );
+        // `start_pos > 0` is supported for chunked prefills — the
+        // dispatcher walks through chunks of up to
+        // `min(max_seq_len, MAX_PREFILL_TOKENS)` and increments
+        // `start_pos` per chunk.
+
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let is = cfg.intermediate_size;
+
+        // Reset profiler spans + seq_len mirror so this chunk owns its
+        // own profile output and starts clean. Conv buffer zeroing is
+        // the dispatcher's responsibility (happens once per fresh
+        // prefill, regardless of which path runs and how many chunks).
+        self.ctx.reset_profiler();
+        self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
+
+        // ─── Stage embeddings into prefill_batch_buf ──────────────────────
+        // CPU-side gather + one queue.write_buffer (the `embedding_f32`
+        // table is pre-dequantized at load time and lives on the host).
+        let mut staged: Vec<f32> = Vec::with_capacity(n * hs);
+        for &t in tokens {
+            let off = (t as usize) * hs;
+            staged.extend_from_slice(&self.gpu_state.embedding_f32[off..off + hs]);
+        }
+        self.ctx
+            .queue
+            .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(&staged));
+
+        let mut enc = self.new_encoder();
+        let n_u = n as u32;
+        let hs_u = hs as u32;
+        let is_u = is as u32;
+
+        for layer in 0..cfg.n_layers {
+            let lw = &self.layers[layer];
+
+            // ─── Phase 1: rmsnorm (or fused add_rmsnorm with prev FFN
+            //              residual) → prefill_normed_buf ─────────────────
+            if layer > 0 {
+                // Fuse: batch_buf += prev_layer_ffn_down (`prefill_up_buf`),
+                // then rmsnorm into `prefill_normed_buf`.
+                //
+                // Metal aliases dst === residual on `prefill_normed_buf`;
+                // wgpu 24's binding-aliasing validator rejects that
+                // pattern (binding 1 read_write + binding 4 read on the
+                // same buffer in one dispatch). Route FFN down to
+                // `prefill_up_buf` so dst and residual stay distinct.
+                self.encode_add_rmsnorm_batch(
+                    &mut enc,
+                    &self.prefill_batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.attn_norm,
+                    &self.prefill_up_buf,
+                    n_u,
+                    hs_u,
+                );
+            } else {
+                self.encode_rmsnorm_batch(
+                    &mut enc,
+                    &self.prefill_batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.attn_norm,
+                    n_u,
+                    hs_u,
+                );
+            }
+
+            if cfg.block_types[layer] == BlockType::GatedConv {
+                let conv_buf = self.gpu_state.conv_buffers[layer].as_ref().unwrap();
+                let w_in = lw.conv_in_proj.as_ref().unwrap();
+                let w_out = lw.conv_out_proj.as_ref().unwrap();
+                let conv_weight = lw.conv_weight.as_ref().unwrap();
+
+                // Phase 2: in_proj batched GEMM (3*hs columns per token).
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_in,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    3 * hs_u,
+                );
+
+                // Phase 3: fused conv1d (1 dispatch over all N tokens;
+                // rolling buffer state walks sequentially per channel).
+                self.encode_conv1d_fused_batch(
+                    &mut enc,
+                    &self.prefill_proj_buf,
+                    conv_buf,
+                    conv_weight,
+                    &self.prefill_normed_buf,
+                    n_u,
+                    hs_u,
+                );
+
+                // Phase 4: out_proj GEMM → prefill_gate_buf (residual
+                // scratch; FFN's add_rmsnorm_batch will fuse the add).
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_out,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    hs_u,
+                );
+            } else {
+                // Attention layer.
+                let head_dim = (hs / cfg.n_heads) as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let kv_dim = n_kv_heads * head_dim;
+                let n_heads = cfg.n_heads as u32;
+                let (k_cache, v_cache) = self.gpu_state.kv_caches[layer].as_ref().unwrap();
+
+                let w_q = lw.attn_q.as_ref().unwrap();
+                let w_k = lw.attn_k.as_ref().unwrap();
+                let w_v = lw.attn_v.as_ref().unwrap();
+                let w_o = lw.attn_output.as_ref().unwrap();
+
+                // Phase A: Q/K/V batched GEMMs.
+                //   Q  → prefill_proj_buf, stride hs
+                //   K  → prefill_gate_buf, stride kv_dim
+                //   V  → prefill_up_buf,   stride kv_dim
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_q,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    hs_u,
+                );
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_k,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    kv_dim,
+                );
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_v,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    kv_dim,
+                );
+
+                // Phase B: batched per-head Q/K rmsnorm + RoPE.
+                self.encode_qk_norm_rope_batch(
+                    &mut enc,
+                    &self.prefill_proj_buf,
+                    &self.prefill_gate_buf,
+                    lw.attn_q_norm.as_ref().unwrap(),
+                    lw.attn_k_norm.as_ref().unwrap(),
+                    start_pos as u32,
+                    n_u,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    hs_u,
+                    kv_dim,
+                );
+
+                // Phase C: bulk-write K/V into the cache. The KV cache is
+                // `max_seq_len × kv_dim` f32; write `n × kv_dim` floats
+                // starting at `start_pos × kv_dim × 4` bytes. wgpu's
+                // copy_buffer_to_buffer is a no-shader memcpy.
+                let kv_off_bytes = (start_pos * kv_dim as usize * 4) as u64;
+                let kv_chunk_bytes = (n * kv_dim as usize * 4) as u64;
+                enc.copy_buffer_to_buffer(
+                    &self.prefill_gate_buf,
+                    0,
+                    k_cache,
+                    kv_off_bytes,
+                    kv_chunk_bytes,
+                );
+                enc.copy_buffer_to_buffer(
+                    &self.prefill_up_buf,
+                    0,
+                    v_cache,
+                    kv_off_bytes,
+                    kv_chunk_bytes,
+                );
+
+                // Phase D: batched causal attention.
+                let max_seq_for_kv = (start_pos + n) as u32;
+                self.encode_attention_prefill(
+                    &mut enc,
+                    &self.prefill_proj_buf,
+                    k_cache,
+                    v_cache,
+                    &self.prefill_normed_buf,
+                    n_u,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    max_seq_for_kv,
+                    start_pos as u32,
+                    hs_u,
+                    hs_u,
+                );
+
+                // Phase E: output projection → prefill_gate_buf (residual
+                // scratch; FFN's add_rmsnorm_batch fuses the add).
+                self.encode_gemm_q4_0(
+                    &mut enc,
+                    w_o,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    hs_u,
+                );
+            }
+
+            // ─── Phase 7: FFN ──────────────────────────────────────────────
+            // Fused add(prefill_gate_buf residual) + ffn_norm.
+            self.encode_add_rmsnorm_batch(
+                &mut enc,
+                &self.prefill_batch_buf,
+                &self.prefill_normed_buf,
+                &lw.ffn_norm,
+                &self.prefill_gate_buf,
+                n_u,
+                hs_u,
+            );
+            // gate + up GEMMs.
+            self.encode_gemm_q4_0(
+                &mut enc,
+                &lw.ffn_gate,
+                &self.prefill_normed_buf,
+                &self.prefill_gate_buf,
+                n_u,
+                hs_u,
+                hs_u,
+                is_u,
+            );
+            self.encode_gemm_q4_0(
+                &mut enc,
+                &lw.ffn_up,
+                &self.prefill_normed_buf,
+                &self.prefill_up_buf,
+                n_u,
+                hs_u,
+                hs_u,
+                is_u,
+            );
+            // silu_mul over the full N × is buffer.
+            {
+                let total = n_u * is_u;
+                let params: [u32; 2] = [total, 0];
+                let p_buf = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&params), "silu_mul_batch_params");
+                let bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.prefill_gate_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.prefill_up_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: p_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                self.encode(
+                    &mut enc,
+                    &self.pipelines.silu_mul_inplace,
+                    &bg,
+                    (total.div_ceil(256), 1, 1),
+                    "silu_mul_batch",
+                );
+            }
+            // FFN down → prefill_up_buf (next layer's residual scratch).
+            // The next layer's add_rmsnorm_batch reads from this buffer
+            // as `residual`; using `prefill_up_buf` (rather than
+            // `prefill_normed_buf` which Metal uses) keeps the dst and
+            // residual bindings on distinct buffers — see the Phase 1
+            // comment above for the wgpu validation reason. The buffer
+            // is is×N, plenty of room for hs×N writes.
+            self.encode_gemm_q4_0(
+                &mut enc,
+                &lw.ffn_down,
+                &self.prefill_gate_buf,
+                &self.prefill_up_buf,
+                n_u,
+                is_u,
+                is_u,
+                hs_u,
+            );
+        }
+
+        // ─── Final residual add: batch_buf += prefill_up_buf ──────────────
+        // Last layer's FFN down residual lives in `prefill_up_buf`;
+        // add it back into the running residual stream.
+        {
+            let total = n_u * hs_u;
+            let params: [u32; 2] = [total, 0];
+            let p_buf = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&params), "final_add_params");
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.prefill_batch_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.prefill_up_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: p_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            self.encode(
+                &mut enc,
+                &self.pipelines.add_inplace,
+                &bg,
+                (total.div_ceil(256), 1, 1),
+                "final_add",
+            );
+        }
+
+        // ─── Final output: norm + LM head, last token only ────────────────
+        // Copy batch_buf[(n-1)*hs..n*hs] → hidden_buf (single-token
+        // scratch), then rmsnorm + output projection through the existing
+        // single-token helpers.
+        let last_off_bytes = ((n - 1) * hs * 4) as u64;
+        enc.copy_buffer_to_buffer(
+            &self.prefill_batch_buf,
+            last_off_bytes,
+            &self.hidden_buf,
+            0,
+            (hs * 4) as u64,
+        );
+        self.encode_rmsnorm(
+            &mut enc,
+            &self.hidden_buf,
+            &self.output_norm,
+            hs_u,
+            cfg.rms_norm_eps,
+        );
+        // Output projection uses the tied embedding (f32). Reuses the
+        // existing per-token gemv_f32 helper.
+        self.encode_gemv_f32(
+            &mut enc,
+            &self.embedding,
+            &self.hidden_buf,
+            &self.logits_buf,
+            cfg.vocab_size as u32,
+            hs_u,
+        );
+
+        self.submit_and_wait(enc);
+
+        // Update seq_len mirrors after the GPU work completes.
+        self.gpu_state
+            .seq_len
+            .store(start_pos + n, Ordering::Relaxed);
+        state.seq_len = start_pos + n;
+        self.ctx.finish_profiler();
+
+        self.ctx.download_f32(&self.logits_buf, cfg.vocab_size)
+    }
+}
+
 impl GpuLfm2Model {
     /// Lock-free body of `Model::snapshot_state`. Callers that already
     /// hold `infer_lock` (e.g. `forward_prefill`'s prefix-cache write
@@ -1824,6 +2780,46 @@ impl Model for GpuLfm2Model {
             // (`restore_state_locked` rewrites the buffers from
             // the snapshot). Mirrors the equivalent fix on Metal.
             self.zero_conv_buffers_locked();
+
+            // Try the batched prefill path. Preconditions:
+            //   * fresh prefill (start_pos == 0, already checked above)
+            //   * non-empty
+            //   * all matmul weights are Q4_0 (the only path the batched
+            //     `gemm_q4_0` shader covers today; non-Q4_0 paths fall
+            //     through to the per-token loop)
+            //
+            // Long prompts are chunked through the batched path in
+            // MAX_PREFILL_TOKENS-sized chunks so the scratch buffers stay
+            // bounded. Each chunk advances `start_pos`; conv rolling
+            // state and KV cache writes carry across chunks naturally.
+            if !tokens.is_empty() && self.all_matmul_weights_q4_0() {
+                // Chunk size respects both the static MAX_PREFILL_TOKENS
+                // budget AND the model's actual `max_seq_len` — otherwise
+                // a caller with `--context-size < 512` would dispatch
+                // batched chunks larger than the KV cache and OOB on the
+                // copy_buffer_to_buffer write.
+                let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+                let mut logits = Vec::new();
+                let mut pos = 0usize;
+                while pos < tokens.len() {
+                    let end = (pos + chunk_size).min(tokens.len());
+                    // `start_pos + pos` rather than `pos`: defensive against
+                    // a future caller passing non-zero start_pos through
+                    // this branch (today the outer `if start_pos == 0`
+                    // gate makes them equal).
+                    logits = self.forward_prefill_batched_locked(
+                        &tokens[pos..end],
+                        start_pos + pos,
+                        state,
+                    );
+                    pos = end;
+                }
+                self.prefix_cache
+                    .lock()
+                    .expect("prefix_cache mutex poisoned")
+                    .insert(tokens, self.snapshot_state_locked());
+                return logits;
+            }
         }
 
         // Cache miss (or continuation prefill): full prefill loop.
