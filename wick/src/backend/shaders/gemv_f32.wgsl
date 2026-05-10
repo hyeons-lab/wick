@@ -10,6 +10,8 @@
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
+#include "common_decls.tmpl"
+
 const NR: u32 = 8u;
 
 @compute @workgroup_size(32, 1, 1)
@@ -20,7 +22,7 @@ fn gemv_f32(
     let m = params.x;
     let k = params.y;
     let tid = lid.x;
-    let r0 = (wid.x + wid.y * 65535u) * NR;
+    let r0 = get_wid(wid) * NR;
 
     var sums: array<f32, 8>;
     for (var r = 0u; r < NR; r += 1u) {

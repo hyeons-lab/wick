@@ -8,9 +8,11 @@
 // Bind group 0:
 //   @binding(0) q: array<f32>       (read-write, Q vector)
 //   @binding(1) k: array<f32>       (read-write, K vector)
-//   @binding(2) params: array<u32>  (pos, n_heads, n_kv_heads, head_dim, freq_base_bits)
+//   @binding(2) params: array<u32, 5>  (pos, n_heads, n_kv_heads, head_dim, freq_base_bits)
 //
 // Dispatch: (ceil(max(n_heads, n_kv_heads) * head_dim/2 / 256), 1, 1)
+
+#include "common_decls.tmpl"
 
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> k: array<f32>;
@@ -32,17 +34,13 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>) {
     if idx < q_total {
         let head = idx / half_dim;
         let d = idx % half_dim;
-        let freq = 1.0 / pow(freq_base, f32(2u * d) / f32(head_dim));
-        let angle = f32(pos) * freq;
-        let cos_a = cos(angle);
-        let sin_a = sin(angle);
+        let angle = rope_angle(pos, d, head_dim, freq_base);
 
         let i0 = head * head_dim + d;
         let i1 = head * head_dim + d + half_dim;
-        let x0 = q[i0];
-        let x1 = q[i1];
-        q[i0] = x0 * cos_a - x1 * sin_a;
-        q[i1] = x0 * sin_a + x1 * cos_a;
+        let res = rotate_rope(q[i0], q[i1], angle);
+        q[i0] = res.x;
+        q[i1] = res.y;
     }
 
     // Apply to K heads
@@ -50,16 +48,13 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>) {
     if idx < k_total {
         let head = idx / half_dim;
         let d = idx % half_dim;
-        let freq = 1.0 / pow(freq_base, f32(2u * d) / f32(head_dim));
-        let angle = f32(pos) * freq;
-        let cos_a = cos(angle);
-        let sin_a = sin(angle);
+        let angle = rope_angle(pos, d, head_dim, freq_base);
 
         let i0 = head * head_dim + d;
         let i1 = head * head_dim + d + half_dim;
-        let x0 = k[i0];
-        let x1 = k[i1];
-        k[i0] = x0 * cos_a - x1 * sin_a;
-        k[i1] = x0 * sin_a + x1 * cos_a;
+        let res = rotate_rope(k[i0], k[i1], angle);
+        k[i0] = res.x;
+        k[i1] = res.y;
     }
 }
+

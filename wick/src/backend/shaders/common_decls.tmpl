@@ -1,0 +1,56 @@
+// Common WGSL declarations for wick kernels
+
+#ifndef COMMON_DECLS_TMPL
+#define COMMON_DECLS_TMPL
+
+// Max workgroups per dimension (standard wgpu limit)
+const MAX_WG: u32 = 65535u;
+
+// Flatten a 2D workgroup ID into a linear index.
+// Used when dispatches exceed MAX_WG in the X dimension.
+fn get_wid(wid: vec3<u32>) -> u32 {
+    return wid.x + wid.y * MAX_WG;
+}
+
+// Tree-reduce `shared_sum[0..256]` in-place; result lands in `shared_sum[0]`.
+// Caller must have already populated `shared_sum[tid]` and issued a
+// `workgroupBarrier()` so all writes are visible.
+// NOTE: Requires `var<workgroup> shared_sum: array<f32, 256>;` to be defined
+// in the calling shader.
+#ifdef WG_SUM_REDUCE
+fn workgroup_sum_reduce(tid: u32) {
+    if tid < 128u { shared_sum[tid] += shared_sum[tid + 128u]; }
+    workgroupBarrier();
+    if tid < 64u { shared_sum[tid] += shared_sum[tid + 64u]; }
+    workgroupBarrier();
+    if tid < 32u { shared_sum[tid] += shared_sum[tid + 32u]; }
+    workgroupBarrier();
+    if tid < 16u { shared_sum[tid] += shared_sum[tid + 16u]; }
+    workgroupBarrier();
+    if tid < 8u { shared_sum[tid] += shared_sum[tid + 8u]; }
+    workgroupBarrier();
+    if tid < 4u { shared_sum[tid] += shared_sum[tid + 4u]; }
+    workgroupBarrier();
+    if tid < 2u { shared_sum[tid] += shared_sum[tid + 2u]; }
+    workgroupBarrier();
+    if tid < 1u { shared_sum[tid] += shared_sum[tid + 1u]; }
+    workgroupBarrier();
+}
+#endif
+
+// RoPE: Compute rotary angle for a given position and dimension.
+fn rope_angle(pos: u32, d: u32, head_dim: u32, freq_base: f32) -> f32 {
+    return f32(pos) * pow(freq_base, -2.0 * f32(d) / f32(head_dim));
+}
+
+// RoPE: Rotate a pair of values by a given angle.
+fn rotate_rope(x0: f32, x1: f32, angle: f32) -> vec2<f32> {
+    let cos_a = cos(angle);
+    let sin_a = sin(angle);
+    return vec2<f32>(
+        x0 * cos_a - x1 * sin_a,
+        x0 * sin_a + x1 * cos_a
+    );
+}
+
+#endif // COMMON_DECLS_TMPL

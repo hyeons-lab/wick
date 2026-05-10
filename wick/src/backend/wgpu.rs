@@ -7,12 +7,15 @@
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
+use crate::backend::wgsl_pp::Preprocessor;
+
 /// GPU compute context: device, queue, and optional timestamp profiling.
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
+    pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<GpuProfiler>,
     /// Pre-allocated staging buffer for download_f32. Resized on demand.
@@ -116,6 +119,9 @@ impl GpuContext {
             None
         };
 
+        let mut preprocessor = Preprocessor::new();
+        preprocessor.add_include("common_decls.tmpl", shaders::COMMON_DECLS);
+
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
@@ -128,6 +134,7 @@ impl GpuContext {
             queue,
             adapter_name,
             backend,
+            preprocessor,
             profiler,
             staging: std::sync::Mutex::new(None),
             staging_size: std::sync::atomic::AtomicU64::new(0),
@@ -274,11 +281,28 @@ impl GpuContext {
         entry_point: &str,
         label: &str,
     ) -> wgpu::ComputePipeline {
+        self.create_pipeline_with_defines(shader_source, entry_point, label, &[])
+    }
+
+    /// Create a compute pipeline from WGSL source with preprocessor defines.
+    pub fn create_pipeline_with_defines(
+        &self,
+        shader_source: &str,
+        entry_point: &str,
+        label: &str,
+        defines: &[(&str, &str)],
+    ) -> wgpu::ComputePipeline {
+        let preprocessed = self
+            .preprocessor
+            .preprocess(shader_source, defines)
+            .with_context(|| format!("failed to preprocess shader: {label}"))
+            .expect("shader preprocessing failed");
+
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+                source: wgpu::ShaderSource::Wgsl(preprocessed.into()),
             });
         self.device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -396,6 +420,7 @@ impl GpuContext {
 // ── Shaders (embedded at compile time) ─────────────────────────────────────
 
 pub mod shaders {
+    pub const COMMON_DECLS: &str = include_str!("shaders/common_decls.tmpl");
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.wgsl");
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
     pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");

@@ -24,6 +24,9 @@
 //   @binding(4) residual: array<f32> (read — only used by `add_rmsnorm_batch`,
 //                                      stride = src_stride)
 
+#define WG_SUM_REDUCE
+#include "common_decls.tmpl"
+
 @group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
@@ -31,28 +34,6 @@
 @group(0) @binding(4) var<storage, read> residual: array<f32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
-
-// Tree-reduce `shared_sum[0..256]` in-place; result lands in `shared_sum[0]`.
-// Caller must have already populated `shared_sum[tid]` and issued a
-// `workgroupBarrier()` so all writes are visible.
-fn workgroup_sum_reduce(tid: u32) {
-    if tid < 128u { shared_sum[tid] += shared_sum[tid + 128u]; }
-    workgroupBarrier();
-    if tid < 64u { shared_sum[tid] += shared_sum[tid + 64u]; }
-    workgroupBarrier();
-    if tid < 32u { shared_sum[tid] += shared_sum[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { shared_sum[tid] += shared_sum[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { shared_sum[tid] += shared_sum[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { shared_sum[tid] += shared_sum[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { shared_sum[tid] += shared_sum[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { shared_sum[tid] += shared_sum[tid + 1u]; }
-    workgroupBarrier();
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn rmsnorm_batch(

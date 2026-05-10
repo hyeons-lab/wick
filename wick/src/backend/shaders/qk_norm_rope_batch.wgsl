@@ -23,6 +23,9 @@
 //                                       head_dim, eps_bits, freq_base_bits,
 //                                       rope_type, q_stride, k_stride)
 
+#define WG_SUM_REDUCE
+#include "common_decls.tmpl"
+
 @group(0) @binding(0) var<storage, read_write> q_batch: array<f32>;
 @group(0) @binding(1) var<storage, read_write> k_batch: array<f32>;
 @group(0) @binding(2) var<storage, read> q_norm_w: array<f32>;
@@ -30,25 +33,6 @@
 @group(0) @binding(4) var<storage, read> params: array<u32, 10>;
 
 var<workgroup> shared_sum: array<f32, 256>;
-
-fn workgroup_sum_reduce(tid: u32) {
-    if tid < 128u { shared_sum[tid] += shared_sum[tid + 128u]; }
-    workgroupBarrier();
-    if tid < 64u { shared_sum[tid] += shared_sum[tid + 64u]; }
-    workgroupBarrier();
-    if tid < 32u { shared_sum[tid] += shared_sum[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { shared_sum[tid] += shared_sum[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { shared_sum[tid] += shared_sum[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { shared_sum[tid] += shared_sum[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { shared_sum[tid] += shared_sum[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { shared_sum[tid] += shared_sum[tid + 1u]; }
-    workgroupBarrier();
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn qk_norm_rope_batch(
@@ -127,9 +111,7 @@ fn qk_norm_rope_batch(
     // theta_d = pos * freq_base^(-2d / head_dim). Compute once per d via pow.
     var d = tid;
     while d < half_dim {
-        let theta = f32(pos) * pow(freq_base, -2.0 * f32(d) / f32(head_dim));
-        let cos_a = cos(theta);
-        let sin_a = sin(theta);
+        let angle = rope_angle(pos, d, head_dim, freq_base);
         var i0: u32;
         var i1: u32;
         if rope_type == 0u {
@@ -140,15 +122,13 @@ fn qk_norm_rope_batch(
             i1 = base + 2u * d + 1u;
         }
         if is_q {
-            let x0 = q_batch[i0];
-            let x1 = q_batch[i1];
-            q_batch[i0] = x0 * cos_a - x1 * sin_a;
-            q_batch[i1] = x0 * sin_a + x1 * cos_a;
+            let res = rotate_rope(q_batch[i0], q_batch[i1], angle);
+            q_batch[i0] = res.x;
+            q_batch[i1] = res.y;
         } else {
-            let x0 = k_batch[i0];
-            let x1 = k_batch[i1];
-            k_batch[i0] = x0 * cos_a - x1 * sin_a;
-            k_batch[i1] = x0 * sin_a + x1 * cos_a;
+            let res = rotate_rope(k_batch[i0], k_batch[i1], angle);
+            k_batch[i0] = res.x;
+            k_batch[i1] = res.y;
         }
         d += 256u;
     }
