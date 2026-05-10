@@ -565,9 +565,14 @@ mod tests {
 
         for i in 0..data.len() {
             let diff = (data[i] - result[i]).abs();
-            // F16 precision is limited, relative error ~1e-3. 
+            // F16 precision is limited, relative error ~1e-3.
             // For values up to 25.6, absolute error can be up to ~0.02.
-            assert!(diff < 2e-2, "f16 mismatch at {i}: {} vs {}", data[i], result[i]);
+            assert!(
+                diff < 2e-2,
+                "f16 mismatch at {i}: {} vs {}",
+                data[i],
+                result[i]
+            );
         }
     }
 
