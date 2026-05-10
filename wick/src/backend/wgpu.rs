@@ -42,7 +42,14 @@ impl GpuTensor {
 
     /// Return the size of the tensor data in bytes.
     pub fn size_bytes(&self) -> usize {
-        (self.numel() / self.dtype.block_size()) * self.dtype.block_bytes()
+        let block_size = self.dtype.block_size();
+        assert!(
+            self.numel() % block_size == 0,
+            "tensor numel {} not divisible by block_size {}",
+            self.numel(),
+            block_size
+        );
+        (self.numel() / block_size) * self.dtype.block_bytes()
     }
 }
 
@@ -334,7 +341,9 @@ impl GpuContext {
                 label: Some("download_f16"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        self.queue.submit(Some(encoder.finish()));
+        rx.recv()
+            .expect("GPU readback channel closed")
+            .expect("GPU readback failed");
 
         let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
