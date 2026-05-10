@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 
-use crate::backend::wgpu::{GpuContext, shaders};
+use crate::backend::wgpu::{GpuContext, GpuTensor, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::model::{BlockType, Model, ModelConfig};
@@ -23,11 +23,7 @@ const MAX_PREFILL_TOKENS: usize = 512;
 
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
-    buf: wgpu::Buffer,
-    dtype: DType,
-    m: u32, // output rows
-    #[allow(dead_code)]
-    k: u32, // input cols (stored in params_buf for shader access)
+    tensor: GpuTensor,
     /// Pre-allocated params buffer with [m, k] — eliminates per-dispatch allocation.
     params_buf: wgpu::Buffer,
     /// Pre-created bind group for this weight's primary GEMV dispatch.
@@ -323,22 +319,25 @@ impl GpuLfm2Model {
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
 
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
-            let buf = if wref.dtype == DType::Q4_0 {
+            let (buf, dtype) = if wref.dtype == DType::Q4_0 {
                 let data = cpu_model.weight_bytes(wref);
-                ctx.upload_storage(data, name)
+                (ctx.upload_storage(data, name), DType::Q4_0)
             } else {
+                // TODO: Upload as F16 to save bandwidth (requires F16-aware matmul shaders
+                // in Phase B.1). For now we dequantize all non-Q4_0 to F32.
                 let f32_data = cpu_model.dequantize_weight(wref);
-                ctx.upload_f32(&f32_data, name)
+                (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
                 bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]),
                 &format!("{name}.params"),
             );
             GpuWeight {
-                buf,
-                dtype: wref.dtype,
-                m: wref.m as u32,
-                k: wref.k as u32,
+                tensor: GpuTensor {
+                    buffer: buf,
+                    dtype,
+                    shape: vec![wref.m, wref.k],
+                },
                 params_buf,
                 cached_bg: None,
             }
@@ -582,7 +581,7 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let pipeline = match w.dtype {
+        let pipeline = match w.tensor.dtype {
             DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
             _ => &self.pipelines.gemv_f32,
         };
@@ -594,7 +593,7 @@ impl GpuLfm2Model {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: w.buf.as_entire_binding(),
+                        resource: w.tensor.buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -718,11 +717,11 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) {
-        let pipeline = match w.dtype {
+        let pipeline = match w.tensor.dtype {
             DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
             _ => &self.pipelines.gemv_f32,
         };
-        let label = match w.dtype {
+        let label = match w.tensor.dtype {
             DType::Q4_0 => "gemv_q4",
             _ => "gemv_f32",
         };
@@ -736,12 +735,12 @@ impl GpuLfm2Model {
             &fresh_bg
         };
         // Fast Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
-        let rows_per_wg: u32 = match w.dtype {
+        let rows_per_wg: u32 = match w.tensor.dtype {
             DType::Q4_0 => 4,
             _ => 1,
         };
-        let workgroups_x = (w.m.div_ceil(rows_per_wg)).min(65535);
-        let workgroups_y = (w.m.div_ceil(rows_per_wg)).div_ceil(65535);
+        let workgroups_x = ((w.tensor.shape[0] as u32).div_ceil(rows_per_wg)).min(65535);
+        let workgroups_y = ((w.tensor.shape[0] as u32).div_ceil(rows_per_wg)).div_ceil(65535);
         self.encode(enc, pipeline, bg, (workgroups_x, workgroups_y, 1), label);
     }
 
@@ -999,7 +998,7 @@ impl GpuLfm2Model {
                         &in_bg_tmp
                     }
                 };
-                let in_rows = in_w.m.div_ceil(4);
+                let in_rows = (in_w.tensor.shape[0] as u32).div_ceil(4);
 
                 // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
                 self.encode_copy(
@@ -1068,7 +1067,7 @@ impl GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
-                let out_rows = out_w.m.div_ceil(4);
+                let out_rows = (out_w.tensor.shape[0] as u32).div_ceil(4);
                 let add_p = &self.elementwise_hs_params;
                 let add_bg = self
                     .ctx
@@ -1258,9 +1257,9 @@ impl GpuLfm2Model {
                         ],
                     });
 
-                let q_rows = q_w.m.div_ceil(4);
-                let k_rows = k_w.m.div_ceil(4);
-                let v_rows = v_w.m.div_ceil(4);
+                let q_rows = (q_w.tensor.shape[0] as u32).div_ceil(4);
+                let k_rows = (k_w.tensor.shape[0] as u32).div_ceil(4);
+                let v_rows = (v_w.tensor.shape[0] as u32).div_ceil(4);
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
 
                 // Copy hidden → normed, then pass 1: norm + QKV + per-head norm + rope.
@@ -1371,7 +1370,7 @@ impl GpuLfm2Model {
                             },
                         ],
                     });
-                let out_rows = out_w.m.div_ceil(4);
+                let out_rows = (out_w.tensor.shape[0] as u32).div_ceil(4);
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("attn_post"),
@@ -1495,9 +1494,9 @@ impl GpuLfm2Model {
                     ],
                 });
 
-            let gate_rows = lw.ffn_gate.m.div_ceil(4);
-            let up_rows = lw.ffn_up.m.div_ceil(4);
-            let down_rows = lw.ffn_down.m.div_ceil(4);
+            let gate_rows = (lw.ffn_gate.tensor.shape[0] as u32).div_ceil(4);
+            let up_rows = (lw.ffn_up.tensor.shape[0] as u32).div_ceil(4);
+            let down_rows = (lw.ffn_down.tensor.shape[0] as u32).div_ceil(4);
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("ffn"),
@@ -1523,7 +1522,7 @@ impl GpuLfm2Model {
                     &mut pass,
                     &self.pipelines.silu_mul_inplace,
                     &silu_bg,
-                    (lw.ffn_gate.m.div_ceil(256), 1, 1),
+                    ((lw.ffn_gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
                 );
                 // down GEMV
                 self.dispatch_into(
@@ -1659,7 +1658,7 @@ impl GpuLfm2Model {
                 lw.conv_out_proj.as_ref(),
             ];
             for w in weights.into_iter().flatten() {
-                if w.dtype != DType::Q4_0 {
+                if w.tensor.dtype != DType::Q4_0 {
                     return false;
                 }
             }
@@ -1787,8 +1786,8 @@ impl GpuLfm2Model {
         x_stride: u32,
         y_stride: u32,
     ) {
-        debug_assert_eq!(w.dtype, DType::Q4_0);
-        let params: [u32; 6] = [w.m, k, n, x_stride, y_stride, 0];
+        debug_assert_eq!(w.tensor.dtype, DType::Q4_0);
+        let params: [u32; 6] = [(w.tensor.shape[0] as u32), k, n, x_stride, y_stride, 0];
         let p_buf = self
             .ctx
             .upload_storage(bytemuck::cast_slice(&params), "gemm_q4_0_params");
@@ -1801,7 +1800,7 @@ impl GpuLfm2Model {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: w.buf.as_entire_binding(),
+                        resource: w.tensor.buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1817,7 +1816,7 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let m_groups = w.m.div_ceil(4);
+        let m_groups = (w.tensor.shape[0] as u32).div_ceil(4);
         self.encode(
             enc,
             &self.pipelines.gemm_q4_0,
