@@ -191,9 +191,10 @@ impl GpuContext {
     /// on the host, reducing peak memory usage.
     pub fn upload_f32_as_f16(&self, data: &[f32], label: &str) -> wgpu::Buffer {
         let byte_size = (data.len() * 2) as u64;
+        let aligned_size = byte_size.div_ceil(4) * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: byte_size,
+            size: aligned_size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -215,7 +216,12 @@ impl GpuContext {
 
     /// Upload f16 data to a GPU storage buffer.
     pub fn upload_f16(&self, data: &[f16], label: &str) -> wgpu::Buffer {
-        self.upload_storage(bytemuck::cast_slice(data), label)
+        let size = (data.len() * 2) as u64;
+        let aligned_size = size.div_ceil(4) * 4;
+        let buffer = self.create_storage_rw(aligned_size, label);
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
     }
 
     /// Create a zeroed GPU buffer with read-write storage usage.
