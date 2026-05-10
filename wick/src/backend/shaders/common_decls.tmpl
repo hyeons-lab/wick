@@ -6,7 +6,7 @@
 // Max workgroups per dimension (standard wgpu limit)
 const MAX_WG: u32 = 65535u;
 
-// Flatten a 2D workgroup ID into a linear index. 
+// Flatten a 2D workgroup ID into a linear index.
 // Used when dispatches exceed MAX_WG in the X dimension.
 fn get_wid(wid: vec3<u32>) -> u32 {
     return wid.x + wid.y * MAX_WG;
