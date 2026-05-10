@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 
-use crate::backend::wgpu::{GpuContext, shaders};
+use crate::backend::wgpu::{GpuContext, GpuTensor, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::model::{BlockType, Model, ModelConfig};
@@ -23,8 +23,7 @@ const MAX_PREFILL_TOKENS: usize = 512;
 
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
-    buf: wgpu::Buffer,
-    dtype: DType,
+    tensor: GpuTensor,
     m: u32, // output rows
     #[allow(dead_code)]
     k: u32, // input cols (stored in params_buf for shader access)
@@ -324,23 +323,21 @@ impl GpuLfm2Model {
 
         let use_f16 = std::env::var("WICK_WGPU_F16").as_deref() == Ok("1");
         if use_f16 {
-            tracing::info!("WGPU: uploading non-Q4_0 weights as F16");
+            tracing::info!("WGPU: F16 weight upload requested (experimental)");
         }
 
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if wref.dtype == DType::Q4_0 {
                 let data = cpu_model.weight_bytes(wref);
-                let (buf, dtype) = if wref.dtype == DType::Q4_0 {
-                    let data = cpu_model.weight_bytes(wref);
-                    (ctx.upload_storage(data, name), DType::Q4_0)
-                } else if use_f16 {
-                    // TODO: Dequantize directly into F16 to avoid intermediate F32 allocation
-                    let f32_data = cpu_model.dequantize_weight(wref);
-                    (ctx.upload_f32_as_f16(&f32_data, name), DType::F16)
-                } else {
-                    let f32_data = cpu_model.dequantize_weight(wref);
-                    (ctx.upload_f32(&f32_data, name), DType::F32)
-                };
+                (ctx.upload_storage(data, name), DType::Q4_0)
+            } else if use_f16 {
+                // TODO: Dequantize directly into F16 to avoid intermediate F32 allocation.
+                // NOTE: gemv_f32.wgsl reinterprets f16 as f32, producing incorrect results.
+                // We default to F32 for now until f16-aware shaders are added in Phase B.1.
+                let f32_data = cpu_model.dequantize_weight(wref);
+                (ctx.upload_f32(&f32_data, name), DType::F32)
+            } else {
+                let f32_data = cpu_model.dequantize_weight(wref);
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
@@ -348,8 +345,11 @@ impl GpuLfm2Model {
                 &format!("{name}.params"),
             );
             GpuWeight {
-                buf,
-                dtype,
+                tensor: GpuTensor {
+                    buffer: buf,
+                    dtype,
+                    shape: vec![wref.m, wref.k],
+                },
                 m: wref.m as u32,
                 k: wref.k as u32,
                 params_buf,
@@ -595,7 +595,7 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let pipeline = match w.dtype {
+        let pipeline = match w.tensor.dtype {
             DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
             _ => &self.pipelines.gemv_f32,
         };
@@ -607,7 +607,7 @@ impl GpuLfm2Model {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: w.buf.as_entire_binding(),
+                        resource: w.tensor.buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -731,11 +731,11 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) {
-        let pipeline = match w.dtype {
+        let pipeline = match w.tensor.dtype {
             DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
             _ => &self.pipelines.gemv_f32,
         };
-        let label = match w.dtype {
+        let label = match w.tensor.dtype {
             DType::Q4_0 => "gemv_q4",
             _ => "gemv_f32",
         };
@@ -749,7 +749,7 @@ impl GpuLfm2Model {
             &fresh_bg
         };
         // Fast Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
-        let rows_per_wg: u32 = match w.dtype {
+        let rows_per_wg: u32 = match w.tensor.dtype {
             DType::Q4_0 => 4,
             _ => 1,
         };
@@ -1672,7 +1672,7 @@ impl GpuLfm2Model {
                 lw.conv_out_proj.as_ref(),
             ];
             for w in weights.into_iter().flatten() {
-                if w.dtype != DType::Q4_0 {
+                if w.tensor.dtype != DType::Q4_0 {
                     return false;
                 }
             }
@@ -1800,7 +1800,7 @@ impl GpuLfm2Model {
         x_stride: u32,
         y_stride: u32,
     ) {
-        debug_assert_eq!(w.dtype, DType::Q4_0);
+        debug_assert_eq!(w.tensor.dtype, DType::Q4_0);
         let params: [u32; 6] = [w.m, k, n, x_stride, y_stride, 0];
         let p_buf = self
             .ctx
@@ -1814,7 +1814,7 @@ impl GpuLfm2Model {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: w.buf.as_entire_binding(),
+                        resource: w.tensor.buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
