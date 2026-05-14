@@ -78,7 +78,7 @@ fn init_shmem_src1(thread_id: u32, offset_n: u32, k_outer: u32) {
         let tile_k = elem_idx % TILE_K;
         let global_n = offset_n + tile_n;
         let global_k = k_outer + tile_k;
-        let src1_idx = global_n * params.k + global_k;
+        let src1_idx = global_n * params.x_stride + global_k;
         let src1_val = select(
             SRC1_TYPE(0.0),
             src1[src1_idx/VEC_SIZE],
@@ -125,9 +125,10 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
                 }
             }
         } else {
-             for (var j = 0u; j < NQ; j++) {
-                 shmem[shmem_idx + j] = 0.0;
-             }
+            for (var j = 0u; j < 8u; j++) {
+                shmem[shmem_idx + j] = 0.0;
+                shmem[shmem_idx + j + 16u] = 0.0;
+            }
         }
     }
 }

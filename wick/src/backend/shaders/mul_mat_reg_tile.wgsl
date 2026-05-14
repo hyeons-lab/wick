@@ -1,8 +1,8 @@
 // Register-tiled matmul kernel: dst = src0 * src1
 //
 // src0 (weights): [m, k] row-major
-// src1 (activations): [k, n] (n column-vectors of length k)
-// dst (output): [m, n] (n column-vectors of length m)
+// src1 (activations): n column-vectors with params.x_stride floats each
+// dst (output): n column-vectors with params.y_stride floats each
 //
 // Tiling strategy:
 // Each workgroup covers (WORKGROUP_SIZE_M * TILE_M) rows of dst and
@@ -33,6 +33,8 @@ struct MulMatParams {
     m: u32,
     k: u32,
     n: u32,
+    x_stride: u32,
+    y_stride: u32,
 };
 
 @group(0) @binding(0) var<storage, read> src0: array<SRC0_TYPE>;
@@ -110,7 +112,7 @@ fn main(
             for (var tm = 0u; tm < TILE_M; tm += VEC_SIZE) {
                 let global_row = output_row_base + tm;
                 if (global_row < params.m) {
-                    let dst_idx = global_col * params.m + global_row;
+                    let dst_idx = global_col * params.y_stride + global_row;
                     dst[dst_idx/VEC_SIZE] = pack_acc_tile(&acc, tn, tm);
                 }
             }

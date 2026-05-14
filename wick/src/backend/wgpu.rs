@@ -798,8 +798,8 @@ mod tests {
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
         let y_buf = ctx.create_storage_rw(((n * m) as u64) * 4, "y_batch");
 
-        // MulMatParams: m, k, n.
-        let params: [u32; 3] = [m, k, n];
+        // MulMatParams: m, k, n, x_stride, y_stride.
+        let params: [u32; 5] = [m, k, n, k, m];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline_with_defines(
@@ -882,34 +882,37 @@ mod tests {
         let m: u32 = 30;
         let k: u32 = 128;
         let n: u32 = 16;
+        let x_stride: u32 = k + 3;
+        let y_stride: u32 = m + 5;
 
         let weights_f32: Vec<f32> = (0..m * k)
             .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
             .collect();
-        let mut x_batch: Vec<f32> = Vec::with_capacity((n * k) as usize);
+        let mut x_batch: Vec<f32> = Vec::with_capacity((n * x_stride) as usize);
         for t in 0..n {
             for i in 0..k {
                 x_batch.push(((t as f32 + 1.0) * (i as f32 - 64.0)) * 0.05);
             }
+            x_batch.resize(x_batch.len() + (x_stride - k) as usize, -999.0);
         }
 
-        let mut expected = vec![0.0f32; (n * m) as usize];
+        let mut expected = vec![0.0f32; (n * y_stride) as usize];
         for t in 0..n as usize {
-            let x_slice = &x_batch[t * k as usize..(t + 1) * k as usize];
+            let x_slice = &x_batch[t * x_stride as usize..t * x_stride as usize + k as usize];
             for row in 0..m as usize {
                 let mut acc = 0.0f32;
                 for col in 0..k as usize {
                     acc += weights_f32[row * k as usize + col] * x_slice[col];
                 }
-                expected[t * m as usize + row] = acc;
+                expected[t * y_stride as usize + row] = acc;
             }
         }
 
         let a_buf = ctx.upload_f32(&weights_f32, "weights");
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
-        let y_buf = ctx.create_storage_rw(((n * m) as u64) * 4, "y_batch");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
 
-        let params: [u32; 3] = [m, k, n];
+        let params: [u32; 5] = [m, k, n, x_stride, y_stride];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline_with_defines(
@@ -967,16 +970,19 @@ mod tests {
         ctx.queue.submit(Some(enc.finish()));
         ctx.device.poll(wgpu::Maintain::Wait);
 
-        let result = ctx.download_f32(&y_buf, (n * m) as usize);
-        for i in 0..(n * m) as usize {
-            let diff = (result[i] - expected[i]).abs();
-            assert!(
-                diff < 1e-4,
-                "mismatch at {}: {} vs {}",
-                i,
-                result[i],
-                expected[i]
-            );
+        let result = ctx.download_f32(&y_buf, (n * y_stride) as usize);
+        for t in 0..n as usize {
+            for row in 0..m as usize {
+                let i = t * y_stride as usize + row;
+                let diff = (result[i] - expected[i]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "mismatch at {}: {} vs {}",
+                    i,
+                    result[i],
+                    expected[i]
+                );
+            }
         }
     }
 
@@ -1019,8 +1025,8 @@ mod tests {
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
         let y_buf = ctx.create_storage_rw(((n * m) as u64) * 4, "y_batch");
 
-        // MulMatParams: m, k, n.
-        let params: [u32; 3] = [m, k, n];
+        // MulMatParams: m, k, n, x_stride, y_stride.
+        let params: [u32; 5] = [m, k, n, k, m];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline_with_defines(
@@ -1127,7 +1133,7 @@ mod tests {
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
         let y_buf = ctx.create_storage_rw(((n * m) as u64) * 4, "y_batch");
 
-        let params: [u32; 3] = [m, k, n];
+        let params: [u32; 5] = [m, k, n, k, m];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline_with_defines(

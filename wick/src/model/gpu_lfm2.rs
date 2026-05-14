@@ -32,8 +32,8 @@ const MUL_MAT_TILE_N: u32 = 1;
 const MUL_MAT_TILE_K: u32 = 32;
 
 /// Build a `mul_mat_reg_tile` pipeline for the requested variant.
-/// `use_vec` enables vec4 loads/stores (requires the `m` and `k` of
-/// every dispatched matrix to be a multiple of 4).
+/// `use_vec` enables vec4 loads/stores (requires the matrix dimensions and
+/// effective row strides used by each dispatch to be multiples of 4).
 fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu::ComputePipeline {
     let wg_m = format!("{MUL_MAT_TILE_WG_M}u");
     let wg_n = format!("{MUL_MAT_TILE_WG_N}u");
@@ -1821,8 +1821,8 @@ impl GpuLfm2Model {
 
     /// Encode register-tiled 2D matmul: y = weight * x.
     /// Weight must be Q4_0 — F32 weights are not yet a production code
-    /// path in this model. The VEC pipeline fires when `m` and `k` are
-    /// both multiples of 4; otherwise SCALAR.
+    /// path in this model. `x_stride` and `y_stride` are measured in f32
+    /// elements between consecutive token vectors.
     fn encode_mul_mat_reg_tile(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -1831,6 +1831,8 @@ impl GpuLfm2Model {
         y: &wgpu::Buffer,
         n: u32,
         k: u32,
+        x_stride: u32,
+        y_stride: u32,
     ) {
         debug_assert_eq!(
             w.tensor.dtype,
@@ -1838,15 +1840,14 @@ impl GpuLfm2Model {
             "encode_mul_mat_reg_tile only supports Q4_0 weights"
         );
         let m = w.tensor.shape[0] as u32;
-        let use_vec = m % 4 == 0 && k % 4 == 0;
+        let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
         let pipeline = if use_vec {
             &self.pipelines.mul_mat_reg_tile_q4_0_vec
         } else {
             &self.pipelines.mul_mat_reg_tile_q4_0_scalar
         };
 
-        // MulMatParams: m, k, n.
-        let params: [u32; 3] = [m, k, n];
+        let params: [u32; 5] = [m, k, n, x_stride, y_stride];
         let p_buf = self
             .ctx
             .upload_storage(bytemuck::cast_slice(&params), "mul_mat_tile_params");
@@ -2212,6 +2213,8 @@ impl GpuLfm2Model {
                     &self.prefill_proj_buf,
                     n_u,
                     hs_u,
+                    hs_u,
+                    3 * hs_u,
                 );
 
                 // Phase 3: fused conv1d (1 dispatch over all N tokens;
@@ -2234,6 +2237,8 @@ impl GpuLfm2Model {
                     &self.prefill_normed_buf,
                     &self.prefill_gate_buf,
                     n_u,
+                    hs_u,
+                    hs_u,
                     hs_u,
                 );
             } else {
@@ -2260,6 +2265,8 @@ impl GpuLfm2Model {
                     &self.prefill_proj_buf,
                     n_u,
                     hs_u,
+                    hs_u,
+                    hs_u,
                 );
                 self.encode_mul_mat_reg_tile(
                     &mut enc,
@@ -2268,6 +2275,8 @@ impl GpuLfm2Model {
                     &self.prefill_gate_buf,
                     n_u,
                     hs_u,
+                    hs_u,
+                    kv_dim,
                 );
                 self.encode_mul_mat_reg_tile(
                     &mut enc,
@@ -2276,6 +2285,8 @@ impl GpuLfm2Model {
                     &self.prefill_up_buf,
                     n_u,
                     hs_u,
+                    hs_u,
+                    kv_dim,
                 );
 
                 // Phase B: batched per-head Q/K rmsnorm + RoPE.
@@ -2343,6 +2354,8 @@ impl GpuLfm2Model {
                     &self.prefill_gate_buf,
                     n_u,
                     hs_u,
+                    hs_u,
+                    hs_u,
                 );
             }
 
@@ -2365,6 +2378,8 @@ impl GpuLfm2Model {
                 &self.prefill_gate_buf,
                 n_u,
                 hs_u,
+                hs_u,
+                is_u,
             );
             self.encode_mul_mat_reg_tile(
                 &mut enc,
@@ -2373,6 +2388,8 @@ impl GpuLfm2Model {
                 &self.prefill_up_buf,
                 n_u,
                 hs_u,
+                hs_u,
+                is_u,
             );
             // silu_mul over the full N × is buffer.
             {
@@ -2424,6 +2441,8 @@ impl GpuLfm2Model {
                 &self.prefill_up_buf,
                 n_u,
                 is_u,
+                is_u,
+                hs_u,
             );
         }
 
