@@ -21,6 +21,45 @@ use crate::tensor::DType;
 /// scratch, so the worst-case scratch footprint is bounded.
 const MAX_PREFILL_TOKENS: usize = 512;
 
+// Tile geometry for the register-tiled matmul pipeline. The shader
+// receives these via preprocessor #defines below; keeping a single
+// source of truth here means dispatch geometry can never drift out of
+// sync with the kernel.
+const MUL_MAT_TILE_WG_M: u32 = 8;
+const MUL_MAT_TILE_WG_N: u32 = 32;
+const MUL_MAT_TILE_M: u32 = 4;
+const MUL_MAT_TILE_N: u32 = 1;
+const MUL_MAT_TILE_K: u32 = 32;
+
+/// Build a `mul_mat_reg_tile` pipeline for the requested variant.
+/// `use_vec` enables vec4 loads/stores (requires the matrix dimensions and
+/// effective row strides used by each dispatch to be multiples of 4).
+fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu::ComputePipeline {
+    let wg_m = format!("{MUL_MAT_TILE_WG_M}u");
+    let wg_n = format!("{MUL_MAT_TILE_WG_N}u");
+    let tile_m = format!("{MUL_MAT_TILE_M}u");
+    let tile_n = format!("{MUL_MAT_TILE_N}u");
+    let tile_k = format!("{MUL_MAT_TILE_K}u");
+    let variant = if use_vec { "VEC" } else { "SCALAR" };
+    ctx.create_pipeline_with_defines(
+        shaders::MUL_MAT_REG_TILE,
+        "main",
+        label,
+        &[
+            (variant, ""),
+            ("SRC0_INNER_TYPE", "u32"),
+            ("SRC1_INNER_TYPE", "f32"),
+            ("INIT_SRC0_SHMEM_Q4_0", ""),
+            ("INIT_SRC1_SHMEM_FLOAT", ""),
+            ("WORKGROUP_SIZE_M", &wg_m),
+            ("WORKGROUP_SIZE_N", &wg_n),
+            ("TILE_M", &tile_m),
+            ("TILE_N", &tile_n),
+            ("TILE_K", &tile_k),
+        ],
+    )
+}
+
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     tensor: GpuTensor,
@@ -75,7 +114,9 @@ struct GpuPipelines {
     add_rmsnorm_batch: wgpu::ComputePipeline,
     qk_norm_rope_batch: wgpu::ComputePipeline,
     conv1d_fused_batch: wgpu::ComputePipeline,
-    gemm_q4_0: wgpu::ComputePipeline,
+
+    mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
+    mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
 }
 
@@ -300,7 +341,13 @@ impl GpuLfm2Model {
                 "conv1d_fused_batch",
                 "conv1d_fused_batch",
             ),
-            gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0", "gemm_q4_0"),
+
+            mul_mat_reg_tile_q4_0_vec: build_mul_mat_pipeline(&ctx, "mul_mat_q4_0_vec", true),
+            mul_mat_reg_tile_q4_0_scalar: build_mul_mat_pipeline(
+                &ctx,
+                "mul_mat_q4_0_scalar",
+                false,
+            ),
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",
@@ -1772,10 +1819,11 @@ impl GpuLfm2Model {
         );
     }
 
-    /// Encode `gemm_q4_0`: y[t * y_stride + r] = Σ_k weight[r, k] * x[t * x_stride + k].
-    /// One workgroup per (4-row block, token).
-    #[allow(clippy::too_many_arguments)]
-    fn encode_gemm_q4_0(
+    /// Encode register-tiled 2D matmul: y = weight * x.
+    /// Weight must be Q4_0 — F32 weights are not yet a production code
+    /// path in this model. `x_stride` and `y_stride` are measured in f32
+    /// elements between consecutive token vectors.
+    fn encode_mul_mat_reg_tile(
         &self,
         enc: &mut wgpu::CommandEncoder,
         w: &GpuWeight,
@@ -1786,17 +1834,30 @@ impl GpuLfm2Model {
         x_stride: u32,
         y_stride: u32,
     ) {
-        debug_assert_eq!(w.tensor.dtype, DType::Q4_0);
-        let params: [u32; 6] = [(w.tensor.shape[0] as u32), k, n, x_stride, y_stride, 0];
+        debug_assert_eq!(
+            w.tensor.dtype,
+            DType::Q4_0,
+            "encode_mul_mat_reg_tile only supports Q4_0 weights"
+        );
+        let m = w.tensor.shape[0] as u32;
+        let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
+        let pipeline = if use_vec {
+            &self.pipelines.mul_mat_reg_tile_q4_0_vec
+        } else {
+            &self.pipelines.mul_mat_reg_tile_q4_0_scalar
+        };
+
+        let params: [u32; 5] = [m, k, n, x_stride, y_stride];
         let p_buf = self
             .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "gemm_q4_0_params");
+            .upload_storage(bytemuck::cast_slice(&params), "mul_mat_tile_params");
+
         let bg = self
             .ctx
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &self.pipelines.gemm_q4_0.get_bind_group_layout(0),
+                layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1816,14 +1877,11 @@ impl GpuLfm2Model {
                     },
                 ],
             });
-        let m_groups = (w.tensor.shape[0] as u32).div_ceil(4);
-        self.encode(
-            enc,
-            &self.pipelines.gemm_q4_0,
-            &bg,
-            (m_groups, n, 1),
-            "gemm_q4_0",
-        );
+
+        let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
+        let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
+
+        self.encode(enc, pipeline, &bg, (wg_m, wg_n, 1), "mul_mat_tile");
     }
 
     /// Encode `qk_norm_rope_batch`: in-place rmsnorm + RoPE on Q (n × n_heads
@@ -2148,7 +2206,7 @@ impl GpuLfm2Model {
                 let conv_weight = lw.conv_weight.as_ref().unwrap();
 
                 // Phase 2: in_proj batched GEMM (3*hs columns per token).
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_in,
                     &self.prefill_normed_buf,
@@ -2173,7 +2231,7 @@ impl GpuLfm2Model {
 
                 // Phase 4: out_proj GEMM → prefill_gate_buf (residual
                 // scratch; FFN's add_rmsnorm_batch will fuse the add).
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_out,
                     &self.prefill_normed_buf,
@@ -2200,7 +2258,7 @@ impl GpuLfm2Model {
                 //   Q  → prefill_proj_buf, stride hs
                 //   K  → prefill_gate_buf, stride kv_dim
                 //   V  → prefill_up_buf,   stride kv_dim
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_q,
                     &self.prefill_normed_buf,
@@ -2210,7 +2268,7 @@ impl GpuLfm2Model {
                     hs_u,
                     hs_u,
                 );
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_k,
                     &self.prefill_normed_buf,
@@ -2220,7 +2278,7 @@ impl GpuLfm2Model {
                     hs_u,
                     kv_dim,
                 );
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_v,
                     &self.prefill_normed_buf,
@@ -2289,7 +2347,7 @@ impl GpuLfm2Model {
 
                 // Phase E: output projection → prefill_gate_buf (residual
                 // scratch; FFN's add_rmsnorm_batch fuses the add).
-                self.encode_gemm_q4_0(
+                self.encode_mul_mat_reg_tile(
                     &mut enc,
                     w_o,
                     &self.prefill_normed_buf,
@@ -2313,7 +2371,7 @@ impl GpuLfm2Model {
                 hs_u,
             );
             // gate + up GEMMs.
-            self.encode_gemm_q4_0(
+            self.encode_mul_mat_reg_tile(
                 &mut enc,
                 &lw.ffn_gate,
                 &self.prefill_normed_buf,
@@ -2323,7 +2381,7 @@ impl GpuLfm2Model {
                 hs_u,
                 is_u,
             );
-            self.encode_gemm_q4_0(
+            self.encode_mul_mat_reg_tile(
                 &mut enc,
                 &lw.ffn_up,
                 &self.prefill_normed_buf,
@@ -2376,7 +2434,7 @@ impl GpuLfm2Model {
             // residual bindings on distinct buffers — see the Phase 1
             // comment above for the wgpu validation reason. The buffer
             // is is×N, plenty of room for hs×N writes.
-            self.encode_gemm_q4_0(
+            self.encode_mul_mat_reg_tile(
                 &mut enc,
                 &lw.ffn_down,
                 &self.prefill_gate_buf,
