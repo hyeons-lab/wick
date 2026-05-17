@@ -205,7 +205,7 @@ pub struct GpuLfm2Model {
     /// `[MAX_PREFILL_TOKENS × 3 × hidden_size]` — sized to fit the
     /// largest batched projection. For attention layers it's split into
     /// Q (offset 0, stride hs); the K/V projections land in the gate/up
-    /// scratches because `gemm_q4_0` writes contiguously. For conv
+    /// scratches because `mul_mat_reg_tile` writes contiguous token rows. For conv
     /// layers the full `3 × hs` slab is the in-projection target.
     prefill_proj_buf: wgpu::Buffer,
     /// `[MAX_PREFILL_TOKENS × intermediate_size]` — FFN gate output;
@@ -1653,7 +1653,7 @@ impl GpuLfm2Model {
 //   rmsnorm_batch / add_rmsnorm_batch (PR #154)
 //   qk_norm_rope_batch                (PR #154)
 //   conv1d_fused_batch                (PR #154)
-//   gemm_q4_0                         (PR #154)
+//   mul_mat_reg_tile                  (PR #162)
 //   attention_prefill                 (PR #156)
 //
 // Scope:
@@ -2764,7 +2764,7 @@ impl Model for GpuLfm2Model {
             //   * fresh prefill (start_pos == 0, already checked above)
             //   * non-empty
             //   * all matmul weights are Q4_0 (the only path the batched
-            //     `gemm_q4_0` shader covers today; non-Q4_0 paths fall
+            //     `mul_mat_reg_tile` shader covers today; non-Q4_0 paths fall
             //     through to the per-token loop)
             //
             // Long prompts are chunked through the batched path in

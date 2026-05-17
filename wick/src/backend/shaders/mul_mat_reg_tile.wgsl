@@ -43,7 +43,13 @@ struct MulMatParams {
 @group(0) @binding(3) var<storage, read> params: MulMatParams;
 
 const TOTAL_WORKGROUP_SIZE = WORKGROUP_SIZE_M * WORKGROUP_SIZE_N;
-const TILE_SRC0_SHMEM: u32 = TILE_K * WORKGROUP_SIZE_M * TILE_M;
+const TILE_SRC0_ROWS: u32 = WORKGROUP_SIZE_M * TILE_M;
+#ifdef INIT_SRC0_SHMEM_Q4_0
+const TILE_SRC0_STRIDE: u32 = TILE_K + 1u;
+#else
+const TILE_SRC0_STRIDE: u32 = TILE_K;
+#endif
+const TILE_SRC0_SHMEM: u32 = TILE_SRC0_STRIDE * TILE_SRC0_ROWS;
 const TILE_SRC1_SHMEM: u32 = TILE_K * WORKGROUP_SIZE_N * TILE_N;
 
 var<workgroup> shmem: array<f32, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
@@ -90,7 +96,7 @@ fn main(
             var src0_tile: array<f32, TILE_M>;
             for (var tm = 0u; tm < TILE_M; tm++) {
                 let src0_m = local_m * TILE_M + tm;
-                let src0_idx = k_inner + src0_m * TILE_K;
+                let src0_idx = k_inner + src0_m * TILE_SRC0_STRIDE;
                 src0_tile[tm] = shmem[src0_idx];
             }
             for (var tn = 0u; tn < TILE_N; tn++) {

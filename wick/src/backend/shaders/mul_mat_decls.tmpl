@@ -57,8 +57,8 @@ fn load_src0_f32_at(byte_offset: u32) -> f32 {
 #ifdef INIT_SRC0_SHMEM_FLOAT
 fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
     for (var elem_idx = thread_id * VEC_SIZE; elem_idx < TILE_SRC0_SHMEM; elem_idx += TOTAL_WORKGROUP_SIZE * VEC_SIZE) {
-        let tile_m = elem_idx / TILE_K;
-        let tile_k = elem_idx % TILE_K;
+        let tile_m = elem_idx / TILE_SRC0_STRIDE;
+        let tile_k = elem_idx % TILE_SRC0_STRIDE;
         let global_m = offset_m + tile_m;
         let global_k = k_outer + tile_k;
         let src0_idx = global_m * params.k + global_k;
@@ -94,22 +94,24 @@ const BLOCK_SIZE_BYTES = 18u;
 
 fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
     let BLOCKS_K = TILE_K / BLOCK_SIZE;
+    let PARAMS_BLOCKS_K = (params.k + BLOCK_SIZE - 1u) / BLOCK_SIZE;
     let NQ = 16u;
     let WEIGHTS_PER_F32 = 4u;
     let F32_PER_THREAD = NQ / WEIGHTS_PER_F32;
 
-    for (var i = thread_id * NQ; i < TILE_SRC0_SHMEM; i += TOTAL_WORKGROUP_SIZE * NQ) {
+    for (var i = thread_id * NQ; i < TILE_SRC0_ROWS * TILE_K; i += TOTAL_WORKGROUP_SIZE * NQ) {
         let blck_idx = i / BLOCK_SIZE;
         let block_offset = (i % BLOCK_SIZE) / WEIGHTS_PER_F32;
-        let shmem_idx = blck_idx * BLOCK_SIZE + block_offset * 2u;
 
         let tile_m = blck_idx / BLOCKS_K;
+        let row_base = tile_m * TILE_SRC0_STRIDE;
+        let shmem_idx = row_base + block_offset * 2u;
         let global_m = offset_m + tile_m;
         let block_k = blck_idx % BLOCKS_K;
         let global_k = k_outer / BLOCK_SIZE + block_k;
 
-        if (global_m < params.m && global_k < params.k / BLOCK_SIZE) {
-            let src0_idx = global_m * (params.k / BLOCK_SIZE) + global_k;
+        if (global_m < params.m && global_k < PARAMS_BLOCKS_K) {
+            let src0_idx = global_m * PARAMS_BLOCKS_K + global_k;
             let block_byte_base = src0_idx * BLOCK_SIZE_BYTES;
             let d = load_src0_f32_at(block_byte_base);
 
