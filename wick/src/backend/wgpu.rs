@@ -101,6 +101,21 @@ impl GpuContext {
         // Use the adapter's actual limits instead of hardcoding. This avoids
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
         let adapter_limits = adapter.limits();
+
+        // The reduction kernels (gemv/gemm Q4_0/Q8_0) launch 32-thread
+        // workgroups and finalize with `subgroupAdd` + a single `tid==0`
+        // writer. That is only correct if all 32 lanes belong to one
+        // subgroup, i.e. the subgroup is at least 32 lanes wide. Fail
+        // clearly here rather than producing silently-wrong matmul output
+        // on hardware that splits the workgroup into smaller subgroups.
+        // A reported `0` means the backend doesn't expose the size (e.g.
+        // GL); proceed on the SUBGROUP-feature assumption in that case.
+        let min_sg = adapter_limits.min_subgroup_size;
+        anyhow::ensure!(
+            min_sg == 0 || min_sg >= 32,
+            "GPU minimum subgroup size {min_sg} < 32; wick's reduction kernels \
+             require a subgroup of at least 32 lanes. Use --device cpu instead."
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wick-gpu"),

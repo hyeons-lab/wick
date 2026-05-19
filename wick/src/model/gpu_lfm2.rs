@@ -1814,7 +1814,27 @@ impl GpuLfm2Model {
                 let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
                 (pipeline, wg_m, wg_n, "mul_mat_tile")
             }
-            DType::Q8_0 => (&self.pipelines.gemm_q8_0, m.div_ceil(8), n, "gemm_q8"),
+            DType::Q8_0 => {
+                let wg_m = m.div_ceil(8);
+                // gemm_q8_0 indexes the row tile with `wid.x` directly (no
+                // get_wid flattening — `wid.y` carries the token axis), so
+                // unlike the GEMV path it cannot fold an overflowing row
+                // dimension into Y. LFM2 weight rows stay far below this
+                // (largest is vocab/embd ≈ 64–128k → /8 ≈ 8–16k), so this
+                // is a guard against a future oversized weight, not a live
+                // limit.
+                debug_assert!(
+                    wg_m <= 65535,
+                    "gemm_q8_0 row tiles {wg_m} exceed the 65535 dispatch \
+                     limit (m={m}); Q8_0 batched prefill needs a flattened \
+                     dispatch for weights this large"
+                );
+                (&self.pipelines.gemm_q8_0, wg_m, n, "gemm_q8")
+            }
+            // Unreachable in practice: the batched path is only entered when
+            // `all_matmul_weights_batched_supported()` already confirmed every
+            // weight is Q4_0/Q8_0. The debug_assert above documents the same
+            // precondition; this arm is the release-mode backstop.
             _ => unreachable!("batched prefill only supports Q4_0/Q8_0"),
         };
 
