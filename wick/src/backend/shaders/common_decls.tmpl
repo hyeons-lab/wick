@@ -59,4 +59,61 @@ fn get_byte(value: u32, index: u32) -> u32 {
 }
 #endif
 
+// Q8_0 dequant helpers. Shared by gemv_q8_0 / gemm_q8_0.
+//
+// Contract: the including shader MUST declare the Q8_0 weight buffer as
+//   @group(0) @binding(0) var<storage, read> a: array<u32>;
+// (these helpers index `a` directly, relying on WGSL module-scope order
+// independence).
+//
+// Q8_0 block layout (34 bytes per 32 elements):
+//   bytes 0-1:  f16 scale
+//   bytes 2-33: 32 signed i8 quants
+#ifdef Q8_0_HELPERS
+// Read a (possibly unaligned) u32 from the byte-addressed `a` buffer.
+//
+// When `byte_offset` is not 4-aligned this also touches `a[word_idx + 1]`.
+// That index is always in bounds: a Q8_0 row is `nb * 34` bytes and the
+// u32 buffer length is `ceil(row_bytes * m / 4)`. Because 34 is not a
+// multiple of 4, rounding up always leaves at least one extra u32 of
+// slack past the final quant word, so the +1 read never exceeds the
+// buffer. Do not call this on a buffer whose length is not derived from
+// whole Q8_0 rows.
+fn get_u32_at(byte_offset: u32) -> u32 {
+    let word_idx = byte_offset / 4u;
+    let shift = (byte_offset & 3u) * 8u;
+    let lo = a[word_idx];
+    if shift == 0u {
+        return lo;
+    }
+    let hi = a[word_idx + 1u];
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+// Dot one Q8_0 block (32 weights) of row `row`, block `bi`, against the
+// 32 staged activations in `xl`. `row_bytes` is the per-row byte stride
+// (`nb * 34`). Returns the scaled partial sum for this block.
+fn process_block_q8_0(
+    row: u32,
+    bi: u32,
+    row_bytes: u32,
+    xl: ptr<function, array<f32, 32>>,
+) -> f32 {
+    let block_byte = row * row_bytes + bi * 34u;
+    let scale_bits = get_u32_at(block_byte) & 0xFFFFu;
+    let scale = unpack2x16float(scale_bits).x;
+
+    var sum = 0.0;
+    for (var i = 0u; i < 32u; i += 4u) {
+        let packed = get_u32_at(block_byte + 2u + i);
+        sum += f32(bitcast<i32>((packed & 0x000000FFu) << 24u) >> 24u) * (*xl)[i + 0u];
+        sum += f32(bitcast<i32>((packed & 0x0000FF00u) << 16u) >> 24u) * (*xl)[i + 1u];
+        sum += f32(bitcast<i32>((packed & 0x00FF0000u) << 8u) >> 24u) * (*xl)[i + 2u];
+        sum += f32(bitcast<i32>(packed & 0xFF000000u) >> 24u) * (*xl)[i + 3u];
+    }
+
+    return sum * scale;
+}
+#endif
+
 #endif // COMMON_DECLS_TMPL
