@@ -3336,12 +3336,8 @@ pub struct FfiHotwordDetector {
 }
 
 impl FfiHotwordDetector {
-    fn lock_inner(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, cera::hotword::HotwordDetector>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
-            detail: format!("Hotword detector mutex poisoned: {e}"),
-        })
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, cera::hotword::HotwordDetector> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -3373,22 +3369,23 @@ impl FfiHotwordDetector {
 
     /// List of target keywords supported by this model.
     pub fn keywords(&self) -> Result<Vec<String>, FfiError> {
-        let det = self.lock_inner()?;
+        let det = self.lock_inner();
         Ok(det.keywords().to_vec())
     }
 
     /// Get default configuration suggested by model metadata.
     pub fn default_config(&self) -> Result<FfiHotwordConfig, FfiError> {
-        let det = self.lock_inner()?;
+        let det = self.lock_inner();
         Ok(det.default_config().into())
     }
 
     /// Process a full audio window and return probability scores for each keyword.
     pub fn process_window(&self, window: Vec<f32>) -> Result<Vec<f32>, FfiError> {
-        let mut det = self.lock_inner()?;
-        det.process_window(&window).map_err(|e| FfiError::Backend {
+        let mut det = self.lock_inner();
+        let scores = det.process_window(&window).map_err(|e| FfiError::Backend {
             detail: e.to_string(),
-        })
+        })?;
+        Ok(scores.to_vec())
     }
 }
 
@@ -3399,12 +3396,8 @@ pub struct FfiHotwordIterator {
 }
 
 impl FfiHotwordIterator {
-    fn lock_inner(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, cera::hotword::HotwordIterator>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
-            detail: format!("Hotword iterator mutex poisoned: {e}"),
-        })
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, cera::hotword::HotwordIterator> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -3438,14 +3431,14 @@ impl FfiHotwordIterator {
 
     /// Reset iterator state, ring buffer, and debounce timers.
     pub fn reset(&self) -> Result<(), FfiError> {
-        let mut it = self.lock_inner()?;
+        let mut it = self.lock_inner();
         it.reset();
         Ok(())
     }
 
     /// Process a streaming audio chunk and return a detection event if triggered.
     pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Option<FfiHotwordEvent>, FfiError> {
-        let mut it = self.lock_inner()?;
+        let mut it = self.lock_inner();
         let ev = it.process_chunk(&chunk).map_err(|e| FfiError::Backend {
             detail: e.to_string(),
         })?;

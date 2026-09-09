@@ -82,7 +82,7 @@ fn test_hotword_oracle_parity() -> Result<()> {
     let num_frames = detector.front_end().num_frames(synthetic_audio.len());
     let mut mel_extracted = vec![0.0f32; fixture.mel_bins * num_frames];
     detector
-        .front_end()
+        .front_end_mut()
         .extract(&synthetic_audio, &mut mel_extracted);
 
     for (m, row) in fixture.mel_slice.iter().enumerate() {

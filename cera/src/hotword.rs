@@ -100,6 +100,7 @@ pub struct LogMelFrontEnd {
     fft: Arc<dyn rustfft::Fft<f32>>,
     hann_window: Vec<f32>,
     mel_filterbank: Vec<f32>,
+    fft_scratch: Vec<Complex32>,
     sample_rate: usize,
     window_samples: usize,
     hop_samples: usize,
@@ -115,13 +116,15 @@ impl LogMelFrontEnd {
         hop_samples: usize,
         fft_size: usize,
         mel_bins: usize,
-    ) -> Self {
-        assert!(mel_bins > 0, "mel_bins must be > 0");
-        assert!(fft_size > 0, "fft_size must be > 0");
-        assert!(
+    ) -> Result<Self> {
+        ensure!(mel_bins > 0, "mel_bins must be > 0");
+        ensure!(fft_size > 0, "fft_size must be > 0");
+        ensure!(
             window_samples <= fft_size,
             "window_samples must be <= fft_size"
         );
+        ensure!(hop_samples > 0, "hop_samples must be > 0");
+        ensure!(sample_rate > 0, "sample_rate must be > 0");
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(fft_size);
@@ -170,16 +173,17 @@ impl LogMelFrontEnd {
             }
         }
 
-        Self {
+        Ok(Self {
             fft,
             hann_window,
             mel_filterbank,
+            fft_scratch: vec![Complex32::new(0.0, 0.0); fft_size],
             sample_rate,
             window_samples,
             hop_samples,
             fft_size,
             mel_bins,
-        }
+        })
     }
 
     /// Expected audio sample rate in Hz.
@@ -197,31 +201,31 @@ impl LogMelFrontEnd {
     }
 
     /// Extract log-mel frames into a flat buffer of shape `[mel_bins, num_frames]`.
-    pub fn extract(&self, audio: &[f32], output: &mut [f32]) {
+    pub fn extract(&mut self, audio: &[f32], output: &mut [f32]) {
         let num_frames = self.num_frames(audio.len());
-        assert!(
-            output.len() >= self.mel_bins * num_frames,
-            "output buffer too small for extracted mel frames"
-        );
+        if output.len() < self.mel_bins * num_frames {
+            debug_assert!(false, "output buffer too small for extracted mel frames");
+            return;
+        }
 
         let n_fft_bins = self.fft_size / 2 + 1;
-        let mut fft_buf = vec![Complex32::new(0.0, 0.0); self.fft_size];
 
         for i in 0..num_frames {
             let start = i * self.hop_samples;
             for j in 0..self.window_samples {
-                fft_buf[j] = Complex32::new(audio[start + j] * self.hann_window[j], 0.0);
+                self.fft_scratch[j] = Complex32::new(audio[start + j] * self.hann_window[j], 0.0);
             }
-            fft_buf[self.window_samples..self.fft_size].fill(Complex32::new(0.0, 0.0));
+            self.fft_scratch[self.window_samples..self.fft_size].fill(Complex32::new(0.0, 0.0));
 
-            self.fft.process(&mut fft_buf);
+            self.fft.process(&mut self.fft_scratch);
 
             for m in 0..self.mel_bins {
                 let filter_row = &self.mel_filterbank[m * n_fft_bins..(m + 1) * n_fft_bins];
                 let mut energy = 0.0f32;
-                for k in 0..n_fft_bins {
-                    let power = fft_buf[k].norm_sqr();
-                    energy += filter_row[k] * power;
+                for (&filter_coeff, complex) in
+                    filter_row.iter().zip(&self.fft_scratch[..n_fft_bins])
+                {
+                    energy += filter_coeff * complex.norm_sqr();
                 }
                 output[m * num_frames + i] = (1.0 + energy.max(0.0)).ln();
             }
@@ -287,10 +291,8 @@ impl HotwordWeights {
 
         let keywords: Vec<String> = gguf
             .get_string_array("kws.keywords")
-            .unwrap_or_else(|| vec!["Hey Liquid"])
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
+            .map(|arr| arr.into_iter().map(ToString::to_string).collect())
+            .unwrap_or_else(|| vec!["Hey Liquid".to_string()]);
         ensure!(
             !keywords.is_empty(),
             "model must define at least one keyword"
@@ -307,6 +309,23 @@ impl HotwordWeights {
         let default_threshold = gguf.get_f32("kws.default_threshold").unwrap_or(0.75);
         let cooldown_ms = gguf.get_u32("kws.cooldown_ms").unwrap_or(2000) as usize;
         let pre_roll_ms = gguf.get_u32("kws.pre_roll_ms").unwrap_or(150) as usize;
+
+        ensure!(sample_rate > 0, "kws.sample_rate must be > 0");
+        ensure!(window_samples > 0, "kws.window_samples must be > 0");
+        ensure!(hop_samples > 0, "kws.hop_samples must be > 0");
+        ensure!(mel_bins > 0, "kws.mel_bins must be > 0");
+        ensure!(mel_window_samples > 0, "kws.mel_window_samples must be > 0");
+        ensure!(mel_hop_samples > 0, "kws.mel_hop_samples must be > 0");
+        ensure!(fft_size > 0, "kws.fft_size must be > 0");
+        ensure!(
+            mel_window_samples <= fft_size,
+            "kws.mel_window_samples must be <= kws.fft_size"
+        );
+        ensure!(
+            window_samples >= mel_window_samples,
+            "kws.window_samples must be >= kws.mel_window_samples"
+        );
+        ensure!(embedding_dim > 0, "kws.embedding_dim must be > 0");
 
         let num_keywords = keywords.len();
 
@@ -367,26 +386,41 @@ fn conv1d_silu_s2(
     weights: &[f32],
     bias: &[f32],
 ) {
-    let out_len = (in_len - 1) / 2 + 1;
-    debug_assert_eq!(output.len(), out_channels * out_len);
-    debug_assert_eq!(weights.len(), out_channels * in_channels * 3);
-    debug_assert_eq!(bias.len(), out_channels);
+    let out_len = (in_len.saturating_sub(1)) / 2 + 1;
+    if in_len == 0
+        || input.len() < in_channels * in_len
+        || output.len() < out_channels * out_len
+        || weights.len() < out_channels * in_channels * 3
+        || bias.len() < out_channels
+    {
+        debug_assert!(false, "buffer dimension mismatch in conv1d_silu_s2");
+        return;
+    }
 
     for (out_c, &b) in bias.iter().enumerate().take(out_channels) {
         let w_out = &weights[out_c * in_channels * 3..(out_c + 1) * in_channels * 3];
-        for out_idx in 0..out_len {
-            let mut acc = b;
-            for k in 0..3 {
-                let in_pos = out_idx * 2 + k;
-                if in_pos > 0 && in_pos <= in_len {
-                    let in_offset = in_pos - 1;
-                    for in_c in 0..in_channels {
-                        let sample = input[in_c * in_len + in_offset];
-                        acc += w_out[in_c * 3 + k] * sample;
+        let out_row_start = out_c * out_len;
+        let out_row = &mut output[out_row_start..out_row_start + out_len];
+        out_row.fill(b);
+
+        for in_c in 0..in_channels {
+            let w_c = &w_out[in_c * 3..(in_c + 1) * 3];
+            let in_row = &input[in_c * in_len..(in_c + 1) * in_len];
+
+            for (out_idx, out_val) in out_row.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for (k, &w) in w_c.iter().enumerate() {
+                    let in_pos = out_idx * 2 + k;
+                    if in_pos > 0 && in_pos <= in_len {
+                        acc += w * in_row[in_pos - 1];
                     }
                 }
+                *out_val += acc;
             }
-            output[out_c * out_len + out_idx] = silu(acc);
+        }
+
+        for val in out_row.iter_mut() {
+            *val = silu(*val);
         }
     }
 }
@@ -404,6 +438,7 @@ pub struct HotwordDetector {
     conv3_scratch: Vec<f32>,
     emb_scratch: Vec<f32>,
     dense1_scratch: [f32; 32],
+    scores_scratch: Vec<f32>,
 }
 
 impl HotwordDetector {
@@ -429,13 +464,19 @@ impl HotwordDetector {
             weights.mel_hop_samples,
             weights.fft_size,
             weights.mel_bins,
-        );
+        )?;
 
         let num_frames = front_end.num_frames(weights.window_samples);
+        ensure!(
+            num_frames > 0,
+            "window_samples {} too short for mel extraction",
+            weights.window_samples
+        );
         let l0 = (num_frames - 1) / 2 + 1;
         let l1 = (l0 - 1) / 2 + 1;
         let l2 = (l1 - 1) / 2 + 1;
         let l3 = (l2 - 1) / 2 + 1;
+        ensure!(l3 > 0, "downsampled temporal dimension l3 must be > 0");
 
         let mel_scratch = vec![0.0f32; weights.mel_bins * num_frames];
         let conv0_scratch = vec![0.0f32; 64 * l0];
@@ -443,6 +484,7 @@ impl HotwordDetector {
         let conv2_scratch = vec![0.0f32; 64 * l2];
         let conv3_scratch = vec![0.0f32; weights.embedding_dim * l3];
         let emb_scratch = vec![0.0f32; weights.embedding_dim];
+        let num_keywords = weights.keywords.len();
 
         Ok(Self {
             weights,
@@ -454,6 +496,7 @@ impl HotwordDetector {
             conv3_scratch,
             emb_scratch,
             dense1_scratch: [0.0f32; 32],
+            scores_scratch: Vec::with_capacity(num_keywords),
         })
     }
 
@@ -465,6 +508,11 @@ impl HotwordDetector {
     /// Access the underlying acoustic log-mel front-end.
     pub fn front_end(&self) -> &LogMelFrontEnd {
         &self.front_end
+    }
+
+    /// Access the underlying acoustic log-mel front-end mutably.
+    pub fn front_end_mut(&mut self) -> &mut LogMelFrontEnd {
+        &mut self.front_end
     }
 
     /// Get default configuration suggested by model metadata.
@@ -480,7 +528,7 @@ impl HotwordDetector {
     }
 
     /// Process a full audio window and return probability scores for each keyword.
-    pub fn process_window(&mut self, window: &[f32]) -> Result<Vec<f32>> {
+    pub fn process_window(&mut self, window: &[f32]) -> Result<&[f32]> {
         ensure!(
             window.len() == self.weights.window_samples,
             "expected window of {} samples, got {}",
@@ -562,7 +610,7 @@ impl HotwordDetector {
         let num_keywords = self.weights.keywords.len();
         let d2_w = self.weights.dense2_w.as_f32_slice();
         let d2_b = self.weights.dense2_b.as_f32_slice();
-        let mut scores = Vec::with_capacity(num_keywords);
+        self.scores_scratch.clear();
 
         for k in 0..num_keywords {
             let mut acc = d2_b[k];
@@ -570,10 +618,10 @@ impl HotwordDetector {
             for (&w, &h) in row.iter().zip(&self.dense1_scratch) {
                 acc += w * h;
             }
-            scores.push(sigmoid(acc));
+            self.scores_scratch.push(sigmoid(acc));
         }
 
-        Ok(scores)
+        Ok(&self.scores_scratch)
     }
 }
 
@@ -597,11 +645,23 @@ impl CircularBuffer {
     }
 
     fn push_slice(&mut self, slice: &[f32]) {
-        for &s in slice {
-            self.buffer[self.write_pos] = if s.is_finite() { s } else { 0.0 };
-            self.write_pos = (self.write_pos + 1) % self.capacity;
-            self.count = (self.count + 1).min(self.capacity);
+        let mut remain = slice;
+        while !remain.is_empty() {
+            let space = self.capacity - self.write_pos;
+            let take = remain.len().min(space);
+            let (head, tail) = remain.split_at(take);
+
+            for (dst, &src) in self.buffer[self.write_pos..self.write_pos + take]
+                .iter_mut()
+                .zip(head)
+            {
+                *dst = if src.is_finite() { src } else { 0.0 };
+            }
+
+            self.write_pos = (self.write_pos + take) % self.capacity;
+            remain = tail;
         }
+        self.count = (self.count + slice.len()).min(self.capacity);
     }
 
     fn read_last(&self, n: usize, out: &mut [f32]) -> bool {
@@ -629,12 +689,16 @@ impl CircularBuffer {
 
 // ── Stateful Streaming Hotword Iterator ───────────────────────────────────────
 
+const VAD_FRAME_SIZE: usize = 512;
+
 /// Streaming Keyword Spotting manager with VAD gating and debounce state.
 pub struct HotwordIterator {
     detector: HotwordDetector,
     vad: Option<SileroVad>,
     ring_buffer: CircularBuffer,
     window_buffer: Vec<f32>,
+    vad_buffer: Vec<f32>,
+    vad_processed_samples: u64,
     config: HotwordConfig,
 
     current_sample: u64,
@@ -652,6 +716,8 @@ impl HotwordIterator {
         Self {
             ring_buffer: CircularBuffer::new(ring_capacity),
             window_buffer: vec![0.0f32; window_samples],
+            vad_buffer: Vec::with_capacity(1024),
+            vad_processed_samples: 0,
             detector,
             vad,
             config,
@@ -666,6 +732,8 @@ impl HotwordIterator {
     pub fn reset(&mut self) {
         self.ring_buffer.reset();
         self.window_buffer.fill(0.0);
+        self.vad_buffer.clear();
+        self.vad_processed_samples = 0;
         if let Some(vad) = &mut self.vad {
             vad.reset();
         }
@@ -681,84 +749,104 @@ impl HotwordIterator {
             return Ok(None);
         }
 
-        self.ring_buffer.push_slice(chunk);
-        self.current_sample += chunk.len() as u64;
+        let hop_samples = self.detector.weights.hop_samples as u64;
+        let mut remain = chunk;
+        let mut detected_event = None;
 
-        // 1. Step Silero VAD if attached (512-sample increments)
-        if let Some(vad) = &mut self.vad {
-            let vad_frame_size = 512;
-            if chunk.len() >= vad_frame_size {
-                for vad_chunk in chunk.chunks_exact(vad_frame_size) {
-                    let prob =
-                        vad.process_chunk(vad_chunk, crate::vad::VadSampleRate::Rate16kHz)?;
+        while !remain.is_empty() {
+            let samples_since_last_eval = self.current_sample.saturating_sub(self.last_eval_sample);
+            let needed_for_hop = if samples_since_last_eval >= hop_samples {
+                hop_samples
+            } else {
+                hop_samples - samples_since_last_eval
+            };
+            let take_len = (remain.len() as u64).min(needed_for_hop) as usize;
+
+            let (sub_chunk, rest) = remain.split_at(take_len);
+            remain = rest;
+
+            self.ring_buffer.push_slice(sub_chunk);
+            self.current_sample += sub_chunk.len() as u64;
+
+            // 1. Step Silero VAD if attached (VAD_FRAME_SIZE increments)
+            if let Some(vad) = &mut self.vad {
+                self.vad_buffer.extend_from_slice(sub_chunk);
+                while self.vad_buffer.len() >= VAD_FRAME_SIZE {
+                    let prob = vad.process_chunk(
+                        &self.vad_buffer[..VAD_FRAME_SIZE],
+                        crate::vad::VadSampleRate::Rate16kHz,
+                    )?;
+                    self.vad_processed_samples += VAD_FRAME_SIZE as u64;
                     if prob >= self.config.vad_threshold {
-                        self.last_vad_speech_sample = self.current_sample;
+                        self.last_vad_speech_sample = self.vad_processed_samples;
                     }
-                }
-            } else if self.current_sample.is_multiple_of(512) {
-                let mut vad_buf = [0.0f32; 512];
-                if self.ring_buffer.read_last(512, &mut vad_buf) {
-                    let prob = vad.process_chunk(&vad_buf, crate::vad::VadSampleRate::Rate16kHz)?;
-                    if prob >= self.config.vad_threshold {
-                        self.last_vad_speech_sample = self.current_sample;
-                    }
+                    self.vad_buffer.drain(..VAD_FRAME_SIZE);
                 }
             }
-        }
 
-        // 2. Evaluate KWS if hop interval has elapsed
-        let hop_samples = self.detector.weights.hop_samples as u64;
-        if self.current_sample.saturating_sub(self.last_eval_sample) < hop_samples {
-            return Ok(None);
-        }
-        self.last_eval_sample = self.current_sample;
+            // 2. Evaluate KWS if hop interval has elapsed
+            if self.current_sample.saturating_sub(self.last_eval_sample) < hop_samples {
+                continue;
+            }
+            self.last_eval_sample = self.current_sample;
 
-        // Gating: if VAD is active and reported no speech within the window, skip KWS
-        let window_samples = self.detector.weights.window_samples as u64;
-        if self.vad.is_some()
-            && self
-                .current_sample
-                .saturating_sub(self.last_vad_speech_sample)
-                > window_samples
-        {
-            return Ok(None);
-        }
+            // Gating: if VAD is active and reported no speech within the window, skip KWS
+            let window_samples = self.detector.weights.window_samples as u64;
+            if self.vad.is_some()
+                && self
+                    .vad_processed_samples
+                    .saturating_sub(self.last_vad_speech_sample)
+                    > window_samples
+            {
+                continue;
+            }
 
-        // 3. Extract 1200 ms audio window from ring buffer
-        if !self.ring_buffer.read_last(
-            self.detector.weights.window_samples,
-            &mut self.window_buffer,
-        ) {
-            return Ok(None);
-        }
+            // 3. Extract 1200 ms audio window from ring buffer
+            if !self.ring_buffer.read_last(
+                self.detector.weights.window_samples,
+                &mut self.window_buffer,
+            ) {
+                continue;
+            }
 
-        // 4. Run KWS inference
-        let scores = self.detector.process_window(&self.window_buffer)?;
+            // 4. Run KWS inference
+            let scores = self.detector.process_window(&self.window_buffer)?;
 
-        // 5. Threshold & Debounce checks
-        let sample_rate = self.detector.weights.sample_rate as u64;
-        let cooldown_samples = (self.config.cooldown_ms as u64 * sample_rate) / 1000;
-        let pre_roll_samples = (self.config.pre_roll_ms as u64 * sample_rate) / 1000;
+            // 5. Threshold & Debounce checks
+            let triggered = if self.current_sample >= self.cooldown_until_sample {
+                scores
+                    .iter()
+                    .enumerate()
+                    .find(|&(_, score)| *score >= self.config.threshold)
+                    .map(|(idx, &score)| (idx, score))
+            } else {
+                None
+            };
 
-        for (idx, &score) in scores.iter().enumerate() {
-            if score >= self.config.threshold && self.current_sample >= self.cooldown_until_sample {
+            if let Some((idx, score)) = triggered {
+                let sample_rate = self.detector.weights.sample_rate as u64;
+                let cooldown_samples = (self.config.cooldown_ms as u64 * sample_rate) / 1000;
+                let pre_roll_samples = (self.config.pre_roll_ms as u64 * sample_rate) / 1000;
+
                 self.cooldown_until_sample = self.current_sample + cooldown_samples;
                 let keyword = self.detector.weights.keywords[idx].clone();
                 let sample_offset = self.current_sample;
                 let command_start_sample = sample_offset.saturating_sub(pre_roll_samples);
                 let timestamp_ms = (sample_offset as f64 * 1000.0 / sample_rate as f64) as f32;
 
-                return Ok(Some(HotwordEvent {
-                    keyword,
-                    sample_offset,
-                    command_start_sample,
-                    timestamp_ms,
-                    confidence: score,
-                }));
+                if detected_event.is_none() {
+                    detected_event = Some(HotwordEvent {
+                        keyword,
+                        sample_offset,
+                        command_start_sample,
+                        timestamp_ms,
+                        confidence: score,
+                    });
+                }
             }
         }
 
-        Ok(None)
+        Ok(detected_event)
     }
 }
 
@@ -787,8 +875,8 @@ mod tests {
     }
 
     #[test]
-    fn test_log_mel_front_end_dimensions() {
-        let front_end = LogMelFrontEnd::new(16000, 400, 160, 512, 32);
+    fn test_log_mel_front_end_dimensions() -> Result<()> {
+        let mut front_end = LogMelFrontEnd::new(16000, 400, 160, 512, 32)?;
         let num_frames = front_end.num_frames(19200);
         assert_eq!(num_frames, 118);
 
@@ -798,5 +886,14 @@ mod tests {
 
         assert_eq!(mel.len(), 32 * 118);
         assert!(mel.iter().all(|&v| v == 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_chunk_handling() -> Result<()> {
+        let mut cb = CircularBuffer::new(10);
+        cb.push_slice(&[]);
+        assert_eq!(cb.count, 0);
+        Ok(())
     }
 }

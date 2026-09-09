@@ -79,3 +79,44 @@ fn test_ffi_hotword_detector_and_iterator() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_ffi_hotword_large_chunk_processing() -> Result<()> {
+    let Some(model_path) = find_hotword_model() else {
+        return Ok(());
+    };
+    let model_str = model_path.to_str().unwrap().to_string();
+
+    let custom_config = FfiHotwordConfig {
+        threshold: 0.40,
+        cooldown_ms: 2000,
+        step_ms: 80,
+        window_ms: 1200,
+        pre_roll_ms: 150,
+        vad_threshold: 0.5,
+    };
+
+    let iterator = FfiHotwordIterator::from_files(model_str, None, Some(custom_config))?;
+
+    // Synthesize 3 seconds (48,000 samples)
+    let mut synthetic_audio = vec![0.0f32; 48000];
+    for (i, sample) in synthetic_audio.iter_mut().enumerate() {
+        let t = i as f64 / 16000.0;
+        let s = 0.3 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+            + 0.2 * (2.0 * std::f64::consts::PI * 880.0 * t).sin()
+            + 0.1 * (2.0 * std::f64::consts::PI * 1760.0 * t).sin();
+        *sample = s as f32;
+    }
+
+    // Pass the entire 48,000 samples in a single call
+    let event = iterator.process_chunk(synthetic_audio)?;
+    assert!(
+        event.is_some(),
+        "expected detection from large single-chunk call"
+    );
+    let event = event.unwrap();
+    assert_eq!(event.keyword, "Hey Liquid");
+    assert!(event.confidence >= 0.40);
+
+    Ok(())
+}
