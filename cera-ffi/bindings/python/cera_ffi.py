@@ -485,6 +485,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360:
@@ -568,6 +570,22 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 53986:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 45182:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 6598:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -950,6 +968,26 @@ _UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_ffisilerovad.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1069,6 +1107,10 @@ _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_list_leap_bundles.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1309,6 +1351,50 @@ _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes =
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_default_config.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_default_config.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_keywords.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_keywords.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_process_window.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_process_window.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_reset.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_reset.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1578,6 +1664,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_u
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.restype = ctypes.c_uint16
@@ -1704,6 +1793,30 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.res
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.restype = ctypes.c_uint16
@@ -3120,6 +3233,165 @@ class _UniffiFfiConverterTypeFfiEntitySpan(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.start_token, buf)
         _UniffiFfiConverterUInt64.write(value.end_token, buf)
         _UniffiFfiConverterString.write(value.text, buf)
+        _UniffiFfiConverterFloat32.write(value.score, buf)
+
+@dataclass
+class FfiHotwordConfig:
+    """
+    Configuration options for keyword spotting.
+"""
+    def __init__(self, *, threshold:float, cooldown_ms:int, step_ms:int, window_ms:int, pre_roll_ms:int, vad_threshold:float):
+        self.threshold = threshold
+        self.cooldown_ms = cooldown_ms
+        self.step_ms = step_ms
+        self.window_ms = window_ms
+        self.pre_roll_ms = pre_roll_ms
+        self.vad_threshold = vad_threshold
+        
+        
+
+    
+    def __str__(self):
+        return "FfiHotwordConfig(threshold={}, cooldown_ms={}, step_ms={}, window_ms={}, pre_roll_ms={}, vad_threshold={})".format(self.threshold, self.cooldown_ms, self.step_ms, self.window_ms, self.pre_roll_ms, self.vad_threshold)
+    def __eq__(self, other):
+        if self.threshold != other.threshold:
+            return False
+        if self.cooldown_ms != other.cooldown_ms:
+            return False
+        if self.step_ms != other.step_ms:
+            return False
+        if self.window_ms != other.window_ms:
+            return False
+        if self.pre_roll_ms != other.pre_roll_ms:
+            return False
+        if self.vad_threshold != other.vad_threshold:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiHotwordConfig(
+            threshold=_UniffiFfiConverterFloat32.read(buf),
+            cooldown_ms=_UniffiFfiConverterUInt32.read(buf),
+            step_ms=_UniffiFfiConverterUInt32.read(buf),
+            window_ms=_UniffiFfiConverterUInt32.read(buf),
+            pre_roll_ms=_UniffiFfiConverterUInt32.read(buf),
+            vad_threshold=_UniffiFfiConverterFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterFloat32.check_lower(value.threshold)
+        _UniffiFfiConverterUInt32.check_lower(value.cooldown_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.step_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.window_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.pre_roll_ms)
+        _UniffiFfiConverterFloat32.check_lower(value.vad_threshold)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterFloat32.write(value.threshold, buf)
+        _UniffiFfiConverterUInt32.write(value.cooldown_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.step_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.window_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.pre_roll_ms, buf)
+        _UniffiFfiConverterFloat32.write(value.vad_threshold, buf)
+
+@dataclass
+class FfiHotwordEvent:
+    """
+    Event emitted when a keyword spotting threshold is crossed.
+"""
+    def __init__(self, *, keyword:str, sample_offset:int, command_start_sample:int, timestamp_ms:float, confidence:float):
+        self.keyword = keyword
+        self.sample_offset = sample_offset
+        self.command_start_sample = command_start_sample
+        self.timestamp_ms = timestamp_ms
+        self.confidence = confidence
+        
+        
+
+    
+    def __str__(self):
+        return "FfiHotwordEvent(keyword={}, sample_offset={}, command_start_sample={}, timestamp_ms={}, confidence={})".format(self.keyword, self.sample_offset, self.command_start_sample, self.timestamp_ms, self.confidence)
+    def __eq__(self, other):
+        if self.keyword != other.keyword:
+            return False
+        if self.sample_offset != other.sample_offset:
+            return False
+        if self.command_start_sample != other.command_start_sample:
+            return False
+        if self.timestamp_ms != other.timestamp_ms:
+            return False
+        if self.confidence != other.confidence:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiHotwordEvent(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiHotwordEvent(
+            keyword=_UniffiFfiConverterString.read(buf),
+            sample_offset=_UniffiFfiConverterUInt64.read(buf),
+            command_start_sample=_UniffiFfiConverterUInt64.read(buf),
+            timestamp_ms=_UniffiFfiConverterFloat32.read(buf),
+            confidence=_UniffiFfiConverterFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.keyword)
+        _UniffiFfiConverterUInt64.check_lower(value.sample_offset)
+        _UniffiFfiConverterUInt64.check_lower(value.command_start_sample)
+        _UniffiFfiConverterFloat32.check_lower(value.timestamp_ms)
+        _UniffiFfiConverterFloat32.check_lower(value.confidence)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.keyword, buf)
+        _UniffiFfiConverterUInt64.write(value.sample_offset, buf)
+        _UniffiFfiConverterUInt64.write(value.command_start_sample, buf)
+        _UniffiFfiConverterFloat32.write(value.timestamp_ms, buf)
+        _UniffiFfiConverterFloat32.write(value.confidence, buf)
+
+@dataclass
+class FfiHotwordScore:
+    """
+    Confidence score for a specific keyword candidate.
+"""
+    def __init__(self, *, keyword:str, score:float):
+        self.keyword = keyword
+        self.score = score
+        
+        
+
+    
+    def __str__(self):
+        return "FfiHotwordScore(keyword={}, score={})".format(self.keyword, self.score)
+    def __eq__(self, other):
+        if self.keyword != other.keyword:
+            return False
+        if self.score != other.score:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiHotwordScore(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiHotwordScore(
+            keyword=_UniffiFfiConverterString.read(buf),
+            score=_UniffiFfiConverterFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.keyword)
+        _UniffiFfiConverterFloat32.check_lower(value.score)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.keyword, buf)
         _UniffiFfiConverterFloat32.write(value.score, buf)
 
 @dataclass
@@ -7710,6 +7982,325 @@ class _UniffiFfiConverterTypeDownloadProgressSink:
     def write(cls, value: DownloadProgressSink, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
+
+class FfiHotwordDetectorProtocol(typing.Protocol):
+    """
+    Stateful Keyword Spotting detector executing pure-Rust forward inference.
+"""
+    
+    def default_config(self, ) -> FfiHotwordConfig:
+        """
+        Get default configuration suggested by model metadata.
+"""
+        raise NotImplementedError
+    def keywords(self, ) -> typing.List[str]:
+        """
+        List of target keywords supported by this model.
+"""
+        raise NotImplementedError
+    def process_window(self, window: typing.List[float]) -> typing.List[float]:
+        """
+        Process a full audio window and return probability scores for each keyword.
+"""
+        raise NotImplementedError
+
+class FfiHotwordDetector(FfiHotwordDetectorProtocol):
+    """
+    Stateful Keyword Spotting detector executing pure-Rust forward inference.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_bytes(cls, bytes: bytes) -> FfiHotwordDetector:
+        """
+        Load a KWS model from in-memory GGUF bytes.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(bytes)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterBytes.lower(bytes),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiHotwordDetector.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_file(cls, path: str) -> FfiHotwordDetector:
+        """
+        Load a KWS model from a `.gguf` file path.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiHotwordDetector.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def default_config(self, ) -> FfiHotwordConfig:
+        """
+        Get default configuration suggested by model metadata.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiHotwordConfig.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_default_config,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def keywords(self, ) -> typing.List[str]:
+        """
+        List of target keywords supported by this model.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_keywords,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def process_window(self, window: typing.List[float]) -> typing.List[float]:
+        """
+        Process a full audio window and return probability scores for each keyword.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(window)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(window),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceFloat32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_process_window,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeFfiHotwordDetector:
+    @staticmethod
+    def lift(value: int) -> FfiHotwordDetector:
+        return FfiHotwordDetector._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: FfiHotwordDetector):
+        if not isinstance(value, FfiHotwordDetector):
+            raise TypeError("Expected FfiHotwordDetector instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: FfiHotwordDetector) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> FfiHotwordDetector:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: FfiHotwordDetector, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+class _UniffiFfiConverterOptionalTypeFfiHotwordEvent(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiHotwordEvent.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiHotwordEvent.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiHotwordEvent.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+class FfiHotwordIteratorProtocol(typing.Protocol):
+    """
+    Streaming Keyword Spotting manager with VAD gating and debounce state.
+"""
+    
+    def process_chunk(self, chunk: typing.List[float]) -> typing.Optional[FfiHotwordEvent]:
+        """
+        Process a streaming audio chunk and return a detection event if triggered.
+"""
+        raise NotImplementedError
+    def reset(self, ) -> None:
+        """
+        Reset iterator state, ring buffer, and debounce timers.
+"""
+        raise NotImplementedError
+
+class FfiHotwordIterator(FfiHotwordIteratorProtocol):
+    """
+    Streaming Keyword Spotting manager with VAD gating and debounce state.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_files(cls, model_path: str,vad_model_path: typing.Optional[str],config: typing.Optional[FfiHotwordConfig]) -> FfiHotwordIterator:
+        """
+        Load and construct a streaming hotword iterator from file paths.
+"""
+        
+        _UniffiFfiConverterString.check_lower(model_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(vad_model_path)
+
+        _UniffiFfiConverterOptionalTypeFfiHotwordConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(model_path),
+            _UniffiFfiConverterOptionalString.lower(vad_model_path),
+            _UniffiFfiConverterOptionalTypeFfiHotwordConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiHotwordIterator.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def process_chunk(self, chunk: typing.List[float]) -> typing.Optional[FfiHotwordEvent]:
+        """
+        Process a streaming audio chunk and return a detection event if triggered.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(chunk)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(chunk),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalTypeFfiHotwordEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def reset(self, ) -> None:
+        """
+        Reset iterator state, ring buffer, and debounce timers.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeFfiHotwordIterator:
+    @staticmethod
+    def lift(value: int) -> FfiHotwordIterator:
+        return FfiHotwordIterator._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: FfiHotwordIterator):
+        if not isinstance(value, FfiHotwordIterator):
+            raise TypeError("Expected FfiHotwordIterator instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: FfiHotwordIterator) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> FfiHotwordIterator:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: FfiHotwordIterator, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
 class _UniffiFfiConverterOptionalTypeFfiVadConfig(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8321,6 +8912,31 @@ class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiHotwordConfig.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiHotwordConfig.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiHotwordConfig.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8394,6 +9010,20 @@ def detect_tool_format(architecture: str) -> typing.Optional[ToolFormat]:
     _uniffi_ffi_result = _uniffi_rust_call_with_error(
         _uniffi_error_converter,
         _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def hotword_default_config() -> FfiHotwordConfig:
+    """
+    Default KWS configuration parameters.
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeFfiHotwordConfig.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config,
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
@@ -8528,6 +9158,9 @@ __all__ = [
     "ChatMessage",
     "EngineConfig",
     "FfiEntitySpan",
+    "FfiHotwordConfig",
+    "FfiHotwordEvent",
+    "FfiHotwordScore",
     "FfiSpeechTimestamp",
     "FfiVadConfig",
     "SpecDecodeConfig",
@@ -8544,6 +9177,7 @@ __all__ = [
     "cera_ffi_version",
     "cpu_backend_report",
     "detect_tool_format",
+    "hotword_default_config",
     "list_leap_bundles",
     "list_leap_bundles_async",
     "parse_tool_calls",
@@ -8561,6 +9195,10 @@ __all__ = [
     "CeraEngineProtocol",
     "DownloadProgressSinkImpl",
     "DownloadProgressSink",
+    "FfiHotwordDetector",
+    "FfiHotwordDetectorProtocol",
+    "FfiHotwordIterator",
+    "FfiHotwordIteratorProtocol",
     "FfiSileroVad",
     "FfiSileroVadProtocol",
     "FfiVadIterator",
