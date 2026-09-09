@@ -443,15 +443,23 @@ pub struct HotwordDetector {
 
 impl HotwordDetector {
     /// Load a detector from a GGUF file path using memory mapping.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let gguf = GgufFile::open(path.as_ref())?;
         Self::from_gguf(&gguf)
     }
 
+    /// Load a detector from a GGUF file path without memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("read hotword model {:?}", path.as_ref()))?;
+        Self::from_bytes(bytes)
+    }
+
     /// Load a detector from in-memory GGUF bytes.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        let gguf = GgufFile::from_bytes(Arc::from(bytes.into_boxed_slice()))?;
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let gguf = GgufFile::from_bytes(bytes.into())?;
         Self::from_gguf(&gguf)
     }
 
