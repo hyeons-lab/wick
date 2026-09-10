@@ -644,6 +644,46 @@ RustBuffer uniffi_cera_ffi_fn_method_ffivaditerator_process_chunk(uint64_t ptr, 
 void uniffi_cera_ffi_fn_method_ffivaditerator_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFIWHISPERMODEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFIWHISPERMODEL
+uint64_t uniffi_cera_ffi_fn_clone_ffiwhispermodel(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFIWHISPERMODEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFIWHISPERMODEL
+void uniffi_cera_ffi_fn_free_ffiwhispermodel(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIWHISPERMODEL_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIWHISPERMODEL_FROM_BYTES
+uint64_t uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes(RustBuffer bytes, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIWHISPERMODEL_FROM_FILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIWHISPERMODEL_FROM_FILE
+uint64_t uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_IS_MULTILINGUAL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_IS_MULTILINGUAL
+int8_t uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_LANGUAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_LANGUAGES
+RustBuffer uniffi_cera_ffi_fn_method_ffiwhispermodel_languages(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_TRANSCRIBE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_TRANSCRIBE
+RustBuffer uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe(uint64_t ptr, RustBuffer pcm, RustBuffer opts, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_TRANSCRIBE_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIWHISPERMODEL_TRANSCRIBE_ASYNC
+uint64_t uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async(uint64_t ptr, RustBuffer pcm, RustBuffer opts
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
 uint64_t uniffi_cera_ffi_fn_clone_loraadapters(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -913,6 +953,12 @@ RustBuffer uniffi_cera_ffi_fn_func_silero_vad_default_config(RustCallStatus *_No
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_TOOL_GRAMMAR
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_TOOL_GRAMMAR
 RustBuffer uniffi_cera_ffi_fn_func_tool_grammar(RustBuffer tools, RustBuffer format, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_WHISPER_DEFAULT_TRANSCRIBE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_WHISPER_DEFAULT_TRANSCRIBE_OPTS
+RustBuffer uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(RustCallStatus *_Nonnull out_status
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
@@ -1229,6 +1275,12 @@ uint16_t uniffi_cera_ffi_checksum_func_tool_grammar(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_WHISPER_DEFAULT_TRANSCRIBE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_WHISPER_DEFAULT_TRANSCRIBE_OPTS
+uint16_t uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(void
@@ -1454,6 +1506,30 @@ uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_RESET
 uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_IS_MULTILINGUAL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_IS_MULTILINGUAL
+uint16_t uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_LANGUAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_LANGUAGES
+uint16_t uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_TRANSCRIBE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_TRANSCRIBE
+uint16_t uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_TRANSCRIBE_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIWHISPERMODEL_TRANSCRIBE_ASYNC
+uint16_t uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async(void
     
 );
 #endif
@@ -1736,6 +1812,18 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIVADITERATOR_NEW
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIVADITERATOR_NEW
 uint16_t uniffi_cera_ffi_checksum_constructor_ffivaditerator_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIWHISPERMODEL_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIWHISPERMODEL_FROM_BYTES
+uint16_t uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIWHISPERMODEL_FROM_FILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIWHISPERMODEL_FROM_FILE
+uint16_t uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file(void
     
 );
 #endif

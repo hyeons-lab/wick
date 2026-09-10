@@ -2727,6 +2727,215 @@ public func FfiConverterTypeFfiVadIterator_lower(_ value: FfiVadIterator) -> UIn
 
 
 /**
+ * Standalone pure-Rust OpenAI Whisper speech recognition engine.
+ */
+public protocol FfiWhisperModelProtocol: AnyObject, Sendable {
+    
+    /**
+     * Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+     */
+    func isMultilingual()  -> Bool
+    
+    /**
+     * List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+     */
+    func languages()  -> [String]
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples synchronously.
+     */
+    func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?) throws  -> String
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     */
+    func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?) async throws  -> String
+    
+}
+/**
+ * Standalone pure-Rust OpenAI Whisper speech recognition engine.
+ */
+open class FfiWhisperModel: FfiWhisperModelProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffiwhispermodel(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffiwhispermodel(handle, $0) }
+    }
+
+    
+    /**
+     * Load a Whisper ASR model from an in-memory GGUF byte buffer.
+     */
+public static func fromBytes(bytes: Data)throws  -> FfiWhisperModel  {
+    return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+    /**
+     * Load a Whisper ASR model from a local `.gguf` file path.
+     */
+public static func fromFile(path: String)throws  -> FfiWhisperModel  {
+    return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+     */
+open func isMultilingual() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+     */
+open func languages() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_languages(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples synchronously.
+     */
+open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(pcm),
+        FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     */
+open func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterSequenceFloat.lower(pcm),FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWhisperModel: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiWhisperModel
+
+    public static func lift(_ handle: UInt64) throws -> FfiWhisperModel {
+        return FfiWhisperModel(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiWhisperModel) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWhisperModel {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiWhisperModel, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperModel_lift(_ handle: UInt64) throws -> FfiWhisperModel {
+    return try FfiConverterTypeFfiWhisperModel.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperModel_lower(_ value: FfiWhisperModel) -> UInt64 {
+    return FfiConverterTypeFfiWhisperModel.lower(value)
+}
+
+
+
+
+
+
+/**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
  * [`Session::attach_lora`]. Load it once and share the handle across sessions —
  * it's reference-counted internally, so attaching to multiple sessions doesn't
@@ -5222,6 +5431,107 @@ public func FfiConverterTypeFfiVadConfig_lower(_ value: FfiVadConfig) -> RustBuf
 
 
 /**
+ * Options for Whisper speech transcription.
+ */
+public struct FfiWhisperTranscribeOpts: Equatable, Hashable {
+    /**
+     * Language code (e.g. "en", "es", "fr").
+     * If None or Some("auto"), dynamic language auto-detection is performed.
+     */
+    public var language: String?
+    /**
+     * Whether to translate speech into English instead of transcribing in source language.
+     */
+    public var translate: Bool
+    /**
+     * Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+     */
+    public var timestamps: Bool
+    /**
+     * Maximum new tokens to decode (defaults to 448).
+     */
+    public var maxTokens: UInt32?
+    /**
+     * Temperature for sampling (0.0 = greedy).
+     */
+    public var temperature: Float?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Language code (e.g. "en", "es", "fr").
+         * If None or Some("auto"), dynamic language auto-detection is performed.
+         */language: String?, 
+        /**
+         * Whether to translate speech into English instead of transcribing in source language.
+         */translate: Bool, 
+        /**
+         * Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+         */timestamps: Bool, 
+        /**
+         * Maximum new tokens to decode (defaults to 448).
+         */maxTokens: UInt32?, 
+        /**
+         * Temperature for sampling (0.0 = greedy).
+         */temperature: Float?) {
+        self.language = language
+        self.translate = translate
+        self.timestamps = timestamps
+        self.maxTokens = maxTokens
+        self.temperature = temperature
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWhisperTranscribeOpts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWhisperTranscribeOpts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWhisperTranscribeOpts {
+        return
+            try FfiWhisperTranscribeOpts(
+                language: FfiConverterOptionString.read(from: &buf), 
+                translate: FfiConverterBool.read(from: &buf), 
+                timestamps: FfiConverterBool.read(from: &buf), 
+                maxTokens: FfiConverterOptionUInt32.read(from: &buf), 
+                temperature: FfiConverterOptionFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWhisperTranscribeOpts, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.language, into: &buf)
+        FfiConverterBool.write(value.translate, into: &buf)
+        FfiConverterBool.write(value.timestamps, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxTokens, into: &buf)
+        FfiConverterOptionFloat.write(value.temperature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperTranscribeOpts_lift(_ buf: RustBuffer) throws -> FfiWhisperTranscribeOpts {
+    return try FfiConverterTypeFfiWhisperTranscribeOpts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperTranscribeOpts_lower(_ value: FfiWhisperTranscribeOpts) -> RustBuffer {
+    return FfiConverterTypeFfiWhisperTranscribeOpts.lower(value)
+}
+
+
+/**
  * Per-call decode options. Mirrors [`cera::GenerateOpts`].
  *
  * `flush_every_tokens` / `flush_every_ms` are accepted but have no
@@ -7309,6 +7619,30 @@ fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiWhisperTranscribeOpts: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWhisperTranscribeOpts?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiWhisperTranscribeOpts.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiWhisperTranscribeOpts.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffer {
     typealias SwiftType = SpecDecodeConfig?
 
@@ -7833,6 +8167,15 @@ public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  
     )
 })
 }
+/**
+ * Default transcription options for Whisper ASR.
+ */
+public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
+    return try!  FfiConverterTypeFfiWhisperTranscribeOpts_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -7874,6 +8217,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
@@ -7988,6 +8334,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -8129,6 +8487,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {

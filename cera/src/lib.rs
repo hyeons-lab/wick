@@ -72,7 +72,7 @@ pub use hotword::{
     HotwordConfig, HotwordDetector, HotwordEvent, HotwordIterator, HotwordScore, LogMelFrontEnd,
 };
 pub use model::whisper::{
-    Conv1dWeights, WHISPER_CATALOG, WhisperConfig, WhisperDecoderBlockWeights,
+    Conv1dWeights, WHISPER_CATALOG, WHISPER_LANGUAGES, WhisperConfig, WhisperDecoderBlockWeights,
     WhisperDecoderWeights, WhisperEncoderBlockWeights, WhisperEncoderWeights, WhisperModel,
     WhisperModelCatalogEntry, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
     find_whisper_catalog_entry, is_whisper_gguf, transcribe_pcm, transcribe_pcm_with_tokens,

@@ -497,6 +497,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_tool_grammar() != 41383:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631:
@@ -604,6 +606,18 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1008,6 +1022,16 @@ _UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1134,6 +1158,10 @@ _UniffiLib.uniffi_cera_ffi_fn_func_tool_grammar.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_tool_grammar.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_new.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1448,6 +1476,39 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_languages.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_languages.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1682,6 +1743,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_silero_vad_default_config.restype = cty
 _UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.restype = ctypes.c_uint16
@@ -1844,6 +1908,24 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.restype 
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.restype = ctypes.c_uint16
@@ -3502,6 +3584,113 @@ class _UniffiFfiConverterTypeFfiVadConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.min_silence_duration_ms, buf)
         _UniffiFfiConverterUInt32.write(value.speech_pad_ms, buf)
 
+class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt32.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt32.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterFloat32.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterFloat32.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterFloat32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiWhisperTranscribeOpts:
+    """
+    Options for Whisper speech transcription.
+"""
+    def __init__(self, *, language:typing.Optional[str], translate:bool, timestamps:bool, max_tokens:typing.Optional[int], temperature:typing.Optional[float]):
+        self.language = language
+        self.translate = translate
+        self.timestamps = timestamps
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        
+        
+
+    
+    def __str__(self):
+        return "FfiWhisperTranscribeOpts(language={}, translate={}, timestamps={}, max_tokens={}, temperature={})".format(self.language, self.translate, self.timestamps, self.max_tokens, self.temperature)
+    def __eq__(self, other):
+        if self.language != other.language:
+            return False
+        if self.translate != other.translate:
+            return False
+        if self.timestamps != other.timestamps:
+            return False
+        if self.max_tokens != other.max_tokens:
+            return False
+        if self.temperature != other.temperature:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiWhisperTranscribeOpts(
+            language=_UniffiFfiConverterOptionalString.read(buf),
+            translate=_UniffiFfiConverterBoolean.read(buf),
+            timestamps=_UniffiFfiConverterBoolean.read(buf),
+            max_tokens=_UniffiFfiConverterOptionalUInt32.read(buf),
+            temperature=_UniffiFfiConverterOptionalFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalString.check_lower(value.language)
+        _UniffiFfiConverterBoolean.check_lower(value.translate)
+        _UniffiFfiConverterBoolean.check_lower(value.timestamps)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.max_tokens)
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.temperature)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalString.write(value.language, buf)
+        _UniffiFfiConverterBoolean.write(value.translate, buf)
+        _UniffiFfiConverterBoolean.write(value.timestamps, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.max_tokens, buf)
+        _UniffiFfiConverterOptionalFloat32.write(value.temperature, buf)
+
 class _UniffiFfiConverterSequenceUInt32(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -4286,31 +4475,6 @@ class _UniffiFfiConverterTypeModelMetadata(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.add_bos_token, buf)
         _UniffiFfiConverterBoolean.write(value.add_eos_token, buf)
         _UniffiFfiConverterString.write(value.cpu_backend, buf)
-
-class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt32.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt32.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt32.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 
 
@@ -8708,6 +8872,225 @@ class _UniffiFfiConverterTypeFfiVadIterator:
     def write(cls, value: FfiVadIterator, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
+class _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+class FfiWhisperModelProtocol(typing.Protocol):
+    """
+    Standalone pure-Rust OpenAI Whisper speech recognition engine.
+"""
+    
+    def is_multilingual(self, ) -> bool:
+        """
+        Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+"""
+        raise NotImplementedError
+    def languages(self, ) -> typing.List[str]:
+        """
+        List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+"""
+        raise NotImplementedError
+    def transcribe(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
+        """
+        Transcribe 16 kHz mono PCM audio samples synchronously.
+"""
+        raise NotImplementedError
+    async def transcribe_async(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
+        """
+        Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+"""
+        raise NotImplementedError
+
+class FfiWhisperModel(FfiWhisperModelProtocol):
+    """
+    Standalone pure-Rust OpenAI Whisper speech recognition engine.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_bytes(cls, bytes: bytes) -> FfiWhisperModel:
+        """
+        Load a Whisper ASR model from an in-memory GGUF byte buffer.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(bytes)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterBytes.lower(bytes),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiWhisperModel.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_file(cls, path: str) -> FfiWhisperModel:
+        """
+        Load a Whisper ASR model from a local `.gguf` file path.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiWhisperModel.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def is_multilingual(self, ) -> bool:
+        """
+        Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def languages(self, ) -> typing.List[str]:
+        """
+        List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_languages,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def transcribe(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
+        """
+        Transcribe 16 kHz mono PCM audio samples synchronously.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(pcm)
+
+        _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.check_lower(opts)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(pcm),
+            _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.lower(opts),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    async def transcribe_async(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
+        """
+        Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(pcm)
+
+        _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.check_lower(opts)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(pcm),
+            _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.lower(opts),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+
+
+
+
+
+class _UniffiFfiConverterTypeFfiWhisperModel:
+    @staticmethod
+    def lift(value: int) -> FfiWhisperModel:
+        return FfiWhisperModel._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: FfiWhisperModel):
+        if not isinstance(value, FfiWhisperModel):
+            raise TypeError("Expected FfiWhisperModel instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: FfiWhisperModel) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> FfiWhisperModel:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: FfiWhisperModel, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
 
 class PiiClassifierProtocol(typing.Protocol):
     """
@@ -8942,31 +9325,6 @@ class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer
             return _UniffiFfiConverterTypeFfiHotwordConfig.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterFloat32.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterFloat32.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterFloat32.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 def cera_ffi_version() -> str:
     """
     Version string of the `cera-ffi` crate. Useful as a smoke test
@@ -9150,6 +9508,20 @@ def tool_grammar(tools: typing.List[ToolDef],format: ToolFormat) -> str:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def whisper_default_transcribe_opts() -> FfiWhisperTranscribeOpts:
+    """
+    Default transcription options for Whisper ASR.
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 
 __all__ = [
     "InternalError",
@@ -9169,6 +9541,7 @@ __all__ = [
     "FfiHotwordScore",
     "FfiSpeechTimestamp",
     "FfiVadConfig",
+    "FfiWhisperTranscribeOpts",
     "SpecDecodeConfig",
     "GenerateOpts",
     "GenerateSummary",
@@ -9189,6 +9562,7 @@ __all__ = [
     "parse_tool_calls",
     "silero_vad_default_config",
     "tool_grammar",
+    "whisper_default_transcribe_opts",
     "BundleRepo",
     "BundleRepoProtocol",
     "LoraAdapters",
@@ -9209,6 +9583,8 @@ __all__ = [
     "FfiSileroVadProtocol",
     "FfiVadIterator",
     "FfiVadIteratorProtocol",
+    "FfiWhisperModel",
+    "FfiWhisperModelProtocol",
     "PiiClassifier",
     "PiiClassifierProtocol",
 ]

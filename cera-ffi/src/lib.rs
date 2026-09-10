@@ -57,6 +57,11 @@
 //! - [`FfiHotwordIterator`]: streaming manager with integrated VAD gating, ring buffering, and debounce.
 //! - [`FfiHotwordConfig`], [`FfiHotwordScore`], [`FfiHotwordEvent`].
 //!
+//! Speech Recognition (ASR / Whisper):
+//! - [`FfiWhisperModel`]: standalone pure-Rust OpenAI Whisper speech recognition engine.
+//! - [`FfiWhisperTranscribeOpts`]: options for language, translation, timestamps, max tokens, and temperature.
+//! - [`whisper_default_transcribe_opts`]: factory for default transcription options.
+//!
 //! Error:
 //! - [`FfiError`] — typed error surface mirroring [`cera::CeraError`]
 //!   one-to-one (`ContextOverflow { max_seq_len, by }`,
@@ -3450,6 +3455,141 @@ impl FfiHotwordIterator {
 }
 
 // ---------------------------------------------------------------------------
+// Speech Recognition / Whisper ASR types
+// ---------------------------------------------------------------------------
+
+/// Options for Whisper speech transcription.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiWhisperTranscribeOpts {
+    /// Language code (e.g. "en", "es", "fr").
+    /// If None or Some("auto"), dynamic language auto-detection is performed.
+    pub language: Option<String>,
+    /// Whether to translate speech into English instead of transcribing in source language.
+    pub translate: bool,
+    /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+    pub timestamps: bool,
+    /// Maximum new tokens to decode (defaults to 448).
+    pub max_tokens: Option<u32>,
+    /// Temperature for sampling (0.0 = greedy).
+    pub temperature: Option<f32>,
+}
+
+impl Default for FfiWhisperTranscribeOpts {
+    fn default() -> Self {
+        Self {
+            language: None,
+            translate: false,
+            timestamps: false,
+            max_tokens: Some(448),
+            temperature: Some(0.0),
+        }
+    }
+}
+
+impl From<FfiWhisperTranscribeOpts> for cera::WhisperTranscribeOpts {
+    fn from(opts: FfiWhisperTranscribeOpts) -> Self {
+        Self {
+            language: opts.language,
+            translate: opts.translate,
+            timestamps: opts.timestamps,
+            max_tokens: opts.max_tokens.map(|v| v as usize).unwrap_or(448),
+            temperature: opts.temperature.unwrap_or(0.0),
+            cancel: None,
+        }
+    }
+}
+
+impl From<cera::WhisperTranscribeOpts> for FfiWhisperTranscribeOpts {
+    fn from(opts: cera::WhisperTranscribeOpts) -> Self {
+        Self {
+            language: opts.language,
+            translate: opts.translate,
+            timestamps: opts.timestamps,
+            max_tokens: Some(opts.max_tokens as u32),
+            temperature: Some(opts.temperature),
+        }
+    }
+}
+
+/// Default transcription options for Whisper ASR.
+#[uniffi::export]
+pub fn whisper_default_transcribe_opts() -> FfiWhisperTranscribeOpts {
+    FfiWhisperTranscribeOpts::default()
+}
+
+/// Standalone pure-Rust OpenAI Whisper speech recognition engine.
+#[derive(uniffi::Object)]
+pub struct FfiWhisperModel {
+    model: cera::WhisperModel,
+    tokenizer: cera::tokenizer::BpeTokenizer,
+}
+
+#[uniffi::export]
+impl FfiWhisperModel {
+    /// Load a Whisper ASR model from a local `.gguf` file path.
+    #[uniffi::constructor]
+    pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
+        let (model, tokenizer) =
+            cera::WhisperModel::from_file(&path).map_err(|e| FfiError::Backend {
+                detail: format!("failed to load Whisper model from {path}: {e}"),
+            })?;
+        Ok(Arc::new(Self { model, tokenizer }))
+    }
+
+    /// Load a Whisper ASR model from an in-memory GGUF byte buffer.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError> {
+        let (model, tokenizer) =
+            cera::WhisperModel::from_bytes(bytes).map_err(|e| FfiError::Backend {
+                detail: format!("failed to load Whisper model from bytes: {e}"),
+            })?;
+        Ok(Arc::new(Self { model, tokenizer }))
+    }
+
+    /// Transcribe 16 kHz mono PCM audio samples synchronously.
+    pub fn transcribe(
+        &self,
+        pcm: Vec<f32>,
+        opts: Option<FfiWhisperTranscribeOpts>,
+    ) -> Result<String, FfiError> {
+        let cera_opts: cera::WhisperTranscribeOpts = opts.unwrap_or_default().into();
+        self.model
+            .transcribe(&self.tokenizer, &pcm, &cera_opts)
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })
+    }
+
+    /// List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+    pub fn languages(&self) -> Vec<String> {
+        cera::WHISPER_LANGUAGES
+            .iter()
+            .map(|&s| s.to_string())
+            .collect()
+    }
+
+    /// Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+    pub fn is_multilingual(&self) -> bool {
+        self.tokenizer.token_to_id("<|transcribe|>").is_some()
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiWhisperModel {
+    /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+    pub async fn transcribe_async(
+        self: Arc<Self>,
+        pcm: Vec<f32>,
+        opts: Option<FfiWhisperTranscribeOpts>,
+    ) -> Result<String, FfiError> {
+        let handle = tokio::task::spawn_blocking(move || self.transcribe(pcm, opts));
+        handle.await.map_err(|e| FfiError::Backend {
+            detail: format!("transcribe_async worker task failed: {e}"),
+        })?
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PII Classification types
 // ---------------------------------------------------------------------------
 
@@ -4539,5 +4679,32 @@ mod tests {
         assert_eq!(ffi_event.command_start_sample, 16800);
         assert_eq!(ffi_event.timestamp_ms, 1200.0);
         assert_eq!(ffi_event.confidence, 0.95);
+    }
+
+    #[test]
+    fn whisper_ffi_conversions() {
+        let def = whisper_default_transcribe_opts();
+        assert_eq!(def.language, None);
+        assert!(!def.translate);
+        assert!(!def.timestamps);
+        assert_eq!(def.max_tokens, Some(448));
+        assert_eq!(def.temperature, Some(0.0));
+
+        let custom = FfiWhisperTranscribeOpts {
+            language: Some("es".to_string()),
+            translate: true,
+            timestamps: true,
+            max_tokens: Some(256),
+            temperature: Some(0.2),
+        };
+        let core_opts: cera::WhisperTranscribeOpts = custom.clone().into();
+        assert_eq!(core_opts.language.as_deref(), Some("es"));
+        assert!(core_opts.translate);
+        assert!(core_opts.timestamps);
+        assert_eq!(core_opts.max_tokens, 256);
+        assert_eq!(core_opts.temperature, 0.2);
+
+        let roundtrip: FfiWhisperTranscribeOpts = core_opts.into();
+        assert_eq!(roundtrip, custom);
     }
 }

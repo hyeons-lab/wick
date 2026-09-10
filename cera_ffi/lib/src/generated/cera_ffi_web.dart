@@ -657,6 +657,84 @@ class FfiVadConfig {
   int get hashCode => Object.hash(threshold, negThreshold, minSpeechDurationMs, minSilenceDurationMs, speechPadMs);
 }
 
+/// Options for Whisper speech transcription.
+class FfiWhisperTranscribeOpts {
+  const FfiWhisperTranscribeOpts({
+    /// Language code (e.g. "en", "es", "fr").
+    /// If None or Some("auto"), dynamic language auto-detection is performed.
+    required this.language,
+    /// Whether to translate speech into English instead of transcribing in source language.
+    required this.translate,
+    /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+    required this.timestamps,
+    /// Maximum new tokens to decode (defaults to 448).
+    required this.maxTokens,
+    /// Temperature for sampling (0.0 = greedy).
+    required this.temperature,
+  });
+
+  /// Language code (e.g. "en", "es", "fr").
+  /// If None or Some("auto"), dynamic language auto-detection is performed.
+  final String? language;
+  /// Whether to translate speech into English instead of transcribing in source language.
+  final bool translate;
+  /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+  final bool timestamps;
+  /// Maximum new tokens to decode (defaults to 448).
+  final int? maxTokens;
+  /// Temperature for sampling (0.0 = greedy).
+  final double? temperature;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'language': this.language,
+      'translate': this.translate,
+      'timestamps': this.timestamps,
+      'maxTokens': this.maxTokens,
+      'temperature': this.temperature,
+    };
+  }
+
+  factory FfiWhisperTranscribeOpts.fromJson(Map<String, dynamic> json) {
+    return FfiWhisperTranscribeOpts(
+      language: json['language'] == null ? null : json['language'] as String,
+      translate: json['translate'] as bool,
+      timestamps: json['timestamps'] as bool,
+      maxTokens: json['maxTokens'] == null ? null : (json['maxTokens'] as num).toInt(),
+      temperature: json['temperature'] == null ? null : (json['temperature'] as num).toDouble(),
+    );
+  }
+
+  FfiWhisperTranscribeOpts copyWith({
+    Object? language = _sentinel,
+    bool? translate,
+    bool? timestamps,
+    Object? maxTokens = _sentinel,
+    Object? temperature = _sentinel,
+  }) {
+    return FfiWhisperTranscribeOpts(
+      language: language == _sentinel ? this.language : language as String?,
+      translate: translate ?? this.translate,
+      timestamps: timestamps ?? this.timestamps,
+      maxTokens: maxTokens == _sentinel ? this.maxTokens : maxTokens as int?,
+      temperature: temperature == _sentinel ? this.temperature : temperature as double?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiWhisperTranscribeOpts(language: $language, translate: $translate, timestamps: $timestamps, maxTokens: $maxTokens, temperature: $temperature)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiWhisperTranscribeOpts && language == other.language && translate == other.translate && timestamps == other.timestamps && maxTokens == other.maxTokens && temperature == other.temperature;
+
+  @override
+  int get hashCode => Object.hash(language, translate, timestamps, maxTokens, temperature);
+}
+
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
@@ -3557,6 +3635,38 @@ final class FfiVadIteratorFfiCodec {
   static FfiVadIterator lift(int handle) => _unsupportedOnWeb('FfiVadIteratorFfiCodec.lift');
 }
 
+/// Standalone pure-Rust OpenAI Whisper speech recognition engine.
+final class FfiWhisperModel {
+  FfiWhisperModel._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiWhisperModel.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiWhisperModel.close');
+
+  /// Load a Whisper ASR model from an in-memory GGUF byte buffer.
+  static FfiWhisperModel fromBytes(Uint8List bytes) => _unsupportedOnWeb('FfiWhisperModel.fromBytes');
+
+  /// Load a Whisper ASR model from a local `.gguf` file path.
+  static FfiWhisperModel fromFile(String path) => _unsupportedOnWeb('FfiWhisperModel.fromFile');
+
+  /// Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+  bool isMultilingual() => _unsupportedOnWeb('FfiWhisperModel.isMultilingual');
+
+  /// List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+  List<String> languages() => _unsupportedOnWeb('FfiWhisperModel.languages');
+
+  /// Transcribe 16 kHz mono PCM audio samples synchronously.
+  String transcribe(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribe');
+
+  /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+  Future<String> transcribeAsync(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribeAsync');
+}
+
+final class FfiWhisperModelFfiCodec {
+  static int lower(FfiWhisperModel value) => _unsupportedOnWeb('FfiWhisperModelFfiCodec.lower');
+  static FfiWhisperModel lift(int handle) => _unsupportedOnWeb('FfiWhisperModelFfiCodec.lift');
+}
+
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
 /// [`Session::attach_lora`]. Load it once and share the handle across sessions —
 /// it's reference-counted internally, so attaching to multiple sessions doesn't
@@ -4066,3 +4176,6 @@ FfiVadConfig sileroVadDefaultConfig() => _unsupportedOnWeb('sileroVadDefaultConf
 /// `GenerateOpts.grammar_trigger_tokens` (see
 /// [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
 String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb('toolGrammar');
+
+/// Default transcription options for Whisper ASR.
+FfiWhisperTranscribeOpts whisperDefaultTranscribeOpts() => _unsupportedOnWeb('whisperDefaultTranscribeOpts');
