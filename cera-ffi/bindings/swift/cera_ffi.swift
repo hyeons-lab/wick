@@ -2016,6 +2016,352 @@ public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgress
 
 
 /**
+ * Stateful Keyword Spotting detector executing pure-Rust forward inference.
+ */
+public protocol FfiHotwordDetectorProtocol: AnyObject, Sendable {
+    
+    /**
+     * Get default configuration suggested by model metadata.
+     */
+    func defaultConfig() throws  -> FfiHotwordConfig
+    
+    /**
+     * List of target keywords supported by this model.
+     */
+    func keywords() throws  -> [String]
+    
+    /**
+     * Process a full audio window and return probability scores for each keyword.
+     */
+    func processWindow(window: [Float]) throws  -> [Float]
+    
+}
+/**
+ * Stateful Keyword Spotting detector executing pure-Rust forward inference.
+ */
+open class FfiHotwordDetector: FfiHotwordDetectorProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffihotworddetector(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffihotworddetector(handle, $0) }
+    }
+
+    
+    /**
+     * Load a KWS model from in-memory GGUF bytes.
+     */
+public static func fromBytes(bytes: Data)throws  -> FfiHotwordDetector  {
+    return try  FfiConverterTypeFfiHotwordDetector_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+    /**
+     * Load a KWS model from a `.gguf` file path.
+     */
+public static func fromFile(path: String)throws  -> FfiHotwordDetector  {
+    return try  FfiConverterTypeFfiHotwordDetector_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Get default configuration suggested by model metadata.
+     */
+open func defaultConfig()throws  -> FfiHotwordConfig  {
+    return try  FfiConverterTypeFfiHotwordConfig_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffihotworddetector_default_config(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * List of target keywords supported by this model.
+     */
+open func keywords()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffihotworddetector_keywords(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Process a full audio window and return probability scores for each keyword.
+     */
+open func processWindow(window: [Float])throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffihotworddetector_process_window(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(window),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHotwordDetector: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiHotwordDetector
+
+    public static func lift(_ handle: UInt64) throws -> FfiHotwordDetector {
+        return FfiHotwordDetector(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiHotwordDetector) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHotwordDetector {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiHotwordDetector, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordDetector_lift(_ handle: UInt64) throws -> FfiHotwordDetector {
+    return try FfiConverterTypeFfiHotwordDetector.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordDetector_lower(_ value: FfiHotwordDetector) -> UInt64 {
+    return FfiConverterTypeFfiHotwordDetector.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ */
+public protocol FfiHotwordIteratorProtocol: AnyObject, Sendable {
+    
+    /**
+     * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     */
+    func processChunk(chunk: [Float]) throws  -> FfiHotwordEvent?
+    
+    /**
+     * Reset iterator state, ring buffer, and debounce timers.
+     */
+    func reset() throws 
+    
+}
+/**
+ * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ */
+open class FfiHotwordIterator: FfiHotwordIteratorProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffihotworditerator(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffihotworditerator(handle, $0) }
+    }
+
+    
+    /**
+     * Load and construct a streaming hotword iterator from file paths.
+     */
+public static func fromFiles(modelPath: String, vadModelPath: String?, config: FfiHotwordConfig?)throws  -> FfiHotwordIterator  {
+    return try  FfiConverterTypeFfiHotwordIterator_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files(
+        FfiConverterString.lower(modelPath),
+        FfiConverterOptionString.lower(vadModelPath),
+        FfiConverterOptionTypeFfiHotwordConfig.lower(config),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     */
+open func processChunk(chunk: [Float])throws  -> FfiHotwordEvent?  {
+    return try  FfiConverterOptionTypeFfiHotwordEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(chunk),$0
+    )
+})
+}
+    
+    /**
+     * Reset iterator state, ring buffer, and debounce timers.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffihotworditerator_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHotwordIterator: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiHotwordIterator
+
+    public static func lift(_ handle: UInt64) throws -> FfiHotwordIterator {
+        return FfiHotwordIterator(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiHotwordIterator) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHotwordIterator {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiHotwordIterator, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordIterator_lift(_ handle: UInt64) throws -> FfiHotwordIterator {
+    return try FfiConverterTypeFfiHotwordIterator.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordIterator_lower(_ value: FfiHotwordIterator) -> UInt64 {
+    return FfiConverterTypeFfiHotwordIterator.lower(value)
+}
+
+
+
+
+
+
+/**
  * Stateful Silero Voice Activity Detector (VAD) session.
  */
 public protocol FfiSileroVadProtocol: AnyObject, Sendable {
@@ -2373,6 +2719,215 @@ public func FfiConverterTypeFfiVadIterator_lift(_ handle: UInt64) throws -> FfiV
 #endif
 public func FfiConverterTypeFfiVadIterator_lower(_ value: FfiVadIterator) -> UInt64 {
     return FfiConverterTypeFfiVadIterator.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Standalone pure-Rust OpenAI Whisper speech recognition engine.
+ */
+public protocol FfiWhisperModelProtocol: AnyObject, Sendable {
+    
+    /**
+     * Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+     */
+    func isMultilingual()  -> Bool
+    
+    /**
+     * List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+     */
+    func languages()  -> [String]
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples synchronously.
+     */
+    func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?) throws  -> String
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     */
+    func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?) async throws  -> String
+    
+}
+/**
+ * Standalone pure-Rust OpenAI Whisper speech recognition engine.
+ */
+open class FfiWhisperModel: FfiWhisperModelProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffiwhispermodel(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffiwhispermodel(handle, $0) }
+    }
+
+    
+    /**
+     * Load a Whisper ASR model from an in-memory GGUF byte buffer.
+     */
+public static func fromBytes(bytes: Data)throws  -> FfiWhisperModel  {
+    return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+    /**
+     * Load a Whisper ASR model from a local `.gguf` file path.
+     */
+public static func fromFile(path: String)throws  -> FfiWhisperModel  {
+    return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+     */
+open func isMultilingual() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+     */
+open func languages() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_languages(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples synchronously.
+     */
+open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(pcm),
+        FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     */
+open func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterSequenceFloat.lower(pcm),FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWhisperModel: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiWhisperModel
+
+    public static func lift(_ handle: UInt64) throws -> FfiWhisperModel {
+        return FfiWhisperModel(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiWhisperModel) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWhisperModel {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiWhisperModel, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperModel_lift(_ handle: UInt64) throws -> FfiWhisperModel {
+    return try FfiConverterTypeFfiWhisperModel.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperModel_lower(_ value: FfiWhisperModel) -> UInt64 {
+    return FfiConverterTypeFfiWhisperModel.lower(value)
 }
 
 
@@ -4465,6 +5020,283 @@ public func FfiConverterTypeFfiEntitySpan_lower(_ value: FfiEntitySpan) -> RustB
 
 
 /**
+ * Configuration options for keyword spotting.
+ */
+public struct FfiHotwordConfig: Equatable, Hashable {
+    /**
+     * Activation probability threshold (default: 0.75).
+     */
+    public var threshold: Float
+    /**
+     * Post-detection debounce cooldown in milliseconds (default: 2000 ms).
+     */
+    public var cooldownMs: UInt32
+    /**
+     * Evaluation step interval in milliseconds (default: 80 ms).
+     */
+    public var stepMs: UInt32
+    /**
+     * Sliding window length in milliseconds (default: 1200 ms).
+     */
+    public var windowMs: UInt32
+    /**
+     * Audio pre-roll margin in milliseconds preserved before command (default: 150 ms).
+     */
+    public var preRollMs: UInt32
+    /**
+     * VAD speech probability threshold for gating KWS (default: 0.5).
+     */
+    public var vadThreshold: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Activation probability threshold (default: 0.75).
+         */threshold: Float, 
+        /**
+         * Post-detection debounce cooldown in milliseconds (default: 2000 ms).
+         */cooldownMs: UInt32, 
+        /**
+         * Evaluation step interval in milliseconds (default: 80 ms).
+         */stepMs: UInt32, 
+        /**
+         * Sliding window length in milliseconds (default: 1200 ms).
+         */windowMs: UInt32, 
+        /**
+         * Audio pre-roll margin in milliseconds preserved before command (default: 150 ms).
+         */preRollMs: UInt32, 
+        /**
+         * VAD speech probability threshold for gating KWS (default: 0.5).
+         */vadThreshold: Float) {
+        self.threshold = threshold
+        self.cooldownMs = cooldownMs
+        self.stepMs = stepMs
+        self.windowMs = windowMs
+        self.preRollMs = preRollMs
+        self.vadThreshold = vadThreshold
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiHotwordConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHotwordConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHotwordConfig {
+        return
+            try FfiHotwordConfig(
+                threshold: FfiConverterFloat.read(from: &buf), 
+                cooldownMs: FfiConverterUInt32.read(from: &buf), 
+                stepMs: FfiConverterUInt32.read(from: &buf), 
+                windowMs: FfiConverterUInt32.read(from: &buf), 
+                preRollMs: FfiConverterUInt32.read(from: &buf), 
+                vadThreshold: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHotwordConfig, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.threshold, into: &buf)
+        FfiConverterUInt32.write(value.cooldownMs, into: &buf)
+        FfiConverterUInt32.write(value.stepMs, into: &buf)
+        FfiConverterUInt32.write(value.windowMs, into: &buf)
+        FfiConverterUInt32.write(value.preRollMs, into: &buf)
+        FfiConverterFloat.write(value.vadThreshold, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordConfig_lift(_ buf: RustBuffer) throws -> FfiHotwordConfig {
+    return try FfiConverterTypeFfiHotwordConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordConfig_lower(_ value: FfiHotwordConfig) -> RustBuffer {
+    return FfiConverterTypeFfiHotwordConfig.lower(value)
+}
+
+
+/**
+ * Event emitted when a keyword spotting threshold is crossed.
+ */
+public struct FfiHotwordEvent: Equatable, Hashable {
+    /**
+     * The matched keyword string.
+     */
+    public var keyword: String
+    /**
+     * Exact audio stream sample index where the keyword completed.
+     */
+    public var sampleOffset: UInt64
+    /**
+     * Audio stream sample index including pre-roll safety margin for downstream ASR.
+     */
+    public var commandStartSample: UInt64
+    /**
+     * Timestamp in milliseconds from stream origin where keyword completed.
+     */
+    public var timestampMs: Float
+    /**
+     * Model confidence probability (0.0 to 1.0).
+     */
+    public var confidence: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The matched keyword string.
+         */keyword: String, 
+        /**
+         * Exact audio stream sample index where the keyword completed.
+         */sampleOffset: UInt64, 
+        /**
+         * Audio stream sample index including pre-roll safety margin for downstream ASR.
+         */commandStartSample: UInt64, 
+        /**
+         * Timestamp in milliseconds from stream origin where keyword completed.
+         */timestampMs: Float, 
+        /**
+         * Model confidence probability (0.0 to 1.0).
+         */confidence: Float) {
+        self.keyword = keyword
+        self.sampleOffset = sampleOffset
+        self.commandStartSample = commandStartSample
+        self.timestampMs = timestampMs
+        self.confidence = confidence
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiHotwordEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHotwordEvent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHotwordEvent {
+        return
+            try FfiHotwordEvent(
+                keyword: FfiConverterString.read(from: &buf), 
+                sampleOffset: FfiConverterUInt64.read(from: &buf), 
+                commandStartSample: FfiConverterUInt64.read(from: &buf), 
+                timestampMs: FfiConverterFloat.read(from: &buf), 
+                confidence: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHotwordEvent, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.keyword, into: &buf)
+        FfiConverterUInt64.write(value.sampleOffset, into: &buf)
+        FfiConverterUInt64.write(value.commandStartSample, into: &buf)
+        FfiConverterFloat.write(value.timestampMs, into: &buf)
+        FfiConverterFloat.write(value.confidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordEvent_lift(_ buf: RustBuffer) throws -> FfiHotwordEvent {
+    return try FfiConverterTypeFfiHotwordEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordEvent_lower(_ value: FfiHotwordEvent) -> RustBuffer {
+    return FfiConverterTypeFfiHotwordEvent.lower(value)
+}
+
+
+/**
+ * Confidence score for a specific keyword candidate.
+ */
+public struct FfiHotwordScore: Equatable, Hashable {
+    /**
+     * Target keyword string.
+     */
+    public var keyword: String
+    /**
+     * Model activation probability between 0.0 and 1.0.
+     */
+    public var score: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Target keyword string.
+         */keyword: String, 
+        /**
+         * Model activation probability between 0.0 and 1.0.
+         */score: Float) {
+        self.keyword = keyword
+        self.score = score
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiHotwordScore: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHotwordScore: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHotwordScore {
+        return
+            try FfiHotwordScore(
+                keyword: FfiConverterString.read(from: &buf), 
+                score: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHotwordScore, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.keyword, into: &buf)
+        FfiConverterFloat.write(value.score, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordScore_lift(_ buf: RustBuffer) throws -> FfiHotwordScore {
+    return try FfiConverterTypeFfiHotwordScore.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHotwordScore_lower(_ value: FfiHotwordScore) -> RustBuffer {
+    return FfiConverterTypeFfiHotwordScore.lower(value)
+}
+
+
+/**
  * A detected speech segment with sample and millisecond boundaries.
  */
 public struct FfiSpeechTimestamp: Equatable, Hashable {
@@ -4595,6 +5427,107 @@ public func FfiConverterTypeFfiVadConfig_lift(_ buf: RustBuffer) throws -> FfiVa
 #endif
 public func FfiConverterTypeFfiVadConfig_lower(_ value: FfiVadConfig) -> RustBuffer {
     return FfiConverterTypeFfiVadConfig.lower(value)
+}
+
+
+/**
+ * Options for Whisper speech transcription.
+ */
+public struct FfiWhisperTranscribeOpts: Equatable, Hashable {
+    /**
+     * Language code (e.g. "en", "es", "fr").
+     * If None or Some("auto"), dynamic language auto-detection is performed.
+     */
+    public var language: String?
+    /**
+     * Whether to translate speech into English instead of transcribing in source language.
+     */
+    public var translate: Bool
+    /**
+     * Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+     */
+    public var timestamps: Bool
+    /**
+     * Maximum new tokens to decode (defaults to 448).
+     */
+    public var maxTokens: UInt32?
+    /**
+     * Temperature for sampling (0.0 = greedy).
+     */
+    public var temperature: Float?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Language code (e.g. "en", "es", "fr").
+         * If None or Some("auto"), dynamic language auto-detection is performed.
+         */language: String?, 
+        /**
+         * Whether to translate speech into English instead of transcribing in source language.
+         */translate: Bool, 
+        /**
+         * Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+         */timestamps: Bool, 
+        /**
+         * Maximum new tokens to decode (defaults to 448).
+         */maxTokens: UInt32?, 
+        /**
+         * Temperature for sampling (0.0 = greedy).
+         */temperature: Float?) {
+        self.language = language
+        self.translate = translate
+        self.timestamps = timestamps
+        self.maxTokens = maxTokens
+        self.temperature = temperature
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWhisperTranscribeOpts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWhisperTranscribeOpts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWhisperTranscribeOpts {
+        return
+            try FfiWhisperTranscribeOpts(
+                language: FfiConverterOptionString.read(from: &buf), 
+                translate: FfiConverterBool.read(from: &buf), 
+                timestamps: FfiConverterBool.read(from: &buf), 
+                maxTokens: FfiConverterOptionUInt32.read(from: &buf), 
+                temperature: FfiConverterOptionFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWhisperTranscribeOpts, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.language, into: &buf)
+        FfiConverterBool.write(value.translate, into: &buf)
+        FfiConverterBool.write(value.timestamps, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxTokens, into: &buf)
+        FfiConverterOptionFloat.write(value.temperature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperTranscribeOpts_lift(_ buf: RustBuffer) throws -> FfiWhisperTranscribeOpts {
+    return try FfiConverterTypeFfiWhisperTranscribeOpts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWhisperTranscribeOpts_lower(_ value: FfiWhisperTranscribeOpts) -> RustBuffer {
+    return FfiConverterTypeFfiWhisperTranscribeOpts.lower(value)
 }
 
 
@@ -6614,6 +7547,54 @@ fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiHotwordConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiHotwordConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiHotwordConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiHotwordConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiHotwordEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiHotwordEvent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiHotwordEvent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiHotwordEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiVadConfig?
 
@@ -6630,6 +7611,30 @@ fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiVadConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiWhisperTranscribeOpts: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWhisperTranscribeOpts?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiWhisperTranscribeOpts.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiWhisperTranscribeOpts.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7064,6 +8069,15 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 })
 }
 /**
+ * Default KWS configuration parameters.
+ */
+public func hotwordDefaultConfig() -> FfiHotwordConfig  {
+    return try!  FfiConverterTypeFfiHotwordConfig_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_hotword_default_config($0
+    )
+})
+}
+/**
  * List every bundle published on `LiquidAI/LeapBundles`, so a picker
  * can offer `<name>, <quant>` pairs instead of making the user type a
  * bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
@@ -7153,6 +8167,15 @@ public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  
     )
 })
 }
+/**
+ * Default transcription options for Whisper ASR.
+ */
+public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
+    return try!  FfiConverterTypeFfiWhisperTranscribeOpts_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -7178,6 +8201,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7191,6 +8217,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
@@ -7274,6 +8303,21 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 53986) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 45182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 58406) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7290,6 +8334,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -7415,6 +8471,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7422,6 +8487,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {

@@ -319,6 +319,218 @@ class FfiEntitySpan {
   int get hashCode => Object.hash(entityType, startChar, endChar, startToken, endToken, text, score);
 }
 
+/// Configuration options for keyword spotting.
+class FfiHotwordConfig {
+  const FfiHotwordConfig({
+    /// Activation probability threshold (default: 0.75).
+    required this.threshold,
+    /// Post-detection debounce cooldown in milliseconds (default: 2000 ms).
+    required this.cooldownMs,
+    /// Evaluation step interval in milliseconds (default: 80 ms).
+    required this.stepMs,
+    /// Sliding window length in milliseconds (default: 1200 ms).
+    required this.windowMs,
+    /// Audio pre-roll margin in milliseconds preserved before command (default: 150 ms).
+    required this.preRollMs,
+    /// VAD speech probability threshold for gating KWS (default: 0.5).
+    required this.vadThreshold,
+  });
+
+  /// Activation probability threshold (default: 0.75).
+  final double threshold;
+  /// Post-detection debounce cooldown in milliseconds (default: 2000 ms).
+  final int cooldownMs;
+  /// Evaluation step interval in milliseconds (default: 80 ms).
+  final int stepMs;
+  /// Sliding window length in milliseconds (default: 1200 ms).
+  final int windowMs;
+  /// Audio pre-roll margin in milliseconds preserved before command (default: 150 ms).
+  final int preRollMs;
+  /// VAD speech probability threshold for gating KWS (default: 0.5).
+  final double vadThreshold;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'threshold': this.threshold,
+      'cooldownMs': this.cooldownMs,
+      'stepMs': this.stepMs,
+      'windowMs': this.windowMs,
+      'preRollMs': this.preRollMs,
+      'vadThreshold': this.vadThreshold,
+    };
+  }
+
+  factory FfiHotwordConfig.fromJson(Map<String, dynamic> json) {
+    return FfiHotwordConfig(
+      threshold: (json['threshold'] as num).toDouble(),
+      cooldownMs: (json['cooldownMs'] as num).toInt(),
+      stepMs: (json['stepMs'] as num).toInt(),
+      windowMs: (json['windowMs'] as num).toInt(),
+      preRollMs: (json['preRollMs'] as num).toInt(),
+      vadThreshold: (json['vadThreshold'] as num).toDouble(),
+    );
+  }
+
+  FfiHotwordConfig copyWith({
+    double? threshold,
+    int? cooldownMs,
+    int? stepMs,
+    int? windowMs,
+    int? preRollMs,
+    double? vadThreshold,
+  }) {
+    return FfiHotwordConfig(
+      threshold: threshold ?? this.threshold,
+      cooldownMs: cooldownMs ?? this.cooldownMs,
+      stepMs: stepMs ?? this.stepMs,
+      windowMs: windowMs ?? this.windowMs,
+      preRollMs: preRollMs ?? this.preRollMs,
+      vadThreshold: vadThreshold ?? this.vadThreshold,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiHotwordConfig(threshold: $threshold, cooldownMs: $cooldownMs, stepMs: $stepMs, windowMs: $windowMs, preRollMs: $preRollMs, vadThreshold: $vadThreshold)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiHotwordConfig && threshold == other.threshold && cooldownMs == other.cooldownMs && stepMs == other.stepMs && windowMs == other.windowMs && preRollMs == other.preRollMs && vadThreshold == other.vadThreshold;
+
+  @override
+  int get hashCode => Object.hash(threshold, cooldownMs, stepMs, windowMs, preRollMs, vadThreshold);
+}
+
+/// Event emitted when a keyword spotting threshold is crossed.
+class FfiHotwordEvent {
+  const FfiHotwordEvent({
+    /// The matched keyword string.
+    required this.keyword,
+    /// Exact audio stream sample index where the keyword completed.
+    required this.sampleOffset,
+    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    required this.commandStartSample,
+    /// Timestamp in milliseconds from stream origin where keyword completed.
+    required this.timestampMs,
+    /// Model confidence probability (0.0 to 1.0).
+    required this.confidence,
+  });
+
+  /// The matched keyword string.
+  final String keyword;
+  /// Exact audio stream sample index where the keyword completed.
+  final int sampleOffset;
+  /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+  final int commandStartSample;
+  /// Timestamp in milliseconds from stream origin where keyword completed.
+  final double timestampMs;
+  /// Model confidence probability (0.0 to 1.0).
+  final double confidence;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'keyword': this.keyword,
+      'sampleOffset': this.sampleOffset,
+      'commandStartSample': this.commandStartSample,
+      'timestampMs': this.timestampMs,
+      'confidence': this.confidence,
+    };
+  }
+
+  factory FfiHotwordEvent.fromJson(Map<String, dynamic> json) {
+    return FfiHotwordEvent(
+      keyword: json['keyword'] as String,
+      sampleOffset: (json['sampleOffset'] as num).toInt(),
+      commandStartSample: (json['commandStartSample'] as num).toInt(),
+      timestampMs: (json['timestampMs'] as num).toDouble(),
+      confidence: (json['confidence'] as num).toDouble(),
+    );
+  }
+
+  FfiHotwordEvent copyWith({
+    String? keyword,
+    int? sampleOffset,
+    int? commandStartSample,
+    double? timestampMs,
+    double? confidence,
+  }) {
+    return FfiHotwordEvent(
+      keyword: keyword ?? this.keyword,
+      sampleOffset: sampleOffset ?? this.sampleOffset,
+      commandStartSample: commandStartSample ?? this.commandStartSample,
+      timestampMs: timestampMs ?? this.timestampMs,
+      confidence: confidence ?? this.confidence,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiHotwordEvent(keyword: $keyword, sampleOffset: $sampleOffset, commandStartSample: $commandStartSample, timestampMs: $timestampMs, confidence: $confidence)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiHotwordEvent && keyword == other.keyword && sampleOffset == other.sampleOffset && commandStartSample == other.commandStartSample && timestampMs == other.timestampMs && confidence == other.confidence;
+
+  @override
+  int get hashCode => Object.hash(keyword, sampleOffset, commandStartSample, timestampMs, confidence);
+}
+
+/// Confidence score for a specific keyword candidate.
+class FfiHotwordScore {
+  const FfiHotwordScore({
+    /// Target keyword string.
+    required this.keyword,
+    /// Model activation probability between 0.0 and 1.0.
+    required this.score,
+  });
+
+  /// Target keyword string.
+  final String keyword;
+  /// Model activation probability between 0.0 and 1.0.
+  final double score;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'keyword': this.keyword,
+      'score': this.score,
+    };
+  }
+
+  factory FfiHotwordScore.fromJson(Map<String, dynamic> json) {
+    return FfiHotwordScore(
+      keyword: json['keyword'] as String,
+      score: (json['score'] as num).toDouble(),
+    );
+  }
+
+  FfiHotwordScore copyWith({
+    String? keyword,
+    double? score,
+  }) {
+    return FfiHotwordScore(
+      keyword: keyword ?? this.keyword,
+      score: score ?? this.score,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiHotwordScore(keyword: $keyword, score: $score)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiHotwordScore && keyword == other.keyword && score == other.score;
+
+  @override
+  int get hashCode => Object.hash(keyword, score);
+}
+
 /// A detected speech segment with sample and millisecond boundaries.
 class FfiSpeechTimestamp {
   const FfiSpeechTimestamp({
@@ -443,6 +655,84 @@ class FfiVadConfig {
 
   @override
   int get hashCode => Object.hash(threshold, negThreshold, minSpeechDurationMs, minSilenceDurationMs, speechPadMs);
+}
+
+/// Options for Whisper speech transcription.
+class FfiWhisperTranscribeOpts {
+  const FfiWhisperTranscribeOpts({
+    /// Language code (e.g. "en", "es", "fr").
+    /// If None or Some("auto"), dynamic language auto-detection is performed.
+    required this.language,
+    /// Whether to translate speech into English instead of transcribing in source language.
+    required this.translate,
+    /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+    required this.timestamps,
+    /// Maximum new tokens to decode (defaults to 448).
+    required this.maxTokens,
+    /// Temperature for sampling (0.0 = greedy).
+    required this.temperature,
+  });
+
+  /// Language code (e.g. "en", "es", "fr").
+  /// If None or Some("auto"), dynamic language auto-detection is performed.
+  final String? language;
+  /// Whether to translate speech into English instead of transcribing in source language.
+  final bool translate;
+  /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+  final bool timestamps;
+  /// Maximum new tokens to decode (defaults to 448).
+  final int? maxTokens;
+  /// Temperature for sampling (0.0 = greedy).
+  final double? temperature;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'language': this.language,
+      'translate': this.translate,
+      'timestamps': this.timestamps,
+      'maxTokens': this.maxTokens,
+      'temperature': this.temperature,
+    };
+  }
+
+  factory FfiWhisperTranscribeOpts.fromJson(Map<String, dynamic> json) {
+    return FfiWhisperTranscribeOpts(
+      language: json['language'] == null ? null : json['language'] as String,
+      translate: json['translate'] as bool,
+      timestamps: json['timestamps'] as bool,
+      maxTokens: json['maxTokens'] == null ? null : (json['maxTokens'] as num).toInt(),
+      temperature: json['temperature'] == null ? null : (json['temperature'] as num).toDouble(),
+    );
+  }
+
+  FfiWhisperTranscribeOpts copyWith({
+    Object? language = _sentinel,
+    bool? translate,
+    bool? timestamps,
+    Object? maxTokens = _sentinel,
+    Object? temperature = _sentinel,
+  }) {
+    return FfiWhisperTranscribeOpts(
+      language: language == _sentinel ? this.language : language as String?,
+      translate: translate ?? this.translate,
+      timestamps: timestamps ?? this.timestamps,
+      maxTokens: maxTokens == _sentinel ? this.maxTokens : maxTokens as int?,
+      temperature: temperature == _sentinel ? this.temperature : temperature as double?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiWhisperTranscribeOpts(language: $language, translate: $translate, timestamps: $timestamps, maxTokens: $maxTokens, temperature: $temperature)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiWhisperTranscribeOpts && language == other.language && translate == other.translate && timestamps == other.timestamps && maxTokens == other.maxTokens && temperature == other.temperature;
+
+  @override
+  int get hashCode => Object.hash(language, translate, timestamps, maxTokens, temperature);
 }
 
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
@@ -3232,6 +3522,61 @@ final class DownloadProgressSinkFfiCodec {
   static DownloadProgressSink lift(int handle) => _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lift');
 }
 
+/// Stateful Keyword Spotting detector executing pure-Rust forward inference.
+final class FfiHotwordDetector {
+  FfiHotwordDetector._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiHotwordDetector.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiHotwordDetector.close');
+
+  /// Load a KWS model from in-memory GGUF bytes.
+  static FfiHotwordDetector fromBytes(Uint8List bytes) => _unsupportedOnWeb('FfiHotwordDetector.fromBytes');
+
+  /// Load a KWS model from a `.gguf` file path.
+  static FfiHotwordDetector fromFile(String path) => _unsupportedOnWeb('FfiHotwordDetector.fromFile');
+
+  /// Get default configuration suggested by model metadata.
+  FfiHotwordConfig defaultConfig() => _unsupportedOnWeb('FfiHotwordDetector.defaultConfig');
+
+  /// List of target keywords supported by this model.
+  List<String> keywords() => _unsupportedOnWeb('FfiHotwordDetector.keywords');
+
+  /// Process a full audio window and return probability scores for each keyword.
+  List<double> processWindow(List<double> window) => _unsupportedOnWeb('FfiHotwordDetector.processWindow');
+}
+
+final class FfiHotwordDetectorFfiCodec {
+  static int lower(FfiHotwordDetector value) => _unsupportedOnWeb('FfiHotwordDetectorFfiCodec.lower');
+  static FfiHotwordDetector lift(int handle) => _unsupportedOnWeb('FfiHotwordDetectorFfiCodec.lift');
+}
+
+/// Streaming Keyword Spotting manager with VAD gating and debounce state.
+final class FfiHotwordIterator {
+  FfiHotwordIterator._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiHotwordIterator.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiHotwordIterator.close');
+
+  /// Load and construct a streaming hotword iterator from file paths.
+  static FfiHotwordIterator fromFiles(String modelPath, String? vadModelPath, FfiHotwordConfig? config) => _unsupportedOnWeb('FfiHotwordIterator.fromFiles');
+
+  /// Process a streaming audio chunk and return a detection event if triggered.
+  ///
+  /// For chunks containing multiple hops, returns the first detected event encountered
+  /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
+  FfiHotwordEvent? processChunk(List<double> chunk) => _unsupportedOnWeb('FfiHotwordIterator.processChunk');
+
+  /// Reset iterator state, ring buffer, and debounce timers.
+  void reset() => _unsupportedOnWeb('FfiHotwordIterator.reset');
+}
+
+final class FfiHotwordIteratorFfiCodec {
+  static int lower(FfiHotwordIterator value) => _unsupportedOnWeb('FfiHotwordIteratorFfiCodec.lower');
+  static FfiHotwordIterator lift(int handle) => _unsupportedOnWeb('FfiHotwordIteratorFfiCodec.lift');
+}
+
 /// Stateful Silero Voice Activity Detector (VAD) session.
 final class FfiSileroVad {
   FfiSileroVad._();
@@ -3288,6 +3633,38 @@ final class FfiVadIterator {
 final class FfiVadIteratorFfiCodec {
   static int lower(FfiVadIterator value) => _unsupportedOnWeb('FfiVadIteratorFfiCodec.lower');
   static FfiVadIterator lift(int handle) => _unsupportedOnWeb('FfiVadIteratorFfiCodec.lift');
+}
+
+/// Standalone pure-Rust OpenAI Whisper speech recognition engine.
+final class FfiWhisperModel {
+  FfiWhisperModel._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiWhisperModel.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiWhisperModel.close');
+
+  /// Load a Whisper ASR model from an in-memory GGUF byte buffer.
+  static FfiWhisperModel fromBytes(Uint8List bytes) => _unsupportedOnWeb('FfiWhisperModel.fromBytes');
+
+  /// Load a Whisper ASR model from a local `.gguf` file path.
+  static FfiWhisperModel fromFile(String path) => _unsupportedOnWeb('FfiWhisperModel.fromFile');
+
+  /// Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+  bool isMultilingual() => _unsupportedOnWeb('FfiWhisperModel.isMultilingual');
+
+  /// List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+  List<String> languages() => _unsupportedOnWeb('FfiWhisperModel.languages');
+
+  /// Transcribe 16 kHz mono PCM audio samples synchronously.
+  String transcribe(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribe');
+
+  /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+  Future<String> transcribeAsync(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribeAsync');
+}
+
+final class FfiWhisperModelFfiCodec {
+  static int lower(FfiWhisperModel value) => _unsupportedOnWeb('FfiWhisperModelFfiCodec.lower');
+  static FfiWhisperModel lift(int handle) => _unsupportedOnWeb('FfiWhisperModelFfiCodec.lift');
 }
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
@@ -3749,6 +4126,9 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
 
+/// Default KWS configuration parameters.
+FfiHotwordConfig hotwordDefaultConfig() => _unsupportedOnWeb('hotwordDefaultConfig');
+
 /// List every bundle published on `LiquidAI/LeapBundles`, so a picker
 /// can offer `<name>, <quant>` pairs instead of making the user type a
 /// bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
@@ -3796,3 +4176,6 @@ FfiVadConfig sileroVadDefaultConfig() => _unsupportedOnWeb('sileroVadDefaultConf
 /// `GenerateOpts.grammar_trigger_tokens` (see
 /// [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
 String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb('toolGrammar');
+
+/// Default transcription options for Whisper ASR.
+FfiWhisperTranscribeOpts whisperDefaultTranscribeOpts() => _unsupportedOnWeb('whisperDefaultTranscribeOpts');

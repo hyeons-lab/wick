@@ -2167,6 +2167,37 @@ impl WhisperModel {
         })
     }
 
+    /// Load Whisper model and tokenizer from a GGUF file path using memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
+    pub fn from_file<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let gguf = GgufFile::open_arc(path.as_ref())?;
+        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+        let model = Self::from_gguf(&gguf, Some(&tokenizer))?;
+        Ok((model, tokenizer))
+    }
+
+    /// Load Whisper model and tokenizer from a GGUF file path without memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_file<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("read whisper model {:?}", path.as_ref()))?;
+        Self::from_bytes(bytes)
+    }
+
+    /// Load Whisper model and tokenizer from in-memory GGUF bytes.
+    pub fn from_bytes(
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let gguf = Arc::new(GgufFile::from_bytes(bytes.into())?);
+        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+        let model = Self::from_gguf(&gguf, Some(&tokenizer))?;
+        Ok((model, tokenizer))
+    }
+
     /// Transcribe 16 kHz mono PCM audio samples.
     pub fn transcribe(
         &self,

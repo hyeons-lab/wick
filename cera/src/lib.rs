@@ -40,6 +40,7 @@ mod generated {
 }
 pub mod gguf;
 pub mod grammar;
+pub mod hotword;
 pub mod kv_cache;
 pub mod lora;
 pub mod manifest;
@@ -67,8 +68,11 @@ pub use classifier::{
 pub use engine::{
     BackendPreference, CeraEngine, EngineConfig, ModelBytes, ModelFiles, ModelMetadata,
 };
+pub use hotword::{
+    HotwordConfig, HotwordDetector, HotwordEvent, HotwordIterator, HotwordScore, LogMelFrontEnd,
+};
 pub use model::whisper::{
-    Conv1dWeights, WHISPER_CATALOG, WhisperConfig, WhisperDecoderBlockWeights,
+    Conv1dWeights, WHISPER_CATALOG, WHISPER_LANGUAGES, WhisperConfig, WhisperDecoderBlockWeights,
     WhisperDecoderWeights, WhisperEncoderBlockWeights, WhisperEncoderWeights, WhisperModel,
     WhisperModelCatalogEntry, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
     find_whisper_catalog_entry, is_whisper_gguf, transcribe_pcm, transcribe_pcm_with_tokens,

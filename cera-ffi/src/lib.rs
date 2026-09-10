@@ -52,6 +52,16 @@
 //! - [`FfiVadIterator`] — stateful speech boundary detector emitting start/end events for live audio streams.
 //! - [`FfiVadConfig`], [`FfiVadSampleRate`], [`FfiSpeechTimestamp`], [`FfiVadEvent`].
 //!
+//! Keyword Spotting (KWS):
+//! - [`FfiHotwordDetector`]: native keyword spotting detector evaluating acoustic models from GGUF.
+//! - [`FfiHotwordIterator`]: streaming manager with integrated VAD gating, ring buffering, and debounce.
+//! - [`FfiHotwordConfig`], [`FfiHotwordScore`], [`FfiHotwordEvent`].
+//!
+//! Speech Recognition (ASR / Whisper):
+//! - [`FfiWhisperModel`]: standalone pure-Rust OpenAI Whisper speech recognition engine.
+//! - [`FfiWhisperTranscribeOpts`]: options for language, translation, timestamps, max tokens, and temperature.
+//! - [`whisper_default_transcribe_opts`]: factory for default transcription options.
+//!
 //! Error:
 //! - [`FfiError`] — typed error surface mirroring [`cera::CeraError`]
 //!   one-to-one (`ContextOverflow { max_seq_len, by }`,
@@ -3221,6 +3231,365 @@ impl FfiVadIterator {
 }
 
 // ---------------------------------------------------------------------------
+// Keyword Spotting (KWS) types
+// ---------------------------------------------------------------------------
+
+/// Configuration options for keyword spotting.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiHotwordConfig {
+    /// Activation probability threshold (default: 0.75).
+    pub threshold: f32,
+    /// Post-detection debounce cooldown in milliseconds (default: 2000 ms).
+    pub cooldown_ms: u32,
+    /// Evaluation step interval in milliseconds (default: 80 ms).
+    pub step_ms: u32,
+    /// Sliding window length in milliseconds (default: 1200 ms).
+    pub window_ms: u32,
+    /// Audio pre-roll margin in milliseconds preserved before command (default: 150 ms).
+    pub pre_roll_ms: u32,
+    /// VAD speech probability threshold for gating KWS (default: 0.5).
+    pub vad_threshold: f32,
+}
+
+impl From<cera::hotword::HotwordConfig> for FfiHotwordConfig {
+    fn from(cfg: cera::hotword::HotwordConfig) -> Self {
+        Self {
+            threshold: cfg.threshold,
+            cooldown_ms: cfg.cooldown_ms as u32,
+            step_ms: cfg.step_ms as u32,
+            window_ms: cfg.window_ms as u32,
+            pre_roll_ms: cfg.pre_roll_ms as u32,
+            vad_threshold: cfg.vad_threshold,
+        }
+    }
+}
+
+impl From<FfiHotwordConfig> for cera::hotword::HotwordConfig {
+    fn from(cfg: FfiHotwordConfig) -> Self {
+        Self {
+            threshold: cfg.threshold,
+            cooldown_ms: cfg.cooldown_ms as usize,
+            step_ms: cfg.step_ms as usize,
+            window_ms: cfg.window_ms as usize,
+            pre_roll_ms: cfg.pre_roll_ms as usize,
+            vad_threshold: cfg.vad_threshold,
+        }
+    }
+}
+
+impl Default for FfiHotwordConfig {
+    fn default() -> Self {
+        cera::hotword::HotwordConfig::default().into()
+    }
+}
+
+/// Default KWS configuration parameters.
+#[uniffi::export]
+pub fn hotword_default_config() -> FfiHotwordConfig {
+    FfiHotwordConfig::default()
+}
+
+/// Confidence score for a specific keyword candidate.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiHotwordScore {
+    /// Target keyword string.
+    pub keyword: String,
+    /// Model activation probability between 0.0 and 1.0.
+    pub score: f32,
+}
+
+impl From<cera::hotword::HotwordScore> for FfiHotwordScore {
+    fn from(s: cera::hotword::HotwordScore) -> Self {
+        Self {
+            keyword: s.keyword,
+            score: s.score,
+        }
+    }
+}
+
+/// Event emitted when a keyword spotting threshold is crossed.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiHotwordEvent {
+    /// The matched keyword string.
+    pub keyword: String,
+    /// Exact audio stream sample index where the keyword completed.
+    pub sample_offset: u64,
+    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    pub command_start_sample: u64,
+    /// Timestamp in milliseconds from stream origin where keyword completed.
+    pub timestamp_ms: f32,
+    /// Model confidence probability (0.0 to 1.0).
+    pub confidence: f32,
+}
+
+impl From<cera::hotword::HotwordEvent> for FfiHotwordEvent {
+    fn from(ev: cera::hotword::HotwordEvent) -> Self {
+        Self {
+            keyword: ev.keyword,
+            sample_offset: ev.sample_offset,
+            command_start_sample: ev.command_start_sample,
+            timestamp_ms: ev.timestamp_ms,
+            confidence: ev.confidence,
+        }
+    }
+}
+
+/// Stateful Keyword Spotting detector executing pure-Rust forward inference.
+#[derive(uniffi::Object)]
+pub struct FfiHotwordDetector {
+    inner: std::sync::Mutex<cera::hotword::HotwordDetector>,
+}
+
+impl FfiHotwordDetector {
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, cera::hotword::HotwordDetector> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[uniffi::export]
+impl FfiHotwordDetector {
+    /// Load a KWS model from a `.gguf` file path.
+    #[uniffi::constructor]
+    pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
+        let detector =
+            cera::hotword::HotwordDetector::from_file(&path).map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(detector),
+        }))
+    }
+
+    /// Load a KWS model from in-memory GGUF bytes.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError> {
+        let detector =
+            cera::hotword::HotwordDetector::from_bytes(bytes).map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(detector),
+        }))
+    }
+
+    /// List of target keywords supported by this model.
+    pub fn keywords(&self) -> Result<Vec<String>, FfiError> {
+        let det = self.lock_inner();
+        Ok(det.keywords().to_vec())
+    }
+
+    /// Get default configuration suggested by model metadata.
+    pub fn default_config(&self) -> Result<FfiHotwordConfig, FfiError> {
+        let det = self.lock_inner();
+        Ok(det.default_config().into())
+    }
+
+    /// Process a full audio window and return probability scores for each keyword.
+    pub fn process_window(&self, window: Vec<f32>) -> Result<Vec<f32>, FfiError> {
+        let mut det = self.lock_inner();
+        let scores = det.process_window(&window).map_err(|e| FfiError::Backend {
+            detail: e.to_string(),
+        })?;
+        Ok(scores.to_vec())
+    }
+}
+
+/// Streaming Keyword Spotting manager with VAD gating and debounce state.
+#[derive(uniffi::Object)]
+pub struct FfiHotwordIterator {
+    inner: std::sync::Mutex<cera::hotword::HotwordIterator>,
+}
+
+impl FfiHotwordIterator {
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, cera::hotword::HotwordIterator> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[uniffi::export]
+impl FfiHotwordIterator {
+    /// Load and construct a streaming hotword iterator from file paths.
+    #[uniffi::constructor]
+    pub fn from_files(
+        model_path: String,
+        vad_model_path: Option<String>,
+        config: Option<FfiHotwordConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        let detector = cera::hotword::HotwordDetector::from_file(&model_path).map_err(|e| {
+            FfiError::Backend {
+                detail: e.to_string(),
+            }
+        })?;
+        let vad = if let Some(vp) = vad_model_path {
+            let v = cera::vad::SileroVad::from_file(&vp).map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })?;
+            Some(v)
+        } else {
+            None
+        };
+        let cfg = config.unwrap_or_default().into();
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(cera::hotword::HotwordIterator::new(detector, vad, cfg)),
+        }))
+    }
+
+    /// Reset iterator state, ring buffer, and debounce timers.
+    pub fn reset(&self) -> Result<(), FfiError> {
+        let mut it = self.lock_inner();
+        it.reset();
+        Ok(())
+    }
+
+    /// Process a streaming audio chunk and return a detection event if triggered.
+    ///
+    /// For chunks containing multiple hops, returns the first detected event encountered
+    /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
+    pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Option<FfiHotwordEvent>, FfiError> {
+        let mut it = self.lock_inner();
+        let ev = it.process_chunk(&chunk).map_err(|e| FfiError::Backend {
+            detail: e.to_string(),
+        })?;
+        Ok(ev.map(Into::into))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speech Recognition / Whisper ASR types
+// ---------------------------------------------------------------------------
+
+/// Options for Whisper speech transcription.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiWhisperTranscribeOpts {
+    /// Language code (e.g. "en", "es", "fr").
+    /// If None or Some("auto"), dynamic language auto-detection is performed.
+    pub language: Option<String>,
+    /// Whether to translate speech into English instead of transcribing in source language.
+    pub translate: bool,
+    /// Whether to output segment timestamps (<|0.00|> to <|30.00|>).
+    pub timestamps: bool,
+    /// Maximum new tokens to decode (defaults to 448).
+    pub max_tokens: Option<u32>,
+    /// Temperature for sampling (0.0 = greedy).
+    pub temperature: Option<f32>,
+}
+
+impl Default for FfiWhisperTranscribeOpts {
+    fn default() -> Self {
+        Self {
+            language: None,
+            translate: false,
+            timestamps: false,
+            max_tokens: Some(448),
+            temperature: Some(0.0),
+        }
+    }
+}
+
+impl From<FfiWhisperTranscribeOpts> for cera::WhisperTranscribeOpts {
+    fn from(opts: FfiWhisperTranscribeOpts) -> Self {
+        Self {
+            language: opts.language,
+            translate: opts.translate,
+            timestamps: opts.timestamps,
+            max_tokens: opts.max_tokens.map(|v| v as usize).unwrap_or(448),
+            temperature: opts.temperature.unwrap_or(0.0),
+            cancel: None,
+        }
+    }
+}
+
+impl From<cera::WhisperTranscribeOpts> for FfiWhisperTranscribeOpts {
+    fn from(opts: cera::WhisperTranscribeOpts) -> Self {
+        Self {
+            language: opts.language,
+            translate: opts.translate,
+            timestamps: opts.timestamps,
+            max_tokens: Some(opts.max_tokens as u32),
+            temperature: Some(opts.temperature),
+        }
+    }
+}
+
+/// Default transcription options for Whisper ASR.
+#[uniffi::export]
+pub fn whisper_default_transcribe_opts() -> FfiWhisperTranscribeOpts {
+    FfiWhisperTranscribeOpts::default()
+}
+
+/// Standalone pure-Rust OpenAI Whisper speech recognition engine.
+#[derive(uniffi::Object)]
+pub struct FfiWhisperModel {
+    model: cera::WhisperModel,
+    tokenizer: cera::tokenizer::BpeTokenizer,
+}
+
+#[uniffi::export]
+impl FfiWhisperModel {
+    /// Load a Whisper ASR model from a local `.gguf` file path.
+    #[uniffi::constructor]
+    pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
+        let (model, tokenizer) =
+            cera::WhisperModel::from_file(&path).map_err(|e| FfiError::Backend {
+                detail: format!("failed to load Whisper model from {path}: {e}"),
+            })?;
+        Ok(Arc::new(Self { model, tokenizer }))
+    }
+
+    /// Load a Whisper ASR model from an in-memory GGUF byte buffer.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError> {
+        let (model, tokenizer) =
+            cera::WhisperModel::from_bytes(bytes).map_err(|e| FfiError::Backend {
+                detail: format!("failed to load Whisper model from bytes: {e}"),
+            })?;
+        Ok(Arc::new(Self { model, tokenizer }))
+    }
+
+    /// Transcribe 16 kHz mono PCM audio samples synchronously.
+    pub fn transcribe(
+        &self,
+        pcm: Vec<f32>,
+        opts: Option<FfiWhisperTranscribeOpts>,
+    ) -> Result<String, FfiError> {
+        let cera_opts: cera::WhisperTranscribeOpts = opts.unwrap_or_default().into();
+        self.model
+            .transcribe(&self.tokenizer, &pcm, &cera_opts)
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })
+    }
+
+    /// List standard 100 language codes supported by OpenAI Whisper in sequential token order.
+    pub fn languages(&self) -> Vec<String> {
+        cera::WHISPER_LANGUAGES
+            .iter()
+            .map(|&s| s.to_string())
+            .collect()
+    }
+
+    /// Whether this Whisper model is multilingual (contains `<|transcribe|>` task token).
+    pub fn is_multilingual(&self) -> bool {
+        self.tokenizer.token_to_id("<|transcribe|>").is_some()
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiWhisperModel {
+    /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+    pub async fn transcribe_async(
+        self: Arc<Self>,
+        pcm: Vec<f32>,
+        opts: Option<FfiWhisperTranscribeOpts>,
+    ) -> Result<String, FfiError> {
+        let handle = tokio::task::spawn_blocking(move || self.transcribe(pcm, opts));
+        handle.await.map_err(|e| FfiError::Backend {
+            detail: format!("transcribe_async worker task failed: {e}"),
+        })?
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PII Classification types
 // ---------------------------------------------------------------------------
 
@@ -4278,5 +4647,64 @@ mod tests {
         assert_eq!(ffi_span.end_token, 4);
         assert_eq!(ffi_span.text, "Alice Smith");
         assert_eq!(ffi_span.score, 0.98);
+    }
+
+    #[test]
+    fn hotword_ffi_conversions() {
+        let def = hotword_default_config();
+        assert_eq!(def.threshold, 0.75);
+        assert_eq!(def.cooldown_ms, 2000);
+        assert_eq!(def.step_ms, 80);
+        assert_eq!(def.window_ms, 1200);
+        assert_eq!(def.pre_roll_ms, 150);
+        assert_eq!(def.vad_threshold, 0.5);
+
+        let core_cfg: cera::HotwordConfig = def.clone().into();
+        assert_eq!(core_cfg.threshold, def.threshold);
+        assert_eq!(core_cfg.cooldown_ms, def.cooldown_ms as usize);
+        assert_eq!(core_cfg.step_ms, def.step_ms as usize);
+        assert_eq!(core_cfg.window_ms, def.window_ms as usize);
+        assert_eq!(core_cfg.pre_roll_ms, def.pre_roll_ms as usize);
+
+        let event = cera::HotwordEvent {
+            keyword: "Hey Liquid".into(),
+            sample_offset: 19200,
+            command_start_sample: 16800,
+            timestamp_ms: 1200.0,
+            confidence: 0.95,
+        };
+        let ffi_event: FfiHotwordEvent = event.clone().into();
+        assert_eq!(ffi_event.keyword, "Hey Liquid");
+        assert_eq!(ffi_event.sample_offset, 19200);
+        assert_eq!(ffi_event.command_start_sample, 16800);
+        assert_eq!(ffi_event.timestamp_ms, 1200.0);
+        assert_eq!(ffi_event.confidence, 0.95);
+    }
+
+    #[test]
+    fn whisper_ffi_conversions() {
+        let def = whisper_default_transcribe_opts();
+        assert_eq!(def.language, None);
+        assert!(!def.translate);
+        assert!(!def.timestamps);
+        assert_eq!(def.max_tokens, Some(448));
+        assert_eq!(def.temperature, Some(0.0));
+
+        let custom = FfiWhisperTranscribeOpts {
+            language: Some("es".to_string()),
+            translate: true,
+            timestamps: true,
+            max_tokens: Some(256),
+            temperature: Some(0.2),
+        };
+        let core_opts: cera::WhisperTranscribeOpts = custom.clone().into();
+        assert_eq!(core_opts.language.as_deref(), Some("es"));
+        assert!(core_opts.translate);
+        assert!(core_opts.timestamps);
+        assert_eq!(core_opts.max_tokens, 256);
+        assert_eq!(core_opts.temperature, 0.2);
+
+        let roundtrip: FfiWhisperTranscribeOpts = core_opts.into();
+        assert_eq!(roundtrip, custom);
     }
 }
