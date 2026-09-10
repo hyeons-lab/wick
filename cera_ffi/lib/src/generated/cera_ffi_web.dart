@@ -3485,6 +3485,9 @@ final class FfiHotwordIterator {
   static FfiHotwordIterator fromFiles(String modelPath, String? vadModelPath, FfiHotwordConfig? config) => _unsupportedOnWeb('FfiHotwordIterator.fromFiles');
 
   /// Process a streaming audio chunk and return a detection event if triggered.
+  ///
+  /// For chunks containing multiple hops, returns the first detected event encountered
+  /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
   FfiHotwordEvent? processChunk(List<double> chunk) => _unsupportedOnWeb('FfiHotwordIterator.processChunk');
 
   /// Reset iterator state, ring buffer, and debounce timers.

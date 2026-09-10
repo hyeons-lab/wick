@@ -2205,6 +2205,9 @@ public protocol FfiHotwordIteratorProtocol: AnyObject, Sendable {
     
     /**
      * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
      */
     func processChunk(chunk: [Float]) throws  -> FfiHotwordEvent?
     
@@ -2285,6 +2288,9 @@ public static func fromFiles(modelPath: String, vadModelPath: String?, config: F
     
     /**
      * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
      */
 open func processChunk(chunk: [Float])throws  -> FfiHotwordEvent?  {
     return try  FfiConverterOptionTypeFfiHotwordEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -7960,7 +7966,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 6598) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {

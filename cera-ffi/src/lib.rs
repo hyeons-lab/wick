@@ -3437,6 +3437,9 @@ impl FfiHotwordIterator {
     }
 
     /// Process a streaming audio chunk and return a detection event if triggered.
+    ///
+    /// For chunks containing multiple hops, returns the first detected event encountered
+    /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
     pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Option<FfiHotwordEvent>, FfiError> {
         let mut it = self.lock_inner();
         let ev = it.process_chunk(&chunk).map_err(|e| FfiError::Backend {

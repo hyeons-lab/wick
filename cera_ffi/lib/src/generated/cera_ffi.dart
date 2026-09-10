@@ -4793,8 +4793,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 6598) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 6598, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 41817) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 41817, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset;
     try {
@@ -16235,6 +16235,9 @@ final class FfiHotwordIterator {
   }
 
   /// Process a streaming audio chunk and return a detection event if triggered.
+  ///
+  /// For chunks containing multiple hops, returns the first detected event encountered
+  /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
   FfiHotwordEvent? processChunk(List<double> chunk) {
     _ensureOpen();
     return _ffi.ffiHotwordIteratorInvokeProcessChunk(_handle, chunk);

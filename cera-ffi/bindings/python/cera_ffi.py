@@ -583,7 +583,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 6598:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -8179,6 +8179,9 @@ class FfiHotwordIteratorProtocol(typing.Protocol):
     def process_chunk(self, chunk: typing.List[float]) -> typing.Optional[FfiHotwordEvent]:
         """
         Process a streaming audio chunk and return a detection event if triggered.
+
+        For chunks containing multiple hops, returns the first detected event encountered
+        during the chunk evaluation steps (or `None` if silence or cooldown persists).
 """
         raise NotImplementedError
     def reset(self, ) -> None:
@@ -8241,6 +8244,9 @@ class FfiHotwordIterator(FfiHotwordIteratorProtocol):
     def process_chunk(self, chunk: typing.List[float]) -> typing.Optional[FfiHotwordEvent]:
         """
         Process a streaming audio chunk and return a detection event if triggered.
+
+        For chunks containing multiple hops, returns the first detected event encountered
+        during the chunk evaluation steps (or `None` if silence or cooldown persists).
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(chunk)

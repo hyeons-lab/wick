@@ -2051,7 +2051,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 6598) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {
@@ -5044,6 +5044,9 @@ public object FfiConverterTypeFfiHotwordDetector : FfiConverter<FfiHotwordDetect
 public interface FfiHotwordIteratorInterface {
     /**
      * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
      */
     fun `processChunk`(`chunk`: List<kotlin.Float>): FfiHotwordEvent?
 
@@ -5159,6 +5162,9 @@ open class FfiHotwordIterator :
 
     /**
      * Process a streaming audio chunk and return a detection event if triggered.
+     *
+     * For chunks containing multiple hops, returns the first detected event encountered
+     * during the chunk evaluation steps (or `None` if silence or cooldown persists).
      */
     @Throws(FfiException::class)
     override fun `processChunk`(`chunk`: List<kotlin.Float>): FfiHotwordEvent? =

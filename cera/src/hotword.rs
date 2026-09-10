@@ -669,7 +669,7 @@ impl CircularBuffer {
             self.write_pos = (self.write_pos + take) % self.capacity;
             remain = tail;
         }
-        self.count = (self.count + slice.len()).min(self.capacity);
+        self.count = self.count.saturating_add(slice.len()).min(self.capacity);
     }
 
     fn read_last(&self, n: usize, out: &mut [f32]) -> bool {
@@ -752,6 +752,9 @@ impl HotwordIterator {
     }
 
     /// Process a streaming chunk of audio samples and return a detection event if triggered.
+    ///
+    /// For chunks containing multiple hops, returns the first detected event encountered
+    /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
     pub fn process_chunk(&mut self, chunk: &[f32]) -> Result<Option<HotwordEvent>> {
         if chunk.is_empty() {
             return Ok(None);
